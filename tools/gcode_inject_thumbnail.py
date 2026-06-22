@@ -28,147 +28,27 @@ import argparse
 import base64
 import io
 import re
-import struct
 import sys
 from pathlib import Path
 from typing import Iterable
 
-import numpy as np
-from PIL import Image, ImageDraw
+# Make sibling tools/ importable when run as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
 
-# ---------- STL parsing ----------
-
-def _is_ascii_stl(head: bytes) -> bool:
-    return head[:5].lower() == b"solid" and b"facet" in head[:1024].lower()
-
-
-def parse_stl(path: Path) -> np.ndarray:
-    """Return triangles as ndarray of shape (N, 3, 3) — N triangles, 3 verts, xyz."""
-    with path.open("rb") as f:
-        head = f.read(1024)
-        f.seek(0)
-        if _is_ascii_stl(head):
-            return _parse_ascii_stl(path)
-        return _parse_binary_stl(f, path.stat().st_size)
-
-
-def _parse_binary_stl(f, file_size: int) -> np.ndarray:
-    if file_size < 84:
-        raise ValueError(f"binary STL too short ({file_size} B; need at least 84)")
-    f.seek(80)
-    (count,) = struct.unpack("<I", f.read(4))
-    expected = 84 + 50 * count
-    if expected != file_size:
-        # Could be a misnamed ASCII STL; fall back
-        f.seek(0)
-        if _is_ascii_stl(f.read(1024)):
-            return _parse_ascii_stl(Path(f.name))
-        raise ValueError(
-            f"binary STL size mismatch: header says {count} tris (expects {expected} B), "
-            f"file is {file_size} B"
-        )
-    buf = f.read(50 * count)
-    dt = np.dtype([
-        ("normal", "<f4", 3),
-        ("v0", "<f4", 3),
-        ("v1", "<f4", 3),
-        ("v2", "<f4", 3),
-        ("attr", "<u2"),
-    ])
-    arr = np.frombuffer(buf, dtype=dt, count=count)
-    # np.stack of <f4 inputs already gives float32; no astype needed.
-    return np.stack([arr["v0"], arr["v1"], arr["v2"]], axis=1)
-
-
-def _parse_ascii_stl(path: Path) -> np.ndarray:
-    verts: list[list[float]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if s.startswith("vertex "):
-                verts.append([float(x) for x in s.split()[1:4]])
-    if len(verts) % 3 != 0:
-        raise ValueError(f"ASCII STL vertex count {len(verts)} not divisible by 3")
-    return np.asarray(verts, dtype=np.float32).reshape(-1, 3, 3)
-
-
-# ---------- rendering ----------
-
-# Isometric-ish rotation matrix: rotate -30° about X, then -45° about Z.
-# Camera looks down +Y after rotation; we drop Y for depth.
-def _iso_rotation() -> np.ndarray:
-    rx, rz = np.deg2rad(-30.0), np.deg2rad(-45.0)
-    Rx = np.array([
-        [1, 0, 0],
-        [0, np.cos(rx), -np.sin(rx)],
-        [0, np.sin(rx), np.cos(rx)],
-    ], dtype=np.float32)
-    Rz = np.array([
-        [np.cos(rz), -np.sin(rz), 0],
-        [np.sin(rz), np.cos(rz), 0],
-        [0, 0, 1],
-    ], dtype=np.float32)
-    return Rx @ Rz
-
-
-def render(tris: np.ndarray, width: int, height: int,
-           bg=(245, 245, 245), pad: float = 0.08) -> Image.Image:
-    """Render an isometric thumbnail of the triangle mesh."""
-    if tris.shape[0] == 0:
-        return Image.new("RGB", (width, height), bg)
-
-    R = _iso_rotation()
-    rotated = tris @ R.T  # (N, 3, 3)
-    # Screen coords: X→horizontal, Z→vertical. Depth = Y after rotation.
-    xs = rotated[..., 0]
-    ys = rotated[..., 2]  # use rotated Z as screen Y
-    depth = rotated[..., 1].mean(axis=1)  # one depth value per triangle
-
-    # Fit bounding box into the image with padding.
-    xmin, xmax = float(xs.min()), float(xs.max())
-    ymin, ymax = float(ys.min()), float(ys.max())
-    obj_w = max(xmax - xmin, 1e-6)
-    obj_h = max(ymax - ymin, 1e-6)
-    avail_w = width * (1 - 2 * pad)
-    avail_h = height * (1 - 2 * pad)
-    scale = min(avail_w / obj_w, avail_h / obj_h)
-    cx_obj, cy_obj = (xmin + xmax) / 2, (ymin + ymax) / 2
-    cx_img, cy_img = width / 2, height / 2
-
-    screen = np.empty((tris.shape[0], 3, 2), dtype=np.float32)
-    screen[..., 0] = (xs - cx_obj) * scale + cx_img
-    # PIL Y axis grows downward; flip Z so "up" in model = up in image.
-    screen[..., 1] = cy_img - (ys - cy_obj) * scale
-
-    # Per-triangle normal (cross of two edges); for Lambertian shading.
-    e1 = rotated[:, 1] - rotated[:, 0]
-    e2 = rotated[:, 2] - rotated[:, 0]
-    normals = np.cross(e1, e2)
-    norms = np.linalg.norm(normals, axis=1, keepdims=True)
-    norms[norms < 1e-9] = 1.0
-    normals = normals / norms
-
-    # Light from upper-front-right.
-    light = np.array([0.3, -0.6, 0.8], dtype=np.float32)
-    light = light / np.linalg.norm(light)
-    intensity = np.clip(np.abs(normals @ light), 0.15, 1.0)  # |dot| so back-faces still shade
-
-    # Painter's algorithm: draw back-to-front (largest Y = farthest from camera).
-    order = np.argsort(-depth)
-
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-    for idx in order:
-        i = intensity[idx]
-        shade = (
-            int(round(60 + 150 * i)),
-            int(round(110 + 130 * i)),
-            int(round(160 + 90 * i)),
-        )
-        poly = [(float(screen[idx, k, 0]), float(screen[idx, k, 1])) for k in range(3)]
-        draw.polygon(poly, fill=shade, outline=None)
-    return img
+# Shared STL parsing + isometric Lambertian render. The thumbnail injector
+# only needs the single-view 'iso' render; the orientation renderer reuses
+# more of the same primitives. See tools/_stl_render.py.
+from _stl_render import (  # noqa: E402
+    _is_ascii_stl,
+    _iso_rotation,
+    _parse_ascii_stl,
+    _parse_binary_stl,
+    parse_stl,
+    render,
+)
 
 
 # ---------- G-code splicing ----------
