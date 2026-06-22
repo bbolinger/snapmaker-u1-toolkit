@@ -352,6 +352,23 @@ Tests use mocked Moonraker responses — no real printer required. The
 thumbnail-injection tests `importorskip` PIL/numpy, so they're harmless
 to omit if you only want to run the safety-script tests.
 
+## Release validation
+
+Each tagged release is install-validated end-to-end before publish — clone,
+test suite, script-help smoke, and the active-print upload-gate safety
+check (the latter against a mocked Moonraker so no live printer is
+touched). The validation surfaces install/docs gaps a fresh-clone user
+would hit.
+
+| Tag | Tooling | Platform |
+|---|---|---|
+| v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
+| **v1.0.1** | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
+
+Findings from the v1.0.1 validation drove every change in that release —
+see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
+for the per-finding breakdown.
+
 ## Known limitations / design notes
 
 1. **Single-printer scope**: scripts assume one U1. Multi-printer would need namespacing in the config + per-printer state dirs.
