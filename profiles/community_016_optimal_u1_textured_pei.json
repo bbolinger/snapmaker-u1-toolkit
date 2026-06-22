@@ -1,0 +1,19 @@
+{
+    "type": "process",
+    "name": "Community 0.16 Optimal @Snapmaker U1 Textured PEI",
+    "inherits": "",
+    "from": "user",
+    "setting_id": "GP003",
+    "instantiation": "true",
+    "description": "Compared with the default profile of a 0.4 mm nozzle, it has a smaller layer height, and results in less apparent layer lines and higher printing quality, but longer printing time.",
+    "smooth_coefficient": "150",
+    "overhang_totally_speed": "50",
+    "compatible_printers": [
+        "Snapmaker U1 (0.4 nozzle)"
+    ],
+    "ooze_prevention": "1",
+    "slowdown_for_curled_perimeters": "0",
+    "standby_temperature_delta": "-150",
+    "curr_bed_type": "Textured PEI Plate",
+    "wipe_tower_filament": "1"
+}
