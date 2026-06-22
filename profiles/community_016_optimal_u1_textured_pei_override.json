@@ -1,0 +1,8 @@
+{
+    "type": "process",
+    "name": "Community 0.16 Optimal U1 Textured PEI override",
+    "from": "user",
+    "inherits": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)",
+    "curr_bed_type": "Textured PEI Plate",
+    "wipe_tower_filament": "1"
+}

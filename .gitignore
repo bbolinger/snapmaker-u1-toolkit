@@ -1,0 +1,18 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime state — don't commit operator-specific JSON/photos
+snapmaker_u1/print_history.json
+snapmaker_u1/print_history.jsonl
+snapmaker_u1/print_history_state.json
+snapmaker_u1/latest_*.jpg
+snapmaker_u1/latest_*.json
+snapmaker_u1/last_layer/*.jpg
+snapmaker_u1/last_layer/*.json
+snapmaker_u1/layer_checks/
+snapmaker_u1/watchdog/
+snapmaker_u1/u1_tool_material_map.json
+snapmaker_u1/u1_config.json
