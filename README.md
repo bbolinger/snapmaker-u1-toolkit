@@ -19,6 +19,7 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 | `snapmaker_u1_status.py` | Read-only status probe |
 | `snapmaker_u1_snapshot.py` | Websocket camera trigger helper |
 | `tools/extract_profile_from_gcode.py` | One-shot extractor — turn a successful G-code into Snapmaker Orca process + filament JSONs |
+| `tools/extract_profiles_from_printer.py` | Auto-pull recent G-codes off your U1 over Moonraker, run the extractor against each — one command, gets your real print history into profiles/ |
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
 | `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
 
@@ -152,7 +153,27 @@ Importing someone else's profiles is fine as a starting point; running them as g
 
 ### Build per-extruder, per-filament profiles from your own print history
 
-This is the recipe Hermes used. It only takes one good print per filament-type-per-extruder slot:
+This is the recipe used to bootstrap the included community profiles. It
+only takes one good print per filament-type-per-extruder slot.
+
+**The fastest path — one command:**
+
+```bash
+python3 tools/extract_profiles_from_printer.py
+```
+
+That connects to your U1 (via `SNAPMAKER_U1_HOST` / `.env`), pulls the 5
+most recent G-codes, runs the extractor against each, and drops process +
+filament JSONs into `profiles/from-printer/` — with multi-tool metadata
+sliced down to the actual tool each print used (so the filament profile
+for a T1 PETG print isn't polluted by T0/T2/T3 settings).
+
+Tweaks: `--list` to see what's on the printer first, `--file "<exact gcode>"`
+to pick a specific one, `--limit N` to grab more, `--vendor SUNLU` to
+override the often-generic vendor field, `--output-dir <path>` to write
+elsewhere.
+
+**The longhand recipe** — same outcome, manual steps:
 
 1. **Print once with Snapmaker's defaults** — get a clean part, no warping/stringing/under-extrusion, on your bed surface and filament. Just enough to call it "good enough to use as a baseline."
 2. **List successful prints via Moonraker**:
@@ -409,17 +430,20 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-135 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+151 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
 corrupt map), upload pre-checks, G-code metadata parsing, print-history
 ledger (incl. atomic-write contract + tmpfile cleanup on failure), profile
-extraction, thumbnail injection, upload-time thumbnail wiring, status-probe
-`safe_to_upload` parity with the actual upload gate, preflight `--host`
-override correctness, STL parsing + view rotations + overhang detection +
-4-view orientation sheet rendering, bundled machine-profile completeness
-(standalone, klipper gcode flavor, 4 extruders, required slicing fields).
+extraction (incl. multi-tool slice handling — `PETG;PETG;PLA;PLA` →
+right value for the actual tool), thumbnail injection, upload-time
+thumbnail wiring, status-probe `safe_to_upload` parity with the actual
+upload gate, preflight `--host` override correctness, STL parsing + view
+rotations + overhang detection + 4-view orientation sheet rendering,
+bundled machine-profile completeness (standalone, klipper gcode flavor,
+4 extruders, required slicing fields), printer-side profile extraction
+(Moonraker list + download mocked, friendly errors).
 
 Tests use mocked Moonraker responses — no real printer required. The
 thumbnail-injection tests `importorskip` PIL/numpy, so they're harmless
@@ -438,7 +462,9 @@ would hit.
 | v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
 | v1.0.1 | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
 | v1.1.0 | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
-| **v1.1.1** | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
+| v1.1.1 | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
+| v1.1.2 | Cold-pass doc fixes + new regenerate_machine_profile.py helper (135 tests) | Linux (Hermes container) |
+| **v1.2.0** | New printer-side extractor with multi-tool slice; live-tested against the U1 (extracted from "Dazzling Uusam_PETG_25m58s.gcode") | Linux (Hermes container) + real U1 |
 
 Findings from the v1.0.1 validation drove every change in that release —
 see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
