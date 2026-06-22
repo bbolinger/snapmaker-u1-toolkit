@@ -18,7 +18,7 @@ pip install Pillow numpy            # only if you'll touch the thumbnail tool
 ## Running the tests
 
 ```bash
-pytest                              # all 105 tests (~25s — subprocess tests dominate)
+pytest                              # all 126 tests (~26s — subprocess tests dominate)
 pytest tests/test_u1_toolmap.py     # one file
 pytest -k "thumbnail"               # by keyword
 ```

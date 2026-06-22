@@ -20,6 +20,7 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 | `snapmaker_u1_snapshot.py` | Websocket camera trigger helper |
 | `tools/extract_profile_from_gcode.py` | One-shot extractor — turn a successful G-code into Snapmaker Orca process + filament JSONs |
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
+| `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
 
 ## Safety model
 
@@ -297,6 +298,27 @@ OrcaSlicer's bundled Snapmaker profiles **do not always resolve inheritance corr
 
 **Workaround**: use the flattened `community_merged_*` process profile in this repo. It pre-resolves the full inheritance chain so CLI loading gets exact values. The `_override` variants only work in the GUI where Orca resolves the official base profile.
 
+### Pre-print orientation review
+
+Before you slice, ask the question every operator forgets: *is this the right
+orientation, and where will it need supports?* The orientation renderer
+gives you a 4-panel image showing isometric / front / side / top views with
+all downward-facing triangles highlighted in orange — those are the faces a
+slicer will warn about.
+
+```bash
+pip install Pillow numpy  # one-time (same deps as the thumbnail tool)
+
+python3 tools/render_stl_orientation.py model.stl \
+    --out orientation.png \
+    --title "Orbital sander vacuum attachment"
+```
+
+Output is a single PNG with header text (bounding-box dims, Z range, count
+of overhang triangles) and the 4 views. Tunable via `--overhang-threshold`
+if your slicer/material is more or less paranoid than the default (-0.3 ≈
+17° below horizontal).
+
 ### Add a Snapmaker-app preview thumbnail
 
 OrcaSlicer's CLI path doesn't render thumbnails (GUI-only — verified with `--debug 5`, no GL/xvfb workaround helps). Without them, the Snapmaker app shows a generic icon for every print. Use the included tool to splice PrusaSlicer/Orca-format thumbnail blocks into the G-code post-slice:
@@ -338,7 +360,7 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-105 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+126 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
@@ -346,7 +368,8 @@ corrupt map), upload pre-checks, G-code metadata parsing, print-history
 ledger (incl. atomic-write contract + tmpfile cleanup on failure), profile
 extraction, thumbnail injection, upload-time thumbnail wiring, status-probe
 `safe_to_upload` parity with the actual upload gate, preflight `--host`
-override correctness.
+override correctness, STL parsing + view rotations + overhang detection +
+4-view orientation sheet rendering.
 
 Tests use mocked Moonraker responses — no real printer required. The
 thumbnail-injection tests `importorskip` PIL/numpy, so they're harmless
@@ -363,7 +386,8 @@ would hit.
 | Tag | Tooling | Platform |
 |---|---|---|
 | v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
-| **v1.0.1** | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
+| v1.0.1 | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
+| **v1.1.0** | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
 
 Findings from the v1.0.1 validation drove every change in that release —
 see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
