@@ -1,0 +1,25 @@
+profiles/machine/snapmaker_u1_0_4_nozzle.json
+=================================================
+
+Derived from upstream OrcaSlicer v2.4.0's bundled Snapmaker vendor profiles:
+
+  resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json
+  resources/profiles/Snapmaker/machine/fdm_U1.json
+  resources/profiles/Snapmaker/machine/fdm_toolchanger.json
+  resources/profiles/Snapmaker/machine/fdm_klipper.json
+
+Those source files were originally contributed by Snapmaker to OrcaSlicer
+upstream. OrcaSlicer is licensed under AGPL-3.0.
+
+The bundled file in this directory is a *flattened* version — the full
+4-level inheritance chain was merged into one standalone JSON so headless
+CLI slicing works without needing Orca to find each parent in its install
+resources. The flattening was done mechanically; no field values were
+modified.
+
+If you'd rather use upstream Orca's original (non-flattened) vendor
+profiles, install OrcaSlicer 2.4.0+ and load:
+
+  <orca-install>/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json
+
+instead of this bundled copy.

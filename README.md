@@ -243,60 +243,100 @@ Diff against official ≈ 93% identical; deltas are documented tuning choices, n
 
 Use this if you're slicing from CLI in a container, CI pipeline, or agent workflow.
 
-### Install OrcaSlicer headlessly
+### Use upstream OrcaSlicer, not the Snapmaker fork
 
-OrcaSlicer ships as an AppImage. In containers without FUSE, extract it instead of mounting:
+> **Important**: use **upstream [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer)
+> v2.4.0+**, not Snapmaker's fork. Snapmaker upstreamed the U1 vendor profile
+> into upstream OrcaSlicer 2.4.0, so it has full U1 support — and its CLI is
+> the better-supported headless path. The Snapmaker fork's Windows CLI has
+> been observed to segfault when slicing with these profiles (verified
+> 2026-06-22 on `snapmaker-orca v2.3.4` Windows, exit code `-1073741819`).
+
+### Install — Linux (extracted AppImage)
 
 ```bash
-# 1. Download the Snapmaker Orca Linux release bundle (a zip that
-#    contains the AppImage — Snapmaker stopped publishing the bare
-#    .AppImage as a single asset around v2.3.4).
-wget https://github.com/Snapmaker/OrcaSlicer/releases/download/v2.3.4/Snapmaker_Orca_Linux_ubuntu_2404_V2.3.4.zip \
-  -O ~/snapmaker-orca-linux.zip
-mkdir -p ~/orcaslicer-bundle
-unzip -o ~/snapmaker-orca-linux.zip -d ~/orcaslicer-bundle
-chmod +x ~/orcaslicer-bundle/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.3.4.AppImage
+# Download upstream OrcaSlicer Linux AppImage
+wget https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v2.4.0/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.4.0.AppImage \
+  -O ~/orcaslicer.AppImage
+chmod +x ~/orcaslicer.AppImage
 
-# 2. Extract instead of running
+# Extract instead of mounting (containers without FUSE)
 mkdir -p ~/orcaslicer-install && cd ~/orcaslicer-install
-~/orcaslicer-bundle/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.3.4.AppImage --appimage-extract
+~/orcaslicer.AppImage --appimage-extract
 # Creates ./squashfs-root/
 
-# 3. Some Linux distros are missing GUI/runtime libs Orca expects.
-#    If you hit "libGL.so.1 not found" or similar, install the deps locally:
+# Some minimal distros are missing GUI/runtime libs Orca expects.
+# If you hit "libGL.so.1 not found" or similar:
 mkdir local-libs && cd local-libs
 apt-get download libgl1 libegl1 libxkbcommon0 libwayland-client0 libnss3 \
                  libasound2 libgtk-3-0 libdbus-1-3 libsecret-1-0
 for d in *.deb; do dpkg-deb -x "$d" .; done
 ```
 
-### Slice a single STL
+### Install — Windows (portable zip, no installer needed)
+
+```powershell
+# Download upstream OrcaSlicer Windows portable
+Invoke-WebRequest -Uri https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v2.4.0/OrcaSlicer_Windows_V2.4.0_portable.zip `
+    -OutFile $env:TEMP\OrcaSlicer.zip
+Expand-Archive $env:TEMP\OrcaSlicer.zip -DestinationPath $env:TEMP\orca240
+
+# The CLI binary lives at $env:TEMP\orca240\orca-slicer.exe
+```
+
+### Slice a single STL — the 3-profile chain
+
+Headless slicing needs **three** profiles in a specific load order:
+
+1. **Machine** — the printer definition (this repo bundles a flattened standalone copy)
+2. **Process** — layer height, walls, infill, supports
+3. **Filament** — material, temps, retraction
 
 ```bash
-# Adjust paths to match your install
+# Linux
 ORCA=$HOME/orcaslicer-install
-PROFILES=$(pwd)/profiles  # this repo's profiles/ dir
+PROFILES=$(pwd)/profiles
 
 LD_LIBRARY_PATH="$ORCA/local-libs/usr/lib/x86_64-linux-gnu:$ORCA/squashfs-root/usr/lib:$ORCA/squashfs-root/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" \
   $ORCA/squashfs-root/bin/orca-slicer \
-  --load-settings "$PROFILES/community_merged_016_optimal_u1_textured_pei.json" \
+  --load-settings "$PROFILES/machine/snapmaker_u1_0_4_nozzle.json;$PROFILES/community_merged_016_optimal_u1_textured_pei.json" \
   --load-filaments "$PROFILES/community_generic_petg_u1_textured_pei.json" \
   --outputdir ./output \
   --slice 0 \
   my_model.stl
 ```
 
+```powershell
+# Windows (PowerShell)
+& "$env:TEMP\orca240\orca-slicer.exe" `
+  --load-settings "profiles\machine\snapmaker_u1_0_4_nozzle.json;profiles\community_merged_016_optimal_u1_textured_pei.json" `
+  --load-filaments "profiles\community_generic_petg_u1_textured_pei.json" `
+  --outputdir .\output `
+  --slice 0 `
+  my_model.stl
+```
+
 Sliced G-code lands in `./output/plate_1.gcode`.
+
+> **Why the bundled machine profile?** Upstream Orca's bundled U1 profile
+> inherits from `fdm_U1` → `fdm_toolchanger` → `fdm_klipper`. Loading the
+> bundled vendor copy via CLI requires Orca to find every parent in its
+> install resources, which is fragile across platforms. The repo's
+> `profiles/machine/snapmaker_u1_0_4_nozzle.json` is **fully flattened**
+> — every inherited field merged into one standalone file. Headless CLI
+> sees one file, gets the complete machine definition, no resolution
+> magic needed. Derived from upstream OrcaSlicer's `Snapmaker/machine/`
+> vendor profiles (AGPL-3.0, contributed by Snapmaker).
 
 ### Headless profile-loading pitfall (READ THIS)
 
-OrcaSlicer's bundled Snapmaker profiles **do not always resolve inheritance correctly via CLI**. Symptoms seen in testing:
+OrcaSlicer's bundled Snapmaker process profiles **do not always resolve inheritance correctly via CLI**. Symptoms seen in testing:
 
 - `filament_settings_id` says PETG but `filament_type` becomes PLA → wrong temps
 - Layer-height preset of 0.16 produces G-code with `layer_height = 0.2`
 - Bed/nozzle temps default to PLA-safe values regardless of selected filament
 
-**Workaround**: use the flattened `community_merged_*` process profile in this repo. It pre-resolves the full inheritance chain so CLI loading gets exact values. The `_override` variants only work in the GUI where Orca resolves the official base profile.
+**Workaround**: use the flattened `community_merged_*` process profile in this repo. It pre-resolves the full inheritance chain so CLI loading gets exact values. The `_override` variants only work in the GUI where Orca resolves the official base profile. The same logic applies to the bundled machine profile above.
 
 ### Pre-print orientation review
 
@@ -360,7 +400,7 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-126 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+135 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
@@ -369,7 +409,8 @@ ledger (incl. atomic-write contract + tmpfile cleanup on failure), profile
 extraction, thumbnail injection, upload-time thumbnail wiring, status-probe
 `safe_to_upload` parity with the actual upload gate, preflight `--host`
 override correctness, STL parsing + view rotations + overhang detection +
-4-view orientation sheet rendering.
+4-view orientation sheet rendering, bundled machine-profile completeness
+(standalone, klipper gcode flavor, 4 extruders, required slicing fields).
 
 Tests use mocked Moonraker responses — no real printer required. The
 thumbnail-injection tests `importorskip` PIL/numpy, so they're harmless
@@ -387,7 +428,8 @@ would hit.
 |---|---|---|
 | v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
 | v1.0.1 | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
-| **v1.1.0** | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
+| v1.1.0 | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
+| **v1.1.1** | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
 
 Findings from the v1.0.1 validation drove every change in that release —
 see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
