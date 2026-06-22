@@ -6,7 +6,7 @@ who've worked out edge cases the existing scripts don't cover.
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR-USER/snapmaker-u1-toolkit.git
+git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
 cd snapmaker-u1-toolkit
 
 python3 -m venv .venv
@@ -18,7 +18,7 @@ pip install Pillow numpy            # only if you'll touch the thumbnail tool
 ## Running the tests
 
 ```bash
-pytest                              # all 94 tests (~25s — subprocess tests dominate)
+pytest                              # all 105 tests (~25s — subprocess tests dominate)
 pytest tests/test_u1_toolmap.py     # one file
 pytest -k "thumbnail"               # by keyword
 ```

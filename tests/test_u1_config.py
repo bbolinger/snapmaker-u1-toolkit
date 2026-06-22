@@ -75,7 +75,11 @@ def test_data_dir_env_var_wins(monkeypatch, tmp_path):
 
 
 def test_data_dir_falls_back_to_home_when_opt_data_absent(monkeypatch, tmp_path):
-    """Fresh community-install path — no /opt/data, no env override."""
+    """Fresh community-install path — no /opt/data, no env override.
+
+    Hermes finding F3: on Windows, `Path.home()` ignores HOME, so the
+    fallback must check HOME explicitly first to keep test + Git Bash
+    behavior consistent with Linux/macOS."""
     monkeypatch.delenv("SNAPMAKER_U1_DATA_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)

@@ -68,7 +68,7 @@ def rounded(value: Any, ndigits: int = 1) -> Any:
     return value
 
 
-def summarize(data: dict[str, Any], camera: dict[str, Any]) -> dict[str, Any]:
+def summarize(data: dict[str, Any], camera: dict[str, Any], host: str | None = None) -> dict[str, Any]:
     obj = data["objects"]
     ps = obj.get("print_stats", {})
     bed = obj.get("heater_bed", {})
@@ -120,7 +120,7 @@ def summarize(data: dict[str, Any], camera: dict[str, Any]) -> dict[str, Any]:
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "printer": {
             "host": data.get("printer_info", {}).get("hostname"),
-            "ip": get_u1_host(),
+            "ip": data.get("printer_info", {}).get("address") or host,
             "state": printer_state,
             "state_message": data.get("printer_info", {}).get("state_message"),
             "klippy_state": data.get("server_info", {}).get("klippy_state"),
@@ -205,10 +205,21 @@ def main() -> int:
     outdir = get_data_dir()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    state = query_printer(host, port)
+    import socket, urllib.error
+    try:
+        state = query_printer(host, port)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout, OSError) as exc:
+        print(
+            f"Could not connect to Snapmaker U1 at {host}:{port}: {exc}\n"
+            "  • Check the printer is on and on your LAN.\n"
+            "  • Edit .env (or set SNAPMAKER_U1_HOST), or pass --host <ip>.\n"
+            "  • The default in .env.example (192.168.1.100) is a placeholder.",
+            file=sys.stderr,
+        )
+        return 2
     camera = run_camera_check(host, port, outdir, args.timeout)
     (outdir / "latest_bed_check_capture.json").write_text(json.dumps(camera, indent=2, sort_keys=True))
-    summary = summarize(state, camera)
+    summary = summarize(state, camera, host=host)
     (outdir / "latest_preflight.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
     (outdir / "latest_preflight.txt").write_text(render_text(summary) + "\n")
 
