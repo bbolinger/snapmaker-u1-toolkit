@@ -67,6 +67,14 @@ def _xdg_data_home() -> Path:
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
         return Path(xdg)
+    # Honor HOME env first so Git Bash/MSYS users and pytest's monkeypatch
+    # get the documented XDG-style behavior. On Windows, `Path.home()`
+    # asks Windows profile APIs and silently ignores HOME, which makes
+    # the test suite fail and surprises Git Bash users. (Hermes Windows
+    # install smoke, 2026-06-22.)
+    home = os.environ.get("HOME")
+    if home:
+        return Path(home) / ".local" / "share"
     return Path.home() / ".local" / "share"
 
 

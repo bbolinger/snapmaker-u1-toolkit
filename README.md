@@ -47,7 +47,7 @@ read → slice → upload (print=false) → operator-approved start → quiet mo
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/YOUR-USER/snapmaker-u1-toolkit.git
+git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
 cd snapmaker-u1-toolkit
 cp .env.example .env
 # edit .env — set SNAPMAKER_U1_HOST to your U1's LAN IP
@@ -74,7 +74,7 @@ python3 scripts/u1_upload_gcode.py /path/to/file.gcode --material PETG \
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/YOUR-USER/snapmaker-u1-toolkit.git
+git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
 cd snapmaker-u1-toolkit
 Copy-Item .env.example .env
 # edit .env — set SNAPMAKER_U1_HOST to your U1's LAN IP
@@ -247,14 +247,18 @@ Use this if you're slicing from CLI in a container, CI pipeline, or agent workfl
 OrcaSlicer ships as an AppImage. In containers without FUSE, extract it instead of mounting:
 
 ```bash
-# 1. Download the OrcaSlicer AppImage (use the SNAPMAKER fork for U1 profiles)
-wget https://github.com/Snapmaker/OrcaSlicer/releases/download/v2.3.4/SnapmakerOrca-Linux-V2.3.4.AppImage \
-  -O ~/orcaslicer.AppImage
-chmod +x ~/orcaslicer.AppImage
+# 1. Download the Snapmaker Orca Linux release bundle (a zip that
+#    contains the AppImage — Snapmaker stopped publishing the bare
+#    .AppImage as a single asset around v2.3.4).
+wget https://github.com/Snapmaker/OrcaSlicer/releases/download/v2.3.4/Snapmaker_Orca_Linux_ubuntu_2404_V2.3.4.zip \
+  -O ~/snapmaker-orca-linux.zip
+mkdir -p ~/orcaslicer-bundle
+unzip -o ~/snapmaker-orca-linux.zip -d ~/orcaslicer-bundle
+chmod +x ~/orcaslicer-bundle/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.3.4.AppImage
 
 # 2. Extract instead of running
 mkdir -p ~/orcaslicer-install && cd ~/orcaslicer-install
-~/orcaslicer.AppImage --appimage-extract
+~/orcaslicer-bundle/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.3.4.AppImage --appimage-extract
 # Creates ./squashfs-root/
 
 # 3. Some Linux distros are missing GUI/runtime libs Orca expects.
@@ -334,13 +338,15 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-94 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+105 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
 corrupt map), upload pre-checks, G-code metadata parsing, print-history
 ledger (incl. atomic-write contract + tmpfile cleanup on failure), profile
-extraction, thumbnail injection, upload-time thumbnail wiring.
+extraction, thumbnail injection, upload-time thumbnail wiring, status-probe
+`safe_to_upload` parity with the actual upload gate, preflight `--host`
+override correctness.
 
 Tests use mocked Moonraker responses — no real printer required. The
 thumbnail-injection tests `importorskip` PIL/numpy, so they're harmless
