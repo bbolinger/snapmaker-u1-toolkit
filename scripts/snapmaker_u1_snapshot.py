@@ -114,6 +114,11 @@ def main() -> int:
 
     host = args.host or get_u1_host()
     port = args.port if args.port is not None else get_u1_port()
+    # Push resolved values back into args so the downstream `args.host` /
+    # `args.port` references (websocket call + summary) use the resolved
+    # values rather than the raw argparse Nones. (Hermes finding F6.)
+    args.host = host
+    args.port = port
     base = f"http://{host}:{port}"
     output = Path(args.output) if args.output else get_data_dir() / "latest_monitor.jpg"
     output.parent.mkdir(parents=True, exist_ok=True)

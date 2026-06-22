@@ -12,11 +12,27 @@ import json
 import sys
 import time
 import urllib.error
+import socket
+import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port, get_data_dir
+
+
+def _print_friendly_connect_error(host: str, port: int, exc: Exception) -> None:
+    """First-run UX: replace the urllib traceback with one actionable line
+    so a community user knows it's a connection problem, not a crash.
+    (Hermes finding F7.)"""
+    print(
+        f"Could not connect to Snapmaker U1 at {host}:{port}: {exc}\n"
+        "  • Check the printer is on and on your LAN.\n"
+        "  • Edit .env (or set SNAPMAKER_U1_HOST), or pass --host <ip>.\n"
+        "  • The default in .env.example (192.168.1.100) is a placeholder.",
+        file=sys.stderr,
+    )
 
 UA = "Hermes Snapmaker U1 read-only status probe"
 
@@ -66,17 +82,24 @@ def main() -> int:
         "read_only": True,
     }
 
-    server = get_json(base, "/server/info")
-    printer = get_json(base, "/printer/info")
-    objects = get_json(base, "/printer/objects/query?print_stats&toolhead&extruder&extruder1&extruder2&extruder3&heater_bed")
-    roots = get_json(base, "/server/files/roots")
-    files = get_json(base, "/server/files/list?root=gcodes")
-    camera_files = get_json(base, "/server/files/list?root=camera")
+    try:
+        server = get_json(base, "/server/info")
+        printer = get_json(base, "/printer/info")
+        objects = get_json(base, "/printer/objects/query?print_stats&virtual_sdcard&pause_resume&webhooks&toolhead&extruder&extruder1&extruder2&extruder3&heater_bed")
+        roots = get_json(base, "/server/files/roots")
+        files = get_json(base, "/server/files/list?root=gcodes")
+        camera_files = get_json(base, "/server/files/list?root=camera")
+    except (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout, OSError) as exc:
+        _print_friendly_connect_error(host, port, exc)
+        return 2
 
     status = objects.get("status", {})
     print_stats = status.get("print_stats", {})
     toolhead = status.get("toolhead", {})
     bed = status.get("heater_bed", {})
+    virtual_sdcard = status.get("virtual_sdcard", {})
+    pause_resume = status.get("pause_resume", {})
+    webhooks = status.get("webhooks", {})
 
     extruders = {}
     for name in ("extruder", "extruder1", "extruder2", "extruder3"):
@@ -118,6 +141,8 @@ def main() -> int:
             "message": print_stats.get("message"),
             "current_layer": (print_stats.get("info") or {}).get("current_layer"),
             "total_layer": (print_stats.get("info") or {}).get("total_layer"),
+            "is_active": virtual_sdcard.get("is_active"),
+            "is_paused": pause_resume.get("is_paused"),
         },
         "toolhead": {
             "homed_axes": toolhead.get("homed_axes"),
@@ -134,7 +159,20 @@ def main() -> int:
         "roots": roots,
         "recent_gcodes": recent_gcodes,
         "camera_monitor": monitor,
-        "safe_to_upload": printer.get("state") == "ready" and print_stats.get("state") in {"complete", "standby", "cancelled", "error"},
+        # `safe_to_upload` must mirror u1_upload_gcode.ensure_idle_ready() —
+        # otherwise the read-only probe says 'safe' in states where the real
+        # upload gate would block, which is misleading. (Hermes finding F4.)
+        "safe_to_upload": (
+            printer.get("state") == "ready"
+            and webhooks.get("state") in {None, "ready"}
+            and not pause_resume.get("is_paused")
+            and not virtual_sdcard.get("is_active")
+            and print_stats.get("state") in {None, "standby", "complete", "cancelled", "error", "ready"}
+            and not any(
+                float((status.get(name) or {}).get("target") or 0) > 0
+                for name in ("heater_bed", "extruder", "extruder1", "extruder2", "extruder3")
+            )
+        ),
         "safe_to_start_requires_user_approval": True,
     })
 
