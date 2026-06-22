@@ -23,3 +23,17 @@ profiles, install OrcaSlicer 2.4.0+ and load:
   <orca-install>/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json
 
 instead of this bundled copy.
+
+Regenerating from a newer OrcaSlicer release
+---------------------------------------------
+
+To refresh this bundled copy from a newer upstream OrcaSlicer:
+
+  python3 tools/regenerate_machine_profile.py \
+      --orca-resources <orca-install>/resources/profiles
+  pytest tests/test_bundled_machine_profile.py
+
+The regen script walks the inheritance chain bottom-up, merges fields
+(child overrides parent), drops `inherits`, and writes the flattened
+result back into this directory. Same recipe used to produce the current
+copy from upstream OrcaSlicer v2.4.0.

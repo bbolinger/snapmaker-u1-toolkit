@@ -232,11 +232,13 @@ Use them as **templates** to copy + modify for your own setup. Don't blindly imp
 
 Diff against official ≈ 93% identical; deltas are documented tuning choices, not regressions.
 
-### Importing profiles into Snapmaker Orca / OrcaSlicer (GUI)
+### Importing profiles into OrcaSlicer (GUI)
 
-1. Open Snapmaker Orca → top-right gear → "Configuration / Profiles"
-2. Drag-and-drop the desired `.json` file into the profiles panel, OR copy to `~/.config/SnapmakerOrca/system/Snapmaker/process/` (or `filament/`)
-3. Restart Orca
+1. Open OrcaSlicer → top-right gear → "Configuration / Profiles"
+2. Drag-and-drop the desired `.json` file into the profiles panel, OR copy to the system config directory for your slicer:
+   - **Upstream OrcaSlicer** (recommended): `~/.config/OrcaSlicer/system/Snapmaker/process/` (or `filament/`) on Linux/macOS; `%APPDATA%\OrcaSlicer\system\Snapmaker\process\` on Windows
+   - **Snapmaker fork** (if you're using `snapmaker-orca` instead): `~/.config/SnapmakerOrca/system/Snapmaker/process/` / `%APPDATA%\Snapmaker_Orca\system\Snapmaker\process\`
+3. Restart OrcaSlicer
 4. Select the Community profile from the dropdown when slicing
 
 ## Headless slicing setup (no GUI / scripted)
@@ -292,6 +294,11 @@ Headless slicing needs **three** profiles in a specific load order:
 2. **Process** — layer height, walls, infill, supports
 3. **Filament** — material, temps, retraction
 
+> **Pass each profile via its own `--load-settings` flag** (not one flag with
+> semicolon-separated paths). Both forms are documented in OrcaSlicer, but
+> the dual-flag form is the one verified-working in our test runs (Hermes
+> Windows smoke, 2026-06-22) and avoids quoting foot-guns on PowerShell.
+
 ```bash
 # Linux
 ORCA=$HOME/orcaslicer-install
@@ -299,7 +306,8 @@ PROFILES=$(pwd)/profiles
 
 LD_LIBRARY_PATH="$ORCA/local-libs/usr/lib/x86_64-linux-gnu:$ORCA/squashfs-root/usr/lib:$ORCA/squashfs-root/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" \
   $ORCA/squashfs-root/bin/orca-slicer \
-  --load-settings "$PROFILES/machine/snapmaker_u1_0_4_nozzle.json;$PROFILES/community_merged_016_optimal_u1_textured_pei.json" \
+  --load-settings "$PROFILES/machine/snapmaker_u1_0_4_nozzle.json" \
+  --load-settings "$PROFILES/community_merged_016_optimal_u1_textured_pei.json" \
   --load-filaments "$PROFILES/community_generic_petg_u1_textured_pei.json" \
   --outputdir ./output \
   --slice 0 \
@@ -309,7 +317,8 @@ LD_LIBRARY_PATH="$ORCA/local-libs/usr/lib/x86_64-linux-gnu:$ORCA/squashfs-root/u
 ```powershell
 # Windows (PowerShell)
 & "$env:TEMP\orca240\orca-slicer.exe" `
-  --load-settings "profiles\machine\snapmaker_u1_0_4_nozzle.json;profiles\community_merged_016_optimal_u1_textured_pei.json" `
+  --load-settings "profiles\machine\snapmaker_u1_0_4_nozzle.json" `
+  --load-settings "profiles\community_merged_016_optimal_u1_textured_pei.json" `
   --load-filaments "profiles\community_generic_petg_u1_textured_pei.json" `
   --outputdir .\output `
   --slice 0 `
