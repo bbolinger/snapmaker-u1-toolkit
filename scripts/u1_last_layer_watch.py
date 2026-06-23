@@ -213,7 +213,7 @@ def main() -> int:
             "pending_resume_check_image": str(image),
         })
         _watchdog_state_path().parent.mkdir(parents=True, exist_ok=True)
-        WATCHDOG__state_path().write_text(json.dumps(watchdog_state, indent=2, sort_keys=True) + "\n")
+        _watchdog_state_path().write_text(json.dumps(watchdog_state, indent=2, sort_keys=True) + "\n")
     elif milestone == "first_layer_check":
         state.update({
             "first_layer_fired_job_key": job_key,
