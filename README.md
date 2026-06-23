@@ -9,11 +9,12 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 | Script | What it does |
 |---|---|
 | `u1_config.py` | Centralized host/port resolution (env > JSON > default) |
-| `u1_camera.py` | Camera capture via Snapmaker-specific websocket `camera.start_monitor` |
+| `u1_camera.py` | Camera capture via Snapmaker-specific websocket `camera.start_monitor`; auto-on/restore the cavity LED for each capture via `u1_led.photo_wrap` |
+| `u1_led.py` | Cavity LED helper — CLI (`status / on / off / set --r/g/b/w / is-on`) and `photo_wrap()` context manager. The U1's cavity LED is white-only (`white_pin: PA10` in printer.cfg); the 4-channel API matches Klipper's interface, only WHITE has visible effect |
 | `u1_toolmap.py` | Multi-tool material gate — declared vs detected material check |
 | `u1_preflight.py` | Combined Moonraker state + camera freshness packet for "is it safe to start?" |
 | `u1_upload_gcode.py` | Upload-only (`print_started=false`) with gates: idle state + tool/material match |
-| `u1_last_layer_watch.py` | Watch active print for final-layer event, snap photo |
+| `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and "last ~6 layers" milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
 | `u1_print_watchdog.py` | Quiet 20-min health watcher with cooldown to avoid notification spam |
 | `u1_print_history.py` | Append-only JSONL print ledger + canonical upserted JSON |
 | `snapmaker_u1_status.py` | Read-only status probe |
@@ -115,6 +116,40 @@ any other script) never touches disk for config. The lookup only fails when
 you actually run a command without any configuration.
 
 See `.env.example` for a starting template.
+
+### Cavity LED auto-control (new in v1.3.0)
+
+The U1's `cavity_led` is white-only — Snapmaker's shipped `printer.cfg`
+defines it as `[led cavity_led] / white_pin: PA10`, no R/G/B. Klipper's
+`[led]` interface exposes all four channels regardless, but only the W
+channel is physically wired. The toolkit drives the LED in two places
+so the operator doesn't have to think about it:
+
+- **Every camera capture** (`u1_camera.py photo`, and therefore every
+  milestone photo from `u1_last_layer_watch.py`) is wrapped in a
+  `u1_led.photo_wrap()` context manager:
+  - LED already on → no change, no flicker.
+  - LED off → turn on white (W=1), settle ~300 ms for the camera's
+    auto-exposure, capture, then restore the LED to off.
+- **5 minutes after a print finishes** (`print_state` enters `complete`,
+  `error`, or `cancelled`) the LED is turned off, once per print. If you
+  manually turn it back on, it stays on — the watcher dedups by
+  `job_key = filename|total_layer` and won't re-fire for the same print.
+
+**Tuning / disabling:**
+
+- `U1_LED_OFF_DELAY_SEC=N` env var — grace window before auto-off. Default
+  `300`. Set `0` for immediate. Set a large value (e.g. `86400`) to
+  effectively disable the auto-off without removing the wiring.
+- The wiring is **fail-soft**: if `cavity_led` isn't configured on your
+  printer (or the LED endpoint errors), the LED helper logs to stderr and
+  the photo/watcher keeps doing its primary job.
+- Manual control via the CLI: `u1_led.py status / on / off / set --r --g --b --w`.
+
+**Why:** photos taken at first/last-layer/post-resume milestones need
+the LED on to be useful, but leaving the cavity bright forever after a
+finished print is wasteful and surprising. The 5-minute grace gives you
+time to inspect the bed before it goes dark.
 
 ## Reference docs
 
