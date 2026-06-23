@@ -155,11 +155,16 @@ def fetch_monitor(host: str, port: int, output: str) -> dict:
 
 
 def command_photo(args: argparse.Namespace) -> dict:
-    before = camera_metadata(args.host, args.port)
-    replies = start_monitor(args.host, args.port, args.interval)
-    time.sleep(args.wait)
-    fetched = fetch_monitor(args.host, args.port, args.output)
-    after = camera_metadata(args.host, args.port)
+    # Lazy import so this module stays usable on systems without cavity_led
+    # configured (the wrap is a no-op then — failures are caught and logged).
+    from u1_led import photo_wrap
+
+    with photo_wrap():
+        before = camera_metadata(args.host, args.port)
+        replies = start_monitor(args.host, args.port, args.interval)
+        time.sleep(args.wait)
+        fetched = fetch_monitor(args.host, args.port, args.output)
+        after = camera_metadata(args.host, args.port)
     return {
         "ok": True,
         "mode": "photo",

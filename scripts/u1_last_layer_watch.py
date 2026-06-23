@@ -14,10 +14,11 @@ No movement/heating/G-code/start/cancel commands.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port, get_data_dir
@@ -43,9 +44,67 @@ def _camera_helper() -> str:
     return str(Path(__file__).resolve().parent / "u1_camera.py")
 
 # Polling once per minute can miss an exact layer boundary, so use narrow windows.
+# LAST_LAYER_WINDOW was previously 1 — too tight for fast finishing prints. A
+# 1-layer window often missed against 60-second cron jitter and the watcher
+# refuses to fire after print_stats.state leaves "printing" (bed may be
+# dropping/dropped already). 6 layers is a generous "we're basically done"
+# zone that still triggers exactly once per print via the job_key dedup.
 FIRST_LAYER_TARGET = 2
 FIRST_LAYER_MAX = 5
-LAST_LAYER_WINDOW = 1
+LAST_LAYER_WINDOW = 6
+
+# Auto-off cavity LED after a print finishes. Default 300s grace so the
+# operator can inspect the bed before the cavity goes dark. Override with
+# U1_LED_OFF_DELAY_SEC=0 for immediate, or a high number to effectively disable.
+LED_FINISHED_STATES = {"complete", "error", "cancelled"}
+LED_OFF_DELAY_SEC = int(os.environ.get("U1_LED_OFF_DELAY_SEC", "300"))
+
+
+def maybe_dim_led_after_finish(state: dict, print_state: str | None, job_key: str) -> None:
+    """One-shot LED off after the print enters a finished state and the grace
+    period elapses. State is mutated in place; caller is responsible for the
+    save_state(state) flush. Failures don't propagate — the watcher's primary
+    job is layer photos, not LED control."""
+    if print_state in {"printing", "paused"}:
+        state.pop("led_off_pending_at", None)
+        state.pop("led_off_pending_key", None)
+        return
+    if print_state not in LED_FINISHED_STATES:
+        return
+    if state.get("led_off_fired_job_key") == job_key:
+        return
+
+    now = datetime.now(timezone.utc)
+    pending_at_str = state.get("led_off_pending_at")
+    pending_key = state.get("led_off_pending_key")
+    if not pending_at_str or pending_key != job_key:
+        state["led_off_pending_at"] = now.isoformat()
+        state["led_off_pending_key"] = job_key
+        return
+
+    try:
+        pending_at = datetime.fromisoformat(pending_at_str.replace("Z", "+00:00"))
+    except Exception:
+        pending_at = now
+    if (now - pending_at) < timedelta(seconds=LED_OFF_DELAY_SEC):
+        return
+
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import u1_led
+        if u1_led.is_on():
+            u1_led.off()
+            state["led_off_fired_at"] = now.isoformat()
+            state["led_off_fired_action"] = "off"
+        else:
+            state["led_off_fired_at"] = now.isoformat()
+            state["led_off_fired_action"] = "noop_already_off"
+        state["led_off_fired_job_key"] = job_key
+        state.pop("led_off_pending_at", None)
+        state.pop("led_off_pending_key", None)
+    except Exception as exc:
+        state["led_off_last_error"] = str(exc)
+        state["led_off_last_error_at"] = now.isoformat()
 
 
 def http_json(path: str, timeout: float = 8.0) -> dict[str, Any]:
@@ -142,6 +201,61 @@ def main() -> int:
         progress = vsd.get("progress")
 
     state = load_state()
+
+    # Re-run detection: detect operator-restart of same gcode via two signals
+    # (either is sufficient) so we don't miss the rerun on the edge where
+    # current_layer is None on the first tick of the new print.
+    #
+    #   1. layer regression — current_layer drops while filename is unchanged
+    #      (covers: rerun where Klipper already reports a layer on tick 1)
+    #   2. state transition — prev print_state was finished/idle and current
+    #      is "printing" with same filename (covers: rerun where Klipper
+    #      hasn't reported a layer yet so current_layer is None)
+    #
+    # Without this, the job_key (filename|total_layer) is identical to the
+    # previous run and every fired_*_job_key marker silently suppresses
+    # re-firing milestone photos for the new session.
+    prev_layer = state.get("current_layer")
+    prev_filename = state.get("filename") or ""
+    prev_state_recorded = state.get("print_state")
+    is_layer_regression = (
+        isinstance(prev_layer, int)
+        and isinstance(current_layer, int)
+        and current_layer < prev_layer
+    )
+    is_state_restart = (
+        prev_state_recorded in {"complete", "error", "cancelled", "standby"}
+        and print_state == "printing"
+    )
+    if (
+        (is_layer_regression or is_state_restart)
+        and filename == prev_filename
+        and filename != ""
+    ):
+        for k in (
+            "first_layer_fired_job_key", "first_layer_fired_at",
+            "first_layer_fired_layer", "first_layer_image",
+            "first_layer_camera_changed",
+            "last_layer_fired_job_key", "last_layer_fired_at",
+            "last_layer_fired_layer", "last_layer_fired_total_layer",
+            "last_layer_image", "last_layer_camera_changed",
+            "post_resume_fired_job_key", "post_resume_fired_at",
+            "post_resume_fired_layer", "post_resume_image",
+            "post_resume_camera_changed",
+            "led_off_fired_job_key", "led_off_fired_at",
+            "led_off_fired_action",
+            "fired_job_key", "fired_at", "fired_layer",
+            "fired_total_layer", "image", "camera_changed",
+        ):
+            state.pop(k, None)
+        state["rerun_detected_at"] = datetime.now(timezone.utc).isoformat()
+        state["rerun_from_layer"] = prev_layer
+        state["rerun_to_layer"] = current_layer
+        state["rerun_trigger"] = (
+            "layer_regression" if is_layer_regression else "state_restart"
+        )
+        state["rerun_prev_state"] = prev_state_recorded
+
     state.update({
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
         "filename": filename,
@@ -150,6 +264,11 @@ def main() -> int:
         "total_layer": total_layer,
         "progress": progress,
     })
+
+    # LED auto-off runs every tick, independent of active-print gate, so a
+    # transition complete → grace → off works even between photo milestones.
+    led_key = f"{filename}|{total_layer}" if filename and total_layer else f"unknown|{print_state}"
+    maybe_dim_led_after_finish(state, print_state, led_key)
 
     active = bool(vsd.get("is_active")) and print_state == "printing" and not pause.get("is_paused")
     if not active or not filename or not isinstance(current_layer, int) or not isinstance(total_layer, int) or total_layer <= 0:
