@@ -239,45 +239,205 @@ def upload_only(gcode: Path, dry_run: bool=True)->dict[str,Any]:
             pass  # fail-soft: enrichment is nice-to-have, not load-bearing
     return result
 
+def _bbox_dims(stl_path: Path) -> tuple[float, float, float]:
+    """Return (x_span, y_span, z_span) of an STL's bounding box. Used to detect
+    whether an auto-orient rotation actually changed the geometry vs identity."""
+    verts = parse_stl(stl_path).reshape(-1, 3)
+    return (
+        float(verts[:, 0].max() - verts[:, 0].min()),
+        float(verts[:, 1].max() - verts[:, 1].min()),
+        float(verts[:, 2].max() - verts[:, 2].min()),
+    )
+
+def _bboxes_differ(stl_a: Path, stl_b: Path, tol_mm: float = 0.5) -> bool:
+    """True iff the two STLs have meaningfully different bbox dimensions in
+    position — i.e., a rotation was applied that changed the per-axis dims
+    by >tol_mm. Position-aware: an axis swap like (80, 163, 140) vs (80, 140,
+    163) IS a different orientation even though the set of dimensions is
+    identical, so we compare X→X, Y→Y, Z→Z. Used to decide whether the
+    auto-oriented render is worth showing as a separate image from the
+    source-as-authored render."""
+    try:
+        a = _bbox_dims(stl_a)
+        b = _bbox_dims(stl_b)
+        return any(abs(a[i] - b[i]) > tol_mm for i in range(3))
+    except Exception:
+        return True  # if we can't compare, err toward "show both"
+
+def _trim_option_payload(opts: list[dict[str, Any]], keep_keys: tuple[str, ...] = ('label', 'value', 'recommended', 'material', 'loaded')) -> list[dict[str, Any]]:
+    """Strip large/internal fields from need_input option payloads. Notably
+    drops 'path' from profile options (multi-KB file paths the agent doesn't
+    need — workflow resolves by value internally). Token-saving for --json-events
+    consumers; reduces typical preset event from ~3KB to ~500B."""
+    return [{k: v for k, v in o.items() if k in keep_keys} for o in opts]
+
+def write_slice_summary(out_dir: Path, slice_res: dict[str, Any]) -> Path:
+    """Write a terse text summary alongside the gcode. Agents should read this
+    instead of re-parsing the gcode (gcode reads inline 12KB of base64 thumbnail
+    data on every read; this is ~300 bytes)."""
+    meta = slice_res.get('metadata', {})
+    moonraker = (slice_res.get('moonraker_metadata') or {}) if isinstance(slice_res.get('moonraker_metadata'), dict) else {}
+    summary_path = out_dir / 'slice_summary.txt'
+    lines = [
+        f"time         = {slice_res.get('time', '?')}",
+        f"weight_g     = {slice_res.get('weight_g', '?')}",
+        f"layer_count  = {moonraker.get('layer_count', '?')}",
+        f"layer_height = {meta.get('layer_height', '?')}",
+        f"profile      = {meta.get('print_settings_id', '?')}",
+        f"material     = {meta.get('filament_type', '?')}",
+        f"tool_idx     = {slice_res.get('tool_idx', '?')}",
+        f"tool_rewrites= {slice_res.get('tool_rewrites', 0)}",
+        f"thumbnails   = {slice_res.get('thumbnails', {}).get('ok', False)}",
+        f"warnings     = {', '.join(slice_res.get('warnings', [])) or 'none'}",
+        f"gcode        = {slice_res.get('gcode', '?')}",
+    ]
+    summary_path.write_text('\n'.join(lines) + '\n')
+    return summary_path
+
 def run_workflow(args)->dict[str,Any]:
+    """v1.4.6 flow: dual-render (source + auto-oriented if different) BEFORE
+    asking questions. User sees both orientation options visually before
+    answering, so the slice happens once with informed input — no re-do
+    cycle. Slice + preview only happen when --yes / --upload-only set,
+    i.e., after the agent collected user answers and re-invoked.
+
+    Three phases:
+      ANALYSIS — always: triage + render source + render auto (if different)
+      DECISION — emit all need_input events (orient/tool/preset/supports)
+      COMMIT (only if --yes or --upload-only): slice + preview + summary + upload
+
+    Without --yes, the workflow exits after DECISION. The agent collects
+    user answers across turns, then re-invokes with --yes and the flag set
+    for each answer.
+    """
     model=Path(args.model).resolve()
     ts=time.strftime('%Y%m%d-%H%M%S')
     out_dir=(Path(args.out_dir) if args.out_dir else DEFAULT_OUT_BASE/model.stem.replace(' ','_')/ts).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    orient_res=orient_model(model, out_dir, orient=args.orient, down_vec=args.down_vec)
-    stl=Path(orient_res['oriented_stl'])
-    emit({'stage':'triage', **triage_stl(stl)}, args.json_events)
-    emit({'stage':'need_input','key':'orient','prompt':'Orientation?','options':[{'label':'Auto-orient','value':'auto','recommended':True},{'label':'As-authored','value':'asauthored'},{'label':'I have notes','value':'notes'}]}, args.json_events)
-    # Material/profile options. In headless/no-printer contexts, fall back to honest supplied tool.
+
+    # === ANALYSIS PHASE ===
+    # Always create the source-as-authored STL (no rotation applied).
+    # orient_model writes to a fixed 'oriented.stl' in out_dir, so we rename
+    # to 'source.stl' to free that name for the auto-orient pass below.
+    source_res = orient_model(model, out_dir, orient='asauthored', down_vec=None)
+    source_stl = out_dir / 'source.stl'
+    Path(source_res['oriented_stl']).rename(source_stl)
+    emit({'stage':'triage', **triage_stl(source_stl)}, args.json_events)
+
+    # Always render the source as authored
+    source_render = out_dir/'source_as_authored.png'
+    render_slice_review(source_stl, source_render, title='Source mesh — as authored (no rotation)')
+    emit({'stage':'render','image':str(source_render),'kind':'source_as_authored'}, args.json_events)
+
+    # If user wants auto-orient (default), also produce + render the auto-oriented version
+    # IF it differs from source. Identity-rotations are detected via bbox-dim compare
+    # and skipped — no need for two identical images.
+    auto_stl: Path = source_stl
+    auto_orient_meta: dict[str, Any] | None = None
+    if args.orient == 'auto':
+        try:
+            auto_res = orient_model(model, out_dir, orient='auto', down_vec=args.down_vec)
+            # Same rename trick — orient_model wrote to oriented.stl; rename so we
+            # don't clobber source on next workflow phase / re-invocation.
+            candidate_auto_stl = out_dir / 'auto_oriented.stl'
+            Path(auto_res['oriented_stl']).rename(candidate_auto_stl)
+            auto_orient_meta = auto_res
+            if _bboxes_differ(source_stl, candidate_auto_stl):
+                auto_stl = candidate_auto_stl
+                auto_render = out_dir/'auto_oriented.png'
+                render_slice_review(auto_stl, auto_render, title='Auto-oriented (Orca cost-optimal)')
+                emit({'stage':'render','image':str(auto_render),'kind':'auto_oriented'}, args.json_events)
+                # Aspect-ratio warning: if auto is dramatically taller than source's smallest axis,
+                # surface a hint that the user might prefer as-authored or a different rotation.
+                src_dims = _bbox_dims(source_stl); auto_dims = _bbox_dims(auto_stl)
+                emit({
+                    'stage':'orient_analysis',
+                    'source_dims_mm': list(src_dims),
+                    'auto_dims_mm': list(auto_dims),
+                    'auto_down_vec': auto_res.get('down_vec'),
+                    'note': (
+                        f"Auto picked Z={auto_dims[2]:.0f}mm; source Z={src_dims[2]:.0f}mm. "
+                        f"Auto height is {auto_dims[2]/max(src_dims[2],0.01):.1f}× source — "
+                        "consider as-authored if taller print = unwanted."
+                    ) if auto_dims[2] > src_dims[2] * 1.5 else None,
+                }, args.json_events)
+        except Exception as e:
+            # Auto-orient failed (Orca missing on review host etc.) — fail-soft.
+            # Source is still available; user can choose as-authored or notes.
+            emit({'stage':'orient_analysis','error': f'auto-orient unavailable: {type(e).__name__}: {e}'}, args.json_events)
+
+    # === DECISION PHASE ===
+    # Material options first — query live state if possible, else fall back to supplied.
     try:
         mat_opts=query_material_options(requested_material=args.material) if not args.no_live_material else []
     except Exception:
         mat_opts=[]
     if not mat_opts:
         mat_opts=[{'label':f'{args.tool or "T1"}: {args.material or "PETG"} (supplied/headless)', 'value':args.tool or 'T1', 'material': args.material or 'PETG', 'loaded': None, 'recommended': True}]
-    emit({'stage':'need_input','key':'tool','prompt':'Filament?','options':mat_opts}, args.json_events)
     prof_opts=list_profiles(class_hint=args.class_hint or model.stem)
-    emit({'stage':'need_input','key':'preset','prompt':'Preset?','options':prof_opts[:8]}, args.json_events)
-    initial=out_dir/'initial_render.png'
-    render_slice_review(stl, initial, title='Step 5: oriented mesh on bed')
-    emit({'stage':'render','image':str(initial),'kind':'oriented_mesh'}, args.json_events)
-    emit({'stage':'need_input','key':'supports','prompt':'Supports?','options':[{'label':'Auto-orient handled it','value':'auto','recommended':True},{'label':'Add supports','value':'supports'},{'label':'Show me overhangs','value':'overhangs'}]}, args.json_events)
-    tool=choose_default(mat_opts, args.tool) or 'T1'; material=args.material or mat_opts[0].get('material','PETG')
+
+    # All four questions emitted in the same phase. Agent should present them
+    # together (or in sequence) with both renders already visible to the user.
+    # Option payloads are trimmed — path strings stripped from profile options
+    # to keep need_input events compact for token economy.
+    emit({'stage':'need_input','key':'orient','prompt':'Orientation?','options':[
+        {'label':'Auto-orient (recommended)','value':'auto','recommended':True},
+        {'label':'As-authored','value':'asauthored'},
+        {'label':'I have notes','value':'notes'},
+    ]}, args.json_events)
+    emit({'stage':'need_input','key':'tool','prompt':'Filament?','options':_trim_option_payload(mat_opts)}, args.json_events)
+    emit({'stage':'need_input','key':'preset','prompt':'Preset?','options':_trim_option_payload(prof_opts[:8])}, args.json_events)
+    emit({'stage':'need_input','key':'supports','prompt':'Supports?','options':[
+        {'label':'Auto-orient handled it','value':'auto','recommended':True},
+        {'label':'Add supports','value':'supports'},
+        {'label':'Show me overhangs','value':'overhangs'},
+    ]}, args.json_events)
+
+    # === COMMIT PHASE === (only runs when --yes / --upload-only present)
+    # Without --yes, we exit after DECISION so the agent can collect answers
+    # across user turns without burning a real slice on speculation.
+    if not (args.yes or args.upload_only):
+        emit({'stage':'awaiting_input','note':'no slice performed — re-invoke with --yes plus collected answers'}, args.json_events)
+        return {
+            'phase':'analysis_complete',
+            'out_dir': str(out_dir),
+            'source_stl': str(source_stl),
+            'source_render': str(source_render),
+            'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None,
+        }
+
+    tool=choose_default(mat_opts, args.tool) or 'T1'
+    material=args.material or mat_opts[0].get('material','PETG')
     profile=choose_default(prof_opts, args.profile) or '020_strength'
+    chosen_stl = auto_stl if args.orient == 'auto' else source_stl
     gcode=out_dir/(model.stem.replace(' ','_')+'_plate_1.gcode')
     emit({'stage':'slicing'}, args.json_events)
-    slice_res=real_orca_slice(stl, gcode, str(tool), str(material), str(profile), supports=False)
-    preview=out_dir/'preview.png'; review=render_slice_review(stl, preview, gcode=gcode, title='Step 8: preview from oriented STL + G-code')
+    slice_res=real_orca_slice(chosen_stl, gcode, str(tool), str(material), str(profile), supports=False)
+    preview=out_dir/'preview.png'
+    review=render_slice_review(chosen_stl, preview, gcode=gcode, title='Final preview from oriented STL + G-code')
     emit({'stage':'render','image':str(preview),'kind':'preview'}, args.json_events)
-    emit({'stage':'summary','time':slice_res['time'],'weight_g':slice_res['weight_g'],'warnings':slice_res['warnings'],'first_layer_bbox':review['first_layer_bbox']}, args.json_events)
+    # Write slice_summary.txt — terse text artifact the agent should read
+    # instead of re-parsing the gcode (which inlines thumbnail base64 blobs).
+    summary_path = write_slice_summary(out_dir, slice_res)
+    emit({'stage':'summary',
+          'time':slice_res['time'],
+          'weight_g':slice_res['weight_g'],
+          'warnings':slice_res['warnings'],
+          'first_layer_bbox':review['first_layer_bbox'],
+          'summary_file': str(summary_path),
+         }, args.json_events)
     if args.cancel:
         emit({'stage':'cancelled'}, args.json_events); return {'cancelled': True, 'out_dir': str(out_dir)}
     if args.upload_only or args.yes:
         up=upload_only(gcode, dry_run=not args.live_upload)
         emit({'stage':'uploaded', **up}, args.json_events)
     else:
-        emit({'stage':'need_input','key':'upload','options':[{'label':'Upload only','value':'upload','recommended':True},{'label':'Upload + start','value':'upload_start'},{'label':'Cancel','value':'cancel'}]}, args.json_events)
-    return {'out_dir': str(out_dir), 'oriented_stl': str(stl), 'initial_render': str(initial), 'preview': str(preview), 'gcode': str(gcode), 'slice': slice_res}
+        emit({'stage':'need_input','key':'upload','options':[
+            {'label':'Upload only','value':'upload','recommended':True},
+            {'label':'Upload + start','value':'upload_start'},
+            {'label':'Cancel','value':'cancel'},
+        ]}, args.json_events)
+    return {'out_dir': str(out_dir), 'oriented_stl': str(chosen_stl), 'source_render': str(source_render), 'preview': str(preview), 'gcode': str(gcode), 'slice': slice_res, 'summary_file': str(summary_path)}
 
 def main(argv=None)->int:
     ap=argparse.ArgumentParser(description='Canonical U1 slice workflow')

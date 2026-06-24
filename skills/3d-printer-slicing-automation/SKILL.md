@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
 description: "Snapmaker U1 staged slicing workflow: orient, render, slice, upload-only, and camera-gated starts."
-version: 1.4.4
+version: 1.4.6
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -53,6 +53,22 @@ When a user attaches a `.stl` or `.3mf` and asks to slice / prepare a print:
 - Fabricate verification procedures, test scores, file paths, or module imports that don't exist in the actual codebase. Future readers and future-you treat skill references as authoritative — hallucinated content is worse than no content. If you write a "checklist," every command in it must actually work against the real codebase. When in doubt, leave it out.
 - Improvise around workflow failures. If the workflow fails, surface the actual error to the user and stop.
 - Start a print from automation, cron, or any chained call. Start commands require explicit in-the-moment operator approval on the bed-clear question.
+
+## Token-efficient operation (read carefully)
+
+The U1 toolkit lives inside Hermes's context window. Every redundant tool call or large output ingested costs the user real tokens. Hermes already deduplicates identical file reads and truncates terminal output >50k chars, but the toolkit's slicing flow produces large artifacts that need explicit discipline:
+
+**YOU MUST:**
+- **Read `slice_summary.txt` ONCE** after a slice completes. It's a ~300-byte terse text file in the workflow's output directory with time, weight, layer count, profile, material, tool, thumbnails-injected status, and warnings. Do not re-parse the gcode to derive these — gcode reads inline 12+ KB of base64 thumbnail blobs as a side effect.
+- **Trust the workflow's JSON event stream as ground truth.** Render images are written to disk and referenced by path in `render` events. Slice metadata lives in `summary` and `slice_summary.txt`. Don't separately invoke vision tools to re-analyze the workflow's own renders unless the user explicitly asks "what's in that image."
+- **Run the workflow in two phases** for an interactive session: first invocation **without `--yes`** emits all renders + `need_input` events and exits at `awaiting_input` without slicing. Collect the user's answers across turns. Then re-invoke **with `--yes` and all flags** (`--orient`, `--tool`, `--material`, `--profile`) to do the actual slice once. This is the documented "collect-answers-then-headless" pattern.
+- **The workflow script at `/opt/data/scripts/u1_slice_workflow.py` does not change between invocations within a session.** Read it at most once. If a question about its behavior arises mid-session, reason from the JSON events you've already seen, not from re-reading the source.
+
+**YOU MUST NOT:**
+- Re-read the gcode file after a slice completes (12+ KB of base64 noise per read).
+- Re-invoke the workflow with the same arguments to "see if it works this time" — failures are deterministic at this level; surface them to the user.
+- Use browser tools to inspect Snapmaker pages or OrcaSlicer docs mid-slice unless the user explicitly asked. The toolkit's render images + `slice_summary.txt` are self-sufficient for the staged workflow.
+- Inline render PNGs into your reply text. Pass the image path to the user's frontend (Telegram, etc.) by reference; the workflow already wrote it to disk.
 
 ## Critical orientation lesson
 
