@@ -223,7 +223,21 @@ def upload_only(gcode: Path, dry_run: bool=True)->dict[str,Any]:
         return {'print_started': False, 'print_queued': False, 'dry_run': True, 'path': str(gcode)}
     cmd=[sys.executable, str(HERE/'u1_upload_gcode.py'), str(gcode)]
     proc=subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
-    return {'print_started': False, 'returncode': proc.returncode, 'output': proc.stdout[-4000:]}
+    result: dict[str, Any] = {'print_started': False, 'returncode': proc.returncode, 'output': proc.stdout[-4000:]}
+    # On successful upload, augment with Moonraker's rich metadata (estimated_time
+    # in seconds, filament_used_mm, slicer/version, uuid, etc). The hand-parser
+    # remains the source of truth for safety IDs (print_settings_id etc) — this
+    # is purely additive UI/history data. See query_moonraker_metadata docstring.
+    if proc.returncode == 0:
+        try:
+            from u1_upload_gcode import query_moonraker_metadata  # local import to avoid hard dep cycle
+            from u1_config import get_u1_host, get_u1_port
+            meta = query_moonraker_metadata(get_u1_host(), get_u1_port(), gcode.name)
+            if meta:
+                result['moonraker_metadata'] = meta
+        except Exception:
+            pass  # fail-soft: enrichment is nice-to-have, not load-bearing
+    return result
 
 def run_workflow(args)->dict[str,Any]:
     model=Path(args.model).resolve()

@@ -44,6 +44,35 @@ hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-a
 
 That skill tells Hermes to call `scripts/u1_slice_workflow.py`, ask the 10 questions instead of guessing, default to upload-only, and fail closed at the bed-clear start gate.
 
+## Optional: notify me when OrcaSlicer has an update
+
+The toolkit ships a small checker that compares your installed `orca-slicer` version against the upstream latest release. **It does nothing unless you wire it into your scheduler.** Cloning the repo does not subscribe you to anything.
+
+To enable, add one line to cron (Linux/macOS):
+
+```
+0 7 * * * /usr/bin/python3 /path/to/snapmaker-u1-toolkit/tools/check_for_updates.py
+```
+
+Behavior:
+- **Silent when you're current.** No stdout → no cron email.
+- **Single-line stdout when an update is available** — cron mails it via your usual cron-email setup. Example: `OrcaSlicer 2.4.1 available (you have 2.4.0). Patch (bug fixes, likely safe). Release notes: https://github.com/OrcaSlicer/OrcaSlicer/releases/tag/v2.4.1`
+- **Refuses to query GitHub more than once per 24h** regardless of how often you invoke it (cache at `~/.cache/snapmaker-u1-toolkit/update-check.json`). `--force` overrides for one-off "tell me now" runs.
+- **Returns silently when GitHub is unreachable or the binary isn't present.** Never breaks your cron with stray stderr.
+
+Compatibility note: Snapmaker upstreamed the U1 vendor profile into OrcaSlicer 2.4.0, and the bundled `community_merged_*` process profile is flattened (no inheritance chain), so patch/minor upgrades should keep slicing U1 prints. Major-version bumps may change CLI flags or profile schema — re-run the EGO trimmer regression after upgrading. The notifier's risk label ("patch / minor / major") flags this in the alert text.
+
+If your `orca-slicer` binary lives anywhere other than `/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer` (Hermes-container default), pass the path explicitly OR set the `ORCA_SLICER_BIN` environment variable in your crontab, otherwise the script silently can't probe your installed version and you'll never see notifications.
+
+CLI:
+
+```
+python3 tools/check_for_updates.py                                    # daily-cached check
+python3 tools/check_for_updates.py --force                            # bypass cache, hit GitHub now
+python3 tools/check_for_updates.py --orca-bin /path/to/orca-slicer    # one-off
+ORCA_SLICER_BIN=/path/to/orca-slicer python3 tools/check_for_updates.py  # persistent env
+```
+
 ## What's in here
 
 | Script | What it does |
