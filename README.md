@@ -1,10 +1,14 @@
 # Snapmaker U1 Toolkit
 
+![Hermes Agent + Snapmaker U1 — safety-staged print automation](docs/images/hero-hermes-snapmaker.png)
+
 Read-only and gated-write automation scripts for the [Snapmaker U1](https://snapmaker.com/snapmaker-u1) multi-tool 3D printer, talking over its Moonraker/Klipper-compatible LAN API.
 
 **Built for safety-staged operation**: read state → slice → upload-only → operator approval → start. The dangerous bits (`start print`, `cancel`, movement) are always gated on explicit operator confirmation.
 
 ## End-to-end slice workflow (v1.4.0)
+
+![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
 
 The canonical STL/3MF → U1 path is now:
 
@@ -35,6 +39,8 @@ After release, Hermes users can install the workflow guidance directly from this
 ```bash
 hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
 ```
+
+![End-to-end example with Hermes — model preview, Telegram operator conversation, AI-derived slice settings, and the actual printed part in hand](docs/images/end-to-end-example.jpg)
 
 That skill tells Hermes to call `scripts/u1_slice_workflow.py`, ask the 10 questions instead of guessing, default to upload-only, and fail closed at the bed-clear start gate.
 
