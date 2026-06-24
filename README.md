@@ -4,6 +4,40 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 
 **Built for safety-staged operation**: read state → slice → upload-only → operator approval → start. The dangerous bits (`start print`, `cancel`, movement) are always gated on explicit operator confirmation.
 
+## End-to-end slice workflow (v1.4.0)
+
+The canonical STL/3MF → U1 path is now:
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf
+```
+
+Agent/Telegram wrappers should use the event stream instead of re-implementing the workflow:
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf --json-events
+```
+
+The workflow owns the full 10-step flow: triage, orientation choice, loaded filament/tool choice, preset choice, oriented render, support choice, slice, preview render, upload-only default, and optional camera-gated start. Render and slice both consume the same `oriented.stl`; Orca `--orient` only reports the best rotation, and this toolkit applies it.
+
+Safe headless proof run:
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf \
+  --tool T1 --material PETG --orient auto --profile 020_strength \
+  --upload-only --yes
+```
+
+## Using with Hermes — install the bundled skill
+
+After release, Hermes users can install the workflow guidance directly from this repo:
+
+```bash
+hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
+```
+
+That skill tells Hermes to call `scripts/u1_slice_workflow.py`, ask the 10 questions instead of guessing, default to upload-only, and fail closed at the bed-clear start gate.
+
 ## What's in here
 
 | Script | What it does |
@@ -14,6 +48,7 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 | `u1_toolmap.py` | Multi-tool material gate — declared vs detected material check |
 | `u1_preflight.py` | Combined Moonraker state + camera freshness packet for "is it safe to start?" |
 | `u1_upload_gcode.py` | Upload-only (`print_started=false`) with gates: idle state + tool/material match |
+| `u1_slice_workflow.py` | Canonical v1.4.0 end-to-end STL/3MF workflow: orient → render → slice → preview → upload-only/start gate |
 | `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and "last ~6 layers" milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
 | `u1_print_watchdog.py` | Quiet 20-min health watcher with cooldown to avoid notification spam |
 | `u1_print_history.py` | Append-only JSONL print ledger + canonical upserted JSON |
@@ -499,7 +534,9 @@ would hit.
 | v1.1.0 | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
 | v1.1.1 | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
 | v1.1.2 | Cold-pass doc fixes + new regenerate_machine_profile.py helper (135 tests) | Linux (Hermes container) |
-| **v1.2.0** | New printer-side extractor with multi-tool slice; live-tested against the U1 (extracted from "Dazzling Uusam_PETG_25m58s.gcode") | Linux (Hermes container) + real U1 |
+| v1.2.0 | New printer-side extractor with multi-tool slice; live-tested against the U1 (extracted from "Dazzling Uusam_PETG_25m58s.gcode") | Linux (Hermes container) + real U1 |
+| v1.3.0 | Cavity LED auto-on for camera captures + 5-minute auto-dim after print finish (`u1_led.photo_wrap()`); 151 pytest tests | Linux (Hermes container) |
+| **v1.4.2** | End-to-end slice workflow (`u1_slice_workflow.py`) with 10-step staged Q&A flow + bundled Hermes skill installable via `hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation`. Render-equals-slice rotation fix verified by Kabsch alignment on the EGO String Trimmer holder. Wrong-extruder G-code rewrite closes a safety bug surfaced by the camera-gated start gate during live test (T0 → T&lt;chosen&gt; in start/end blocks while preserving multi-tool cooling commands). 172 pytest tests | Linux (Hermes container) + real U1 |
 
 Findings from the v1.0.1 validation drove every change in that release —
 see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
