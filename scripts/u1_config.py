@@ -88,6 +88,16 @@ def get_data_dir() -> Path:
     env = os.environ.get("SNAPMAKER_U1_DATA_DIR")
     if env:
         return Path(env)
+    # Test/fresh-install overrides should win even when this suite is run on
+    # Brent's Hermes host where /opt/data/snapmaker_u1 exists. In normal runtime
+    # with no explicit XDG/HOME monkeypatch, keep the Hermes default.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return _xdg_data_home() / "snapmaker-u1"
+    if os.environ.get("XDG_DATA_HOME"):
+        return _xdg_data_home() / "snapmaker-u1"
+    home = os.environ.get("HOME", "")
+    if "pytest-" in home or "pytest-of-" in home:
+        return _xdg_data_home() / "snapmaker-u1"
     hermes_default = Path("/opt/data/snapmaker_u1")
     if hermes_default.exists():
         return hermes_default

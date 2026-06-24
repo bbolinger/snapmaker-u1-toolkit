@@ -51,7 +51,7 @@ VIEW_LABELS = {
     "iso": "ISOMETRIC",
     "front": "FRONT",
     "side": "SIDE",
-    "top": "TOP / BED FOOTPRINT",
+    "top": "SOURCE STL VIEW (as-authored, NOT what the slicer will use)",
 }
 
 
@@ -149,6 +149,10 @@ def render_orientation_sheet(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("stl", type=Path, help="Source STL (binary or ASCII).")
+    ap.add_argument("--for-slice-review", action="store_true",
+                    help="Shim to the v1.4.0 slice-review renderer; render the exact oriented STL used for slicing.")
+    ap.add_argument("--gcode", type=Path, default=None,
+                    help="Optional G-code for --for-slice-review first-layer footprint extraction.")
     ap.add_argument("--out", type=Path, default=None,
                     help="Output PNG path. Default: <stl-stem>_orientation.png next to the STL.")
     ap.add_argument("--width", type=int, default=1800, help="Output width in px. Default: 1800.")
@@ -162,6 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.stl.exists() or not args.stl.is_file():
         print(f"STL not found: {args.stl}", file=sys.stderr)
         return 2
+
+    if args.for_slice_review:
+        from render_slice_review import render_slice_review
+        out = args.out or args.stl.with_name(args.stl.stem + "_slice_review.png")
+        render_slice_review(args.stl, out, gcode=args.gcode, title=args.title or args.stl.stem.replace("_", " "))
+        print(f"Slice review -> {out}")
+        return 0
 
     tris = parse_stl(args.stl)
     if tris.shape[0] == 0:

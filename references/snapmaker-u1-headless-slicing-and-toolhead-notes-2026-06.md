@@ -83,3 +83,9 @@ For user-supplied STL:
 3. Validate G-code metadata for printer/profile/material/temps/layer height.
 4. Upload with `print=false` only.
 5. Report readiness and require explicit start approval.
+## v1.4.0 orientation/render correction
+
+Orca `--orient` only prints the optimum; toolkit applies the rotation. See `snapmaker-u1-orient-rotate-and-slice-review-2026-06.md`.
+
+Orca `--orient` only prints the optimal orientation; it does not export a rotated STL. The toolkit applies Orca's row vector as the source-frame direction that becomes build-up `+Z`, writes `oriented.stl`, and uses that same file for both render and slice. If a render disagrees with the slice, the rotation step or first-layer parser did not run. See `references/snapmaker-u1-orient-rotate-and-slice-review-2026-06.md`.
+
