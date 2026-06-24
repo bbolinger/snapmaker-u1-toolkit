@@ -112,6 +112,70 @@ def parse_gcode_metadata(path: Path) -> dict[str, Any]:
     return {"path": str(path), "size": size, "metadata": meta, "startup_commands": startup[:40], "intended_tool": intended_tool}
 
 
+def query_userdata_space(host: str, port: int, timeout: float = 5.0) -> dict[str, Any] | None:
+    """Query the U1's user-data storage space via Snapmaker's custom Moonraker
+    endpoint `/server/files/get_userdata_space` (POST). Returns the result dict
+    with `free_space`, `total_space`, `units` (MiB) — or None on any error or
+    if the endpoint isn't implemented on the firmware.
+
+    Verified live 2026-06-24 against U1 firmware 1.4.1: returns
+    `{state: 'success', free_space: N, total_space: N, units: 'MiB'}` and
+    reflects real-time post-upload state (a 21 MiB upload immediately reduced
+    free_space by ~21 MiB).
+
+    Fail-soft: older firmware that doesn't implement this endpoint should not
+    block uploads. Callers must handle the None case as "skip the check."
+    """
+    url = f"{base_url(host, port)}/server/files/get_userdata_space"
+    try:
+        req = urllib.request.Request(url, data=b"", method="POST",
+                                     headers={"Content-Length": "0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        result = data.get("result", {})
+        if result.get("state") != "success":
+            return None
+        return result
+    except Exception:
+        return None
+
+def query_moonraker_metadata(host: str, port: int, filename: str,
+                              settle_seconds: float = 0.0,
+                              timeout: float = 5.0) -> dict[str, Any] | None:
+    """Query Moonraker's rich G-code metadata for an already-uploaded file.
+
+    Standard Moonraker endpoint `/server/files/metadata?filename=...` returns
+    ~34 numeric/structured fields the hand parser doesn't (estimated_time as
+    int seconds, filament_used_mm per extruder, filament_colour, slicer +
+    slicer_version, object_height, line_width, uuid, thumbnail descriptors,
+    gcode_start_byte/end_byte, etc.). Verified live 2026-06-24 against U1
+    firmware 1.4.1 (~24ms for an already-scanned 21 MB gcode).
+
+    `settle_seconds` defaults to 0 — Moonraker's metadata scan is fast in
+    practice and complete by the time the multipart upload subprocess returns
+    (verified live 2026-06-24). Set a small positive value only if you observe
+    thin results on first-upload metadata queries.
+
+    Returns the result dict or None on any error / empty result. Fail-soft.
+    Hand-parser fields (`print_settings_id`, `printer_settings_id`,
+    `curr_bed_type`) are NOT here — keep using `parse_gcode_metadata()`
+    for the v1.4.2 fidelity-check safety rule.
+    """
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+    url = f"{base_url(host, port)}/server/files/metadata?filename={urllib.parse.quote(filename)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        result = data.get("result", {})
+        # Empty / metadata not yet scanned — treat as None so caller doesn't
+        # surface a misleading partial dict.
+        if not result or "size" not in result:
+            return None
+        return result
+    except Exception:
+        return None
+
 def query_state(host: str, port: int) -> dict[str, Any]:
     # Include print_task_config/filament_detect so readiness/upload artifacts use
     # printer-reported material/color as primary truth, not just local labels.
@@ -274,6 +338,26 @@ def main() -> int:
 
     state_before = query_state(host, port)
     blockers.extend(ensure_idle_ready(state_before))
+
+    # Preflight: confirm the U1 has enough user-data space for this gcode. The
+    # endpoint is Snapmaker's custom /server/files/get_userdata_space (POST,
+    # ~0.01s, returns MiB). Fail-soft — older firmware without this endpoint
+    # returns None and we skip the check rather than block uploads.
+    SPACE_HEADROOM_MIB = 50  # keep some breathing room; don't fill to 0
+    space = query_userdata_space(host, port)
+    if space is not None:
+        try:
+            free_mib = int(space.get("free_space", 0))
+            gcode_mib = int(gcode.stat().st_size / (1024 * 1024)) + 1  # round up
+            needed_mib = gcode_mib + SPACE_HEADROOM_MIB
+            if free_mib < needed_mib:
+                blockers.append(
+                    f"insufficient U1 storage: need ~{needed_mib} MiB "
+                    f"(gcode {gcode_mib} MiB + {SPACE_HEADROOM_MIB} MiB headroom), "
+                    f"have {free_mib} MiB free of {space.get('total_space')} MiB"
+                )
+        except (TypeError, ValueError):
+            pass  # malformed response — treat like missing endpoint
 
     tool_ok, tool_out = run_tool_gate(host, port, args.material, parsed["intended_tool"])
     if not tool_ok:
