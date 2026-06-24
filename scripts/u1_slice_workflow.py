@@ -105,6 +105,33 @@ def _tool_to_index(tool) -> int:
     except ValueError:
         return 0
 
+def inject_snapmaker_thumbnails(gcode: Path, source_stl: Path, sizes: str = '48x48,300x300') -> dict:
+    """Inject Snapmaker-format thumbnail blocks into the sliced G-code so the
+    U1 touchscreen shows a preview instead of a generic icon. Uses the bundled
+    tools/gcode_inject_thumbnail.py.
+
+    Default sizes match Snapmaker's own Orca profile — the U1 machine JSON in
+    Snapmaker/OrcaSlicer declares `thumbnails: 48x48/PNG, 300x300/PNG`.
+    OrcaSlicer's CLI doesn't emit thumbnail blocks (GUI-only code path), so
+    without this injection step every headless-sliced print lands on the U1
+    with a generic icon. Live-verified on the U1 touchscreen 2026-06-24.
+
+    Fail-soft: if PIL/numpy missing, STL malformed, or any other error,
+    returns {'ok': False, 'error': ...} so the surrounding slice still ships.
+    The slice is more important than the preview image.
+    """
+    try:
+        from gcode_inject_thumbnail import main as inject_main  # bundled tool
+        rc = inject_main([
+            '--stl', str(source_stl),
+            '--gcode', str(gcode),
+            '--sizes', sizes,
+            '--in-place',
+        ])
+        return {'ok': rc == 0, 'sizes': sizes, 'returncode': rc}
+    except Exception as e:
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}', 'sizes': sizes}
+
 def rewrite_gcode_for_tool(gcode: Path, tool_idx: int) -> int:
     """Orca's --load-filaments puts the filament into slot 0, so generated
     gcode references T0 in start/end blocks even when the user picked T1+.
@@ -166,6 +193,12 @@ def real_orca_slice(oriented_stl: Path, out_gcode: Path, tool: str, material: st
     # caught by the camera-gated start during the 2026-06-24 live test.
     tool_idx = _tool_to_index(tool)
     tool_rewrites = rewrite_gcode_for_tool(out_gcode, tool_idx)
+    # Inject Snapmaker-format thumbnails so the U1 touchscreen shows a preview
+    # instead of a generic icon. Sizes match the U1 machine profile in
+    # Snapmaker/OrcaSlicer. OrcaSlicer's CLI itself never emits thumbnail
+    # blocks (GUI-only render path), so without this step every headless print
+    # lands on the U1 with no preview. Fail-soft — preview is nice-to-have.
+    thumbnails = inject_snapmaker_thumbnails(out_gcode, oriented_stl)
     info=parse_gcode_metadata(out_gcode)
     meta=info.get('metadata', {})
     flb=parse_first_layer_bbox(out_gcode)
@@ -178,6 +211,7 @@ def real_orca_slice(oriented_stl: Path, out_gcode: Path, tool: str, material: st
         'stdout_tail': proc.stdout[-4000:],
         'tool_idx': tool_idx,
         'tool_rewrites': tool_rewrites,
+        'thumbnails': thumbnails,
         'metadata': meta,
         'first_layer_bbox': flb,
         'time': meta.get('estimated printing time (normal mode)') or meta.get('estimated printing time'),
