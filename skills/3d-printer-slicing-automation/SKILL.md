@@ -48,6 +48,8 @@ The workflow walks the operator through five prompts one at a time: **orient →
 ```bash
 python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
+If the messaging platform rejects raw `.stl` documents but accepts `.zip`, extract the STL/3MF from the ZIP first, then immediately run the same required workflow call on the extracted model path. See `references/telegram-stl-zip-ingest.md`.
+
 Optionally `--no-live-material` if Moonraker isn't reachable. Do not ask the user anything before this runs.
 
 **Step 2 — For each `need_input` event the workflow emits:**
