@@ -7,11 +7,83 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# Real-Orca test harness (added 2026-06-26). When pytest runs from
+# claude-code-simple (Alpine/musl), the bundled Orca appimage can't execute
+# directly. Tests marked with @pytest.mark.real_orca instead use the shim
+# at tests/_orca_shim/orca-via-hermes.sh to invoke Orca via
+# `docker exec hermes-agent-stack`. Path translation is automatic for any
+# arg under /appdata/hermes/.
+_HERE = Path(__file__).resolve().parent
+_ORCA_SHIM = _HERE / "_orca_shim" / "orca-via-hermes.sh"
+_HERMES_VISIBLE_TMP_ROOT = Path("/appdata/hermes/test-tmp")
+
+
+def _hermes_orca_available() -> bool:
+    """True iff (a) we can docker-exec into hermes-agent-stack, AND (b) the
+    shim runs Orca's --help cleanly. Returns False with no exception so the
+    skip-marker decorators can use it."""
+    if not _ORCA_SHIM.exists() or not os.access(_ORCA_SHIM, os.X_OK):
+        return False
+    try:
+        proc = subprocess.run(
+            [str(_ORCA_SHIM), "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0 and "OrcaSlicer" in proc.stdout
+
+
+_HAS_REAL_ORCA = _hermes_orca_available()
+
+
+@pytest.fixture
+def hermes_visible_tmp(request):
+    """Yield a tmp dir under /appdata/hermes/test-tmp/ — visible from BOTH
+    claude-code-simple (this container, where pytest runs) and Hermes
+    (where the Orca shim docker-execs to). Auto-cleaned after the test.
+
+    Use this for any test that calls the real Orca shim — pytest's default
+    tmp_path is under /tmp which Hermes can't see."""
+    _HERMES_VISIBLE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    scratch = _HERMES_VISIBLE_TMP_ROOT / f"{request.node.name}-{uuid.uuid4().hex[:8]}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.fixture
+def real_orca(monkeypatch, hermes_visible_tmp):
+    """Sets ORCA_SLICER_BIN to the docker-exec shim so the workflow's
+    real_orca_slice() actually runs OrcaSlicer (via Hermes).
+
+    Tests using this fixture should ALSO use `hermes_visible_tmp` for any
+    paths handed to the workflow, since Hermes can't see claude-code-simple's
+    pytest tmp_path.
+
+    Skips the test cleanly if Hermes/Orca isn't reachable from this env."""
+    if not _HAS_REAL_ORCA:
+        pytest.skip("real Orca unreachable (no Hermes container or shim not working)")
+    monkeypatch.setenv("ORCA_SLICER_BIN", str(_ORCA_SHIM))
+    # Force u1_orient and dependent modules to re-resolve DEFAULT_ORCA from
+    # the env (it's set at import time otherwise).
+    import importlib
+    import u1_orient
+    importlib.reload(u1_orient)
+    import u1_slice_workflow
+    importlib.reload(u1_slice_workflow)
+    return {"shim": _ORCA_SHIM, "tmp": hermes_visible_tmp}
 
 # Make scripts/ importable from tests
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
