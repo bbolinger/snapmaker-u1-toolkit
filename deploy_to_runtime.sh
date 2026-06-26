@@ -132,6 +132,34 @@ if [[ -d "$SKILL_SRC" ]]; then
   chown -R 10000:10000 "$SKILL_DST" 2>/dev/null || true
 fi
 
+# v1.6 (2026-06-26): deploy HERMES.md to Hermes' prompt-assembly stable
+# tier. Hermes' _find_hermes_md (agent/prompt_builder.py) walks from
+# Hermes daemon CWD (/opt/hermes inside the container) UPward looking for
+# .hermes.md or HERMES.md, stopping at git root or filesystem root.
+#
+# Path mapping makes this tricky: /opt/data IS bind-mounted from
+# /appdata/hermes but ISN'T on Hermes' walk path. /opt/ IS on the walk
+# path but is container-private — we have to write into it via docker exec.
+#
+# Strategy: keep the canonical copy at /opt/data/.hermes.md (so it
+# persists across container recreates via the bind mount), then docker
+# exec to also place it at /opt/.hermes.md (container-private but on the
+# walk path). The container-private one is re-created on every deploy.
+HERMES_MD_SRC="$ROOT/HERMES.md"
+if [[ -f "$HERMES_MD_SRC" ]]; then
+  # Canonical persistent copy
+  HERMES_MD_PERSISTENT="$_DEFAULT_ROOT/.hermes.md"
+  copy_if_changed "$HERMES_MD_SRC" "$HERMES_MD_PERSISTENT"
+  chown 10000:10000 "$HERMES_MD_PERSISTENT" 2>/dev/null || true
+  # Container-private walk-path copy (Hermes finds this at
+  # /opt/.hermes.md when its prompt_builder walks up from /opt/hermes)
+  if command -v docker >/dev/null 2>&1 && docker inspect hermes-agent-stack >/dev/null 2>&1; then
+    docker exec hermes-agent-stack cp /opt/data/.hermes.md /opt/.hermes.md 2>/dev/null || true
+    docker exec hermes-agent-stack chown 10000:10000 /opt/.hermes.md 2>/dev/null || true
+    CHANGED+=("/opt/.hermes.md (via docker exec)")
+  fi
+fi
+
 # Host writes under /appdata/hermes must be readable by Hermes uid 10000.
 for path in "${CHANGED[@]}"; do
   case "$path" in

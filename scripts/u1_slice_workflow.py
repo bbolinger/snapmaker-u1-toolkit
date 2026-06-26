@@ -152,6 +152,259 @@ def emit(obj: dict[str,Any], json_events: bool=False):
             pass  # mirroring is observability — never break the workflow on disk-write failure
 
 
+# =============================================================================
+# v1.6 (A) — pre-slice Orca mesh-topology analysis
+# =============================================================================
+# Surfaces Orca's real overhang verdict ("floating cantilever" / "floating
+# regions" / overhang-tagged layer count) DURING the analysis phase, before
+# the operator commits to a slice. Replaces the conservative-stupid
+# face-angle metric used pre-v1.6. See docs/v1.6-design.md for the design,
+# the empirical validation, and the specific override values.
+
+# Empirically-validated draft-profile overrides (v1.6 study, 5 fixtures ×
+# 5 variants vs ground-truth production slice). PERFECT warning_category
+# match + overhang_pct within ±0.4pp of ground truth + 2× faster than
+# the production slice. KEEPS production layer_height — that's what
+# makes overhang_pct commit-predictive.
+_V16_DRAFT_OVERRIDES = {
+    'wall_loops': '1',
+    'sparse_infill_density': '0%',
+    'top_shell_layers': '0',
+    'bottom_shell_layers': '0',
+    'gcode_thumbnails': '0',
+    'enable_support': '0',
+}
+
+# Per-plate compute cap (seconds). Defends against pathological huge
+# meshes. wall_mount_auto at 765 production layers ran in 16s; benchmark
+# fixtures all under 5s. 30s gives headroom + still keeps the analysis
+# phase responsive.
+_V16_MSTPP_SECS = 30
+# Subprocess-level timeout — Orca may hang separately from --mstpp.
+_V16_DRAFT_TIMEOUT_SECS = 60
+# Clean threshold (warning_category=CLEAN AND overhang_pct below this).
+_V16_CLEAN_OVERHANG_THRESHOLD_PCT = 10.0
+
+
+def _categorize_orca_warning(warning_text: str | None) -> str:
+    """Map Orca's raw warning_message string to a stable category.
+    See docs/v1.6-design.md for the empirical evidence behind these
+    category names (validated on 4 real-world fixtures incl. Snapmaker's
+    own 3DBenchy reference print).
+    """
+    txt = (warning_text or '').strip().lower()
+    if not txt or txt == 'null':
+        return 'CLEAN'
+    if 'floating cantilever' in txt:
+        return 'CANTILEVER'
+    if 'floating region' in txt:
+        return 'FLOATING_REGIONS'
+    if 'overhang' in txt:
+        return 'OVERHANG_FLAGGED'
+    return 'UNKNOWN'
+
+
+def _count_overhang_layers(gcode_path: Path) -> tuple[int, int]:
+    """Count layers containing at least one ;TYPE:Overhang wall segment.
+    Returns (overhang_layers, total_layers). Both zero if gcode missing/empty.
+    """
+    if not gcode_path.exists():
+        return 0, 0
+    overhang_layers: set[int] = set()
+    cur_layer = 0
+    try:
+        with gcode_path.open() as f:
+            for line in f:
+                if line.startswith(';LAYER_CHANGE'):
+                    cur_layer += 1
+                elif cur_layer and line.startswith(';TYPE:Overhang wall'):
+                    overhang_layers.add(cur_layer)
+    except OSError:
+        return 0, 0
+    return len(overhang_layers), cur_layer
+
+
+def _materialize_draft_profile(production_process: Path, dest_dir: Path) -> Path:
+    """Build a draft process profile = production + v1.6 compute-skipping
+    overrides. Caller passes the FULL (flattened, if needed) production
+    process profile path. Writes to <dest_dir>/draft_process.json."""
+    src = json.loads(production_process.read_text())
+    src.update(_V16_DRAFT_OVERRIDES)
+    dest = dest_dir / 'draft_process.json'
+    dest.write_text(json.dumps(src))
+    return dest
+
+
+def _draft_slice_analysis(
+    stl: Path,
+    out_dir: Path,
+    production_process: Path,
+    filament: Path,
+    orca_bin: Path = DEFAULT_ORCA,
+) -> dict[str, Any]:
+    """Run a fast Orca slice for mesh-topology analysis. Never raises.
+
+    Returns:
+      {
+        'category': CLEAN | CANTILEVER | FLOATING_REGIONS | OVERHANG_FLAGGED | UNKNOWN | DRAFT_FAILED,
+        'warning_text': raw Orca warning_message string (or empty),
+        'overhang_layers': int,
+        'total_layers': int,
+        'overhang_pct': float,           # 0.0 on failure
+        'elapsed_ms': int,
+        'clean': bool,                    # True iff CLEAN AND < threshold
+        'error': str (only on DRAFT_FAILED),
+      }
+
+    On Orca failure, returns category=DRAFT_FAILED with the error captured.
+    The caller should surface the v1.5.x face-angle metric as fallback and
+    flag the failure prominently — never silently fabricate.
+    """
+    machine = machine_profile_for_orca(orca_bin)
+    draft_dir = out_dir / 'draft' / stl.stem
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    draft_profile = _materialize_draft_profile(production_process, draft_dir)
+    cmd = [
+        str(orca_bin),
+        '--load-settings', f'{machine};{draft_profile}',
+        '--load-filaments', str(filament),
+        '--outputdir', str(draft_dir),
+        '--mstpp', str(_V16_MSTPP_SECS),
+        '--slice', '0',
+        str(stl),
+    ]
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=orca_env(orca_bin), timeout=_V16_DRAFT_TIMEOUT_SECS,
+        )
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+        return {
+            'category': 'DRAFT_FAILED',
+            'error': f'{type(e).__name__}: {e}',
+            'overhang_pct': 0.0,
+            'overhang_layers': 0,
+            'total_layers': 0,
+            'elapsed_ms': int((time.monotonic() - t0) * 1000),
+            'clean': False,
+        }
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    # Parse result.json — Orca emits it even on some failure modes
+    result_path = draft_dir / 'result.json'
+    warning_text = ''
+    if result_path.exists():
+        try:
+            res = json.loads(result_path.read_text())
+            plate = (res.get('sliced_plates') or [{}])[0]
+            warning_text = (plate.get('warning_message') or '').strip()
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Parse gcode for overhang layers
+    gcode_path = draft_dir / 'plate_1.gcode'
+    overhang_layers, total_layers = _count_overhang_layers(gcode_path)
+    overhang_pct = round(100 * overhang_layers / max(1, total_layers), 1) if total_layers else 0.0
+
+    # If Orca returned non-zero AND we got no parseable result, mark failed
+    if proc.returncode != 0 and not result_path.exists():
+        return {
+            'category': 'DRAFT_FAILED',
+            'error': f'Orca rc={proc.returncode}: {(proc.stdout or "")[-300:]}',
+            'overhang_pct': 0.0,
+            'overhang_layers': 0,
+            'total_layers': 0,
+            'elapsed_ms': elapsed_ms,
+            'clean': False,
+        }
+
+    category = _categorize_orca_warning(warning_text)
+    clean = category == 'CLEAN' and overhang_pct < _V16_CLEAN_OVERHANG_THRESHOLD_PCT
+    return {
+        'category': category,
+        'warning_text': warning_text,
+        'overhang_layers': overhang_layers,
+        'total_layers': total_layers,
+        'overhang_pct': overhang_pct,
+        'elapsed_ms': elapsed_ms,
+        'clean': clean,
+    }
+
+
+def _compose_orient_note(
+    source_draft: dict[str, Any],
+    auto_draft: dict[str, Any] | None,
+    auto_skip_reason: str | None = None,
+) -> str:
+    """Plain-language summary for the operator about Orca's verdict.
+    Surfaced verbatim in the orient need_input event's `note` field. Agent
+    surfaces this verbatim to the operator. No risk math required of the LLM.
+
+    `auto_skip_reason` differentiates WHY auto_draft is None:
+      - 'source_clean'   → as-authored is clean (clean-case skip)
+      - 'auto_identical' → Orca's auto-orient produced the same bbox as
+                           the source, so the second draft would be
+                           redundant
+      - 'auto_failed'    → auto-orient computation failed earlier in
+                           the analysis phase
+      - None             → auto_draft is present (or no skip applied)
+    """
+    def _phrase(d: dict[str, Any], label: str) -> str:
+        cat = d.get('category')
+        pct = d.get('overhang_pct', 0.0)
+        if cat == 'CLEAN':
+            return f"{label} is clean (Orca: no warnings, {pct:.0f}% of layers tagged overhang)"
+        if cat == 'CANTILEVER':
+            return f"{label} has a floating-cantilever warning ({pct:.0f}% of layers tagged overhang)"
+        if cat == 'FLOATING_REGIONS':
+            return f"{label} has a floating-regions warning ({pct:.0f}% of layers tagged overhang) — Orca suggests re-orient or enable supports"
+        if cat == 'OVERHANG_FLAGGED':
+            return f"{label} has Orca-flagged overhang concerns ({pct:.0f}% of layers tagged)"
+        if cat == 'DRAFT_FAILED':
+            return f"{label} draft slice failed ({d.get('error', 'unknown error')[:120]}) — falling back to face-angle estimate"
+        return f"{label} draft slice returned UNKNOWN warning category"
+
+    src_phrase = _phrase(source_draft, 'As-authored')
+    if auto_draft is not None:
+        return f"{src_phrase}. {_phrase(auto_draft, 'Auto-orient')}."
+    # auto_draft is None — explain why
+    if auto_skip_reason == 'auto_identical':
+        return f"{src_phrase}. Auto-orient found no better rotation (same orientation as as-authored)."
+    if auto_skip_reason == 'auto_failed':
+        return f"{src_phrase}. Auto-orient analysis failed — pick as-authored, or re-run with --orient auto to retry."
+    # Default = source_clean (the original clean-case skip)
+    return f"{src_phrase}. Auto-orient not analyzed (as-authored is clean — no need to re-orient). Pick option 2 to force a comparison."
+
+
+def _decide_orient_recommendation(
+    source_draft: dict[str, Any],
+    auto_draft: dict[str, Any] | None,
+) -> str:
+    """Return 'asauthored' or 'auto' based on the Orca-verdict tier.
+
+    Priority:
+      1. If as-authored is clean (and auto skipped or non-clean) → asauthored
+      2. If as-authored failed/risky AND auto is clean → auto
+      3. If both risky, prefer the one with lower overhang_pct (tiebreak
+         to asauthored — no weird rotation needed)
+    """
+    src_clean = source_draft.get('clean', False)
+    if auto_draft is None:
+        # Source was clean; auto was skipped. Recommend source.
+        return 'asauthored'
+    auto_clean = auto_draft.get('clean', False)
+    if src_clean and not auto_clean:
+        return 'asauthored'
+    if not src_clean and auto_clean:
+        return 'auto'
+    # Both clean or both risky — prefer lower overhang_pct (tiebreak to as-authored)
+    if source_draft.get('overhang_pct', 100.0) <= auto_draft.get('overhang_pct', 100.0):
+        return 'asauthored'
+    return 'auto'
+
+
+# =============================================================================
 # v1.5.2 (2026-06-26): next_command per option. The workflow is the source
 # of truth for "what to run next" — the agent never synthesizes commands
 # from chat memory. Each need_input event's options carry a `next_command`
@@ -1356,6 +1609,81 @@ def run_workflow(args)->dict[str,Any]:
         _auto_rec = recommended_orient == 'auto'
         _as_authored_rec = recommended_orient == 'asauthored'
 
+        # =====================================================================
+        # v1.6 (A) — pre-slice Orca mesh-topology analysis
+        # =====================================================================
+        # Run a fast draft slice (v1.6 v2 settings: production layer_height +
+        # compute-skipping overrides) on the source STL; if source is risky,
+        # also draft auto. Surface the categorized Orca verdict in the orient
+        # need_input's `note` field. See docs/v1.6-design.md for the empirical
+        # evidence backing the draft profile and the clean-case skip.
+        #
+        # Profile-INVARIANCE of warning_message (proven by v1.6 empirical
+        # study) means we can use any sensible default process profile here —
+        # we don't need the operator to have picked one yet. We choose
+        # whichever profile the picker recommends for this model's class.
+        _v16_source_draft = None
+        _v16_auto_draft = None
+        _v16_auto_skip_reason: str | None = None
+        _v16_note_override = None
+        _v16_skipped_reason = None
+        try:
+            _v16_prof_opts = list_profiles(
+                class_hint=args.class_hint or model.stem,
+                nozzle=args.nozzle,
+                history_print_settings_id=None,
+            )
+            _v16_top = next((p for p in _v16_prof_opts if p.get('recommended')),
+                            _v16_prof_opts[0] if _v16_prof_opts else None)
+            if _v16_top is None:
+                _v16_skipped_reason = 'no profiles available (run setup scripts)'
+            else:
+                _v16_prod_proc = Path(_v16_top['path'])
+                _v16_filament_raw = filament_path(args.material or 'PETG', nozzle=args.nozzle)
+                _v16_filament = _materialize_flat_filament(_v16_filament_raw, out_dir)
+                _v16_source_draft = _draft_slice_analysis(
+                    source_stl, out_dir, _v16_prod_proc, _v16_filament,
+                )
+                # Decide whether to also draft auto. Three skip paths:
+                #   1. source.clean  → operator usually wants as-authored
+                #   2. auto identical → Orca found no better rotation
+                #   3. (success)     → draft auto for comparison
+                if _v16_source_draft.get('clean'):
+                    _v16_auto_skip_reason = 'source_clean'
+                elif auto_stl == source_stl:
+                    _v16_auto_skip_reason = 'auto_identical'
+                else:
+                    _v16_auto_draft = _draft_slice_analysis(
+                        auto_stl, out_dir, _v16_prod_proc, _v16_filament,
+                    )
+        except Exception as e:
+            _v16_skipped_reason = f'{type(e).__name__}: {e}'
+
+        if _v16_source_draft is not None:
+            # Override v1.5.x face-angle recommendation with Orca's real verdict.
+            _v16_rec = _decide_orient_recommendation(_v16_source_draft, _v16_auto_draft)
+            _v16_note_override = _compose_orient_note(
+                _v16_source_draft, _v16_auto_draft, _v16_auto_skip_reason,
+            )
+            recommended_orient = _v16_rec
+            _auto_rec = _v16_rec == 'auto'
+            _as_authored_rec = _v16_rec == 'asauthored'
+            emit({
+                'stage': 'orient_analysis_v16',
+                'as_authored': _v16_source_draft,
+                'auto': _v16_auto_draft,  # may be None if skipped
+                'auto_skip_reason': _v16_auto_skip_reason,
+                'recommended_orient': _v16_rec,
+                'note': _v16_note_override,
+            }, args.json_events)
+        else:
+            emit({
+                'stage': 'orient_analysis_v16',
+                'kind': 'skipped',
+                'reason': _v16_skipped_reason or 'unknown',
+                'note': 'pre-slice Orca analysis unavailable; using v1.5 face-angle recommendation',
+            }, args.json_events)
+
         def _dims_text(stl: Path | None) -> str:
             if not stl or not stl.exists():
                 return ''
@@ -1409,7 +1737,13 @@ def run_workflow(args)->dict[str,Any]:
                 {'label': _as_authored_label(), 'value': 'asauthored', 'recommended': _as_authored_rec,
                  'next_command': f'{prefix} --orient asauthored'},
             ]}
-            if _as_authored_rec and recommendation_reason:
+            # v1.6 (A): if Orca pre-slice analysis succeeded, use its
+            # plain-language note. Otherwise fall back to v1.5's face-angle
+            # recommendation_reason. Both pathways surface as the same `note`
+            # field so the agent's contract doesn't change.
+            if _v16_note_override:
+                _orient_prompt['note'] = _v16_note_override
+            elif _as_authored_rec and recommendation_reason:
                 _orient_prompt['note'] = recommendation_reason
             emit(_orient_prompt, args.json_events)
             emit({'stage':'awaiting_input','need':'orient'}, args.json_events)
