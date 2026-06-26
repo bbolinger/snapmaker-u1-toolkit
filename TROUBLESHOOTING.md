@@ -237,6 +237,20 @@ The gate exists specifically to prevent heating the wrong nozzle. It's working a
 
 ## Agent / Skill side (Hermes etc.)
 
+### Telegram drops your `.stl` / `.3mf` attachment; agent surfaces stale data
+
+**Symptom:** You send a fresh `.stl` (or `.3mf`) to a Telegram-bridged agent, and instead of running `u1_slice_workflow.py` against it, the agent surfaces an orient prompt with dimensions or render paths from a *previously sliced* file in the same conversation.
+
+**Cause:** Hermes' Telegram gateway has a hardcoded document mimetype allowlist (`gateway/platforms/base.py:SUPPORTED_DOCUMENT_TYPES` — 17 mimetypes including `.pdf`, `.zip`, `.json`, etc., but NOT `.stl` or `.3mf`). When the gateway sees an `.stl`, it replaces the attachment with a text message — `"Unsupported document type '.stl'. Supported types: ..."` — and never calls `download_attachment`. The agent now sees a chat where you said "slice this" with no real file attached, and a quantized local model under the v1.5.2 next_command flow will sometimes fabricate the orient prompt from prior-conversation state instead of refusing.
+
+**Fixes (any one):**
+
+1. **Zip the STL and resend** — `.zip` is on the allowlist. Drop the .stl into a zip, send. The agent gets a real attachment path and can extract / process it.
+2. **Drop the file on disk and send the path as text** — e.g., upload to `/opt/data/snapmaker_u1/incoming/cable_holder_vcd.stl` (anywhere the Hermes container can reach), then send the path as a plain Telegram message. The agent uses it verbatim as the workflow's positional arg.
+3. **Send a download URL** — Drive / Dropbox / GitHub raw — any publicly accessible link. The agent can `curl` it down before invoking the workflow.
+
+**Upstream fix:** add `".stl": "model/stl"` and `".3mf": "model/3mf"` to Hermes' `SUPPORTED_DOCUMENT_TYPES`. Tracking issue: [TODO link once filed].
+
 ### Skill rules silently disappear mid-session
 
 **Symptom:** The deployed `/opt/data/skills/hardware-automation/3d-printer-slicing-automation/SKILL.md` has changed since it was last installed. Specifically the "Token-efficient operation" section is missing — or other sections look truncated.
