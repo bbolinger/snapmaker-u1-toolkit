@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
 description: "Snapmaker U1 staged slicing workflow: orient, render, slice, upload-only, and camera-gated starts."
-version: 1.4.6
+version: 1.5.2
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -19,116 +19,176 @@ prerequisites:
 
 ## RULES FOR AGENTS — read first, no exceptions
 
-When a user attaches a `.stl` or `.3mf` and asks to slice / prepare a print:
+### Pre-flight acknowledgement (FIRST user-visible reply, after the first tool call)
+
+Run the analysis tool call FIRST (Step 1 below), then include this acknowledgement at the top of your first text response. The five points must each appear explicitly. Generic "I'll help you slice this" sentences do NOT count.
+
+Order: tool call → acknowledgement → analysis-event surface (orientation question). Don't speak before the tool call; don't skip the acknowledgement after it.
+
+> "Acknowledging the Snapmaker U1 skill rules: I'll (1) run `u1_slice_workflow.py --json-events` FIRST before asking anything; (2) ask 6 staged questions one per user turn; (3) never invent procedures, magic phrases, file paths, or printer state — every action I claim must come from an actual tool call; (4) attach files by writing absolute paths bare in my reply text (Hermes auto-attaches); (5) call the named scripts (`u1_print_start_gate.py`, `u1_camera.py`) directly when the skill names them, never write my own status checks or magic confirmation phrases."
+
+Do the acknowledgement once per conversation, not every turn. Skipping it is correlated 1:1 with sessions where the agent later fabricates state, invents protocols, and stacks questions (caught live 2026-06-25).
+
+### How this works (v1.5.2 — `next_command` flow)
+
+The workflow IS the source of truth for what command to run next. You never construct slicing commands from chat memory. Two event-types tell you what to run:
+
+| Event | What you do |
+|---|---|
+| `need_input` with options | Surface the prompt + options to the operator. When they answer, find the matching option, tool-call its `next_command` field VERBATIM. |
+| `next_action_required` | Tool-call its `command` field VERBATIM immediately. No operator question, no narrative preamble. The workflow has decided this is the next step. |
+
+For both: copy the string, do not edit, do not paraphrase, do not add or remove flags. The workflow handles state.
+
+The workflow walks the operator through five prompts one at a time: **orient → tool → preset → supports → upload**. Each turn = one tool call. The workflow tracks state via the CLI flags it pre-wrote into each next_command.
 
 ### YOU MUST
 
-1. **Use `/opt/data/scripts/u1_slice_workflow.py` as the only slicing path.** Do not write your own slicing python. Do not call `orca-slicer` directly. Do not bypass the workflow because "you already know the defaults."
-2. **Ask the user EVERY one of these questions, in order, ONE PER USER TURN,** before invoking the workflow:
-   - *Orientation?* — Auto-orient (recommended) / As-authored / I have notes
-   - *Filament/tool?* — show loaded slots from `u1_material_picker.py --json` output
-   - *Preset?* — show options from `u1_profile_picker.py --json` output, recommend the one matching the object class (bracket/utility → 0.20 Strength; cosmetic → 0.16 Optimal)
-   - *Supports?* — Auto-orient handled it (recommended) / Add supports / Show me overhangs
-   - *Upload?* — Upload only (print=false) (recommended) / Upload + start / Cancel
-3. **Wait for the user's reply between each question.** Do not stack questions. Do not assume.
-4. **Only after collecting every answer**, invoke the workflow in headless mode with the collected values:
-   ```bash
-   python3 /opt/data/scripts/u1_slice_workflow.py <model.stl> \
-     --tool <T0|T1|T2|T3> \
-     --material <PETG|PLA|...> \
-     --orient <auto|asauthored> \
-     --profile <020_strength|016_optimal|...> \
-     --upload-only --yes
-   ```
-5. **Show the user the preview render** (the `preview.png` from the workflow's output dir) before continuing.
-6. **If the user chose "Upload + start"**, run the camera-gated start gate via `u1_print_start_gate.py` AFTER the workflow's upload completes. The bed-clear question is its own user turn. The default answer is **Cancel**.
+**Step 1 — Start.** When the user gives you an STL/3MF, your next tool call IS:
+```bash
+python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
+```
+Optionally `--no-live-material` if Moonraker isn't reachable. Do not ask the user anything before this runs.
+
+**Step 2 — For each `need_input` event the workflow emits:**
+
+1. Surface the event's `prompt` field as a bold header line, THEN each option's `label` numbered 1, 2, 3 on their own lines. NOTHING ELSE. No paraphrasing, no commentary, no defaults. If the event has a `note` field, surface it verbatim AFTER the options.
+2. **For the orient prompt**: ALSO surface both `render` event paths (`source_as_authored` + `auto_oriented` if present) bare in your reply text BEFORE the prompt, so the images attach. Paths must NOT be inside backticks or fenced code blocks (gateway skips those).
+3. Wait for the operator's answer. They will reply with a number, a slug (`asauthored`, `T1`, `no_supports`), or a paraphrase (`the as-authored one`, `0.20mm fast`).
+4. Find the option whose `value` or `label` matches their answer. For paraphrased preset names that don't match any option's `value`, run `python3 /opt/data/scripts/u1_profile_picker.py --nozzle 0.4 --json` to look up the right slug, then re-match.
+5. **Tool-call the matched option's `next_command` field verbatim.** No flag additions. No flag re-orderings. No splitting. The workflow knows what to do — it wrote this command. For commands likely to take >60s (the commit step that triggers a real slice), set `background: true` + `notify_on_complete: true`.
+
+That's the entire prompt loop. Repeat until you see a `readiness_card` event — that means the COMMIT phase ran and the agent should proceed to Step 3.
+
+**Cancel option.** Some options have `next_command: null` (e.g. the Upload? prompt's "Cancel" option). When the operator picks one of those, do not tool-call anything. Tell the user it was cancelled and stop.
+
+**Filename collision.** If the workflow emits a `need_input` event with `key: "filename_collision"`, surface its options and use the matching option's `next_command` like any other prompt. The workflow already populated the `--out-dir` AND `--on-collision` flags into the next_command, so you don't have to think about it — just copy and tool-call. A `slice_reused` event in the re-run means the cached slice was reused (no wasted re-slicing).
+
+**Step 3 — Surface the preview + readiness card.** After the COMMIT slice finishes (you'll see a `summary` event and a `readiness_card` event), surface the post-slice review:
+
+- From the `render` event with `kind:"preview"`, emit its `image` field bare in your reply (auto-attaches).
+- If there's a `slicer_warning` event, surface every entry in its `messages` array verbatim BEFORE the user trusts the preview.
+- From the `summary` event, present `first_layer_width_mm` × `first_layer_depth_mm` for the footprint — NEVER render `first_layer_bbox` as "X by Y to X by Y" (that's the raw xmin/xmax/ymin/ymax tuple, not dimensions).
+
+**Reading the `uploaded` event truthfully.** v1.5.1 audit (2026-06-26) split the upload result into granular fields. Read them, don't infer from `returncode` alone:
+
+| Field | Meaning |
+|---|---|
+| `moonraker_upload_ok` | The Moonraker upload itself succeeded (file bytes accepted) |
+| `remote_metadata_ok` | The printer can serve metadata for the uploaded file — independent confirmation that it lives in storage |
+| `post_upload_validation_ok` | No blockers in post-upload state (warnings OK) |
+| `post_upload_warnings` | Non-blocking state observations (e.g. terminal `cancelled` state that's otherwise idle) |
+| `post_upload_blockers` | Real problems with post-upload state (e.g. printer became active) |
+| `human_summary` | Quote verbatim. NEVER substitute "no file reached the U1" if `moonraker_upload_ok` AND `remote_metadata_ok` are both true |
+
+Specifically: **`returncode=3` means "upload succeeded but post-upload state has warnings/blockers"**, NOT "file failed to upload". The file IS on the printer. Surface the blockers, but do NOT claim the upload failed.
+
+After `uploaded`, the workflow emits a `readiness_card` event. Use it to compose your pre-start narrative:
+
+- `orient_supports_tier` + `orient_overhang_area_pct` describe the CHOSEN orientation's overhang risk (not the abstract recommended one). Always mention this if the tier is `heavy` or `very heavy`.
+- `warning_if_overhang_risky` is pre-filled when `supports=no_supports` AND tier is heavy/very heavy. If present, surface it verbatim before the start question.
+- `next_step_if_starting` is the exact stage-1 start-gate command shape — use as your Step 9 next tool call.
+
+**Step 4 — Stage 1 (only if operator picked "Upload + start gate").**
+
+After the `readiness_card` event, the workflow emits a `next_action_required` event. Its `command` field is the Stage-1 invocation. **Tool-call it BEFORE writing any narrative.** This is the same rule as Step 2: workflow says run X, you run X.
+
+What you MUST NOT do here (gemma4-26b failed this in harness run 6/7):
+- Surface the SLICE preview path and ask "bed clear?" — that preview is the gcode visualization, NOT a bed photo. Asking "bed clear?" without a real bed photo is anti-fab pattern #4 (state from chat memory) + #6 (verification fabrication).
+- Wait for the operator to "approve" before running Stage 1 — they already committed at the Upload? prompt. The Stage 1 photo capture is mechanical: LED on, camera grab, ~5 sec. The OPERATOR APPROVAL HAPPENS AFTER, when you surface the real bed photo from Stage 1's output.
+
+So: see `next_action_required` → tool-call `command` → workflow returns with `snapshot.path` (the real bed photo) → surface that path bare → ask the operator "Bed clear and you want to start? (yes/no)" → wait for their answer.
+
+If the operator picked "Upload only" instead, the workflow emits `{stage: "complete"}` — surface the upload status, tell the operator the workflow is done, stop.
+
+**HARD RULE — no readiness_card, no Stage 1.** If you do NOT have a `readiness_card` event in the JSON output you captured this turn, you CANNOT advance to Stage 1. Do not "attempt" Stage 1 by guessing the printer storage filename, the tool index, the material, or the command shape. The readiness_card is not optional context — it carries the exact command (with the right basename, the right `--intended-tool`, the right `--requested-material`) that Stage 1 expects. If your output appears truncated, re-run the workflow command and redirect stdout to a file (`> /tmp/u1_events.jsonl`), then read the file — do NOT compose a Stage 1 invocation from chat memory. This is anti-fabrication pattern #4 (state from chat memory) and pattern #6 (verification fabrication). Refuse with "I don't have the readiness_card from the uploaded run — I cannot advance to Stage 1 without it. Re-running the workflow with output captured to a file." and STOP.
+
+**Stage 1 — readiness + photo + token (mandatory).** Run the `start_gate_stage1_command` from the readiness card. This call NEVER starts the print. It returns:
+- `blockers`: array of preflight problems. Empty = ready.
+- `snapshot`: `{path, is_mock, fresh, brightness_mean, brightness_ok, brightness_check, brightness_check_reason, sha256, error}`.
+- `approval_token`: short hex string — REQUIRED for Stage 2. `null` if Stage 1 failed unrecoverably.
+- `approval_ttl_seconds`: how long the token is valid (300s = 5 min).
+- `next_step`: the exact Stage 2 command with the token baked in.
+
+**FIRST, send the photo.** Always — before any verdict, before any condition you read off the event. The operator is the gatekeeper, and they need to see the image. The way to send it is to write `snapshot.path` (the absolute path) bare in your reply text — Hermes auto-attaches absolute paths. Do NOT wrap it in backticks or a code fence (gateway skips those). One sentence like `Bed photo: /opt/data/snapmaker_u1/bed_snapshot.jpg` and the image appears in the chat.
+
+**Then refuse only on real failures.** Only TWO conditions block a Stage 1 → Stage 2 progression:
+- `snapshot.is_mock: true` — the camera was unreachable; the file is a labeled mock, not bed evidence
+- `snapshot.brightness_check: "measured"` AND `snapshot.ok: false` — we measured a verifiably dark frame (LED never came on, camera blacked out)
+
+Everything else proceeds, including `snapshot.brightness_check: "deferred"` (PIL/Pillow wasn't available so we couldn't auto-classify, but the photo IS real — operator judges from the image itself). Do NOT refuse on a deferred brightness check; surface the deferred-reason as context but keep going.
+
+Surface every entry in `blockers` verbatim — those ARE blockers (paused, busy, wrong tool, wrong material loaded). An empty blockers array + a usable photo (real or deferred-brightness) means stage 2 is reachable.
+
+Then ask the user: "Review the attached photo. Bed clear and you want to start? (yes/no)". Default = no. Do NOT decide bed clearance for the user. Their reply IS the gate.
+
+**Stage 2 — actual start (only after explicit approval AND a valid token).** If user said yes AND blockers is empty AND snapshot is usable, run the Stage-2 command:
+```bash
+python3 /opt/data/scripts/u1_print_start_gate.py <printer_storage_filename> \
+  --intended-tool extruder<N> --requested-material <material> \
+  --bed-clear start --approval-token <token-from-stage-1>
+```
+
+The gate validates the token (5-min TTL), re-runs preflight, takes a sanity-only fresh capture (NOT shown — operator already approved Stage 1's photo), and starts only if everything passes. If the token is wrong/expired, or if the sanity capture is dark/mock, the gate refuses — re-run Stage 1.
+
+DO NOT skip Stage 1. DO NOT invent a magic phrase. DO NOT pass `--bed-clear start` without the token AND the operator's explicit yes. Default = cancel.
 
 ### YOU MUST NOT
 
-- Pick the orientation, tool, material, preset, support, or upload values yourself.
-- Guess what the user "probably wants."
-- Re-implement the staged workflow with custom Python or shell heredocs.
-- Run the workflow's `--json-events` mode in a Telegram-driven session — that mode requires bidirectional stdin, which Telegram-driven agents cannot provide. The collect-answers-then-run-headless pattern above is the right one.
-- Patch this skill manifest OR any file under `/opt/data/skills/hardware-automation/3d-printer-slicing-automation/**` mid-session — for ANY reason, even to capture good lessons. ALL changes must go through the workspace (`/opt/data/workspaces/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation/`), get reviewed by Brent, and ship via `deploy_to_runtime.sh`. If you have a real lesson worth keeping, propose the workspace edit in your reply and let Brent commit + redeploy it. Never write directly to the live skill path. (This rule exists because mid-session live edits silently drift from `main`, so every user who installs the skill via `hermes skills install` loses the lesson, and the next deploy clobbers your edit anyway.)
-- Fabricate verification procedures, test scores, file paths, or module imports that don't exist in the actual codebase. Future readers and future-you treat skill references as authoritative — hallucinated content is worse than no content. If you write a "checklist," every command in it must actually work against the real codebase. When in doubt, leave it out.
-- Improvise around workflow failures. If the workflow fails, surface the actual error to the user and stop.
-- Start a print from automation, cron, or any chained call. Start commands require explicit in-the-moment operator approval on the bed-clear question.
+Named patterns (each one was observed in a live run on 2026-06-25):
 
-## Token-efficient operation (read carefully)
+- **PICKING DEFAULTS** — Inventing orientation/tool/material/preset/support/upload values yourself. Defaults from "what's most common" are wrong by definition because every U1 setup differs.
+- **STACKING QUESTIONS** — Two or more questions in one turn. User answers one; you guess the others.
+- **CUSTOM SLICING PYTHON** — `subprocess.run(['orca-slicer', ...])` or `import requests` to query the printer. Bypasses v1.4.2 T0→T1 rewriter, v1.4.3 thumbnail injector, the JSON event schema, AND the toolkit's stdlib-only safety discipline.
+- **PATCHING THE LIVE SKILL** — Writing to `/opt/data/skills/.../SKILL.md`. Has silently deleted whole sections twice (v1.4.4 + v1.4.6 sessions). Workspace edits only; let the maintainer commit + redeploy.
+- **IMPROVISING AROUND FAILURES** — Surface the actual error verbatim and stop. Don't retry with different args.
+- **STARTING FROM CRON / CHAIN** — Start commands require in-the-moment operator confirmation on the bed-clear question.
 
-The U1 toolkit lives inside Hermes's context window. Every redundant tool call or large output ingested costs the user real tokens. Hermes already deduplicates identical file reads and truncates terminal output >50k chars, but the toolkit's slicing flow produces large artifacts that need explicit discipline:
+### ANTI-FABRICATION (named patterns from live testing)
 
-**YOU MUST:**
-- **Read `slice_summary.txt` ONCE** after a slice completes. It's a ~300-byte terse text file in the workflow's output directory with time, weight, layer count, profile, material, tool, thumbnails-injected status, and warnings. Do not re-parse the gcode to derive these — gcode reads inline 12+ KB of base64 thumbnail blobs as a side effect.
-- **Trust the workflow's JSON event stream as ground truth.** Render images are written to disk and referenced by path in `render` events. Slice metadata lives in `summary` and `slice_summary.txt`. Don't separately invoke vision tools to re-analyze the workflow's own renders unless the user explicitly asks "what's in that image."
-- **Run the workflow in two phases** for an interactive session: first invocation **without `--yes`** emits all renders + `need_input` events and exits at `awaiting_input` without slicing. Collect the user's answers across turns. Then re-invoke **with `--yes` and all flags** (`--orient`, `--tool`, `--material`, `--profile`) to do the actual slice once. This is the documented "collect-answers-then-headless" pattern.
-- **The workflow script at `/opt/data/scripts/u1_slice_workflow.py` does not change between invocations within a session.** Read it at most once. If a question about its behavior arises mid-session, reason from the JSON events you've already seen, not from re-reading the source.
+The "no fabrication" rule has eight failure patterns. Naming them helps you catch yourself:
 
-**YOU MUST NOT:**
-- Re-read the gcode file after a slice completes (12+ KB of base64 noise per read).
-- Re-invoke the workflow with the same arguments to "see if it works this time" — failures are deterministic at this level; surface them to the user.
-- Use browser tools to inspect Snapmaker pages or OrcaSlicer docs mid-slice unless the user explicitly asked. The toolkit's render images + `slice_summary.txt` are self-sufficient for the staged workflow.
-- Inline render PNGs into your reply text. Pass the image path to the user's frontend (Telegram, etc.) by reference; the workflow already wrote it to disk.
+1. **Magic confirmation phrases.** "START U1 PRINT", "CONFIRM PRINT", etc. — phrases the user has to type to advance. The skill names actual scripts (`u1_print_start_gate.py`). If you're inventing a magic phrase instead of calling the named script, that's fabrication.
+2. **Describing dry-run state as real.** If the workflow's `uploaded` event has `dry_run: true`, NO file was sent. **Surface the event's `human_summary` field verbatim** — that's the workflow's authoritative narrative for this state. Do NOT add explanations like "the upload was blocked by a tool gate" or "filament type mismatch" — those are fabrications. The dry-run happened because `--live-upload` wasn't passed, period. No gate fired, no error occurred, no filament check failed. If you find yourself about to write "BLOCKED by X" / "your profile is set to Y" / "I'll investigate the filament configuration", STOP — that's pattern #6 (verification fabrication) cascading from pattern #4 (state from chat memory). Quote `human_summary`, recommend re-running with `--live-upload`, stop.
+3. **Confusing host filesystem with printer storage.** The `uploaded` event distinguishes `host_path` (Hermes-host local disk, where the gcode physically is) from any printer-side reference. Never say "file is in printer storage" when only `host_path` is present in the event — that means the file is on the Hermes container's disk, not the U1.
+4. **State narratives from chat memory.** "I can see from the process that..." followed by a confirmation summary, composed without an actual tool call, is fabrication. Only describe state you READ from JSON events received this session.
+5. **Inventing user rationales.** Don't write "the user picked X for reason Y" unless they stated Y. If you need to justify a choice, ask them.
+6. **Verification fabrication.** Reporting checks ("camera image captured", "bed checked", "printer at 22°C bed / 25°C nozzle") that no tool actually performed. If you didn't call the tool, the check didn't happen.
+7. **Printing the command instead of running it.** Writing `python3 /opt/data/scripts/u1_slice_workflow.py ...` into your reply text is NOT a tool call — it's documentation. The user can't run it for you, and the skill DOES NOT ask you to surface the command for review. Always invoke via the `terminal` tool. Same applies to `u1_print_start_gate.py`. If a step says "your next tool call IS X," call X — don't quote X.
+8. **Claiming you backgrounded a tool call you didn't issue.** "I have started the slicing and upload process in the background. I will notify you as soon as it finishes" / "running it in the background, will update you when it's done" — these are fabrication UNLESS your reply contains a real tool_use block targeting the named script. The operator cannot see a tool you didn't call. If you wrote a "background started" sentence WITHOUT a tool call attached, you are inventing state. Catch this before sending: scan your reply — is there a tool_use? If no, delete the promise and issue the call.
 
-## Critical orientation lesson
+**Diagnostic for the user:** if the skill required you to attach a file (camera photo, render PNG) and you claim it happened but no attached image shows up in the reply, the user knows the action didn't happen. Missing artifact = no real file referenced = no real action.
 
-Orca `--orient` only prints the optimal rotation; the toolkit applies it. Render and slice both consume the same `oriented.stl`. If a render disagrees with a slice, the rotation step was not run. The earlier "TOP / BED FOOTPRINT projections are misleading" lesson was incorrect — that was a symptom, not the bug. The bug was rendering an unrotated STL while slicing an auto-oriented one.
+The named scripts that DO actions: `u1_slice_workflow.py`, `u1_print_start_gate.py`, `u1_camera.py`, `u1_material_picker.py`, `u1_profile_picker.py`, `u1_print_history.py`. These are the only things you should be calling for state changes. Everything else is narrating events you've received.
 
-The current `u1_orient.py` applies Orca's chosen rotation by interpreting its output vector as the source-frame direction that becomes the new build-up (+Z) axis. Do not change that semantic without re-running the EGO trimmer regression test in `tests/test_u1_orient.py` and `tests/test_u1_slice_workflow.py`.
+## Profile sources (v1.5.0)
 
-## Critical profile/tool-fidelity lessons
+`list_profiles()` scans three sources in priority order. Each profile dict carries `source`, `has_supports` (from JSON `enable_support`), and `supports_status`.
 
-As of v1.4.3, after slicing `u1_slice_workflow.py` calls `inject_snapmaker_thumbnails()` to add Snapmaker-format 48×48 and 300×300 thumbnail blocks to the G-code before upload, so the U1 touchscreen shows a preview instead of a generic icon. Thumbnail injection is fail-soft preview metadata, not a print-safety gate.
+| Source | Populated by | Priority |
+|---|---|---|
+| `profiles/from-printer/` | `tools/extract_profiles_from_printer.py` | Highest (physics-validated) |
+| `profiles/user/` | Operator manually | Middle |
+| `profiles/snapmaker-stock/` | `tools/fetch_snapmaker_profiles.py` | Lowest (universal baseline) |
 
-After slicing, verify that the workflow used the exact preset and tool the user selected. Do **not** trust that a value shown by `u1_profile_picker.py --json` or `u1_material_picker.py --json` was necessarily mapped correctly inside `u1_slice_workflow.py` or Orca CLI output. Check the workflow output before telling the user the slice is ready:
+If `list_profiles()` returns empty, workflow emits `{stage:"setup_required", kind:"no_profiles"}`. Surface the event's `message` verbatim — point user at the named scripts.
 
-- `slice.profiles.process` should point to the expected profile file.
-- `slice.metadata.print_settings_id` should name the requested profile, e.g. `Community 0.20 Strength Gyroid @Snapmaker U1 Textured PEI` for `020_strength_gyroid`.
-- Inspect the first ~100 G-code lines for actual initial tool commands (`T0`/`T1`, `M104 T*`, `M109 T*`). If the user selected T1 but the G-code start block uses T0 as `{initial_extruder}`, fail closed; do not "select T1 and start" because the file itself may switch back to T0.
-- If the metadata/path/G-code show a fallback profile or wrong tool, stop, surface the actual issue to the user, and let them decide whether to rerun. Do not silently retry or patch.
-- v1.4.2 runtime fix: `profile_path()` resolves via `u1_profile_picker.list_profiles()`, so picker values such as `020_strength_gyroid` and `020_strength_gyroid_supports` no longer fall through to plain strength.
-- v1.4.2 runtime fix: `rewrite_gcode_for_tool()` post-processes Orca output for non-default tools, rewriting initial-extruder `T0` references to the chosen tool while preserving slot-literal multi-tool cooling commands such as `M104 S0 T<n> A0`.
-- Even when Moonraker reports `toolhead.extruder=extruder` during warmup, verify actual heater targets and G-code start block before blocking: a corrected T1 file may show `extruder1` heating while the active-tool field has not switched yet.
+## Slicer warnings (v1.5.0)
 
-Known examples (captured from the 2026-06-24 EGO trimmer session):
-
-- `020_strength_gyroid` fell through to plain `020_strength` even though the picker offered the gyroid option; v1.4.2 fixed this.
-- A T1 black PETG U1 slice produced G-code with T0 as the initial extruder because Orca CLI was fed a single filament profile; v1.4.2 added the G-code rewrite step. The wrong-extruder failure was caught at the camera-gated start gate before any heat command — exactly the failure mode the gate was built for.
-
-The safe pattern is: collect choice → slice → inspect metadata/path/tool commands → fail closed and surface if mismatch → only then upload/start-gate.
-
-## 10-step canonical flow (mirrors the user MUST-asks above)
-
-1. Receive `.stl`/`.3mf` — silent triage: dimensions, triangles, volume
-2. **Ask orientation** — default Auto-orient
-3. **Ask filament/tool** — only show loaded slots from `filament_detect` + toolmap
-4. **Ask preset** — recommend based on object class
-5. **Show oriented render** — iso + side-on-printer + top-down, generated from the `oriented.stl` the slicer will use
-6. **Ask supports** — default "auto-orient handled it"
-7. Slice — workflow handles this, using the same `oriented.stl` rendered in step 5
-8. **Show preview render** — first-layer footprint + time/weight/material
-9. **Ask upload** — default "Upload only (print=false)"
-10. **If upload+start**: capture fresh LED-on bed photo, show it, ask "Bed clear?" — default Cancel
+Workflow emits `{stage:"warning", kind:"slicer_warning", messages:[...], count:N}` after the commit slice when Orca flags geometric concerns. Surface every entry in `messages` verbatim BEFORE the user trusts the preview. Don't filter, don't paraphrase, don't auto-block — these are advisory.
 
 ## Safety gates
 
-- Upload-only is the default. Never run upload+start without bed-clear confirmation.
-- Never start from arbitrary STL/3MF without a fresh camera snapshot + in-the-moment operator approval.
-- If printer state, tool/material, slicer metadata, or bed visibility is unknown, fail closed.
-- Start/resume/cancel are physical side effects; never run them from cron or chained automation.
-
-## Agent integration: WHY collect-then-headless instead of `--json-events`
-
-`u1_slice_workflow.py --json-events` emits questions on stdout and reads answers from stdin. That requires a bidirectional pipe held open across the user's reply. Telegram-driven agents like Hermes cannot keep a subprocess pipe alive across user turns — each user message starts a fresh tool-call context.
-
-The realistic pattern: agent collects answers across turns (one question per user message), then invokes the workflow in `--yes` headless mode with all flags set. The workflow's `--json-events` mode is reserved for terminal-UI or CI/CD adapters where bidirectional pipes work.
-
-The `recommended:true` field in `u1_material_picker.py --json` and `u1_profile_picker.py --json` output is a UI hint for highlighting the default option. The agent should still ask the user.
+- **Upload-only is default.** Never upload+start without bed-clear via `u1_print_start_gate.py`.
+- **Start = physical action.** Never run from cron / chain / automation. In-the-moment operator confirmation only.
+- **If anything is unknown** — printer state, tool, material, slicer metadata, bed visibility — fail closed.
 
 ## References
+
+Historical session notes + reverse-engineering captures (not load-bearing for the current flow — skim only if a question references something earlier than v1.5.0):
 
 - `references/snapmaker-u1-question-flow.md`
 - `references/snapmaker-u1-safety-gates.md`
 - `references/snapmaker-u1-orient-rotate-and-slice-review-2026-06.md`
-- `references/profile-tool-fidelity-v1.4.2.md` — session notes for the profile-picker resolution fix, T0→chosen-tool G-code rewrite, and Moonraker active-tool warmup nuance.
-- `references/deploy-to-runtime.md` — workspace → runtime deploy pipeline overview, target dirs, and the container-path-boundary lesson.
+- `references/profile-tool-fidelity-v1.4.2.md` — T0→T1 rewriter + profile_path resolution
+- `references/deploy-to-runtime.md`

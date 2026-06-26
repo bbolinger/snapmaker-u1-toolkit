@@ -1,9 +1,20 @@
 .env
 .venv/
+.venv_*/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 artifacts/
+
+# Bootstrap installers that shouldn't be committed (e.g., pip's standalone
+# script lands here when someone runs the curl-pipe-python install)
+get-pip.py
+
+# Editor / OS noise
+*.bak
+*.tmp
+.DS_Store
 
 # Runtime state — don't commit operator-specific JSON/photos
 snapmaker_u1/print_history.json
@@ -17,3 +28,9 @@ snapmaker_u1/layer_checks/
 snapmaker_u1/watchdog/
 snapmaker_u1/u1_tool_material_map.json
 snapmaker_u1/u1_config.json
+
+# Profile sources fetched/extracted at the user's site — not redistributed
+# in the repo. Each user runs the setup scripts to populate these locally.
+profiles/snapmaker-stock/
+profiles/from-printer/
+profiles/user/

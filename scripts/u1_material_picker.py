@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port
 TOOLS=[('T0','extruder',1),('T1','extruder1',2),('T2','extruder2',3),('T3','extruder3',4)]
+_COLOR_PALETTE={'white':(255,255,255),'black':(0,0,0),'gray':(128,128,128),'silver':(192,192,192),'beige':(226,222,219),'red':(224,40,46),'orange':(255,140,0),'yellow':(255,213,0),'green':(0,168,89),'cyan':(0,188,212),'blue':(27,92,176),'purple':(138,63,188),'pink':(245,160,197),'brown':(123,78,46)}
+def rgba_to_color_name(rgba: Any) -> str:
+    if not isinstance(rgba, str) or not rgba: return 'unknown'
+    h=rgba.strip().lstrip('#').upper()
+    if len(h) not in (6,8) or any(c not in '0123456789ABCDEF' for c in h): return rgba
+    r,g,b=int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+    return min(_COLOR_PALETTE.items(), key=lambda kv:(r-kv[1][0])**2+(g-kv[1][1])**2+(b-kv[1][2])**2)[0]
 def http_json(url: str, timeout: float=8.0)->dict[str,Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r: return json.loads(r.read().decode())
 def _get(v, i, default=None): return v[i] if isinstance(v, list) and i < len(v) else default
@@ -20,9 +27,10 @@ def status_to_options(status: dict[str,Any], requested_material: str|None=None) 
         if not loaded: continue
         material=_get(ptc.get('filament_type'), i, 'unknown') or 'unknown'
         vendor=_get(ptc.get('filament_vendor'), i, 'unknown') or 'unknown'
-        color=_get(ptc.get('filament_color_rgba'), i, 'unknown') or 'unknown'
-        label=f'{tool}: {vendor} {color} {material} (loaded)'
-        opts.append({'label':label,'value':tool,'object':obj,'printhead':ph,'material':material,'vendor':vendor,'color_rgba':color,'loaded':True})
+        color_rgba=_get(ptc.get('filament_color_rgba'), i, 'unknown') or 'unknown'
+        color_name=rgba_to_color_name(color_rgba)
+        label=f'{tool}: {vendor} {color_name} {material} (loaded)'
+        opts.append({'label':label,'value':tool,'object':obj,'printhead':ph,'material':material,'vendor':vendor,'color_rgba':color_rgba,'color_name':color_name,'loaded':True})
     if opts:
         req=(requested_material or '').lower()
         preferred=next((o for o in opts if req and req in str(o.get('material','')).lower()), opts[0])

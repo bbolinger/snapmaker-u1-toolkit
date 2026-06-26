@@ -1,5 +1,7 @@
 # Snapmaker U1 profile/tool fidelity fixes — v1.4.2
 
+> **v1.5.0 disclaimer:** profile paths referenced below (`community_020_strength_*`, `community_016_optimal_*`, etc.) lived in `profiles/` in v1.4.x — they moved to `examples/profiles/` in v1.5.0 when the picker was rewritten around three real sources (`from-printer/`, `user/`, `snapmaker-stock/`). The v1.4.2 fixes themselves (`profile_path` via `list_profiles()`, `rewrite_gcode_for_tool()`) are still active code. See `README.md#profile-sources-v150` for the current path semantics.
+
 Session learning captured from the EGO String Trimmer holder workflow.
 
 ## Failure modes observed

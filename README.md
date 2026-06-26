@@ -6,11 +6,111 @@ Read-only and gated-write automation scripts for the [Snapmaker U1](https://snap
 
 **Built for safety-staged operation**: read state → slice → upload-only → operator approval → start. The dangerous bits (`start print`, `cancel`, movement) are always gated on explicit operator confirmation.
 
-## End-to-end slice workflow (v1.4.0)
+## Setup
+
+### Requirements
+
+- Python 3.9 or newer
+- `numpy` + `Pillow` — installed via `requirements.txt`
+- [OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary (extracted AppImage path is fine; full install steps in [Headless slicing setup](#headless-slicing-setup-no-gui--scripted))
+- Network reachability from your host to your U1's Moonraker port (default `7125`)
+
+### Install
+
+```bash
+git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
+cd snapmaker-u1-toolkit
+python3 -m pip install -r requirements.txt
+```
+
+### Verify
+
+```bash
+python3 scripts/u1_slice_workflow.py --help
+```
+
+If you see argparse usage text, your environment is ready. If you see `ERROR: u1_slice_workflow.py needs numpy + PIL`, the workflow tells you exactly which interpreters it tried and how to fix — see the next section.
+
+### Choosing a Python interpreter
+
+The workflow needs `numpy` and `Pillow` on the Python that runs it. It auto-detects a working interpreter in this priority order — the first one that can `import numpy, PIL` wins:
+
+1. `$U1_TOOLKIT_PYTHON` (your override; set to any path you like)
+2. `/opt/hermes/.venv/bin/python` (Hermes-bundled venv — common on agent hosts)
+3. `<repo>/venv/bin/python` (project-local venv — the recommended fresh install)
+4. `<repo>/.venv/bin/python` (uv-/poetry-style hidden venv)
+5. `/opt/homebrew/bin/python3` (macOS Homebrew on Apple Silicon — the M-series default)
+6. `/usr/local/bin/python3` (macOS Homebrew on Intel — legacy install path)
+
+If none has the deps, the workflow exits with a clear error listing each path it tried and concrete fix steps. You'll know exactly what to do next.
+
+### Recommended: isolated project venv
+
+Cleanest install for a fresh host, no clutter in your system Python:
+
+```bash
+cd snapmaker-u1-toolkit
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+export U1_TOOLKIT_PYTHON=$PWD/venv/bin/python
+```
+
+Add the `export U1_TOOLKIT_PYTHON=...` line to your shell rc (`~/.bashrc`, `~/.zshrc`) to make it permanent. The workflow respects this on every invocation.
+
+### For Hermes users
+
+Hermes typically ships with `numpy` + `Pillow` already in its bundled venv. Verify:
+
+```bash
+/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'
+```
+
+If that prints `ok`, the workflow's auto-detection finds it automatically — you don't need to set `U1_TOOLKIT_PYTHON`. The bundled Hermes skill is installable in one command:
+
+```bash
+hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
+```
+
+See [Using with Hermes](#using-with-hermes--install-the-bundled-skill) below for what the skill does and how Hermes drives the workflow.
+
+### Configure your U1
+
+Connection details (host, port, data dir) live in [Configuration](#configuration) below. The toolkit honors env vars, then a JSON config file, then sane defaults — set whichever fits your host best.
+
+### Deploy to runtime (Hermes users)
+
+If you're driving the toolkit through Hermes, the bundled skill expects the workflow scripts to live at the runtime paths Hermes calls into. Deploy them:
+
+```bash
+bash deploy_to_runtime.sh
+```
+
+After copying files, the deploy script invokes the deployed workflow's `--help` to confirm the Python at the runtime location can actually start the workflow. On success: `✓ workflow starts cleanly` + `✓ Deploy complete`. On env failure (no Python with `numpy`+`Pillow` reachable): files are deployed but the script exits non-zero with the workflow's own diagnostic output — fix what it tells you, re-run.
+
+Override target paths via env vars if your layout differs from the Hermes default:
+
+```bash
+U1_DEPLOY_SCRIPTS=/my/runtime/scripts \
+U1_DEPLOY_TOOLS=/my/runtime/tools \
+U1_DEPLOY_SKILL=/my/runtime/skill/.../3d-printer-slicing-automation \
+U1_DEPLOY_PROFILES=/my/runtime/profiles \
+bash deploy_to_runtime.sh
+```
+
+## End-to-end slice workflow (v1.4.0, picker rework v1.5.0)
 
 ![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
 
-The canonical STL/3MF → U1 path is now:
+**Before your first slice**, populate the profile picker (one-time setup — see [Profile sources (v1.5.0)](#profile-sources-v150) below):
+
+```bash
+python3 tools/fetch_snapmaker_profiles.py            # Snapmaker U1 stock baseline
+python3 tools/extract_profiles_from_printer.py       # extract YOUR successful prints
+```
+
+Without either, the workflow exits with a `setup_required` event and points you back at these scripts. Hit something the docs didn't cover? Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+Then the canonical STL/3MF → U1 path:
 
 ```bash
 python3 scripts/u1_slice_workflow.py model.3mf
@@ -24,12 +124,13 @@ python3 scripts/u1_slice_workflow.py model.3mf --json-events
 
 The workflow owns the full 10-step flow: triage, orientation choice, loaded filament/tool choice, preset choice, oriented render, support choice, slice, preview render, upload-only default, and optional camera-gated start. Render and slice both consume the same `oriented.stl`; Orca `--orient` only reports the best rotation, and this toolkit applies it.
 
-Safe headless proof run:
+Safe headless proof run (pass `--profile` slugs your picker actually has — list with `python3 scripts/u1_profile_picker.py`):
 
 ```bash
 python3 scripts/u1_slice_workflow.py model.3mf \
-  --tool T1 --material PETG --orient auto --profile 020_strength \
-  --upload-only --yes
+  --tool T1 --material PETG --orient auto \
+  --profile 0_20_strength_snapmaker_u1_0_4_nozzle \
+  --supports auto --upload-only --yes
 ```
 
 ## Using with Hermes — install the bundled skill
@@ -43,6 +144,18 @@ hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-a
 ![End-to-end example with Hermes — model preview, Telegram operator conversation, AI-derived slice settings, and the actual printed part in hand](docs/images/end-to-end-example.jpg)
 
 That skill tells Hermes to call `scripts/u1_slice_workflow.py`, ask the 10 questions instead of guessing, default to upload-only, and fail closed at the bed-clear start gate.
+
+### Gotcha for skill writers: Hermes attaches files via bare paths in text, not a tool parameter
+
+If you fork this skill or write your own, Hermes' platform gateways (Telegram, Discord, Signal, etc.) deliver media to the user by scanning the agent's reply text for **bare absolute file paths** ending in known media extensions and auto-attaching whatever exists on disk. There is **no** `files=[...]` tool parameter the agent needs to call. See `gateway/platforms/base.py:extract_local_files()` in Hermes 0.15.2 for the canonical implementation.
+
+What this means for your skill prompt:
+
+- ✅ Tell the agent: *"emit the absolute path bare in your reply text"*
+- ❌ Do NOT tell the agent: *"attach the file via the reply tool's files parameter"*
+- ❌ Paths inside backticks or fenced code blocks are skipped — the agent must emit them as bare text
+
+This caught me out during the first v1.5.0 live test — the agent kept claiming it would "attach" renders but the gateway saw nothing to extract. See `TROUBLESHOOTING.md` for the full diagnosis if you hit the same.
 
 ## Optional: notify me when OrcaSlicer has an update
 
@@ -60,7 +173,7 @@ Behavior:
 - **Refuses to query GitHub more than once per 24h** regardless of how often you invoke it (cache at `~/.cache/snapmaker-u1-toolkit/update-check.json`). `--force` overrides for one-off "tell me now" runs.
 - **Returns silently when GitHub is unreachable or the binary isn't present.** Never breaks your cron with stray stderr.
 
-Compatibility note: Snapmaker upstreamed the U1 vendor profile into OrcaSlicer 2.4.0, and the bundled `community_merged_*` process profile is flattened (no inheritance chain), so patch/minor upgrades should keep slicing U1 prints. Major-version bumps may change CLI flags or profile schema — re-run the EGO trimmer regression after upgrading. The notifier's risk label ("patch / minor / major") flags this in the alert text.
+Compatibility note: Snapmaker upstreamed the U1 vendor profile into OrcaSlicer 2.4.0, and `tools/fetch_snapmaker_profiles.py` pulls fresh stock profiles from that upstream — patch/minor upgrades should keep slicing U1 prints. Major-version bumps may change CLI flags or profile schema — re-run the EGO trimmer regression after upgrading. The notifier's risk label ("patch / minor / major") flags this in the alert text.
 
 If your `orca-slicer` binary lives anywhere other than `/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer` (Hermes-container default), pass the path explicitly OR set the `ORCA_SLICER_BIN` environment variable in your crontab, otherwise the script silently can't probe your installed version and you'll never see notifications.
 
@@ -106,7 +219,8 @@ Idempotent: a tag that already has a Release is skipped unless `--update` is pas
 | `snapmaker_u1_status.py` | Read-only status probe |
 | `snapmaker_u1_snapshot.py` | Websocket camera trigger helper |
 | `tools/extract_profile_from_gcode.py` | One-shot extractor — turn a successful G-code into Snapmaker Orca process + filament JSONs |
-| `tools/extract_profiles_from_printer.py` | Auto-pull recent G-codes off your U1 over Moonraker, run the extractor against each — one command, gets your real print history into profiles/ |
+| `tools/extract_profiles_from_printer.py` | Auto-pull recent G-codes off your U1 over Moonraker, run the extractor against each — one command, gets your real print history into `profiles/from-printer/` |
+| `tools/fetch_snapmaker_profiles.py` | Fetch Snapmaker's official U1 stock profiles (machine + process + filament) from the upstream `Snapmaker/OrcaSlicer` GitHub repo into `profiles/snapmaker-stock/` (v1.5.0) |
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
 | `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
 
@@ -253,15 +367,49 @@ Real reverse-engineering notes from getting these scripts working — the kind o
 | `references/snapmaker-u1-orca-moonraker.md` | OrcaSlicer + Moonraker integration |
 | `references/snapmaker-u1-research.md` | First-pass research summary |
 
-## Profile templates
+## Profile sources (v1.5.0)
 
-**The included profiles are REFERENCE EXAMPLES, not "the right" profiles for your U1.**
+**The toolkit no longer ships default profiles.** A fresh install has an empty picker. Profiles come from one of three sources you populate yourself, scanned in priority order:
 
-`profiles/` contains 13 Snapmaker Orca JSONs derived from one operator's successful prints. They demonstrate the *shape* of a per-extruder + per-filament profile but they're tuned for that specific environment: one bed surface (Textured PEI), one bed temp, certain filament brands (SUNLU PETG, HF White PETG), specific tool assignments.
+| Source dir | Populated by | Purpose | Priority |
+|---|---|---|---|
+| `profiles/from-printer/` | `python3 tools/extract_profiles_from_printer.py` | Profiles extracted from your printer's recent G-code history. Physics-validated — every setting produced a successful print. | Highest |
+| `profiles/user/` | The operator, manually | Hand-tuned overrides + custom variants you want to keep stable across stock refreshes | Middle |
+| `profiles/snapmaker-stock/` | `python3 tools/fetch_snapmaker_profiles.py` | Snapmaker's official U1 profiles, pulled fresh from the Snapmaker/OrcaSlicer upstream repo (~217 files: every nozzle size + layer height + Snapmaker-tuned filament) | Lowest (universal baseline) |
 
-**The real value is the methodology**: extract YOUR profiles from YOUR successful prints, mapped to YOUR extruders and YOUR filaments. Here's why and how.
+All three are listed in `.gitignore` — they're per-user, not redistributed.
 
-### Why build your own (vs. just importing these)
+### First-run setup
+
+```bash
+# Pull Snapmaker's official U1 baseline (~217 files, one-time):
+python3 tools/fetch_snapmaker_profiles.py
+
+# Extract whatever you've actually printed successfully so far:
+python3 tools/extract_profiles_from_printer.py
+```
+
+Both are idempotent — re-run anytime to pick up Snapmaker upstream updates or fresh prints from your printer's history. Snapmaker stock gives you the universal U1 baseline; extracted profiles reflect what you've validated on your hardware.
+
+Without either, the workflow fails closed at analysis time with a clear `setup_required` event pointing you back here. Hermes agents surface that error verbatim.
+
+### Why ship empty (v1.4.x → v1.5.0)
+
+Earlier versions shipped 13 of my (Brent's) personal community profiles in `profiles/` as defaults. They were tuned for one bed surface (Textured PEI), one bed temp, specific filament brands (SUNLU PETG, HF White PETG), specific tool assignments. Running them silently on another U1 with different filaments or a different bed surface could ruin prints — and the toolkit had no way to warn the user that the profile underneath didn't match their setup.
+
+v1.5.0 moves those personal templates to `examples/profiles/` and points the picker at three honest sources: Snapmaker upstream (universal baseline), your printer's history (physics-validated on your hardware), and your own hand-tuned profiles. The agent's *Preset?* prompt now annotates each option with `source`, `has_supports` (read from the JSON's `enable_support` field), and `supports_status` (does picking "Add supports" auto-promote to a `_supports` sibling, already encode supports, or fail with a `no_supports_variant` warning).
+
+### Supports auto-detection (v1.5.0)
+
+Profiles are JSON-typed for supports — the picker reads each profile's `enable_support` field and annotates the option with `has_supports: true/false`. The agent's *Preset?* prompt also carries a `supports_status` that pre-warns the user before the *Supports?* question:
+
+- `"self"` → preset already encodes supports; "Add supports" is a no-op for them
+- `"<variant_name>"` → if user picks "Add supports", workflow auto-promotes to this same-source sibling and emits a `preset_promoted` event
+- `null` → no same-source supports sibling exists (or multiple ambiguous candidates). Workflow emits a `warning` event with `kind:no_supports_variant` and slices without supports — agent surfaces it before the user trusts the preview
+
+Why "same-source exactly one"? Snapmaker stock has multiple Support flavors at the same layer height (`0.20 Support`, `0.20 Support W`, `0.20 Bambu Support W`) — auto-promote can't pick one; the user has to.
+
+### Why build your own (vs. just importing the examples)
 
 Profile-as-data-from-real-prints means every setting is *physics-validated* — it produced a completed print on actual hardware. But the validation is environment-specific:
 
@@ -312,7 +460,7 @@ elsewhere.
    ; sparse_infill_density, wall_loops
    ; nozzle_diameter
    ```
-4. **Build a flattened process JSON** (see `profiles/community_merged_*.json` for shape) and a matching filament JSON (see `profiles/community_generic_petg_*.json`). Name them with the extruder + filament so you don't confuse yourself: e.g. `myprinter_extruder1_sunlu_black_petg.json`.
+4. **Build a flattened process JSON** (see `examples/profiles/community_merged_*.json` for shape) and a matching filament JSON (see `examples/profiles/community_generic_petg_*.json`). Name them with the extruder + filament so you don't confuse yourself: e.g. `myprinter_extruder1_sunlu_black_petg.json`.
 
    **Or run the included extractor** to do steps 3-4 in one go:
    ```bash
@@ -338,9 +486,11 @@ elsewhere.
 
 The toolmap gate (`u1_toolmap.py`) then prevents you from accidentally slicing a job for PETG and uploading it against the slot loaded with PLA.
 
-### About the included profile files
+### Reference: example community profiles in `examples/profiles/`
 
-The 13 profiles in `profiles/` follow this naming convention so you can see the pattern:
+The 13 profiles I (Brent) used during development live in `examples/profiles/` as a shape reference. They're MIT-licensed and show what a working community-tuned profile looks like for the U1. **Do not use them as defaults** — they assume Textured PEI + specific filament brands. If you happen to share that setup, copy them into `profiles/user/` and they'll appear in the picker.
+
+The naming convention so you can see the pattern:
 
 | Pattern | Meaning |
 |---|---|
@@ -487,7 +637,11 @@ OrcaSlicer's bundled Snapmaker process profiles **do not always resolve inherita
 - Layer-height preset of 0.16 produces G-code with `layer_height = 0.2`
 - Bed/nozzle temps default to PLA-safe values regardless of selected filament
 
-**Workaround**: use the flattened `community_merged_*` process profile in this repo. It pre-resolves the full inheritance chain so CLI loading gets exact values. The `_override` variants only work in the GUI where Orca resolves the official base profile. The same logic applies to the bundled machine profile above.
+**Workaround**: use profiles whose inheritance chain CLI can resolve. Three good options today:
+
+- `tools/extract_profiles_from_printer.py` writes **flat process JSONs from your successful prints** (no inheritance) — physics-validated AND CLI-safe by construction. Best default.
+- `tools/fetch_snapmaker_profiles.py` pulls Snapmaker's upstream stock — CLI resolves these against the bundled OrcaSlicer install when the install matches the stock branch.
+- `examples/profiles/community_merged_*` (in `examples/`) is the legacy flat-profile shape; if you're handwriting your own, follow that pattern. The `_override` variants only work in the GUI where Orca resolves the official base profile. The same flatness logic applies to the bundled machine profile above.
 
 ### Pre-print orientation review
 

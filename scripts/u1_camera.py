@@ -154,27 +154,48 @@ def fetch_monitor(host: str, port: int, output: str) -> dict:
     return {"output": str(out), "bytes": len(image), "jpeg_magic": image[:3] == b"\xff\xd8\xff"}
 
 
-def command_photo(args: argparse.Namespace) -> dict:
-    # Lazy import so this module stays usable on systems without cavity_led
-    # configured (the wrap is a no-op then — failures are caught and logged).
+def capture_photo(host: str, port: int, output: str,
+                  wait: float = 5.0, interval: float = 1.0) -> dict:
+    """Canonical photo-capture entry point — used by both the CLI
+    (command_photo) AND u1_print_start_gate. Wraps photo_wrap so the LED
+    is on, settles for `wait` seconds, captures, and restores LED state.
+
+    The 5-second default `wait` is critical: the U1's cavity LED needs
+    time to settle and the camera needs an exposed frame. Skipping the
+    wrap or shortening the wait produces dark/black frames that look
+    like valid JPEGs but are unusable for bed-clear inspection (the
+    audit failure 2026-06-25 round 10).
+
+    Returns the same dict shape as command_photo: ok/before/after/changed/
+    websocket_replies/output/bytes/jpeg_magic.
+
+    Adding a brightness check here would tie capture to PIL availability;
+    leaving photo-usability gating to the caller (start gate has it)."""
     from u1_led import photo_wrap
 
-    with photo_wrap():
-        before = camera_metadata(args.host, args.port)
-        replies = start_monitor(args.host, args.port, args.interval)
-        time.sleep(args.wait)
-        fetched = fetch_monitor(args.host, args.port, args.output)
-        after = camera_metadata(args.host, args.port)
+    with photo_wrap(settle_sec=wait):
+        before = camera_metadata(host, port)
+        replies = start_monitor(host, port, interval)
+        time.sleep(wait)
+        fetched = fetch_monitor(host, port, output)
+        after = camera_metadata(host, port)
     return {
         "ok": True,
         "mode": "photo",
-        "host": args.host,
+        "host": host,
         "before": before,
         "after": after,
         "changed": bool(before and after and before.get("modified") != after.get("modified")),
         "websocket_replies": replies,
         **fetched,
     }
+
+
+def command_photo(args: argparse.Namespace) -> dict:
+    # Lazy import so this module stays usable on systems without cavity_led
+    # configured (the wrap is a no-op then — failures are caught and logged).
+    return capture_photo(args.host, args.port, args.output,
+                         wait=args.wait, interval=args.interval)
 
 
 def command_freshness(args: argparse.Namespace) -> dict:
