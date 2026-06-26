@@ -249,7 +249,7 @@ The gate exists specifically to prevent heating the wrong nozzle. It's working a
 2. **Drop the file on disk and send the path as text** — e.g., upload to `/opt/data/snapmaker_u1/incoming/cable_holder_vcd.stl` (anywhere the Hermes container can reach), then send the path as a plain Telegram message. The agent uses it verbatim as the workflow's positional arg.
 3. **Send a download URL** — Drive / Dropbox / GitHub raw — any publicly accessible link. The agent can `curl` it down before invoking the workflow.
 
-**Upstream fix:** add `".stl": "model/stl"` and `".3mf": "model/3mf"` to Hermes' `SUPPORTED_DOCUMENT_TYPES`. Tracking issue: [TODO link once filed].
+**Upstream fix:** add `".stl": "model/stl"` and `".3mf": "model/3mf"` to Hermes' `SUPPORTED_DOCUMENT_TYPES`. Tracking issue: https://github.com/NousResearch/hermes-agent/issues/53249
 
 ### Skill rules silently disappear mid-session
 
