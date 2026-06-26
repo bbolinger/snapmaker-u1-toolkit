@@ -1,9 +1,15 @@
-# Snapmaker U1 toolkit — procedural rules (compression-resistant)
+# Snapmaker U1 toolkit — procedural rules (stable tier)
 
-These rules sit in Hermes' **stable+context tier** so they survive context
-compression on long multi-turn conversations. They are minimum-viable —
-just the rules small local LLMs (gemma4-26b-64k and below) have been seen
-to drop on the 7th turn of a slicing workflow.
+These rules sit in Hermes' **stable+context tier** — the prompt-assembly
+layer that survives compression on long multi-turn conversations,
+regardless of model size or conversation length. Skill text loads into
+the *volatile* tier and gets summarized once context pressure exceeds the
+threshold; stable-tier rules don't. This is the architecture pattern
+Hermes (and Claude, and other agent runtimes) ship specifically for
+procedural rules that must remain unconditionally present — not a
+small-LLM workaround. Large agents need the same scaffolding for the
+same reasons; the toolkit author has been caught violating his own
+stable-tier rules too.
 
 The rich SKILL.md procedural runbook still applies. These rules are the
 backbone that cannot get summarized away.
