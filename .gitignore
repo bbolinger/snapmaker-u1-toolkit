@@ -34,3 +34,11 @@ snapmaker_u1/u1_config.json
 profiles/snapmaker-stock/
 profiles/from-printer/
 profiles/user/
+
+# Binary STL fixtures + raw experiment outputs from the v1.6 draft-profile
+# empirical validation. Test rig is committed (tests/experiments/), STLs
+# are fetched per the rig's download step (3DBenchy from upstream + synth
+# locally), and raw timing/categorization data lives outside the repo.
+tests/fixtures-v16/
+tests/experiments/v16-out/
+tests/experiments/v16-results.tsv
