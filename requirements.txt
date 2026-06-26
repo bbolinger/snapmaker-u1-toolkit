@@ -1,0 +1,32 @@
+# snapmaker-u1-toolkit runtime dependencies.
+#
+# Install in one shot:
+#   python3 -m pip install -r requirements.txt
+#
+# OR set up an isolated venv first (recommended for new users):
+#   python3 -m venv venv
+#   venv/bin/pip install -r requirements.txt
+#   # then run the workflow with venv/bin/python or
+#   # export U1_TOOLKIT_PYTHON=$PWD/venv/bin/python
+#
+# Tested versions are the upper bound of "known good." The toolkit's
+# auto-detection (U1_TOOLKIT_PYTHON env var in u1_slice_workflow.py)
+# accepts any interpreter that can import these modules.
+
+# Core slicer-side: STL parsing, rotation math, rendering, thumbnail PNG
+# encoding. Required for u1_orient.py, render_slice_review.py, and the
+# thumbnail injector.
+numpy>=1.24
+Pillow>=10.0
+
+# Tests only — not required for runtime, but pulled in when running
+# the test suite. Comment out if you only want to run the workflow.
+# pytest>=7.0
+
+# NOT required (commonly misidentified):
+# - trimesh: NOT imported by any script in this toolkit. Some agents
+#   confabulate this dependency; ignore them.
+# - orca-slicer: installed separately as a CLI binary (see README's
+#   "Headless slicing setup" section). Not a Python package.
+# - moonraker / klipper: server-side, run on the U1's host. Not a
+#   Python package consumed by the toolkit.

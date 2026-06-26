@@ -3,6 +3,8 @@
 Single-maintainer project but PRs are welcome — especially from other U1 owners
 who've worked out edge cases the existing scripts don't cover.
 
+> **Working with an AI assistant on this repo?** Read [docs/DESIGN-CONTRACT.md](docs/DESIGN-CONTRACT.md) **before** touching the skill, the workflow, or the start gate. It's the single source of truth for what the system MUST do — short, opinionated, and the place to resolve "what was this supposed to do again?" The SKILL.md and scripts implement it; they don't override it.
+
 ## Setup
 
 ```bash
@@ -18,7 +20,7 @@ pip install Pillow numpy            # only if you'll touch the thumbnail tool
 ## Running the tests
 
 ```bash
-pytest                              # all 151 tests (~26s — subprocess tests dominate)
+pytest                              # full suite (~30s; the two Orca-on-alpine tests fail without a real Orca binary — expected)
 pytest tests/test_u1_toolmap.py     # one file
 pytest -k "thumbnail"               # by keyword
 ```
@@ -34,9 +36,14 @@ subset works in stdlib-only environments.
   ways to break the operator's environment.
 - **Tools (`tools/`)** — third-party deps OK, but document them in the README
   and in the tool's docstring. Use `pytest.importorskip` in matching tests.
-- **Profiles (`profiles/`)** — community-derived JSONs. New profiles should
-  follow the existing naming convention (`community_<preset>_<surface>.json`)
-  and target the Snapmaker U1 platform.
+- **Profiles (`profiles/`)** — as of v1.5.0 this dir is per-user and
+  `.gitignore`'d. Three subdirs (`from-printer/`, `user/`, `snapmaker-stock/`)
+  are populated locally via `tools/extract_profiles_from_printer.py` and
+  `tools/fetch_snapmaker_profiles.py`. **Don't commit JSONs to `profiles/`.**
+  For PR-able contributions:
+  - **Bug fixes / new filters / U1-only logic** in `tools/fetch_snapmaker_profiles.py` or `tools/extract_profile_from_gcode.py`
+  - **New picker semantics** (e.g. new annotation field) in `scripts/u1_profile_picker.py` + tests
+  - **Worked-example profiles** for handwriting reference go in `examples/profiles/` (MIT-licensed); see the existing `community_*.json` shape there.
 - **Paths** — never hardcode `/opt/data/...`. Use `u1_config.get_data_dir()`
   for runtime state and `__file__`-relative for sibling-script `exec` targets.
   See [`scripts/u1_config.py`](scripts/u1_config.py) for the 3-tier

@@ -25,6 +25,17 @@ from typing import Any
 from u1_config import get_u1_host, get_u1_port, get_data_dir
 
 # Toolmap helper sits next to this script — derive at call time, no hardcoded path.
+def _suggested_rename(filename: str) -> str:
+    """Build the timestamped rename target for a filename collision.
+
+    Inserts <stem>_<UTC YYYYMMDD-HHMMSS><suffix>. Audit 2026-06-26: operator
+    preferred default when a target already exists on U1 storage."""
+    from datetime import datetime, timezone
+    p = Path(filename)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{p.stem}_{stamp}{p.suffix}"
+
+
 def _default_toolmap_path() -> str:
     return str(Path(__file__).resolve().parent / "u1_toolmap.py")
 
@@ -303,6 +314,17 @@ def main() -> int:
     ap.add_argument("--thumbnail-sizes", default="48x48,300x300",
                     help="Comma-separated WxH list passed through to the injector "
                          "(default matches the U1 machine profile).")
+    # Audit 2026-06-26 (filename collision finding). Pre-upload metadata
+    # query catches the case where the same printer-storage name already
+    # exists; without this the operator gets a silent overwrite that may
+    # clobber an in-progress queue.
+    ap.add_argument("--on-collision", choices=["cancel", "overwrite", "rename"],
+                    default=None,
+                    help="What to do if the target filename already exists on the U1. "
+                         "Not set + collision detected → exit rc=5 with a collision packet "
+                         "the caller can present to the operator. 'cancel' = exit. "
+                         "'overwrite' = upload over the existing file. "
+                         "'rename' = upload as <stem>_<timestamp><suffix> (preferred default).")
     args = ap.parse_args()
 
     # Resolve host/port lazily (env or config file) — no import-time call.
@@ -320,8 +342,10 @@ def main() -> int:
         ok, detail = inject_thumbnail(args.stl, gcode, sizes=args.thumbnail_sizes)
         thumbnail_result = {"ok": ok, "stl": str(args.stl), "sizes": args.thumbnail_sizes, "detail": detail}
         if not ok:
-            # Fail-closed: operator asked for thumbnails, don't silently upload without.
-            raise SystemExit(f"Thumbnail injection failed (refusing upload): {detail}")
+            # Fail-soft 2026-06-25 (gate audit). Thumbnail is a cosmetic preview
+            # for the U1 touchscreen — not safety-critical. Warn + proceed so a
+            # bad STL or PIL hiccup doesn't block a legitimate upload.
+            print(f"WARNING: thumbnail injection failed ({detail}); uploading without preview", file=sys.stderr)
 
     parsed = parse_gcode_metadata(gcode)
     meta = parsed["metadata"]
@@ -332,12 +356,23 @@ def main() -> int:
         blockers.append(f"printer_settings_id mismatch: {printer_id!r}")
     if args.material.upper() not in filament_type.upper().split(";"):
         blockers.append(f"filament_type does not include {args.material}: {filament_type!r}")
-    bed = meta.get("first_layer_bed_temperature") or meta.get("bed_temperature")
-    if bed and not re.search(r"\b80\b", bed):
-        blockers.append(f"unexpected PETG bed temp: {bed}")
+    # Bed temp check removed 2026-06-25. The upload gate was duplicating the
+    # slicer's job — checking gcode metadata bed temps to catch the case where
+    # Orca silently fell back to PLA defaults. With v1.5.1's filament inheritance
+    # flattening (_flatten_filament_profile + _materialize_flat_filament in
+    # u1_slice_workflow.py), Orca can't silently fall back anymore; filament_type
+    # reflects the actual loaded profile, and bed temps come from that profile's
+    # validated values. The filament_type blocker above is the meaningful gate.
 
+    # Idle/print-state check removed 2026-06-25. Moonraker accepts file
+    # uploads to storage regardless of print state — a busy printer can
+    # still receive a file into its filesystem; you just can't START a
+    # new print until it's idle. The idle/paused/heater-target checks
+    # belong on the START gate (u1_print_start_gate.py already has them),
+    # not the upload path. Blocking uploads on busy state forced the
+    # operator to wait for a print to finish before queueing the next
+    # file, which is the wrong UX.
     state_before = query_state(host, port)
-    blockers.extend(ensure_idle_ready(state_before))
 
     # Preflight: confirm the U1 has enough user-data space for this gcode. The
     # endpoint is Snapmaker's custom /server/files/get_userdata_space (POST,
@@ -359,62 +394,191 @@ def main() -> int:
         except (TypeError, ValueError):
             pass  # malformed response — treat like missing endpoint
 
-    tool_ok, tool_out = run_tool_gate(host, port, args.material, parsed["intended_tool"])
-    if not tool_ok:
-        blockers.append(f"tool/material gate failed for {parsed['intended_tool']} / {args.material}")
+    # Tool/material gate moved to u1_print_start_gate.py 2026-06-25 (gate
+    # audit). Checking whether the printer currently has the right filament
+    # loaded on the intended tool is a START-time concern, not an UPLOAD-time
+    # concern. The operator should be able to queue an upload now and load
+    # material later. The start gate calls u1_toolmap with the same args.
 
     if blockers:
+        # Cold review F1 (2026-06-26): the dead `print(tool_out)` lines used
+        # to print the tool/material gate output here, but the gate moved to
+        # u1_print_start_gate.py (commit ffa425d) and `tool_out` is no longer
+        # defined. Calling this path raised NameError on every pre-upload
+        # blocker (printer_id mismatch, filament_type mismatch, storage). The
+        # crash exited rc=1, which the workflow's _real_upload mistreats as
+        # rc=3 ("upload succeeded with warnings") — totally wrong. Removed.
         print("UPLOAD BLOCKED")
         for b in blockers:
             print(f"- {b}")
-        print("\n--- tool gate ---")
-        print(tool_out)
         return 2
 
+    # Filename collision detection (audit 2026-06-26). Query the target's
+    # metadata; if Moonraker returns a non-empty result, the file exists
+    # already. Resolve per --on-collision policy.
+    target_storage_name = gcode.name if not args.path else f"{args.path.rstrip('/')}/{gcode.name}"
+    try:
+        existing_meta = http_json(
+            f"{base_url(host,port)}/server/files/metadata?filename={urllib.parse.quote(target_storage_name)}"
+        ).get("result", {})
+    except Exception:
+        existing_meta = {}
+    filename_already_existed = bool(existing_meta) and existing_meta.get("filename")
+    uploaded_filename = target_storage_name
+    collision_policy: str | None = None
+    if filename_already_existed:
+        if args.on_collision is None:
+            # Caller didn't pre-decide. Emit collision packet + exit rc=5.
+            # The workflow surfaces this as a need_input prompt to the operator.
+            packet = {
+                "filename_already_existed": True,
+                "target_filename": target_storage_name,
+                "existing_size": existing_meta.get("size"),
+                "existing_modified": existing_meta.get("modified"),
+                "options": [
+                    {"value": "rename", "label": "Upload with timestamped name (recommended)",
+                     "preview": _suggested_rename(target_storage_name)},
+                    {"value": "overwrite", "label": "Overwrite existing file"},
+                    {"value": "cancel", "label": "Cancel"},
+                ],
+                "human_summary": (
+                    f"A file named {target_storage_name} already exists on the U1. "
+                    "Re-run with --on-collision=rename (recommended), overwrite, or cancel."
+                ),
+            }
+            print("UPLOAD COLLISION")
+            print(json.dumps(packet, indent=2))
+            return 5
+        if args.on_collision == "cancel":
+            # Cold review F9: return rc=6 (not rc=5) so the workflow can
+            # distinguish "user cancelled" from "needs operator answer."
+            # Without this, the workflow's rc=5 handler kept re-emitting the
+            # collision prompt forever.
+            print("UPLOAD CANCELLED (filename collision, --on-collision=cancel)")
+            return 6
+        if args.on_collision == "rename":
+            uploaded_filename = _suggested_rename(target_storage_name)
+            collision_policy = "rename"
+        elif args.on_collision == "overwrite":
+            uploaded_filename = target_storage_name
+            collision_policy = "overwrite"
+
     upload_url = f"{base_url(host, port)}/server/files/upload"
-    response = multipart_upload(upload_url, {"root": "gcodes", "path": args.path, "print": "false"}, "file", gcode)
+    # Moonraker's upload form field 'filename' is what determines the storage
+    # name. When renaming, we need to send the rename-target, not the local
+    # gcode's basename. The multipart_upload helper uses the file's local
+    # name by default — when collision_policy=='rename', stage a renamed
+    # copy in a temp dir so the Moonraker storage name comes out right.
+    import tempfile, shutil
+    upload_source = gcode
+    _tmp_for_rename: tempfile.TemporaryDirectory | None = None
+    if collision_policy == "rename":
+        _tmp_for_rename = tempfile.TemporaryDirectory()
+        upload_source = Path(_tmp_for_rename.name) / Path(uploaded_filename).name
+        shutil.copyfile(gcode, upload_source)
+    try:
+        response = multipart_upload(upload_url, {"root": "gcodes", "path": args.path, "print": "false"}, "file", upload_source)
+    finally:
+        if _tmp_for_rename is not None:
+            _tmp_for_rename.cleanup()
 
     state_after = query_state(host, port)
-    after_blockers = []
-    if state_after.get("virtual_sdcard", {}).get("is_active"):
+    after_blockers: list[str] = []
+    after_warnings: list[str] = []
+
+    # Audit 2026-06-26: `cancelled` is a benign terminal state when the
+    # printer is otherwise idle and ready. Treat as warning, not blocker.
+    vsd = state_after.get("virtual_sdcard", {})
+    pause = state_after.get("pause_resume", {})
+    wh = state_after.get("webhooks", {})
+    ps_state = state_after.get("print_stats", {}).get("state")
+    ps_idle_terminal = (ps_state in {None, "standby", "complete", "ready"})
+    ps_cancelled_but_clean = (
+        ps_state == "cancelled"
+        and not vsd.get("is_active")
+        and not pause.get("is_paused")
+        and (wh.get("state") in {None, "ready"})
+    )
+
+    if vsd.get("is_active"):
         after_blockers.append("printer became active after upload")
-    if state_after.get("print_stats", {}).get("state") not in {None, "standby", "complete", "ready"}:
-        after_blockers.append(f"post-upload print state is {state_after.get('print_stats', {}).get('state')}")
+    if not ps_idle_terminal and not ps_cancelled_but_clean:
+        after_blockers.append(f"post-upload print state is {ps_state}")
+    elif ps_cancelled_but_clean:
+        after_warnings.append("post-upload print_stats.state is 'cancelled' but printer is idle + webhooks ready — not blocking")
     if response.get("result", {}).get("print_started") is True or response.get("result", {}).get("print_queued") is True:
         after_blockers.append(f"Moonraker indicated print start/queue: {response}")
 
-    remote_name = gcode.name if not args.path else f"{args.path.rstrip('/')}/{gcode.name}"
+    remote_name = uploaded_filename
     metadata = http_json(f"{base_url(host,port)}/server/files/metadata?filename={urllib.parse.quote(remote_name)}").get("result", {})
+    remote_metadata_ok = bool(metadata)
+    # Moonraker's /server/files/upload response can be EITHER wrapped (with
+    # a top-level "result" key, Moonraker JSON-RPC convention) OR unwrapped
+    # (the inner dict directly, which is what we actually observe live —
+    # caught 2026-06-26 against the production U1). And the action is
+    # 'create_file' for new files, 'modify_file' for overwrite. Accept all
+    # four combinations rather than just the wrapped/create-file case.
+    _payload = response.get("result", response) if isinstance(response, dict) else {}
+    moonraker_upload_ok = bool(
+        _payload.get("item")
+        or _payload.get("action") in ("create_file", "modify_file")
+    )
 
     result = {
-        "ok": not after_blockers,
+        # Granular truth (audit 2026-06-26).
+        "moonraker_upload_ok": moonraker_upload_ok,
+        "remote_metadata_ok": remote_metadata_ok,
+        "post_upload_validation_ok": not after_blockers,
+        "ok": moonraker_upload_ok and remote_metadata_ok and not after_blockers,
+        # File identity.
         "uploaded": remote_name,
+        "uploaded_filename": uploaded_filename,
+        "target_filename": target_storage_name,
+        "filename_already_existed": bool(filename_already_existed),
+        "collision_policy": collision_policy,
+        # Existing fields, kept for backward compat with downstream consumers.
         "upload_response": response.get("result", response),
         "parsed": parsed,
         "thumbnail_injection": thumbnail_result,
         "printer_before_filaments": printer_filament_table(state_before),
         "printer_after": {
-            "state": state_after.get("print_stats", {}).get("state"),
-            "active": state_after.get("virtual_sdcard", {}).get("is_active"),
+            "state": ps_state,
+            "active": vsd.get("is_active"),
             "filename": state_after.get("print_stats", {}).get("filename"),
         },
         "printer_after_filaments": printer_filament_table(state_after),
         "remote_metadata": metadata,
         "post_upload_blockers": after_blockers,
+        "post_upload_warnings": after_warnings,
     }
     out = get_data_dir() / "latest_upload_result.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
+    # Audit 2026-06-26 return-code contract:
+    #   0 — upload succeeded + post-upload validation clean (warnings allowed)
+    #   3 — upload succeeded BUT post-upload blockers (file is on printer)
+    #   4 — Moonraker upload itself failed; no printer-side file confirmed
+    if not moonraker_upload_ok or not remote_metadata_ok:
+        print("UPLOAD FAILED (Moonraker upload did not produce a remote file)")
+        print(json.dumps(result, indent=2)[:4000])
+        return 4
+
     if after_blockers:
-        print("UPLOAD WARNING")
+        print("UPLOAD WARNING (file IS on printer; blockers below are post-upload state, not transport)")
         for b in after_blockers:
             print(f"- {b}")
+        for w in after_warnings:
+            print(f"warning: {w}")
         print(json.dumps(result, indent=2)[:4000])
         return 3
 
     print("U1 upload-only staging complete:")
+    for w in after_warnings:
+        print(f"- warning: {w}")
     print(f"- File: {remote_name}")
+    if collision_policy:
+        print(f"- Collision: {collision_policy} (original target was {target_storage_name})")
     print(f"- print_started: {result['upload_response'].get('print_started')}")
     print(f"- print_queued: {result['upload_response'].get('print_queued')}")
     print(f"- Printer after: {result['printer_after']['state']} active={result['printer_after']['active']} last={result['printer_after']['filename']}")

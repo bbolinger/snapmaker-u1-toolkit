@@ -98,6 +98,16 @@ def face_normals(tris: np.ndarray) -> np.ndarray:
     return normals / norms
 
 
+def face_areas(tris: np.ndarray) -> np.ndarray:
+    """Per-triangle surface area (N,) in the mesh's native units²
+    (mm² for printer-bound STLs). Zero-area faces report 0."""
+    if tris.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    e1 = tris[:, 1] - tris[:, 0]
+    e2 = tris[:, 2] - tris[:, 0]
+    return 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+
+
 def overhang_mask(tris: np.ndarray, threshold: float = -0.3) -> np.ndarray:
     """Boolean mask flagging triangles whose face normal Z is below the
     threshold — these are the downward-pointing faces a 3D printer can't
