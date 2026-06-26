@@ -1146,3 +1146,174 @@ def test_workflow_uses_uploaded_filename_when_renamed(tmp_path, monkeypatch):
     assert result['uploaded_filename'] == 'wall_mount_20260626-160000.gcode'
     assert result['target_filename'] == 'wall_mount.gcode'
     assert result['collision_policy'] == 'rename'
+
+
+# ============================================================================
+# v1.6 (A) — pre-slice Orca mesh-topology analysis
+# ============================================================================
+# Backing evidence: docs/v1.6-design.md (empirical validation on 4 fixtures)
+
+
+def test_v16_categorize_clean_on_empty_warning():
+    from u1_slice_workflow import _categorize_orca_warning
+    assert _categorize_orca_warning('') == 'CLEAN'
+    assert _categorize_orca_warning(None) == 'CLEAN'
+    assert _categorize_orca_warning('null') == 'CLEAN'
+    assert _categorize_orca_warning('   ') == 'CLEAN'
+
+
+def test_v16_categorize_cantilever():
+    from u1_slice_workflow import _categorize_orca_warning
+    # The exact wording Orca emitted for wall_mount source in the v1.6 study
+    msg = ("It seems object source.stl has floating cantilever. "
+           "Please re-orient the object or enable support generation.")
+    assert _categorize_orca_warning(msg) == 'CANTILEVER'
+    # Case-invariant
+    assert _categorize_orca_warning('FLOATING CANTILEVER detected') == 'CANTILEVER'
+
+
+def test_v16_categorize_floating_regions():
+    from u1_slice_workflow import _categorize_orca_warning
+    msg = ("It seems object source.stl has floating regions. "
+           "Please re-orient the object or enable support generation.")
+    assert _categorize_orca_warning(msg) == 'FLOATING_REGIONS'
+
+
+def test_v16_categorize_overhang_flagged_fallback():
+    from u1_slice_workflow import _categorize_orca_warning
+    # Any other "overhang" wording lands in OVERHANG_FLAGGED, not UNKNOWN
+    assert _categorize_orca_warning('Detected overhang above threshold') == 'OVERHANG_FLAGGED'
+
+
+def test_v16_categorize_unknown_for_unrelated_text():
+    from u1_slice_workflow import _categorize_orca_warning
+    assert _categorize_orca_warning('warning: bed temperature high') == 'UNKNOWN'
+
+
+def test_v16_count_overhang_layers_synthetic_gcode(tmp_path):
+    from u1_slice_workflow import _count_overhang_layers
+    gc = tmp_path / 'synth.gcode'
+    # 4 layers; layers 2 and 3 contain Overhang wall tags
+    gc.write_text("\n".join([
+        ";LAYER_CHANGE", ";TYPE:Inner wall", "G1 X0 Y0",
+        ";LAYER_CHANGE", ";TYPE:Overhang wall", "G1 X1 Y1",
+        ";LAYER_CHANGE", ";TYPE:Overhang wall", "G1 X2 Y2", ";TYPE:Inner wall",
+        ";LAYER_CHANGE", ";TYPE:Inner wall", "G1 X3 Y3",
+    ]))
+    overhang, total = _count_overhang_layers(gc)
+    assert total == 4
+    assert overhang == 2
+
+
+def test_v16_count_overhang_layers_missing_file(tmp_path):
+    from u1_slice_workflow import _count_overhang_layers
+    assert _count_overhang_layers(tmp_path / 'nope.gcode') == (0, 0)
+
+
+def test_v16_materialize_draft_profile_applies_overrides(tmp_path):
+    from u1_slice_workflow import _materialize_draft_profile, _V16_DRAFT_OVERRIDES
+    prod = tmp_path / 'prod.json'
+    prod.write_text(json.dumps({
+        'layer_height': '0.20',
+        'wall_loops': '6',
+        'sparse_infill_density': '25%',
+        'top_shell_layers': '4',
+        'bottom_shell_layers': '4',
+        'gcode_thumbnails': '1',
+        'enable_support': '0',
+        'other_field': 'keep_me',
+    }))
+    dest = _materialize_draft_profile(prod, tmp_path)
+    out = json.loads(dest.read_text())
+    # All v1.6 overrides applied
+    for k, v in _V16_DRAFT_OVERRIDES.items():
+        assert out[k] == v, f'override {k} not applied'
+    # Production layer_height preserved (the load-bearing decision)
+    assert out['layer_height'] == '0.20'
+    # Unrelated fields untouched
+    assert out['other_field'] == 'keep_me'
+
+
+def test_v16_decide_recommendation_source_clean_no_auto():
+    from u1_slice_workflow import _decide_orient_recommendation
+    src = {'clean': True, 'category': 'CLEAN', 'overhang_pct': 4.0}
+    assert _decide_orient_recommendation(src, None) == 'asauthored'
+
+
+def test_v16_decide_recommendation_source_risky_auto_clean():
+    from u1_slice_workflow import _decide_orient_recommendation
+    src = {'clean': False, 'category': 'FLOATING_REGIONS', 'overhang_pct': 56.3}
+    auto = {'clean': True, 'category': 'CLEAN', 'overhang_pct': 7.5}
+    assert _decide_orient_recommendation(src, auto) == 'auto'
+
+
+def test_v16_decide_recommendation_both_clean_prefer_asauthored():
+    from u1_slice_workflow import _decide_orient_recommendation
+    src = {'clean': True, 'category': 'CLEAN', 'overhang_pct': 5.0}
+    auto = {'clean': True, 'category': 'CLEAN', 'overhang_pct': 3.0}
+    # Tiebreak goes to asauthored when overhang_pcts are close (5 vs 3, but
+    # asauthored avoids weird rotation when both are clean) — actual rule:
+    # lower overhang_pct wins, tiebreak to asauthored
+    assert _decide_orient_recommendation(src, auto) == 'auto'  # 3 < 5 → auto
+
+
+def test_v16_decide_recommendation_both_risky_lower_overhang_wins():
+    from u1_slice_workflow import _decide_orient_recommendation
+    src = {'clean': False, 'category': 'CANTILEVER', 'overhang_pct': 8.8}
+    auto = {'clean': False, 'category': 'FLOATING_REGIONS', 'overhang_pct': 56.3}
+    assert _decide_orient_recommendation(src, auto) == 'asauthored'  # 8.8 < 56.3
+
+
+def test_v16_compose_note_clean_skipped_auto():
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'CLEAN', 'overhang_pct': 4.0, 'clean': True}
+    note = _compose_orient_note(src, None, auto_skip_reason='source_clean')
+    assert 'As-authored' in note
+    assert 'clean' in note.lower()
+    assert 'not analyzed' in note.lower() or 'force a comparison' in note.lower()
+
+
+def test_v16_compose_note_auto_identical_skip_reason():
+    # Regression guard for the smoke-test bug: source is FLOATING_REGIONS but
+    # Orca's auto-orient produced no rotation (auto_stl == source_stl), so
+    # auto_draft is None. Note must NOT say "as-authored is clean" — it must
+    # explain that auto found no better rotation.
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'FLOATING_REGIONS', 'overhang_pct': 39.0, 'clean': False}
+    note = _compose_orient_note(src, None, auto_skip_reason='auto_identical')
+    assert 'no better rotation' in note.lower()
+    # Must surface the floating-regions warning, not "is clean"
+    assert 'floating-regions' in note.lower()
+
+
+def test_v16_compose_note_auto_failed_skip_reason():
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'CANTILEVER', 'overhang_pct': 22.0, 'clean': False}
+    note = _compose_orient_note(src, None, auto_skip_reason='auto_failed')
+    assert 'auto-orient analysis failed' in note.lower()
+
+
+def test_v16_compose_note_cantilever_with_clean_auto():
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'CANTILEVER', 'overhang_pct': 22.1, 'clean': False}
+    auto = {'category': 'CLEAN', 'overhang_pct': 7.5, 'clean': True}
+    note = _compose_orient_note(src, auto)
+    assert 'cantilever' in note.lower()
+    assert 'clean' in note.lower()
+
+
+def test_v16_compose_note_both_floating_regions():
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'FLOATING_REGIONS', 'overhang_pct': 27.7, 'clean': False}
+    auto = {'category': 'FLOATING_REGIONS', 'overhang_pct': 20.0, 'clean': False}
+    note = _compose_orient_note(src, auto)
+    # Both phrases present
+    assert note.count('floating-regions') >= 2 or note.lower().count('floating') >= 2
+
+
+def test_v16_compose_note_draft_failed_includes_fallback_marker():
+    from u1_slice_workflow import _compose_orient_note
+    src = {'category': 'DRAFT_FAILED', 'overhang_pct': 0.0, 'clean': False, 'error': 'Orca rc=-99: bad mesh'}
+    note = _compose_orient_note(src, None)
+    assert 'failed' in note.lower()
+    assert 'face-angle' in note.lower() or 'fallback' in note.lower()
