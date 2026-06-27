@@ -1,6 +1,8 @@
 # Roadmap — Safe AI Print Operator (U1 first)
 
-This document captures the project's direction across **9 phases** that take it from "Hermes-compatible slicer" (where v1.6 is now) to "Safe AI Print Operator with a portable safety model." Each phase is small enough to ship in a single working session if necessary, with explicit cross-links to design docs and acceptance criteria.
+This document captures the project's direction across **9 phases** that take it from v1.6 ("Hermes-compatible slicer") to **v2.0** ("Safe AI Print Operator with a portable safety model"). All 9 phases ship as a single v2.0.0 release — no intermediate public alphas. Each phase is small enough to ship in a single working session if necessary, with explicit cross-links to design docs and acceptance criteria.
+
+The v1.x line is frozen on `main` at v1.6.0. The v2.0 work lives on the `v2.0-dev` branch until all 9 phases are complete and acceptance-tested end-to-end.
 
 The ordering is dependency-driven, not strictly sequential — Phase 8 (operator-experience polish) overlaps with Phase 5 (request-ID approval flow), for example. Status markers:
 

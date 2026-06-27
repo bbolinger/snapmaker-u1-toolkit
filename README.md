@@ -130,10 +130,13 @@ For the design rationale, architecture, and acceptance criteria, see [`docs/DESI
 Where the toolkit is going:
 
 - ✅ **v1.5–v1.6** (shipped) — Agent-driven staged workflow with the `next_command` pattern, pre-slice Orca mesh-topology analysis, stable-tier procedural rules ([HERMES.md](HERMES.md))
-- 🔜 **v1.7** — Print Request Objects. Every job gets a stable `request_id` + a `requests/<id>/request.json` durable record. Approval becomes "approve start `u1_2026_0626_abc123`" instead of vague "yes" — specific, auditable, tied to the exact model/profile/G-code combination. Replaces the current implicit session-state caching.
-- 🔜 **v1.8** — Per-request `audit.jsonl`. Who requested, what was selected, what checks passed, who approved, what actually happened. Defends the project to skeptical operators.
-- 🔜 **v1.9** — Explicit capability modes (`read_only` / `upload_only` / `operator_start`). Picks the security posture per deployment.
-- 🔜 **v2.0** — Sandbox mode for CI + demos without hardware. Strong demo flow recorded end-to-end.
+- 🚧 **v2.0 — Safe AI Print Operator** (in progress on the `v2.0-dev` branch) — a 9-phase reframe that turns this from "Hermes slicer for the U1" into a staged, auditable, request-driven print-operator toolkit. The full plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md). Headline pieces:
+  - **Print Request Objects** — every job gets a stable `request_id` + a durable `requests/<id>/request.json` record. Approval becomes "approve start `u1_2026_0626_abc123`," not vague "yes."
+  - **Per-request `audit.jsonl`** — who requested, what was selected, what checks passed, who approved, what actually happened.
+  - **Capability modes** — `read_only` / `upload_only` / `operator_start`. Pick the security posture per deployment.
+  - **Sandbox mode** — full workflow without hardware, for CI and demos.
+  - **JSON event contract** — formalize the event stream so any frontend (Telegram, web UI, MCP server) can wrap it without re-implementing.
+  - v2.0 ships as a single release once all 9 phases are complete and acceptance-tested end-to-end on `gemma4-26b-64k`. No intermediate public alphas.
 
 The Snapmaker U1 is the first implementation. The safety model is portable — multi-printer support comes only after the U1 experience is solid, and only along seams that the U1 implementation has already proven.
 
