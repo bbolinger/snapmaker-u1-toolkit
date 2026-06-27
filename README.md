@@ -1,10 +1,143 @@
 # Snapmaker U1 Toolkit
 
+### Safe AI Print Operator — Snapmaker U1 first
+
 ![Hermes Agent + Snapmaker U1 — safety-staged print automation](docs/images/hero-hermes-snapmaker.png)
 
-Read-only and gated-write automation scripts for the [Snapmaker U1](https://snapmaker.com/snapmaker-u1) multi-tool 3D printer, talking over its Moonraker/Klipper-compatible LAN API.
+> Inspired by safety-staged agent workflows, this project applies the pattern specifically to the [Snapmaker U1](https://snapmaker.com/snapmaker-u1) — local slicing, visual previews, camera-gated checks, and explicit operator approval. Useful from the command line on its own; an AI agent like Hermes is the optional remote-control layer on top.
 
-**Built for safety-staged operation**: read state → slice → upload-only → operator approval → start. The dangerous bits (`start print`, `cancel`, movement) are always gated on explicit operator confirmation.
+This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
+
+---
+
+## What This Is
+
+A toolkit + workflow that turns "I have an STL, slice it for my U1" into a staged, auditable, operator-gated print job:
+
+1. **Triage** the model (dimensions, triangle count, mesh validity)
+2. **Orient** it — show both as-authored and Orca's auto-orient, with the real mesh-topology verdict (`floating cantilever` / `clean` / overhang layer fraction) so the operator picks based on Orca's actual call, not a face-angle approximation
+3. **Tool / filament / preset / supports** — surface live U1 state (what's actually loaded), recommend, never assume
+4. **Slice** through OrcaSlicer with the chosen profile, T0→T<chosen> rewriting, Snapmaker thumbnail injection, real Orca warnings surfaced
+5. **Preview** — show the slice render + footprint dimensions + slicer warnings
+6. **Upload** to the U1's Moonraker storage with `print=false` (file lands; printer does NOT start)
+7. **Bed-clear photo** captured fresh by the U1's onboard camera, surfaced to the operator
+8. **Explicit operator approval** — yes/no on the real bed photo
+9. **Start** — only after approval, only via a token handed off from the photo step (5-min TTL)
+10. **Monitor** — first-layer photo, last-layer check, completion
+
+Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
+
+## What This Is Not
+
+- **It is not an autonomous printer driver.** No agent in this stack can start a print without an operator yes/no on a real bed photo captured in-the-moment.
+- **It is not a generic slicer wrapper.** Specific profile resolution, T0→T<n> rewriting, Snapmaker thumbnail injection, and Moonraker storage discipline are baked in for the U1.
+- **It is not a multi-printer abstraction yet.** The safety model and event contract are portable in principle. The implementation is U1-specific by design until the U1 experience is solid.
+- **It is not a Hermes-only project.** Hermes is the convenient remote-control layer. Every workflow step has a CLI form and JSON event stream — wrap it with whatever you want.
+
+## Safety Model
+
+Hermes — and any other AI agent layered on top — can recommend, explain, and prepare a print, but the U1 toolkit owns the final safety checks and will not perform printer-affecting actions without an explicit operator approval tied to a specific request ID.
+
+The default lifecycle:
+
+```text
+read state → slice → preview → upload-only → operator approval → start → monitor
+```
+
+Actions that always require explicit operator confirmation:
+
+- Starting a print
+- Resuming or canceling a print
+- Heating nozzle or bed
+- Moving axes
+- Clearing alarms
+- Changing tool state
+- Anything that affects the physical printer
+
+The workflow fails closed. If a check is unsure, it stops and asks rather than guessing. Bed-clear verdicts come from the operator looking at a real photo, not from the toolkit deciding the bed is "probably fine." Slicer profile mismatches abort BEFORE the slice. Upload that hits a filename collision asks before overwriting.
+
+## The Three Layers
+
+The toolkit ships as three layers that build on each other.
+
+### 1. CLI mode — useful without Hermes
+
+Scriptable, deterministic, single-purpose tools that a U1 owner can use directly:
+
+- Slice + preview a model
+- Inspect printer state, profiles, print history
+- Generate orientation renders
+- Upload a job with `print=false`
+- Review G-code metadata before printing
+
+These are designed for shell scripts, cron jobs, manual workflows. No AI required.
+
+### 2. Operator workflow — the staged experience
+
+A multi-step state machine that walks an operator through the print decision. Emits structured JSON events at every step, so any frontend (Telegram bot, web UI, custom integration) can wrap it without re-implementing the logic.
+
+This is the core product. It's what makes the toolkit feel like a responsible assistant instead of a generic API wrapper.
+
+### 3. Hermes mode — the remote-control layer
+
+A bundled Hermes skill (`3d-printer-slicing-automation`) that lets a Telegram-bridged Hermes agent drive the operator workflow on the user's behalf. The agent:
+
+- Surfaces the staged questions to the user verbatim
+- Tool-calls the named scripts (never invents its own slicing path)
+- Surfaces every preview and bed photo for visual approval
+- Never decides bed-clear status on its own — the operator does, looking at a real photo
+
+The skill is designed to work on small local models (`gemma4-26b-64k` and below) via [Ollama](https://ollama.com/). See [Using with Hermes](#using-with-hermes--install-the-bundled-skill) for the full setup.
+
+## What the Operator Approves
+
+Every operator decision is concrete and tied to a specific artifact:
+
+| Decision | What the operator sees |
+|---|---|
+| Orientation | Source render + auto-oriented render + Orca's mesh-topology verdict |
+| Tool / filament | Live U1 toolhead state ("T0: Generic white PETG (loaded)") |
+| Preset | Recommended profile based on model class + your print history |
+| Supports | Overhang verdict from a fast draft slice — Orca's real call, not face-angle |
+| Upload | Three options: upload-only / upload+start gate / cancel |
+| Filename collision | Three options: timestamped rename / overwrite / cancel |
+| **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. The operator types yes/no. Default is no. |
+
+If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
+
+## Quick Start
+
+If you have a U1 reachable on the LAN and want to try a slice:
+
+```bash
+git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
+cd snapmaker-u1-toolkit
+python3 -m pip install -r requirements.txt
+
+# Fetch Snapmaker's stock U1 profiles (~217 files)
+python3 tools/fetch_snapmaker_profiles.py
+
+# Slice a model — workflow asks for orient / tool / preset / supports / upload
+python3 scripts/u1_slice_workflow.py path/to/your_model.stl --json-events --no-live-material
+```
+
+For the full install (interpreter selection, Hermes skill install, U1 connection setup), see [Setup](#setup) below.
+
+For the design rationale, architecture, and acceptance criteria, see [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md).
+
+## Roadmap
+
+Where the toolkit is going:
+
+- ✅ **v1.5–v1.6** (shipped) — Agent-driven staged workflow with the `next_command` pattern, pre-slice Orca mesh-topology analysis, stable-tier procedural rules ([HERMES.md](HERMES.md))
+- 🔜 **v1.7** — Print Request Objects. Every job gets a stable `request_id` + a `requests/<id>/request.json` durable record. Approval becomes "approve start `u1_2026_0626_abc123`" instead of vague "yes" — specific, auditable, tied to the exact model/profile/G-code combination. Replaces the current implicit session-state caching.
+- 🔜 **v1.8** — Per-request `audit.jsonl`. Who requested, what was selected, what checks passed, who approved, what actually happened. Defends the project to skeptical operators.
+- 🔜 **v1.9** — Explicit capability modes (`read_only` / `upload_only` / `operator_start`). Picks the security posture per deployment.
+- 🔜 **v2.0** — Sandbox mode for CI + demos without hardware. Strong demo flow recorded end-to-end.
+
+The Snapmaker U1 is the first implementation. The safety model is portable — multi-printer support comes only after the U1 experience is solid, and only along seams that the U1 implementation has already proven.
+
+---
 
 ## Setup
 
@@ -224,7 +357,9 @@ Idempotent: a tag that already has a Release is skipped unless `--update` is pas
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
 | `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
 
-## Safety model
+## Safety model — concrete details
+
+The high-level model is in [Safety Model](#safety-model) above. This is the per-action breakdown.
 
 ```
 read → slice → upload (print=false) → operator-approved start → quiet monitor
@@ -245,7 +380,9 @@ read → slice → upload (print=false) → operator-approved start → quiet mo
 - Cancel/stop a print
 - Any movement/heating command
 
-## Quick start
+## Quick start — per-platform commands
+
+The 30-second flavor is in [Quick Start](#quick-start) above. This section has the per-platform install + first-status-probe commands.
 
 ### Linux / macOS
 
