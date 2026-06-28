@@ -125,6 +125,7 @@ from u1_orient import orient_model, DEFAULT_ORCA, orca_env
 from u1_profile_picker import list_profiles
 from u1_material_picker import query_material_options, status_to_options
 from u1_upload_gcode import parse_gcode_metadata
+from u1_print_start_gate import build_stage1_command
 from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
@@ -2274,10 +2275,11 @@ def run_workflow(args)->dict[str,Any]:
         # whenever the card was first written wins over current state. The
         # env-resolved path is forward-compatible across replays + container
         # restarts.
-        _stage1_cmd = (
-            f'python3 /opt/data/scripts/u1_print_start_gate.py {_printer_filename} '
-            f'--intended-tool {_start_extruder} --requested-material {_shell_quote(str(material))} '
-            f'--request-id {request_id}'
+        _stage1_cmd = build_stage1_command(
+            printer_filename=_printer_filename,
+            intended_tool=_start_extruder,
+            material=str(material),
+            request_id=request_id,
         )
         # Build the readiness_card payload once, then emit + persist together
         # so the phase-aware resume short-circuit upstream has the same
