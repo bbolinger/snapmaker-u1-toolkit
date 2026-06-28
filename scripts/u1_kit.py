@@ -109,7 +109,15 @@ def part_fits_bed(
 
 
 def summarize_part(stl: Path) -> dict[str, Any]:
-    """Measure one part: filename, content hash, bbox, footprint, height."""
+    """Measure one part: filename, content hash, bbox, footprint, height.
+
+    Footprint is measured **as-authored** (the STL's current orientation). If
+    the operator later chooses auto-orient, Orca may reorient the part and its
+    real footprint will differ — so ``fits_bed`` derived from this is a
+    pre-orientation hint, not a guarantee. The actual fit is decided by Orca's
+    arrange at slice time (a part that truly can't fit fails the slice, which
+    the workflow surfaces).
+    """
     stl = Path(stl)
     tris = parse_stl(stl)
     xmin, xmax, ymin, ymax, zmin, zmax = bbox(tris)

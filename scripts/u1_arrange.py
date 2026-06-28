@@ -117,6 +117,15 @@ def arrange_slice(
     intentionally skipped here — a single-part thumbnail would misrepresent a
     multi-part plate; revisit with a plate render later (fail-soft, like the
     single-STL path treats thumbnails).
+
+    ``auto_orient`` adds ``--orient 1``. Verified on the real binary
+    (2026-06-28) that ``--orient 1`` + multiple objects + ``--arrange 1`` runs
+    headless without crashing and yields valid plates; the *quality* of
+    per-object orientation is Orca's own heuristic and is not independently
+    verified here. The operator reviews the readiness card + Stage-1 photo
+    before any start, so a poor orient is caught by the human, not silently
+    printed. Kits default to as-authored (``auto_orient=False``) since
+    Printables kits are usually pre-oriented.
     """
     stl_paths = [Path(p) for p in stl_paths]
     if not stl_paths:
@@ -130,27 +139,32 @@ def arrange_slice(
         filament_path(material, nozzle=nozzle), out_dir, orca_bin=orca_bin
     )
 
+    # Clear any stale plate gcode so the post-slice glob is unambiguous. The
+    # old "diff before/after, fall back to all if nothing fresh" pattern could
+    # leak a plate from a prior slice into this result when a re-slice produced
+    # fewer plates (review finding, 2026-06-28). Deleting first makes the count
+    # exact. Inputs are *.stl, so this never touches an input.
+    for stale in out_dir.glob("plate_*.gcode"):
+        stale.unlink()
+
     cmd = build_arrange_cmd(
         stl_paths, out_dir,
         machine=machine, process=process, filament=filament, orca_bin=orca_bin,
         auto_orient=auto_orient, allow_rotations=allow_rotations,
     )
 
-    before = {p.resolve() for p in out_dir.glob("plate_*.gcode")}
     proc = (runner or _default_runner)(cmd, orca_bin)
     if proc.returncode != 0:
         tail = (proc.stdout or "")[-4000:]
         raise RuntimeError(f"Orca arrange-slice failed rc={proc.returncode}: {tail}")
 
-    all_plates = list(out_dir.glob("plate_*.gcode"))
-    fresh = [p for p in all_plates if p.resolve() not in before] or all_plates
-    fresh = sorted(fresh, key=_plate_index)
-    if not fresh:
+    plates_found = sorted(out_dir.glob("plate_*.gcode"), key=_plate_index)
+    if not plates_found:
         raise RuntimeError("Orca arrange-slice produced no plate gcode")
 
     tool_idx = _tool_to_index(tool)
     plates: list[dict[str, Any]] = []
-    for g in fresh:
+    for g in plates_found:
         if g.stat().st_size == 0:
             raise RuntimeError(f"empty plate gcode: {g.name}")
         rewrite_gcode_for_tool(g, tool_idx)
