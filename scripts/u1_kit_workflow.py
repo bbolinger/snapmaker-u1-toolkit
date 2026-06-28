@@ -73,10 +73,29 @@ def _audit(request_id: str, event: str, operator: str, **details: Any):
         return None
 
 
-def _build_form_spec(kit: dict[str, Any], nozzle: str) -> dict[str, Any]:
-    """Assemble the u1_form spec from analysis (parts + offered options)."""
-    prof_opts = list_profiles(nozzle=nozzle)
-    profiles = [{"idx": i + 1, "label": o.get("label", o["value"])} for i, o in enumerate(prof_opts)]
+def _build_form_spec(kit: dict[str, Any], nozzle: str,
+                     persisted_profiles: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Assemble the u1_form spec from analysis (parts + offered options).
+
+    ``profile N`` is resolved by INDEX, and form-emit / answer-parse happen in
+    SEPARATE invocations. To keep index N stable even if print-history or the
+    on-disk profiles change between the two calls, the form's profile list is
+    persisted at emit time and replayed here on the answer call
+    (``persisted_profiles``). Without that, a recommendation re-sort between
+    calls could silently shift what ``profile 2`` means. Verified 2026-06-28:
+    list_profiles order changes when history_print_settings_id changes.
+    """
+    if persisted_profiles:
+        profiles_full = [
+            {"idx": int(p["idx"]), "value": p["value"], "label": p.get("label", p["value"])}
+            for p in persisted_profiles
+        ]
+    else:
+        prof_opts = list_profiles(nozzle=nozzle)
+        profiles_full = [
+            {"idx": i + 1, "value": o["value"], "label": o.get("label", o["value"])}
+            for i, o in enumerate(prof_opts)
+        ]
     parts = [
         {"id": p["part_id"], "label": f"{p['filename']} ({p['footprint_mm'][0]:.0f}x{p['footprint_mm'][1]:.0f}mm)"}
         for p in kit["parts"]
@@ -85,10 +104,11 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str) -> dict[str, Any]:
         "parts": parts,
         "tools": DEFAULT_TOOLS,
         "materials": DEFAULT_MATERIALS,
-        "profiles": profiles,
+        "profiles": [{"idx": p["idx"], "label": p["label"]} for p in profiles_full],
         "supports": ["supports", "no-supports", "overhangs"],
         "actions": ["start", "upload-only"],
-        "_prof_opts": prof_opts,  # internal: idx -> resolution
+        "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
+        "_profiles_full": profiles_full,  # persisted at form-emit for index stability
     }
 
 
@@ -129,17 +149,25 @@ def run_kit_workflow(args) -> dict[str, Any]:
                         "Deselect them or split the model; the slice will fail otherwise."),
         }, json_events)
 
-    spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"))
+    # Reuse the profile list persisted at form-emit so `profile N` means the
+    # same thing on the answer call (index stability — see _build_form_spec).
+    existing = u1_request.read_request(request_id) or {}
+    spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"),
+                            persisted_profiles=existing.get("form_profiles"))
     if not spec["profiles"]:
         _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
                             "message": "No profiles found. Run tools/fetch_snapmaker_profiles.py."}, json_events)
         return {"phase": "setup_required", "request_id": request_id, "out_dir": str(out_dir)}
 
-    # Persist the kit record (additive fields; no schema bump).
+    # Persist the kit record (additive fields; no schema bump). model_hash is
+    # the recovery key — without it, re-sending the same zip (no --request-id)
+    # can't resume this request (find_recent_request_for_model matches on it).
     u1_request.write_request(
         request_id, model_file=archive.name, model_path=str(archive),
+        model_hash=u1_request.compute_model_hash(archive) if archive.exists() else None,
         out_dir=str(out_dir), operator=operator,
         kit={"parts": kit["parts"], "part_count": kit["part_count"]},
+        form_profiles=spec["_profiles_full"],
         phase="kit_analysis",
     )
 
@@ -205,12 +233,24 @@ def _commit_kit(args, request_id, operator, out_dir, events_file, archive, kit, 
     slice_out = out_dir / "slice"
     _emit(events_file, {"stage": "kit_slicing", "request_id": request_id,
                         "parts": len(selected_paths), "auto_orient": auto_orient}, json_events)
-    arr = u1_arrange.arrange_slice(
-        selected_paths, slice_out,
-        tool=tool, material=material, profile=profile_slug, nozzle=nozzle,
-        auto_orient=auto_orient, allow_rotations=True,
-        process_path_override=process,
-    )
+    try:
+        arr = u1_arrange.arrange_slice(
+            selected_paths, slice_out,
+            tool=tool, material=material, profile=profile_slug, nozzle=nozzle,
+            auto_orient=auto_orient, allow_rotations=True,
+            process_path_override=process,
+        )
+    except Exception as exc:
+        # Surface a clean event instead of a stack trace — e.g. an oversized
+        # part Orca refuses to arrange, or a slicer error. The operator can
+        # deselect parts and re-answer the form.
+        _emit(events_file, {
+            "stage": "kit_slice_failed", "request_id": request_id,
+            "error": str(exc)[:600],
+            "instruction": "Slice failed. If a part is too big, deselect it and re-answer the form.",
+        }, json_events)
+        _audit(request_id, "kit_slice_failed", operator, error=str(exc)[:300])
+        return {"phase": "slice_failed", "request_id": request_id, "error": str(exc)[:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
