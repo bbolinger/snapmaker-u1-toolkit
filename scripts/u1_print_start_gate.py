@@ -45,6 +45,24 @@ APPROVAL_TTL_SEC = 1800  # 30 minutes
 # bed photos with a part on it.
 DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
 
+# Canonical deployed path of this gate script — used when building the Stage-1
+# command string the workflow hands to the agent.
+GATE_SCRIPT_PATH = "/opt/data/scripts/u1_print_start_gate.py"
+
+
+def build_stage1_command(*, printer_filename: str, intended_tool: str,
+                         material: str, request_id: str) -> str:
+    """Build the Stage-1 gate command string (shared by the single-STL and kit
+    workflows so the two never drift). Stage 1 captures a real bed photo +
+    approval token; nothing starts until Stage 2 with that token + operator yes.
+    """
+    import shlex
+    return (
+        f"python3 {GATE_SCRIPT_PATH} {printer_filename} "
+        f"--intended-tool {intended_tool} --requested-material {shlex.quote(str(material))} "
+        f"--request-id {request_id}"
+    )
+
 
 def http_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r:
