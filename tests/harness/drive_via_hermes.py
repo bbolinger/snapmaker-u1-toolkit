@@ -45,17 +45,27 @@ SKILL = '3d-printer-slicing-automation'
 TURN_TIMEOUT = 600   # 10 minutes — slice can take ~100s + LLM latency
 MAX_TURNS = 25       # hard ceiling to prevent runaway loops
 
-# Workflow mirrors every emit() to <out_dir>/events.jsonl. Search the
-# default slice-workflow artifact tree for files newer than the harness
-# start time and merge their contents into our event stream.
-# The runtime workflow is at /opt/data/scripts/u1_slice_workflow.py with
-# ROOT=/opt/data → DEFAULT_OUT_BASE=/opt/data/artifacts/slice_workflow.
-# From this container, that's /appdata/hermes/artifacts/slice_workflow.
-ARTIFACT_TREE_CANDIDATES = [
-    Path('/appdata/hermes/artifacts/slice_workflow'),  # from dev-container
-    Path('/opt/data/artifacts/slice_workflow'),        # from inside Hermes
+# Workflow mirrors every emit() to <out_dir>/events.jsonl. We scan multiple
+# possible roots to find them:
+#   - v2.0+: <data_dir>/requests/<request_id>/events.jsonl  (Print Request Objects)
+#   - v1.5-v1.6 legacy: <ROOT>/artifacts/slice_workflow/<stem>/<ts>/events.jsonl
+# Both trees may coexist during the v2.0 migration window. The harness
+# walks both — the per-run scan picks up whichever the workflow wrote to.
+#
+# H4 (Phase 2 cold review): the candidates list is fixed at import; the
+# .exists() check happens INSIDE scan_events_jsonl at scan time, so a
+# request dir created AFTER the harness imports is found on the very next
+# scan (not silently missed forever).
+ARTIFACT_TREES = [
+    # v2.0 Print Request Objects (primary)
+    Path('/appdata/hermes/snapmaker_u1/requests'),
+    Path('/opt/data/snapmaker_u1/requests'),
+    # v1.5-v1.6 legacy slice_workflow tree (kept for in-flight runs)
+    Path('/appdata/hermes/artifacts/slice_workflow'),
+    Path('/opt/data/artifacts/slice_workflow'),
 ]
-ARTIFACT_TREE = next((p for p in ARTIFACT_TREE_CANDIDATES if p.exists()), ARTIFACT_TREE_CANDIDATES[0])
+# Back-compat alias for any code that still imports ARTIFACT_TREE
+ARTIFACT_TREE = ARTIFACT_TREES[0]
 
 
 @dataclass
@@ -154,18 +164,29 @@ def parse_json_events(stdout: str) -> list[dict[str, Any]]:
 
 
 def scan_events_jsonl(start_time: float, already_read_bytes: dict[Path, int]) -> tuple[list[dict[str, Any]], dict[Path, int]]:
-    """Walk ARTIFACT_TREE for events.jsonl files modified since start_time.
-    Read only the new bytes since the last scan (incremental tail).
+    """Walk every ARTIFACT_TREES root for events.jsonl files modified since
+    start_time. Read only the new bytes since the last scan (incremental tail).
     Returns (newly_parsed_events, updated_already_read_bytes).
 
     This is the fallback for when `hermes chat -Q` strips tool stdout from
     its own output. The workflow writes every emit() to events.jsonl, so
-    this file is the ground-truth event stream."""
+    this file is the ground-truth event stream.
+
+    v2.0 Phase 2: scans BOTH the v2.0 requests/ tree AND the legacy
+    slice_workflow tree, so the harness keeps working through the migration."""
     new_events: list[dict[str, Any]] = []
     updated = dict(already_read_bytes)
-    if not ARTIFACT_TREE.exists():
+    found_paths: list[Path] = []
+    # H4 fix: check .exists() at scan time, not at import time. A request
+    # directory created mid-conversation needs to be picked up on the very
+    # next scan call, not silently missed because it didn't exist when
+    # the harness module loaded.
+    for tree in ARTIFACT_TREES:
+        if tree.exists():
+            found_paths.extend(tree.rglob('events.jsonl'))
+    if not found_paths:
         return new_events, updated
-    for events_path in ARTIFACT_TREE.rglob('events.jsonl'):
+    for events_path in found_paths:
         try:
             mtime = events_path.stat().st_mtime
         except FileNotFoundError:

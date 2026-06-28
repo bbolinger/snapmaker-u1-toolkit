@@ -7,8 +7,13 @@ MACHINE="/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker/m
 FILAMENT="/opt/data/artifacts/slice_workflow/wall_mount_laid_on_back/20260626-123427/Snapmaker PETG @U1__flat.json"
 PROD_PROC="/opt/data/artifacts/slice_workflow/wall_mount_laid_on_back/20260626-123427/0.20 Strength @Snapmaker U1 (0.4 nozzle)__no_supports.json"
 
-WORK=/opt/data/snapmaker_u1/v16-experiment2
+: "${WORK:=$(mktemp -d -t v16-experiment-XXXXXX)}"  # ephemeral by default;
+# override with WORK=/persistent/path bash v16-draft-validation.sh to keep
+# results around between runs (e.g. for diffing). Never default to the
+# operator's data dir — scratch in production state has caused real bugs
+# (see feedback_no_scratch_in_operator_data_dir in the dev memory).
 rm -rf $WORK; mkdir -p $WORK/profiles $WORK/runs
+echo "v16-draft-validation work dir: $WORK"
 RESULTS=$WORK/results.tsv
 echo -e "fixture\tvariant\twall_clock_ms\trc\twarning_category\twarning_text\toverhang_pct\tlayer_count" > $RESULTS
 

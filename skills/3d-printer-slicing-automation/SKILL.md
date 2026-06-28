@@ -133,6 +133,8 @@ python3 /opt/data/scripts/u1_print_start_gate.py <printer_storage_filename> \
 
 The gate validates the token (5-min TTL), re-runs preflight, takes a sanity-only fresh capture (NOT shown — operator already approved Stage 1's photo), and starts only if everything passes. If the token is wrong/expired, or if the sanity capture is dark/mock, the gate refuses — re-run Stage 1.
 
+**After Stage 2 succeeds:** report only the start result fields (`started`, `response`, `blockers`, filename/tool/material). Do **not** surface or attach the Stage-2 sanity snapshot path in the final message; that capture is an internal safety check, not a second operator-review artifact. The only bed photo the operator should review is Stage 1's approval photo.
+
 DO NOT skip Stage 1. DO NOT invent a magic phrase. DO NOT pass `--bed-clear start` without the token AND the operator's explicit yes. Default = cancel.
 
 ### YOU MUST NOT

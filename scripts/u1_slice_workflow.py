@@ -128,6 +128,7 @@ from u1_upload_gcode import parse_gcode_metadata
 from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
+import u1_request
 
 DEFAULT_OUT_BASE=ROOT/'artifacts'/'slice_workflow'
 
@@ -424,8 +425,17 @@ def _shell_quote(s: str) -> str:
 def _cmd_prefix(script_path: str, model_path: str, args) -> str:
     """Build the cumulative invocation prefix from args that are already set.
     Each subsequent need_input's next_command extends this prefix with one
-    more flag + the option's value."""
+    more flag + the option's value.
+
+    v2.0 Phase 2: includes --request-id so agent re-invocations pin to the
+    same on-disk request. Recovery via content hash still works without it
+    but explicit --request-id is more robust against context loss + faster
+    (no hash recompute, no directory scan)."""
     parts = ['python3', script_path, _shell_quote(model_path), '--json-events']
+    # Pin request_id so chained next_command invocations all hit the same
+    # request folder. This is what makes the agent's flow context-loss-resistant.
+    if getattr(args, 'request_id', None):
+        parts += ['--request-id', args.request_id]
     if getattr(args, 'orient', None):
         parts += ['--orient', args.orient]
     if getattr(args, 'tool', None):
@@ -1410,13 +1420,124 @@ def run_workflow(args)->dict[str,Any]:
     for each answer.
     """
     model=Path(args.model).resolve()
-    ts=time.strftime('%Y%m%d-%H%M%S')
-    out_dir=(Path(args.out_dir) if args.out_dir else DEFAULT_OUT_BASE/model.stem.replace(' ','_')/ts).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
+    # request_id (explicit --request-id, recovery via content hash, or
+    # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;
+    # --out-dir is preserved as a legacy escape hatch for tests + direct CLI
+    # use that wants a specific output location. Either way, the workflow
+    # writes request.json so the request object is the source of truth.
+    request_id, was_resumed = u1_request.resolve_request_id(
+        cli_request_id=getattr(args, 'request_id', None),
+        cli_fresh=getattr(args, 'fresh', False),
+        stl=model,
+    )
+    # Pin the resolved id back onto args so _cmd_prefix picks it up for
+    # every emitted next_command — chained invocations all target the same
+    # on-disk request, no recovery lookup needed on subsequent turns.
+    args.request_id = request_id
+
+    if args.out_dir:
+        # argparse already returns Path via type=Path; no re-wrap needed (L6).
+        out_dir = args.out_dir.resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = u1_request.ensure_request_dir(request_id)
+
     # Mirror every emit() to <out_dir>/events.jsonl so harness + agent
     # have a recoverable audit trail independent of stdout capture.
     global _EVENTS_FILE
     _EVENTS_FILE = out_dir / 'events.jsonl'
+
+    # Initial request.json write (idempotent on resume). The workflow updates
+    # this file at every state transition so request.json is the durable view
+    # of "what's been answered so far."
+    _existing = u1_request.read_request(request_id) or {}
+    _request_fields = {
+        'model_file': model.name,
+        'model_path': str(model),
+        'model_hash': u1_request.compute_model_hash(model) if model.exists() else None,
+        'out_dir': str(out_dir),
+    }
+    # Merge any CLI args the operator has already answered so the request
+    # reflects the latest decision state.
+    for fld in ('orient', 'tool', 'material', 'profile', 'supports', 'upload_decision', 'nozzle'):
+        v = getattr(args, fld, None)
+        if v is not None:
+            _request_fields[fld] = v
+    # MED-2 fix (Phase 2 cold review): only stamp initial phase when there
+    # isn't one already on disk. Phase advances monotonically forward via
+    # the H5 sites below (analysis → sliced → uploaded → awaiting_start_approval),
+    # so unconditionally writing 'analysis' here would clobber a forward
+    # phase on every resume — breaking phase-based skip logic + misleading
+    # any future audit that reads the phase field. (The legacy --fresh path
+    # already generates a new request_id, so _existing is empty there.)
+    if not _existing.get('phase'):
+        _request_fields['phase'] = 'commit' if (args.yes or args.upload_only) else 'analysis'
+    u1_request.write_request(request_id, **_request_fields)
+
+    # Emit the lifecycle event so the agent (and harness scoring) can tell
+    # which path we took.
+    if was_resumed:
+        # L10: hoist dict-comprehension out of f-string for readability.
+        _resumed_answers = {k: _existing.get(k) for k in ('orient', 'tool', 'material', 'profile', 'supports') if _existing.get(k)}
+        emit({
+            'stage': 'request_resumed',
+            'request_id': request_id,
+            'out_dir': str(out_dir),
+            'resumed_from': _existing.get('phase', 'unknown'),
+            'note': (f'Recovered in-flight request {request_id} from disk. '
+                     f'Pre-existing answers: {_resumed_answers}'),
+        }, args.json_events)
+        # Backfill the args with the resumed answers so the rest of the
+        # workflow walks through to the next unanswered prompt.
+        for fld in ('orient', 'tool', 'material', 'profile', 'supports', 'upload_decision', 'nozzle'):
+            if getattr(args, fld, None) is None and _existing.get(fld):
+                setattr(args, fld, _existing[fld])
+
+        # Phase-aware skip (Phase 2 polish): when the prior run reached the
+        # readiness_card and operator just lost agent context, don't re-walk
+        # ANALYSIS → orient → slice → Upload? → collision. All answers are
+        # already on disk and the start_gate command was already issued. Just
+        # re-emit the saved readiness_card + next_action_required and return
+        # so the operator only sees ONE approval prompt instead of three
+        # redundant ones. Gated on all required fields being present; if any
+        # missing, fall through and let the workflow rebuild from scratch.
+        if (_existing.get('phase') == 'awaiting_start_approval'
+                and _existing.get('readiness_card_event')
+                and _existing.get('printer_storage_filename')
+                and _existing.get('start_gate_stage1_command')):
+            _saved_card = dict(_existing['readiness_card_event'])
+            _saved_card['stage'] = 'readiness_card_resumed'
+            _saved_card['resumed_from_phase'] = 'awaiting_start_approval'
+            emit(_saved_card, args.json_events)
+            _saved_next = _existing.get('next_action_required_event')
+            if _saved_next:
+                emit(dict(_saved_next), args.json_events)
+            else:
+                # Backward compat: a prior version stored phase but not the
+                # full next_action payload. Rebuild a minimal one from the
+                # start_gate command so the agent still has an imperative.
+                emit({
+                    'stage': 'next_action_required',
+                    'reason': ('Resumed in-flight request already at the start gate. '
+                               'Run Stage 1 to capture a real bed photo + approval token.'),
+                    'command': _existing['start_gate_stage1_command'],
+                }, args.json_events)
+            return {
+                'phase': 'awaiting_start_approval',
+                'request_id': request_id,
+                'out_dir': str(out_dir),
+                'resumed': True,
+                'start_gate_stage1_command': _existing['start_gate_stage1_command'],
+                'printer_storage_filename': _existing['printer_storage_filename'],
+            }
+    else:
+        emit({
+            'stage': 'request_created',
+            'request_id': request_id,
+            'out_dir': str(out_dir),
+            'note': f'New print request {request_id} created for {model.name}.',
+        }, args.json_events)
 
     # === ANALYSIS PHASE ===
     # Always create the source-as-authored STL (no rotation applied).
@@ -1946,6 +2067,22 @@ def run_workflow(args)->dict[str,Any]:
           'first_layer_depth_mm': _fld,
           'summary_file': str(summary_path),
          }, args.json_events)
+    # H5 fix (Phase 2 cold review): persist sliced state so resume after
+    # context loss doesn't re-run the slice. If the agent loses context
+    # AFTER COMMIT but BEFORE Stage 1, request.json knows the slice
+    # finished + carries the gcode hash for the readiness card to recover.
+    try:
+        u1_request.write_request(
+            request_id,
+            phase='sliced',
+            gcode_path=str(gcode),
+            gcode_hash=u1_request.compute_model_hash(gcode) if gcode.exists() else None,
+            estimated_time=slice_res.get('time'),
+            estimated_filament_g=slice_res.get('weight_g'),
+            preview_image=str(preview) if preview.exists() else None,
+        )
+    except Exception:
+        pass  # phase tracking is observability — never break the slice on disk-write failure
     if args.cancel:
         emit({'stage':'cancelled'}, args.json_events); return {'cancelled': True, 'out_dir': str(out_dir)}
     if args.upload_only or args.yes:
@@ -1957,6 +2094,19 @@ def run_workflow(args)->dict[str,Any]:
         else:
             up = _real_upload(gcode, on_collision=args.on_collision)
         emit({'stage':'uploaded', **up}, args.json_events)
+        # H5 fix: persist upload-completed state. If agent loses context now,
+        # request.json says phase='uploaded' so resume routes to Stage 1
+        # (readiness_card recovery) instead of re-running the slice.
+        try:
+            u1_request.write_request(
+                request_id,
+                phase='uploaded',
+                uploaded_filename=up.get('uploaded_filename'),
+                upload_returncode=up.get('returncode'),
+                upload_moonraker_ok=up.get('moonraker_upload_ok'),
+            )
+        except Exception:
+            pass
         # If the helper detected a collision and no resolution was supplied,
         # emit a structured need_input prompt + exit so the agent surfaces it.
         if up.get('cancelled'):
@@ -2025,7 +2175,10 @@ def run_workflow(args)->dict[str,Any]:
             f'python3 /opt/data/scripts/u1_print_start_gate.py {_printer_filename} '
             f'--intended-tool {_start_extruder} --requested-material {_shell_quote(str(material))}'
         )
-        emit({
+        # Build the readiness_card payload once, then emit + persist together
+        # so the phase-aware resume short-circuit upstream has the same
+        # event payload to replay verbatim (no re-derivation).
+        _readiness_card_payload = {
             'stage': 'readiness_card',
             'orient': args.orient,
             'orient_supports_tier': _chosen_orient_tier,
@@ -2052,7 +2205,8 @@ def run_workflow(args)->dict[str,Any]:
                 if args.supports == 'no_supports' and _chosen_orient_tier in ('heavy', 'very heavy')
                 else None
             ),
-        }, args.json_events)
+        }
+        emit(_readiness_card_payload, args.json_events)
 
         # v1.5.2 (2026-06-26): emit a next_action_required event AFTER the
         # readiness_card so the agent's flow stays "tool-call the command
@@ -2061,15 +2215,17 @@ def run_workflow(args)->dict[str,Any]:
         # harness run 6 because the readiness_card was descriptive rather
         # than imperative. This event is imperative: agent SHOULD just
         # tool-call command. No synthesis, no decision tree.
+        _next_action_payload = None
         if args.upload_decision == 'upload_start':
-            emit({
+            _next_action_payload = {
                 'stage': 'next_action_required',
                 'reason': ('Operator chose "Upload + start gate" at Upload?. '
                            'Run Stage 1 to capture a real bed photo + approval token. '
                            'This call NEVER starts the print — only the photo+token. '
                            'The operator then visually approves the photo before Stage 2.'),
                 'command': _stage1_cmd,
-            }, args.json_events)
+            }
+            emit(_next_action_payload, args.json_events)
         else:
             # 'upload' (no start) or fallback — workflow is complete here.
             emit({
@@ -2078,6 +2234,24 @@ def run_workflow(args)->dict[str,Any]:
                            'printer; no Stage 1 photo is needed. Workflow is done — '
                            'tell the operator the upload finished and stop.'),
             }, args.json_events)
+
+        # H5 fix + phase-aware skip: persist phase + the full event payloads
+        # so a context-loss resume can replay them without re-walking
+        # analysis → slice → upload → Upload?/collision prompts. Phase
+        # depends on upload_decision: upload-only is 'complete'; upload+start
+        # (and legacy default) is 'awaiting_start_approval'.
+        _persist_phase = 'complete' if args.upload_decision == 'upload' else 'awaiting_start_approval'
+        try:
+            u1_request.write_request(
+                request_id,
+                phase=_persist_phase,
+                printer_storage_filename=_printer_filename,
+                start_gate_stage1_command=_stage1_cmd,
+                readiness_card_event=_readiness_card_payload,
+                next_action_required_event=_next_action_payload,
+            )
+        except Exception:
+            pass
     return {'out_dir': str(out_dir), 'oriented_stl': str(chosen_stl), 'source_render': str(source_render), 'preview': str(preview), 'gcode': str(gcode), 'slice': slice_res, 'summary_file': str(summary_path)}
 
 def main(argv=None)->int:
@@ -2108,7 +2282,18 @@ def main(argv=None)->int:
                          "Passed through to u1_upload_gcode.py. Default = unset → helper detects collision "
                          "and emits a filename_collision need_input prompt; re-run with this flag to commit.")
     ap.add_argument('--no-live-material', action='store_true', help='Do not query live material state; use supplied/headless option')
-    ap.add_argument('--out-dir', type=Path); ap.add_argument('--cancel', action='store_true')
+    ap.add_argument('--out-dir', type=Path,
+                    help='LEGACY override of the output dir. Tests + direct CLI use that wants a specific path. '
+                         'When set, workflow STILL writes a request.json in there. Otherwise output lands in '
+                         '<data_dir>/requests/<request_id>/ (the v2.0 default).')
+    ap.add_argument('--request-id', type=str, default=None,
+                    help='v2.0 Phase 2: resume an in-flight print request by ID. If the id has no on-disk state, '
+                         'workflow fails loud (no silent half-state). When unset, workflow recovers the most-recent '
+                         'request whose model_hash matches this STL, or generates a fresh request_id if none.')
+    ap.add_argument('--fresh', action='store_true',
+                    help='v2.0 Phase 2: ignore any prior in-flight request for this STL and start a brand-new one. '
+                         'Useful when operator wants to restart the slicing decision from scratch.')
+    ap.add_argument('--cancel', action='store_true')
     a=ap.parse_args(argv); res=run_workflow(a)
     if not a.json_events: print(json.dumps(res, indent=2))
     return 0
