@@ -222,7 +222,11 @@ PROMPT_PATTERNS = {
     'supports':       re.compile(r'support', re.I),
     'upload_mode':    re.compile(r'(?:upload[?\s]+|upload\s*(?:only|\+|and|or)|start\s+gate)', re.I),
     'collision':      re.compile(r'collision|already exists|filename', re.I),
-    'bed_clear':      re.compile(r'(?:bed clear|review the (?:attached )?photo|start[?\s]+\(yes/no\))', re.I),
+    # Bed-clear matchers — v2.0 Phase 5 added request_id phrasing
+    # ("start request `u1_2026_...` ?"), so the loose alternatives match
+    # either "bed clear", any "review the photo" sentence, or the literal
+    # "(yes/no)" / "yes/no" suffix.
+    'bed_clear':      re.compile(r'(?:bed clear|review the (?:attached )?photo|\(yes/no\)|yes\s*/\s*no)', re.I),
 }
 
 
@@ -277,8 +281,29 @@ def match_question_to_event(agent_text: str, events: list[dict[str, Any]]) -> st
 
 def detect_prompt_kind(agent_text: str, events: list[dict[str, Any]]) -> str | None:
     """Return one of the PROMPT_PATTERNS keys, or 'photo_first' if a Stage 1
-    photo path appears, or None if no prompt is being asked."""
-    # need_input events are the authoritative source
+    photo path appears, or None if no prompt is being asked.
+
+    Order matters: the Stage-1 photo check happens BEFORE the need_input
+    lookup. Live harness regression 2026-06-28 — when Stage 1 surfaced a
+    bed photo at turn 7, this function used to find a stale need_input
+    event from turn 6's collision prompt in rolling events, return
+    'collision', and the already-answered filter would set it to None.
+    The photo path never got matched. Checking the photo path first wins
+    that race because Stage 1 photos are an unambiguous signal that
+    overrides any older need_input still in rolling-event scope.
+    """
+    # Stage 1 photo path → highest priority signal. If we see a fresh
+    # bed-snapshot path in the agent's reply, we're past the workflow
+    # decision phase and on to the operator's "bed clear?" review.
+    #
+    # Tightened 2026-06-28: previously matched any *.jpg/png under
+    # /opt/data/snapmaker_u1/, which false-positived on orient render
+    # previews (source_as_authored.png, auto_oriented.png) surfaced at
+    # the orient prompt. Bed snapshots are always named bed_snapshot.jpg
+    # by u1_print_start_gate.py::capture_real_bed_photo.
+    if re.search(r'bed_snapshot[^\s`"\']*\.jpg', agent_text, re.I):
+        return 'photo_first'
+    # need_input events are the authoritative source for decision-phase prompts
     for ev in reversed(events):
         if ev.get('stage') == 'need_input':
             key = ev.get('key', '')
@@ -292,9 +317,6 @@ def detect_prompt_kind(agent_text: str, events: list[dict[str, Any]]) -> str | N
                 return 'supports'
             if key == 'filename_collision':
                 return 'collision'
-    # Photo path = Stage 1 succeeded
-    if re.search(r'/opt/data/snapmaker_u1/[^\s`"\']*\.(jpg|png)', agent_text):
-        return 'photo_first'
     # Fallback to text patterns
     if PROMPT_PATTERNS['upload_mode'].search(agent_text):
         return 'upload_mode'

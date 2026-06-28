@@ -133,13 +133,110 @@ def ensure_request_dir(request_id: str) -> Path:
 #   oriented_model_hash, gcode_hash, tool, material, profile, supports,
 #   orient, upload_decision, estimated_time, estimated_filament_g,
 #   preview_image, bed_photo, phase, answered, next_prompt, status
+#
+# v3a additions (auto-injected by write_request, no caller change required):
+#   schema_version=1, request_revision, approvals.{upload,start},
+#   safety.{bed_clear_check_required, bed_clear_photo_captured}, operator
+
+SCHEMA_VERSION = 1
+
+# Plan-affecting fields: a change to ANY of these bumps request_revision.
+# Photo/upload/status changes do NOT bump (they don't change WHAT prints).
+_PLAN_AFFECTING_FIELDS: tuple[str, ...] = (
+    'model_hash', 'orient', 'profile', 'material', 'tool', 'supports',
+    'gcode_hash', 'nozzle',
+)
+
+_EMPTY_APPROVAL: dict[str, Any] = {
+    'approved': False,
+    'approved_by': None,
+    'approved_at': None,
+    'approved_revision': None,
+    'approved_gcode_hash': None,
+}
+
+
+def _bump_revision_if_changed(prior: dict[str, Any], new_fields: dict[str, Any]) -> int:
+    """Return the request_revision integer to write.
+
+    Rules:
+      - First write of a request (no prior ``request_revision``) → 1.
+        Initial-setting fields are NOT a "change," they're the baseline.
+      - Subsequent write that SETS a plan-affecting field for the first
+        time (field absent from prior) → no bump. Setting something for
+        the first time is also a baseline, not a change.
+      - Subsequent write that MODIFIES a plan-affecting field already
+        in prior → +1.
+      - Subsequent write that doesn't touch plan-affecting fields → unchanged.
+      - Photo/upload/status fields are NOT plan-affecting (don't change WHAT prints).
+      - Never bump backward.
+
+    Live harness test 2026-06-28 showed this function bumped on every
+    operator answer because the comparison ``new_fields[field] != prior.get(field)``
+    saw ``value != None`` for first-time sets. The ``field in prior`` guard
+    distinguishes initial set from real plan change.
+    """
+    if 'request_revision' not in prior:
+        # First write — establish baseline at 1. New fields are "initial set,"
+        # not "change."
+        return 1
+    current = prior['request_revision']
+    if not isinstance(current, int) or current < 1:
+        current = 1
+    for field in _PLAN_AFFECTING_FIELDS:
+        if field not in new_fields:
+            continue
+        if field not in prior:
+            # Initial set of this field, not a change. Don't bump.
+            continue
+        if new_fields[field] != prior[field]:
+            return current + 1
+    return current
+
+
+def _ensure_schema_defaults(d: dict[str, Any]) -> dict[str, Any]:
+    """Fill in v1 schema defaults on a request dict in-place. Idempotent.
+
+    Called from write_request so every persisted request carries the v1
+    shape regardless of caller. Safe to call repeatedly: existing values
+    are preserved; only missing keys get defaults.
+    """
+    d.setdefault('schema_version', SCHEMA_VERSION)
+    d.setdefault('request_revision', 1)
+    approvals = d.get('approvals')
+    if not isinstance(approvals, dict):
+        approvals = {}
+        d['approvals'] = approvals
+    for kind in ('upload', 'start'):
+        block = approvals.get(kind)
+        if not isinstance(block, dict):
+            approvals[kind] = dict(_EMPTY_APPROVAL)
+        else:
+            for k, v in _EMPTY_APPROVAL.items():
+                block.setdefault(k, v)
+    safety = d.get('safety')
+    if not isinstance(safety, dict):
+        safety = {}
+        d['safety'] = safety
+    safety.setdefault('bed_clear_check_required', True)
+    safety.setdefault('bed_clear_photo_captured', False)
+    return d
+
 
 def _request_json_path(request_id: str) -> Path:
     return request_dir(request_id) / 'request.json'
 
 
 def read_request(request_id: str) -> dict[str, Any] | None:
-    """Return the parsed request.json contents, or None if missing/invalid."""
+    """Return the parsed request.json contents, or None if missing/invalid.
+
+    Returns raw on-disk contents — does NOT apply v1 schema defaults on
+    read. Callers that need the full v1 shape should call write_request()
+    afterward (which idempotently fills defaults) or call
+    _ensure_schema_defaults() on the returned dict. The one-shot migrator
+    script (`scripts/migrate_v0_to_v1.py`) does an in-place rewrite for
+    bulk fix-up.
+    """
     p = _request_json_path(request_id)
     if not p.exists():
         return None
@@ -152,9 +249,11 @@ def read_request(request_id: str) -> dict[str, Any] | None:
 def write_request(request_id: str, **fields: Any) -> Path:
     """Merge *fields* into the on-disk request.json (creating it if missing).
 
-    Always stamps ``updated_at`` and preserves any prior keys not being
-    overwritten. Atomic write via mkstemp+os.replace so concurrent crons
-    or workflow re-invocations never produce half-written JSON.
+    Always stamps ``updated_at``, ``schema_version``, ``request_revision``,
+    and the ``approvals`` + ``safety`` blocks (idempotent — pre-existing
+    values are preserved). Bumps ``request_revision`` automatically when
+    *fields* contains a plan-affecting change. Atomic write via mkstemp +
+    os.replace so concurrent invocations never see half-written JSON.
     """
     ensure_request_dir(request_id)
     p = _request_json_path(request_id)
@@ -162,9 +261,13 @@ def write_request(request_id: str, **fields: Any) -> Path:
     now = time.time()
     if 'created_at' not in prior:
         prior['created_at'] = now
+    # Compute new revision against PRIOR state BEFORE merging the new fields.
+    new_revision = _bump_revision_if_changed(prior, fields)
     prior.update(fields)
     prior['request_id'] = request_id
     prior['updated_at'] = now
+    prior['request_revision'] = new_revision
+    _ensure_schema_defaults(prior)
     # Atomic write: write to sibling temp file, then os.replace.
     tmp = p.with_suffix(p.suffix + f'.tmp.{os.getpid()}')
     try:
@@ -175,6 +278,47 @@ def write_request(request_id: str, **fields: Any) -> Path:
             try: tmp.unlink()
             except OSError: pass
     return p
+
+
+def record_approval(
+    request_id: str,
+    *,
+    kind: str,
+    operator: str,
+    gcode_hash: str | None = None,
+) -> dict[str, Any]:
+    """Record an explicit operator approval against the current request state.
+
+    Binds the approval to the current ``request_revision`` and (if provided)
+    ``gcode_hash`` so that a later plan mutation can be detected by
+    ``can_start()`` — the approval becomes invalid the moment its bound
+    revision or gcode_hash no longer matches what's on disk.
+
+    *kind* is ``'upload'`` or ``'start'``. *operator* is the identity string
+    (e.g. ``'telegram:brent'`` or ``'cli:local'``). When *gcode_hash* is
+    None, the current ``request['gcode_hash']`` is used.
+
+    Returns the written approval block.
+    """
+    if kind not in ('upload', 'start'):
+        raise ValueError(f'invalid approval kind: {kind!r} (expected upload|start)')
+    req = read_request(request_id) or {}
+    # NB: write_request below applies schema defaults atomically — no need
+    # to call _ensure_schema_defaults here (removed as L13 in 2026-06-27
+    # cold-review cleanup; the call was dead).
+    revision = req.get('request_revision', 1)
+    bound_gcode_hash = gcode_hash if gcode_hash is not None else req.get('gcode_hash')
+    approval = {
+        'approved': True,
+        'approved_by': operator,
+        'approved_at': time.time(),
+        'approved_revision': revision,
+        'approved_gcode_hash': bound_gcode_hash,
+    }
+    approvals = dict(req.get('approvals') or {})
+    approvals[kind] = approval
+    write_request(request_id, approvals=approvals)
+    return approval
 
 
 # ============================================================================
