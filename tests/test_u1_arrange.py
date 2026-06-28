@@ -122,16 +122,18 @@ def test_arrange_slice_empty_parts_raises(tmp_path, hermetic):
         )
 
 
-def test_arrange_slice_only_counts_fresh_plates(tmp_path, hermetic):
-    # A stale plate from a prior run must not be double-counted.
+def test_arrange_slice_clears_stale_plates_before_slicing(tmp_path, hermetic):
+    # Review fix: a stale plate from a prior slice must be cleared so it can't
+    # leak into this result. Here a prior run left plate_1 AND plate_2; the new
+    # slice produces only plate_1 — the result must be EXACTLY [1], not [1, 2].
     out = tmp_path / "out"
     out.mkdir()
-    (out / "plate_1.gcode").write_text("; stale\n")
+    (out / "plate_1.gcode").write_text("; stale 1\n")
+    (out / "plate_2.gcode").write_text("; stale 2\n")
     res = u1_arrange.arrange_slice(
         [tmp_path / "a.stl"], out,
         tool="T0", material="PLA", profile="0.20 Standard",
-        runner=_runner_writing(2),  # writes plate_1 (overwrite) + plate_2
+        runner=_runner_writing(1),  # new slice yields a single plate
     )
-    # plate_1 existed before; only plate_2 is strictly fresh. The function
-    # falls back to all plates only when NOTHING is fresh — here plate_2 is.
-    assert [p["plate_idx"] for p in res["plates"]] == [2]
+    assert [p["plate_idx"] for p in res["plates"]] == [1]
+    assert not (out / "plate_2.gcode").exists()  # stale plate gone
