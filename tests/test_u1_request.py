@@ -369,6 +369,166 @@ def test_resolve_falls_through_to_new_request_when_nothing_matches(_patched_data
 
 
 # ============================================================================
+# Phase 3a — schema_version, request_revision, approvals, safety
+# ============================================================================
+
+def test_first_write_stamps_v1_schema_defaults(_patched_data_dir):
+    """write_request idempotently fills schema_version, request_revision,
+    approvals (upload + start), and safety blocks."""
+    rid = generate_request_id()
+    write_request(rid, model_file='m.stl')
+    data = read_request(rid)
+    assert data['schema_version'] == 1
+    assert data['request_revision'] == 1
+    # Both approval kinds present with empty defaults
+    assert data['approvals']['upload']['approved'] is False
+    assert data['approvals']['upload']['approved_revision'] is None
+    assert data['approvals']['upload']['approved_gcode_hash'] is None
+    assert data['approvals']['start']['approved'] is False
+    # Safety block has the two Phase 3a fields (no capability_mode — that's Phase 4)
+    assert data['safety']['bed_clear_check_required'] is True
+    assert data['safety']['bed_clear_photo_captured'] is False
+    assert 'capability_mode' not in data['safety']  # confirmed NOT leaking Phase 4
+
+
+def test_revision_does_not_bump_on_first_write(_patched_data_dir):
+    """First write of any request → revision 1, even if it sets many
+    plan-affecting fields. The fields being set are the baseline, not a change."""
+    rid = generate_request_id()
+    write_request(rid, model_hash='sha256:a', tool='T1', material='PETG',
+                  profile='0.20strength', supports='no_supports', orient='asauthored',
+                  nozzle='0.4', gcode_hash='sha256:b')
+    assert read_request(rid)['request_revision'] == 1
+
+
+def test_revision_bumps_on_plan_affecting_change(_patched_data_dir):
+    """When a plan-affecting field changes from a prior value, revision bumps by 1.
+
+    Note: per the live harness regression fix 2026-06-28, initial-set of a
+    field is no longer a 'change' — so the baseline write must include
+    every field we want to test changes on later."""
+    rid = generate_request_id()
+    # Baseline carries all plan-affecting fields so subsequent CHANGES bump.
+    write_request(rid, tool='T1', material='PETG',
+                  supports='no_supports', orient='asauthored')
+    assert read_request(rid)['request_revision'] == 1
+    # Same fields → no bump
+    write_request(rid, tool='T1')
+    assert read_request(rid)['request_revision'] == 1
+    # Plan-affecting change → bump
+    write_request(rid, material='PLA')  # material changed
+    assert read_request(rid)['request_revision'] == 2
+    # Another plan-affecting change → another bump
+    write_request(rid, supports='supports')  # was 'no_supports', now changed
+    assert read_request(rid)['request_revision'] == 3
+
+
+def test_revision_does_not_bump_on_non_plan_fields(_patched_data_dir):
+    """Photo/upload/status changes don't bump revision — they don't change
+    WHAT prints."""
+    rid = generate_request_id()
+    write_request(rid, tool='T1')
+    assert read_request(rid)['request_revision'] == 1
+    write_request(rid, phase='sliced', uploaded_filename='m_plate_1.gcode',
+                  preview_image='/some/preview.png', estimated_time='1h 20m')
+    assert read_request(rid)['request_revision'] == 1
+
+
+def test_revision_does_not_bump_on_first_time_field_set(_patched_data_dir):
+    """Live harness regression (2026-06-28): each operator answer was
+    setting a plan-affecting field for the first time (orient on turn 2,
+    tool on turn 3, etc.). The old code bumped revision each time because
+    'value != None' was treated as a change. Setting a field for the
+    FIRST time is initial baseline, not a change."""
+    rid = generate_request_id()
+    write_request(rid, model_file='m.stl', model_hash='sha256:abc')
+    assert read_request(rid)['request_revision'] == 1
+    # Operator answers orient — was absent from prior, now set. NOT a bump.
+    write_request(rid, orient='asauthored')
+    assert read_request(rid)['request_revision'] == 1
+    # Operator answers tool — was absent, now set. NOT a bump.
+    write_request(rid, tool='T1')
+    assert read_request(rid)['request_revision'] == 1
+    # Operator answers profile + material + supports + nozzle. Still no bump.
+    write_request(rid, profile='0.20_strength')
+    write_request(rid, material='PETG')
+    write_request(rid, supports='no_supports')
+    write_request(rid, nozzle='0.4')
+    assert read_request(rid)['request_revision'] == 1
+    # Now operator CHANGES their tool answer — that IS a real change.
+    write_request(rid, tool='T2')
+    assert read_request(rid)['request_revision'] == 2
+    # And changing back bumps again
+    write_request(rid, tool='T1')
+    assert read_request(rid)['request_revision'] == 3
+
+
+def test_revision_bumps_for_each_plan_affecting_field():
+    """Every documented plan-affecting field triggers a bump when it changes."""
+    from u1_request import _PLAN_AFFECTING_FIELDS, _bump_revision_if_changed
+    prior = {'request_revision': 5}
+    for field in _PLAN_AFFECTING_FIELDS:
+        prior_with_field = {**prior, field: 'old_value'}
+        new = {field: 'new_value'}
+        assert _bump_revision_if_changed(prior_with_field, new) == 6, \
+            f'field {field!r} did not trigger a bump'
+
+
+def test_record_approval_binds_revision_and_gcode_hash(_patched_data_dir):
+    """record_approval captures the CURRENT revision + gcode_hash so a later
+    plan mutation can be detected (the foundation of Phase 3b can_start())."""
+    from u1_request import record_approval
+    rid = generate_request_id()
+    write_request(rid, tool='T1', gcode_hash='sha256:abc')
+    # Revision is 1, gcode_hash is sha256:abc
+    approval = record_approval(rid, kind='start', operator='telegram:brent')
+    assert approval['approved'] is True
+    assert approval['approved_by'] == 'telegram:brent'
+    assert approval['approved_revision'] == 1
+    assert approval['approved_gcode_hash'] == 'sha256:abc'
+    # Verify it's persisted
+    after = read_request(rid)
+    assert after['approvals']['start']['approved'] is True
+    assert after['approvals']['start']['approved_revision'] == 1
+    assert after['approvals']['start']['approved_gcode_hash'] == 'sha256:abc'
+
+
+def test_record_approval_rejects_invalid_kind(_patched_data_dir):
+    from u1_request import record_approval
+    rid = generate_request_id()
+    write_request(rid)
+    with pytest.raises(ValueError):
+        record_approval(rid, kind='nonsense', operator='cli:test')
+
+
+def test_record_approval_can_be_overridden_by_explicit_gcode_hash(_patched_data_dir):
+    """record_approval accepts an explicit gcode_hash so callers (e.g. the
+    Stage 1 gate, which may bind to a specific build) can record against a
+    hash that isn't necessarily the current request.json one."""
+    from u1_request import record_approval
+    rid = generate_request_id()
+    write_request(rid, gcode_hash='sha256:current')
+    approval = record_approval(rid, kind='upload', operator='cli:test',
+                               gcode_hash='sha256:explicit_override')
+    assert approval['approved_gcode_hash'] == 'sha256:explicit_override'
+
+
+def test_schema_defaults_idempotent(_patched_data_dir):
+    """Calling write_request many times in a row should not change the
+    schema_version, request_revision, or empty-approval shape."""
+    rid = generate_request_id()
+    write_request(rid, tool='T1')
+    snapshot = read_request(rid)
+    for _ in range(5):
+        write_request(rid)  # no fields → no changes
+    final = read_request(rid)
+    assert final['schema_version'] == snapshot['schema_version']
+    assert final['request_revision'] == snapshot['request_revision']
+    assert final['approvals'] == snapshot['approvals']
+    assert final['safety'] == snapshot['safety']
+
+
+# ============================================================================
 # Phase 2 integration scenarios — context-loss recovery
 # ============================================================================
 # These walk the same recovery scenario the operator hit in the live Telegram
