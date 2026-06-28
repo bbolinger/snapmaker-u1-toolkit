@@ -225,7 +225,7 @@ Consolidated final-decision summary the agent surfaces to the operator before St
 - `gcode_host_path` — absolute host path
 - `printer_storage_filename` — basename on the printer
 - `uploaded` — same shape as the `uploaded` event payload
-- `start_gate_stage1_command` — shell-ready string (includes `--request-id` + `--operator`)
+- `start_gate_stage1_command` — shell-ready string (includes `--request-id`; operator identity is resolved from `U1_OPERATOR` env at gate execution time, not baked into the command — keeps replays correct across operator config changes)
 - `next_step_if_starting` — human-readable
 - *`warning_if_overhang_risky`* — set when chosen orient + no_supports is risky
 - **Audit twin:** `event: "readiness_card_emitted"` (carries `request_revision`, `gcode_hash`, `printer_storage_filename`).

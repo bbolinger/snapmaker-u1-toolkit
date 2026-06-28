@@ -99,7 +99,7 @@ The agent is dumb-by-design — it does what the skill says, no more. Specifical
 - DECISION events are independent — agent asks them across separate turns.
 - COMMIT only runs with `--yes` (operator has answered all four).
 - Collision resume short-circuits the slice via `slice_res.json` cache + `--out-dir` re-use.
-- Stage 2 requires BOTH a valid token (5-min TTL) AND a fresh sanity capture.
+- Stage 2 requires BOTH a valid token (30-min TTL) AND a fresh sanity capture.
 
 ---
 
