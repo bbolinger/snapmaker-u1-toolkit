@@ -168,6 +168,60 @@ def test_upload_only_action_completes_without_gate(tmp_path, fake_profiles, fake
     assert len(req["plates"]) == 2
 
 
+def test_analysis_persists_model_hash_for_recovery(tmp_path, fake_profiles):
+    # Review fix: model_hash is the recovery key. Without it, re-sending the
+    # same zip (no --request-id) can't resume.
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2)))
+    req = __import__("u1_request").read_request(res["request_id"])
+    assert req.get("model_hash"), "model_hash must be persisted for content-hash recovery"
+
+
+def test_recovery_by_resend_finds_request(tmp_path, fake_profiles, fake_slice_upload):
+    # Review fix: re-sending the SAME zip with NO --request-id must resume the
+    # request created at form-emit (via find_recent_request_for_model).
+    zp = _kit_zip(tmp_path, 2)
+    r1 = kw.run_kit_workflow(_args(zp))  # no request-id -> creates request, writes model_hash
+    # Second call, same zip, NO request-id, with answers -> must recover r1's id
+    r2 = kw.run_kit_workflow(_args(zp, form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    assert r2["request_id"] == r1["request_id"], "recovery-by-resend must find the prior request"
+
+
+def test_profile_index_stable_via_persisted_list(tmp_path, fake_profiles, fake_slice_upload, monkeypatch):
+    # Review fix: form-emit persists the profile list; the answer call resolves
+    # `profile N` against the PERSISTED list even if list_profiles reorders.
+    zp = _kit_zip(tmp_path, 1)
+    r1 = kw.run_kit_workflow(_args(zp))  # persists form_profiles = [standard, optimal]
+    rid = r1["request_id"]
+    # Now flip list_profiles order to simulate a history-driven re-sort.
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+        {"value": "0_16_optimal", "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)"},
+        {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"},
+    ])
+    # profile 1 must STILL mean the originally-listed first profile (standard),
+    # not the reordered one (optimal), because we replay the persisted list.
+    captured = {}
+    orig = kw.u1_arrange.arrange_slice
+    def spy(paths, out_dir, *, profile, **k):
+        captured["profile"] = profile
+        return orig(paths, out_dir, profile=profile, **k)
+    monkeypatch.setattr(kw.u1_arrange, "arrange_slice", spy)
+    kw.run_kit_workflow(_args(zp, request_id=rid,
+                              form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    assert captured["profile"] == "0_20_standard", "profile index must resolve against the persisted list"
+
+
+def test_slice_failure_emits_clean_event_not_stacktrace(tmp_path, fake_profiles, monkeypatch):
+    monkeypatch.setattr(kw, "profile_path", lambda slug: Path("/tmp/p.json"))
+    monkeypatch.setattr(kw, "apply_supports_override", lambda p, en, od: Path("/tmp/p.json"))
+    def boom(*a, **k):
+        raise RuntimeError("Orca arrange-slice failed rc=206: object too large")
+    monkeypatch.setattr(kw.u1_arrange, "arrange_slice", boom)
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2),
+                                    form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    assert res["phase"] == "slice_failed"
+    assert "206" in res["error"]
+
+
 def test_resume_by_request_id_after_form(tmp_path, fake_profiles, fake_slice_upload):
     # First call: emit form (no answers). Second call: same request-id + answers.
     r1 = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2)))
