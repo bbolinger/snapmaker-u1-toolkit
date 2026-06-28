@@ -1317,3 +1317,172 @@ def test_v16_compose_note_draft_failed_includes_fallback_marker():
     note = _compose_orient_note(src, None)
     assert 'failed' in note.lower()
     assert 'face-angle' in note.lower() or 'fallback' in note.lower()
+
+
+# ============================================================================
+# Phase 2 — phase-aware resume short-circuit + MED-2 phase preservation
+# ============================================================================
+# These don't need real_orca: the short-circuit fires BEFORE any slicing,
+# so the orca-shim machinery is never touched. We exercise run_workflow
+# directly with a pre-seeded request.json and assert it returns early.
+
+
+def _build_phase2_args(model_path, out_dir, request_id, *, upload_decision='upload_start'):
+    """Build a Namespace shaped like argparse output for run_workflow.
+
+    Mirrors u1_slice_workflow.main's argparser so when add_argument() lines
+    grow, this helper just needs the matching field added — same shape, no
+    coupling to internal flag plumbing."""
+    return argparse.Namespace(
+        model=str(model_path),
+        json_events=True,
+        yes=False,
+        orient=None,
+        down_vec=None,
+        tool=None,
+        material=None,
+        profile=None,
+        class_hint=None,
+        supports=None,
+        nozzle='0.4',
+        upload_only=False,
+        live_upload=False,
+        upload_decision=upload_decision,
+        on_collision=None,
+        no_live_material=True,
+        out_dir=Path(out_dir),
+        request_id=request_id,
+        fresh=False,
+        cancel=False,
+    )
+
+
+def _seed_awaiting_start_approval_request(tmp_path, *, with_next_action=True):
+    """Pre-seed a request.json that looks like a prior workflow run reached
+    the readiness_card. Returns (request_id, stl_path)."""
+    import u1_request as _u1r
+    # Use an STL with stable bytes so the content hash is deterministic.
+    stl = tmp_path / 'cable_holder.stl'
+    stl.write_bytes(b'STABLE_STL_BYTES_FOR_RESUME_TEST')
+    rid = _u1r.generate_request_id()
+    fields = {
+        'model_file': stl.name,
+        'model_path': str(stl),
+        'model_hash': _u1r.compute_model_hash(stl),
+        'orient': 'asauthored',
+        'tool': 'T1',
+        'material': 'PETG',
+        'profile': '0_20_standard_snapmaker_u1_0_4_nozzle',
+        'supports': 'no_supports',
+        'upload_decision': 'upload_start',
+        'phase': 'awaiting_start_approval',
+        'printer_storage_filename': 'cable_holder.gcode',
+        'start_gate_stage1_command': (
+            'python3 /opt/data/scripts/u1_print_start_gate.py cable_holder.gcode '
+            '--intended-tool extruder --requested-material PETG'
+        ),
+        'readiness_card_event': {
+            'stage': 'readiness_card',
+            'orient': 'asauthored',
+            'tool': 'T1',
+            'material': 'PETG',
+            'printer_storage_filename': 'cable_holder.gcode',
+            'start_gate_stage1_command': (
+                'python3 /opt/data/scripts/u1_print_start_gate.py cable_holder.gcode '
+                '--intended-tool extruder --requested-material PETG'
+            ),
+        },
+    }
+    if with_next_action:
+        fields['next_action_required_event'] = {
+            'stage': 'next_action_required',
+            'reason': 'Resumed test fixture',
+            'command': fields['start_gate_stage1_command'],
+        }
+    _u1r.write_request(rid, **fields)
+    return rid, stl
+
+
+def _read_events_jsonl(out_dir):
+    events_path = Path(out_dir) / 'events.jsonl'
+    if not events_path.exists():
+        return []
+    return [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+
+
+def test_phase_aware_skip_fires_on_awaiting_start_approval_resume(tmp_path):
+    """Phase 2 polish: when request.json has phase='awaiting_start_approval'
+    + saved payloads, the resume must NOT re-walk analysis/slice/upload/
+    Upload?/collision. It must emit ONLY the resumed readiness_card + the
+    saved next_action_required, then return early."""
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    result = run_workflow(args)
+    # The short-circuit returns a dict shaped explicitly for this case.
+    assert result['phase'] == 'awaiting_start_approval'
+    assert result['resumed'] is True
+    assert result['request_id'] == rid
+    assert result['printer_storage_filename'] == 'cable_holder.gcode'
+
+    # Events: request_resumed → readiness_card_resumed → next_action_required.
+    # CRITICALLY: no 'triage', no 'render', no 'slice', no 'uploaded', no
+    # 'readiness_card' (the original — only the _resumed variant).
+    events = _read_events_jsonl(out_dir)
+    stages = [e.get('stage') for e in events]
+    assert 'request_resumed' in stages
+    assert 'readiness_card_resumed' in stages
+    assert 'next_action_required' in stages
+    forbidden = {'triage', 'render', 'slice', 'uploaded', 'readiness_card', 'profile_picked'}
+    leaked = forbidden.intersection(stages)
+    assert not leaked, f'short-circuit failed — these stages should NOT have fired: {leaked}'
+
+
+def test_phase_aware_skip_falls_through_when_no_saved_payload(tmp_path):
+    """Backward-compat guard: a request created by an OLDER workflow won't
+    have readiness_card_event saved. The short-circuit must NOT fire — it
+    must fall through and let the workflow rebuild from scratch (no
+    KeyError, no silent half-resume)."""
+    import u1_request as _u1r
+    stl = tmp_path / 'legacy.stl'
+    stl.write_bytes(b'LEGACY_STL')
+    rid = _u1r.generate_request_id()
+    # phase='awaiting_start_approval' BUT no readiness_card_event saved.
+    _u1r.write_request(rid,
+                       model_hash=_u1r.compute_model_hash(stl),
+                       phase='awaiting_start_approval',
+                       printer_storage_filename='legacy.gcode',
+                       start_gate_stage1_command='python3 /opt/data/scripts/u1_print_start_gate.py legacy.gcode')
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    # Short-circuit doesn't fire → workflow tries to proceed → without a
+    # valid STL/orca, it'll fail somewhere downstream. We only care that it
+    # didn't take the resumed-short-circuit path. Detect that by asserting
+    # readiness_card_resumed never emitted (workflow may raise — fine).
+    try:
+        run_workflow(args)
+    except Exception:
+        pass  # downstream failure is fine; we just need to verify no resume-skip
+    events = _read_events_jsonl(out_dir)
+    stages = [e.get('stage') for e in events]
+    assert 'readiness_card_resumed' not in stages, \
+        'short-circuit fired without saved readiness_card_event payload — should have fallen through'
+
+
+def test_med2_phase_not_clobbered_on_resume(tmp_path):
+    """MED-2 fix: a prior phase ('awaiting_start_approval', 'sliced', etc.)
+    must NOT be overwritten with 'analysis' just because the resume
+    invocation came in without --yes. Phase progresses monotonically; the
+    initial write must preserve forward progress.
+
+    Concretely: resume into the phase-aware short-circuit and assert that
+    after the workflow returns, request.json still says
+    phase='awaiting_start_approval' (NOT 'analysis')."""
+    import u1_request as _u1r
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    run_workflow(args)
+    after = _u1r.read_request(rid)
+    assert after['phase'] == 'awaiting_start_approval', \
+        f"MED-2 regression: initial write clobbered phase to {after['phase']!r}"
