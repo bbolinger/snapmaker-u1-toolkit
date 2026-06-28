@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
 description: "Snapmaker U1 staged slicing workflow: orient, render, slice, upload-only, and camera-gated starts."
-version: 1.5.2
+version: 2.0.0
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:

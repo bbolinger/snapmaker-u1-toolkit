@@ -1,314 +1,73 @@
 # Roadmap — Safe AI Print Operator (U1 first)
 
-This document captures the project's direction across **9 phases** that take it from v1.6 ("Hermes-compatible slicer") to **v2.0** ("Safe AI Print Operator with a portable safety model"). All 9 phases ship as a single v2.0.0 release — no intermediate public alphas. Each phase is small enough to ship in a single working session if necessary, with explicit cross-links to design docs and acceptance criteria.
+This document tracks the project's direction across 9 phases from v1.6 ("Hermes-compatible slicer") to v2.0 ("Safe AI Print Operator with a portable safety model"). All 9 phases ship as a single v2.0.0 release.
 
-The v1.x line is frozen on `main` at v1.6.0. The v2.0 work lives on the `v2.0-dev` branch until all 9 phases are complete and acceptance-tested end-to-end.
+The v1.x line is frozen on `main` at v1.6.0. The v2.0 work lives on the `v2.0-dev` branch until end-to-end acceptance, then merges to `main` with a v2.0.0 tag.
 
-The ordering is dependency-driven, not strictly sequential — Phase 8 (operator-experience polish) overlaps with Phase 5 (request-ID approval flow), for example. Status markers:
+Status markers:
+- ✅ **DONE** — shipped and validated end-to-end
+- 📋 **QUEUED** — design clear, scope deferred; resume when a real need appears
+- 🎯 **POSTURE** — ongoing principle, not a sprint
 
-- ✅ **DONE** — shipped and tested
-- 🚧 **IN PROGRESS** — actively being built
-- 🔜 **NEXT** — the unblocking phase, ready to start
-- 📋 **QUEUED** — design clear, depends on earlier phase
-- 🎯 **POSTURE** — not a sprint, an ongoing principle
-
-When you pick this up cold: start by reading [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the immutable system contracts, then [`HERMES.md`](../HERMES.md) for the agent's procedural rules, then this document for what's next.
+When you pick this up cold: read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the system contracts, then [`HERMES.md`](../HERMES.md) for the agent's procedural rules, then [`docs/events.md`](events.md) for the public event contract.
 
 ---
 
 ## Phase 1 — Repo identity + README reframe
 
-**Status:** ✅ DONE (commit `32a5e6d` on `v1.7-dev`)
+**Status:** ✅ DONE
 
-**Goal:** Position the project as "Safe AI Print Operator — Snapmaker U1 first," not "Hermes slicer for U1."
+Positions the project as "Safe AI Print Operator — Snapmaker U1 first." README explains the safety model, the three layers (CLI / operator workflow / Hermes mode), and what the operator approves to a new reader in three minutes.
 
-**Deliverables:**
-- README.md top sections: What This Is / What This Is Not / Safety Model / The Three Layers / What the Operator Approves / Quick Start / Roadmap
-- Tagline: "Safe AI Print Operator — Snapmaker U1 first"
-- Hero blockquote: "Inspired by safety-staged agent workflows, this project applies the pattern specifically to the Snapmaker U1..."
-- Safety Model language: "Hermes — and any other AI agent — can recommend, explain, and prepare a print, but the U1 toolkit owns the final safety checks..."
-
-**Done when:** README's first 130 lines explain the product to a new reader in three minutes, without requiring them to install anything.
-
-**Depends on:** nothing.
+**Cross-links:** [`README.md`](../README.md)
 
 ---
 
-## Phase 2 — Print Request Object
+## Phase 2 — Print Request Objects
 
-**Status:** ✅ DONE (commit `06a4972` on `v2.0-dev`, 2026-06-27 — live cross-model validated)
+**Status:** ✅ DONE
 
-**Goal:** Every print job becomes a first-class entity with a stable, human-readable `request_id`. Approval flows attach to that ID, not to a vague "yes." Solves the v1.7 implicit-state-cache problem more cleanly, AND lays the foundation for audit logging, capability modes, and the Hermes approval pattern.
+Every print job is a first-class entity with a stable `request_id` (`u1_YYYY_MMDD_xxxxxx`) and a durable `requests/<id>/request.json`. Content-hash recovery resumes in-flight requests across model swaps when the agent loses conversation context. Approval flows attach to the ID.
 
-**Deliverables:**
-- `requests/` top-level dir (gitignored — runtime state, not source)
-- Per-request folder structure:
-  ```
-  requests/<request_id>/
-    request.json          # The full job spec — see schema below
-    model_original.stl    # The exact bytes the operator submitted
-    model_oriented.stl    # After orient_model has run
-    output.gcode          # If sliced
-    preview.png           # If sliced
-    bed_photo.jpg         # If Stage 1 ran
-    events.jsonl          # Per-request event mirror (moved from out_dir)
-  ```
-- `request.json` schema:
-  ```json
-  {
-    "request_id": "u1_2026_0626_abc123",
-    "created_at": "2026-06-26T19:42:00-05:00",
-    "updated_at": "2026-06-26T19:51:00-05:00",
-    "model_file": "caulk_holder.stl",
-    "model_hash": "sha256:...",
-    "oriented_model_hash": "sha256:...",
-    "gcode_hash": "sha256:...",
-    "tool": "T1",
-    "material": "PETG",
-    "profile": "0.20_strength_snapmaker_u1",
-    "supports": "no_supports",
-    "estimated_time": "3h 12m",
-    "estimated_filament_g": 86,
-    "preview_image": "requests/u1_2026_0626_abc123/preview.png",
-    "bed_photo": "requests/u1_2026_0626_abc123/bed.jpg",
-    "phase": "decision",
-    "answered": ["orient", "tool"],
-    "next_prompt": "preset",
-    "status": "pending_operator_approval"
-  }
-  ```
-- `--request-id <id>` flag on the workflow — resume from on-disk state when set, or generate a new one when not
-- `--fresh` flag — wipe state for the current request (Case C from the v1.7 sketch)
-- Workflow merge logic: explicit CLI flag > request.json > None default
-- Workflow emits `request_created` and `request_resumed` events so the agent sees what's happening
-
-**Done when:**
-- A new request gets a stable ID generated by the workflow (deterministic given STL path + timestamp + small entropy)
-- The agent loses context mid-flow → re-runs workflow with `--request-id <id>` (no other flags) → workflow resumes from where it left off
-- The agent loses context AND the request_id → re-runs workflow with just `<stl path>` → workflow finds the most-recent request for that path (by `model_hash`, not path — handles same-name-different-content) → resumes from it
-- Same-filename-different-content STL → `model_hash` mismatch → workflow creates a NEW request, doesn't resume
-- All 322+ tests still green, plus new tests for the request-resume path
-- Harness 5/5 still green on gemma4-26b-64k
-
-**Depends on:** Phase 1.
-
-**Cross-links:** docs/PRINT-REQUEST-OBJECT.md (write during Phase 2 design), [`docs/v1.6-design.md`](v1.6-design.md) (for the v1.7 state-persistence approach this replaces).
-
-**Notes / open questions:**
-- Does the existing `<out_dir>/events.jsonl` migrate, or does the workflow write to BOTH `<out_dir>` and `requests/<id>/`? Suggest: migrate fully — out_dir becomes a synonym for `requests/<id>/`. Simpler.
-- Does the slice/collision short-circuit move into the request folder? Probably yes — `requests/<id>/slice_res.json`.
-- Request_id format: `u1_YYYY_MMDD_<6-hex>` — short, sortable, includes printer model. **UTC** timestamp (not local) so the sortability claim holds across operator timezones.
-- Concurrent operators on same Hermes instance: this design solves it by `request_id` being unique. The earlier "session-id keying" concern dissolves — every operator gets unique request IDs.
-
-**Cold-review punch-list** (two rounds during Phase 2 build, plus a third
-sweep before the v2.0-dev commit. The third sweep — 2026-06-27 — found two
-MED issues that landed before commit and seven LOW items; the safe-to-land
-LOWs got folded into the same commit, two are explicitly deferred below):
-
-| Item | Why deferred / disposition | When to revisit |
-|---|---|---|
-| **L1** — `_cli_show` used `__import__('sys').stderr` | Cosmetic; fixed during Phase 2 build (`import sys` at module top) | — DONE |
-| **L2** — `is_request_id` rejects uppercase hex | `secrets.token_hex` is guaranteed lowercase per Python docs; the asymmetry is a footgun if another path ever generates IDs differently. Add a normalization step OR a `is_request_id_loose()` variant when a real second generator appears. | Phase 5 or later |
-| **L3** — No `delete_request` / cleanup helper | Request directories accumulate forever. The retrieval path's TTL stops resume but not disk growth. Build a cleanup CLI (`u1_request.py prune --older-than 30d`) when audit log lands. **L12 (--fresh orphans) rolls into this.** | Phase 3 (audit lands first; cleanup CLI rides with it) |
-| **L4** — `find_recent_request_for_model` is O(n) over all requests | Fine for hundreds of entries. Pair with periodic cleanup or shard by date once a deployment has 10k+ requests. | Phase 3 (alongside the cleanup CLI) |
-| **L5** — Test fixture monkeypatches module attribute | Pattern works for the helper test file because nothing else imports `u1_request._data_dir`. As Phase 2 progresses and the workflow + harness import the module, audit whether any test could leak production data-dir state. | Phase 2 workflow integration (re-audit before commit) |
-| **L6** — `Path(args.out_dir).resolve()` redundant `Path()` wrap | Fixed in third sweep — argparse already returns Path, so the wrap is gone. | — DONE |
-| **L7** — Conftest `_isolated_data_dir` is `autouse=True` for every test | Polluting tests that don't import `u1_config` at all with an env var set. Cheap; scope it to specific test files if it ever causes a real issue. | Phase 5 or later (only if it bites) |
-| **L8** — `_cli_show` raises uncaught `ValueError` on bad ID | Fixed in third sweep — try/except + non-zero exit + stderr message. | — DONE |
-| **L9** — Read-merge-write race in `write_request` between concurrent invocations | NOT FIXED in this sweep — locking a JSON file races with `os.replace`; sidecar lock is cleaner but over-engineering for a code path with no current concurrent writers. **Becomes real when the audit-log writer joins in Phase 3** — both will touch `request.json`. Solve then with a fcntl-based sidecar lock OR by switching `request.json` to append-only event log + reduce-to-snapshot. | Phase 3 (audit-log writer adds the concurrency) |
-| **L10** — f-string with embedded dict comprehension in `request_resumed` note | Fixed in third sweep — hoisted to a named local for readability. | — DONE |
-| **L11** — `_cli_list` sorted by filesystem `mtime` not `updated_at` | Fixed in third sweep — uses `req['updated_at']` first, falls back to `mtime`. Now consistent with `find_recent_request_for_model`'s ordering. | — DONE |
-| **L12** — `--fresh` accumulates orphan request directories | NOT FIXED in this sweep — needs a policy decision (delete-on-supersede vs. mark `superseded` with retention) that conflicts with the standing "preserve historical data" rule. Rolls into **L3** cleanup CLI. | Phase 3 (with L3) |
-| **L13** — Rule 6 ("don't re-extract") is aspirational Hermes-side guidance | Not a fix target — the workflow already defends via content-hash recovery regardless of Hermes' compliance. Verified live 2026-06-27. | — N/A |
-| **MED-1** — `ensure_request_dir` self-heal only chowned the immediate request_id dir, missing the `requests/` parent it just created | Fixed in third sweep — chown walks up from new dir, bounded to `_data_dir()` ceiling (test verifies it doesn't escape the data_dir subtree). | — DONE |
-| **MED-2** — Initial `write_request` clobbered `phase` on resume, overwriting forward progress with `analysis` | Fixed in third sweep — guard on `_existing.get('phase')` preserves monotone forward progress. Verified the phase-aware skip depends on this. | — DONE |
+**Cross-links:** [`scripts/u1_request.py`](../scripts/u1_request.py), [`HERMES.md`](../HERMES.md) Rules 6 + 7
 
 ---
 
-## Phase 3 — Audit log + safety-gate moat (LEAN)
+## Phase 3 — Audit log + start-safety gate
 
-**Status:** 🔜 NEXT
+**Status:** ✅ DONE
 
-**Goal:** Add the safety boundary around physical print-start actions. Per-request `audit.jsonl` for forensic evidence; `can_start()` precondition function as the single source of truth for "is this safe to dispatch"; approval blocks carrying `approved_revision` + `approved_gcode_hash` so the binding is documented. **No cosmetic churn, no Phase 4 leak, no defensive code for non-existent attack surfaces.**
+Per-request append-only `audit.jsonl` (forensic evidence trail) + the `can_start()` precondition function as the single source of truth for whether it's safe to physically dispatch a print. Every Stage 2 path routes through it; refuses if the print plan has drifted (revision bump, re-slice, missing bed photo) since the operator reviewed the readiness card.
 
-**Design constraint (load-bearing):** This toolkit serves ONE operator (Brent) via Hermes routed to a small local LLM (gemma4-26b-64k). Every additional `request.json` field = more context burn for Gemma. Every extra HERMES.md rule = more chance Gemma drops it. Phase 3 is scoped at the minimum that delivers the safety moat without cosmetic tax. (See [feedback_lean_for_single_op_and_gemma in dev memory.)
-
-This phase reached its lean shape on 2026-06-27 after a planning session weighed an expanded spec (schema versioning + migration framework + phase→status rename + folder substructure + capability_mode + auto-invalidation) against the project's single-operator + small-LLM constraints. Six items earned their cost; four were rejected as cosmetic or premature.
-
-**Scope (6 deliverables — the lean cut):**
-
-1. **`scripts/u1_audit.py`** — `append(request_id, event_dict)` using `O_APPEND + fcntl.flock` (atomic line write, multi-process safe); `read(request_id, since=None, until=None)` chronological iterator; `fold(request_id) -> dict` state reconstructor.
-2. **`scripts/u1_safety.py`** — `can_start(request) -> (bool, reason)` precondition. Single source of truth. Every Stage 2 dispatch routes through it. Checks: status allows start, approval present, `approved_revision` matches current `request_revision`, `approved_gcode_hash` matches current `gcode_hash`, bed_clear photo captured if required.
-3. **`u1_request.py` extensions:**
-   - `schema_version: 1` field (one line of JSON, opens door for future revs without forcing a migration framework now)
-   - `request_revision` integer + `_bump_revision_if_changed(request_id, new_fields)` helper that bumps on plan-affecting changes (model / orient / scale / profile / material / tool / supports / new gcode hash)
-   - `approvals.upload` + `approvals.start` blocks: `{approved, approved_by, approved_at, approved_revision, approved_gcode_hash}` per approval
-   - `safety.bed_clear_check_required` + `safety.bed_clear_photo_captured` (just those two — `capability_mode` is Phase 4)
-   - Top-level `operator` field (just the string; no full `source` block with `source_type` + `original_filename`)
-4. **Workflow integration:**
-   - `--operator <id>` CLI flag + `U1_OPERATOR` env fallback (CLI wins) → workflow stamps `operator` field
-   - Audit emits at canonical decision points (request_created/resumed, orientation_selected, profile_selected, slicing_completed, bed_photo_captured, approval_recorded, upload_completed, print_dispatched)
-   - Revision bumps automatically when plan fields change (via helper)
-5. **Stage 2 (`u1_print_start_gate.py`) routes through `can_start()`** — audits `start_safety_check_passed` / `start_safety_check_failed` with reason. The existing token/preflight/sanity-capture checks remain (they're orthogonal); `can_start()` adds the revision/hash binding check.
-6. **One-shot migrator: `scripts/migrate_v0_to_v1.py`** — run-once script (not in-code framework). Walks existing requests; sets `schema_version=1`; converts `phase` field name in-place IF present (cheap rename without back-compat shim). Resilient (idempotent, safe to re-run). Documented in HERMES.md as "run after upgrade."
-
-**What's explicitly DROPPED from the expanded spec (and why):**
-
-| Dropped item | Why |
-|---|---|
-| `phase` → `status` rename with back-compat shim | Cosmetic. Costs every callsite + a shim that lives forever. The one-shot migrator does an in-place rename instead; no shim. Tests use new name; old name is gone after migration. |
-| Folder substructure (`input/working/output/images/`) | Cosmetic. Current flat layout zips fine. Adds path-management complexity + a migration story without a real burn. |
-| `capability_mode` field | Phase 4. Adding the field with nothing reading it is YAGNI. Phase 4 will add field + enforcement together. |
-| Auto-invalidation of approvals on revision/hash change (the `approval_invalidated` event) | Defends a flow that doesn't exist. Today no current code path mutates `request_revision` or `gcode_hash` after an approval lands. Build the data (the binding fields), let `can_start()` reject mismatches, add the auto-invalidation event when a real plan-mutation flow ships. |
-| In-code schema migration framework (`schema_migration_started` events, .bak files, conservative-defaults algorithm baked into every read) | Heavy machinery for a one-time event. One-shot migrator script is simpler, easier to audit, easier to skip when not needed. |
-| `source` block with `submitted_by` / `source_type` / `original_filename` | Single-operator project. Just `operator` as a top-level string is enough. Sub-structure is YAGNI. |
-| Audit-first-then-state as a refactor sweep | Documented as a guideline in HERMES.md. New code follows it. Existing Phase 2 callsites migrate opportunistically, not in a forced sweep. |
-
-**CLI surface (Fork B = show-only for v2.0.0):**
-- `python3 scripts/u1_audit.py show <request_id>` — chronological timeline.
-- `query`, `stats`, `prune` deferred to v2.1.
-
-**Done when (acceptance criteria — must all pass before commit):**
-
-Audit:
-- Each request has its own `audit.jsonl`
-- Writes use `O_APPEND + flock` (verified by concurrent-process test)
-- Canonical decision points emit audit lines
-- `u1_audit.py show <request_id>` displays the timeline
-
-Approval binding (data structure only — no auto-invalidation):
-- Upload + start approvals each store `approved_revision`, `approved_gcode_hash`, `approved_by`, `approved_at`
-- Revision bumps automatically on plan-affecting changes via `_bump_revision_if_changed`
-
-Start gate:
-- `can_start(request)` exists in `u1_safety.py`
-- Every Stage 2 start dispatch routes through it
-- Rejects: missing approval, mismatched revision, mismatched gcode_hash, missing bed photo (when required)
-- Pass + fail both audited as `start_safety_check_passed` / `start_safety_check_failed`
-
-Migration:
-- `scripts/migrate_v0_to_v1.py` rewrites existing Phase 2 requests in place (rename `phase` → `status`, add `schema_version=1`, add empty `approvals` block, add `safety` block with defaults). Idempotent.
-- New writes include `schema_version`, `request_revision`, `status`, `approvals`, `safety`, `operator`
-
-**Required tests (5 acceptance + sub-tests):**
-1. Approval present but `request_revision` bumped → `can_start()` returns `False` with "different request revision" reason.
-2. Approval present but `gcode_hash` differs from `approved_gcode_hash` → `can_start()` returns `False` with "different G-code" reason.
-3. Stage 2 dispatch with no approval → `can_start()` rejects; printer_start never called; `start_safety_check_failed` audited.
-4. Migrator script: pre-Phase-3 request.json (with `phase`, no `status`/`approvals`/`safety`) loads, migrator rewrites it idempotently, second run is a no-op.
-5. `u1_audit.py show` outputs chronological events with seq/ts/event/operator/details.
-
-Plus sub-tests: audit concurrency (multiprocessing fixture, two processes appending simultaneously); revision bump helper covers all plan-affecting fields; `can_start()` matrix covers every reject branch.
-
-**Depends on:** Phase 2 (request folder + content-hash recovery exist).
-
-**Cross-links:**
-- [`scripts/u1_print_history.py`](../scripts/u1_print_history.py) — existing per-print lifetime stats (distinct from audit; aggregate, not per-request).
-- [`scripts/u1_print_start_gate.py`](../scripts/u1_print_start_gate.py) — Stage 2 dispatcher rerouted through `can_start()`.
-
-**Notes:**
-- `operator` field never fabricated. When unknown, write `unknown:<source>` where source = `cli` / `hermes` / `harness`.
-- Audit log is APPEND-ONLY at the application level; flock guards multi-process tear.
-- The pattern is: `load → check → audit pass/fail → dispatch → audit result → update request.json`. No start command bypasses the check, including direct CLI use.
-
-**Why the lean shape:** The expanded spec read enterprise-shape — schema-migration frameworks, folder reorganization, field renames, defensive auto-invalidation for a flow that doesn't exist. For ONE operator + Gemma-4 downstream, every additional schema field is token burn for the small model, and every cosmetic refactor is a chance to drop something. The safety moat (`can_start()` + revision/hash binding + audit) is the win; everything else is gold-plating that adds tax without solving a problem Brent has actually hit.
-
-**Sub-phase split for commits (Option 3):**
-- **Phase 3a — recording layer** (audit + schema fields + migrator): `u1_audit.py`, schema_version/request_revision/approvals/safety fields, `--operator` flag, migrator script, audit emits at canonical points, tests for audit/migrate
-- **Phase 3b — enforcement layer** (the moat): `u1_safety.py`, `can_start()`, Stage 2 routing through it, `start_safety_check_passed/failed` audit events, HERMES.md Rule 8, tests for can_start matrix + Stage-2-bypass-attempt
-
-Splitting at the recording/enforcement seam means 3a can ship and be reviewed independently. 3b builds on 3a's data shape.
+**Cross-links:** [`scripts/u1_audit.py`](../scripts/u1_audit.py), [`scripts/u1_safety.py`](../scripts/u1_safety.py), [`HERMES.md`](../HERMES.md) Rule 8
 
 ---
 
 ## Phase 4 — Capability modes
 
-**Status:** ⏭️ DEFERRED post-v2.0.0 (2026-06-27)
+**Status:** 📋 QUEUED
 
-**Why deferred:** Single-operator deployment. The three modes (`read_only`, `upload_only`, `operator_start`) target three different deployment postures, but only `operator_start` is in use today — and that IS the current behavior. Building the env var + `u1_capability.assert_capability()` helper + per-script gates would land code that nothing in the active deployment exercises. The safety story is complete without it: Phase 3's `can_start()` moat covers the actual print-safety properties. Capability modes are *posture flexibility*, not safety — useful when a second deployment posture actually shows up. Until then: skipping.
-
-**Resume when:** A real second deployment posture appears that needs read_only or upload_only enforcement (e.g. a public CI demo running without printer access, or a research bench running without operator approval).
-
-**Original scope (kept for reference if revived):**
-
-**Goal:** Pick the security posture per deployment. A public CI runs in `read_only`; a Hermes deployment runs in `operator_start`; a research bench can run in `trusted_local_start` if the operator accepts the risk.
-
-**Deliverables:**
-- New env var `U1_CAPABILITY_MODE` (one of three modes initially — START SMALL, defer the other two)
-- Three modes:
-  ```
-  read_only        — inspect printer state, profiles, history. No slice, no upload, no movement.
-  upload_only      — slice + preview + upload (print=false). Default for public CLI users.
-  operator_start   — upload + start AFTER explicit operator approval via Stage 1. Default for Hermes deployments.
-  ```
-- Per-script capability gates: each `u1_*.py` script checks `U1_CAPABILITY_MODE` at entry and refuses gracefully if its action isn't allowed
-- `u1_capability.py` helper: `assert_capability("upload_only")` raises `CapabilityError` with a clear message
-- README documents the three modes, when to use which
-
-**Done when:**
-- `U1_CAPABILITY_MODE=read_only python3 scripts/u1_slice_workflow.py model.stl` → workflow refuses with a clear "set U1_CAPABILITY_MODE=upload_only to slice" message
-- `U1_CAPABILITY_MODE=upload_only` allows slice + upload but Stage 1 refuses
-- `U1_CAPABILITY_MODE=operator_start` (default for Hermes) — current behavior
-- Tests cover all three modes' gating
-
-**Depends on:** Phase 2 (clean request-ID flow means capability gates can attach to request state).
-
-**Notes / open questions:**
-- The original 5-mode plan (`slice_only`, `trusted_local_start`) is deferred to a future revision. Three modes cover 95% of real deployments. Adding more later is easier than retracting them.
-- Hermes default = `operator_start` is the safest production default. Users who want experiments set it explicitly.
+Three deployment postures: `read_only` (inspection only), `upload_only` (slice + preview + upload, no start), `operator_start` (current behavior — start requires Stage 1 token). Build out when a second deployment posture appears.
 
 ---
 
 ## Phase 5 — Hermes skill operates on `request_id`
 
-**Status:** ✅ DONE (2026-06-27, SKILL.md + README updates)
+**Status:** ✅ DONE
 
-**Goal:** Hermes asks "Bed clear and you want to start request `u1_2026_0627_abc123`? (yes/no)" instead of vague "yes/no" — specific, auditable, tied to the exact model/profile/G-code combination.
+Every operator-facing approval question includes the `request_id` verbatim, so the operator's "yes" routes to the specific named request rather than "whatever was most recent." Aligns the agent's behavior with the toolkit's already-built request_id primitives.
 
-**Done what (the lean cut):**
-
-- **SKILL.md "Approval phrasing" section** added — a 3-row table showing the request_id-keyed question at every approval boundary (Stage 1 readiness, Stage 2 photo review, cancel). Includes the rule: NEVER ask "yes/no" without the `request_id`.
-- **SKILL.md operator-question templates** updated — the two pre-existing approval prompts ("Bed clear and you want to start? (yes/no)") now include the `request_id` placeholder + a pointer to the new section.
-- **README "What an approval looks like" section** added — short Telegram exchange showing what the operator actually sees end-to-end, anchored on the live test from 2026-06-27.
-
-**Done what (already shipped by Phase 2 + 3):**
-
-- HERMES.md Rule 7 ("Operator approval is keyed to a specific `request_id`") — landed with Phase 2
-- HERMES.md Rule 8 ("Approvals are revision+hash bound") — landed with Phase 3b
-- Workflow + gate accept `--request-id` and verify via `can_start()` — Phase 3b
-- `request_id` in every event payload (request_created, request_resumed, readiness_card, etc.) — Phase 2
-
-**Explicitly DROPPED from original ROADMAP scope** (gold-plating for one-printer single-operator deployment):
-
-- **"approve start u1_xxx" reply-pattern parser** — operator's "yes" is unambiguous because there's only one printer = at most one in-flight request. Building a parser for `approve start <id>` syntax would add code that nothing exercises.
-- **Stale-request (>15 min) re-confirmation** — token TTL is already 5 min, and revision/hash drift detection catches plan changes. A second time-based check is redundant.
-
-**Live evidence (2026-06-27 Telegram test):** Cross-model validation of Phase 2 + 3b on `gpt-5.5` and `gemma4-26b-64k`. Both runs included the `request_id` in operator-facing context. The agent's exact phrasing varied (no SKILL.md guidance yet); Phase 5's SKILL.md changes lock that in for future runs.
-
-**Cross-links:** [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md) (Approval phrasing section), [`HERMES.md`](../HERMES.md) (Rules 7 + 8), [`README.md`](../README.md#what-an-approval-looks-like).
+**Cross-links:** [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md), [`HERMES.md`](../HERMES.md), [`README.md`](../README.md#what-an-approval-looks-like)
 
 ---
 
-## Phase 6 — Formalize JSON event contract
+## Phase 6 — Public event contract
 
-**Status:** 📋 QUEUED
+**Status:** ✅ DONE
 
-**Goal:** Turn the JSON event stream into a public contract any frontend can wrap (Telegram bot, web UI, Discord, future MCP server). Prevents wrapper reimplementations of core workflow logic.
+[`docs/events.md`](events.md) is the public contract for both event streams (workflow `events.jsonl` and forensic `audit.jsonl`). A new frontend (Telegram bot, web UI, MCP server) can wrap the workflow using this doc alone, with no source-reading required.
 
-**Deliverables:**
-- `docs/events.md` — every event the workflow can emit, with payload schema + examples
-- `docs/request-lifecycle.md` — state machine: which events fire in what order, what state transitions they imply
-- `docs/hermes-skill-contract.md` — the agent's responsibilities versus the toolkit's
-- Event vocabulary cleanup: any one-off `stage:` strings get normalized to `event:` consistent with audit.jsonl
-
-**Done when:**
-- A new contributor can build a custom Telegram bot wrapping the workflow using ONLY the docs (no source-reading required)
-- All existing event names are documented
-- The harness scoring criteria match the documented event vocabulary
-
-**Depends on:** Phase 2 (event payloads carry request_id), Phase 5 (Hermes skill is a reference consumer of the contract).
-
-**Notes:**
-- This is mostly documentation work — minimal code changes if events were named well during Phase 2-3. Worth doing BEFORE Phase 7 (sandbox), since the sandbox should emit the same event vocabulary.
+**Cross-links:** [`docs/events.md`](events.md)
 
 ---
 
@@ -316,120 +75,33 @@ Splitting at the recording/enforcement seam means 3a can ship and be reviewed in
 
 **Status:** 📋 QUEUED
 
-**Goal:** Run the entire workflow with no real hardware. Critical for CI, demos, and onboarding contributors who don't own a U1.
-
-**Deliverables:**
-- New env var `U1_BACKEND=sandbox` (default: `real`)
-- Sandbox mode fakes:
-  - Printer status responses (idle, ready)
-  - Loaded tools/materials (configurable via `examples/sandbox_loadout.json`)
-  - Camera image (returns `examples/demo_bed_clear.jpg`)
-  - Upload result (writes a marker file instead of hitting Moonraker)
-  - Print lifecycle (synthesized events at synthetic intervals)
-  - First-layer photo (returns `examples/demo_first_layer.jpg`)
-  - Completion photo (returns `examples/demo_complete.jpg`)
-- `examples/` folder with the demo assets
-- New CLI flag: `python3 scripts/u1_slice_workflow.py examples/test_cube.stl --sandbox`
-- CI runs the full end-to-end workflow in sandbox mode on every PR
-
-**Done when:**
-- A new contributor can clone the repo, run `python3 scripts/u1_slice_workflow.py examples/test_cube.stl --sandbox --json-events --yes`, and see the full workflow execute to completion without a real U1
-- Harness can run against sandbox mode for fast iteration (no real Orca, no real printer)
-- CI does end-to-end sandbox test on every push
-
-**Done when (relaxed):** Sandbox mode produces the SAME event vocabulary as real mode. Frontends shouldn't care.
-
-**Depends on:** Phase 6 (event contract must be stable, otherwise sandbox + real drift).
-
-**Scope warning:** This is genuinely a week of work. Don't let it block Phase 2-3.
+Run the workflow without a U1 for CI and demos. The toolkit's existing `--no-live-material` flag + dry-run upload already cover the meaningful workflow steps (analysis, slice, upload). Stage 1/2 require real hardware by design — they verify physical state, so a sandbox would have to fake the moat to be useful, which would mislead evaluators. Build out a non-misleading version when a contributor without a U1 actually needs it.
 
 ---
 
-## Phase 8 — Polish operator experience
+## Phase 8 — First/last-layer photos + quiet monitoring
 
-**Status:** 🚧 PARTIALLY DONE (most of this landed in v1.6)
+**Status:** ✅ DONE
 
-**Goal:** The staged operator experience is the strongest part of this project. Make it FEEL like a responsible assistant, not a generic API wrapper.
+Cron-driven: `u1_last_layer_watch.py` captures milestone photos (first 5 layers + last layer), and `u1_print_watchdog.py` runs a 20-minute health poll. Both follow the "print nothing unless operator-worthy" contract — quiet during normal print, one alert per distinct issue, no spam.
 
-**Already in v1.6:**
-- Orient prompt surfaces Orca's mesh-topology verdict (`floating cantilever` / `clean` / overhang %), not face-angle
-- Preview render + footprint dimensions surfaced verbatim
-- Bed photo surfaced bare in reply for auto-attachment
-- Operator-gated bed-clear question (default = no)
-- Live tool/material state surfaced from the U1
-
-**Phase 8 remaining work:**
-- Operator summary text consolidation around `request_id`:
-  ```
-  I prepared print request u1_2026_0626_abc123.
-
-  Model: caulk_holder.stl
-  Material: PETG (T1)
-  Profile: 0.20mm Strength
-  Supports: none (Orca: clean)
-  Estimated time: 3h 12m
-  Estimated filament: 86g
-
-  Bed photo looks clear.
-
-  Reply:
-    approve upload u1_2026_0626_abc123
-    approve start  u1_2026_0626_abc123
-    cancel         u1_2026_0626_abc123
-  ```
-- First-layer photo automation (workflow triggers camera on layer N=1 milestone)
-- Last-layer / completion photo automation
-- Quiet-monitor mode while print is in progress (status pings to operator, NOT new prompts)
-
-**Done when:**
-- Operator sees a complete summary block before being asked to approve
-- First and last layer photos appear automatically (request_id-keyed)
-- Operator gets a completion notification with the final photo
-
-**Depends on:** Phase 2 (request_id), Phase 5 (Hermes skill uses request_id), Phase 3 (audit log records the photos).
+**Cross-links:** [`scripts/u1_last_layer_watch.py`](../scripts/u1_last_layer_watch.py), [`scripts/u1_print_watchdog.py`](../scripts/u1_print_watchdog.py)
 
 ---
 
 ## Phase 9 — Multi-printer scope avoidance
 
-**Status:** 🎯 POSTURE — ongoing principle, not a sprint
+**Status:** 🎯 POSTURE
 
-**Goal:** Resist scope creep. Make the U1 implementation excellent before chasing Bambu, Prusa, OctoPrint, Klipper, Cura, PrusaSlicer.
+Resist scope creep. Make the U1 implementation excellent before chasing Bambu / Prusa / OctoPrint / Klipper / etc. Design internals so a second printer could be added later, but don't pre-build the abstraction — it will be wrong without a real second printer to design against.
 
-**What this means in practice:**
-- README explicitly says "The Snapmaker U1 is the first implementation. The safety model is portable. Multi-printer support is deliberately deferred."
-- Design internals so a second printer COULD be added later — but don't pre-build the abstraction (it WILL be wrong without a real second printer to design against)
-- When a second printer eventually appears, refactor along the seams the U1 implementation has proven, NOT along guessed seams
-
-**What this is NOT:**
-- A directory split (`core/` vs `printers/snapmaker_u1/`) on day one — that's premature abstraction
-- A plugin API designed without a plugin
-- A "generic Moonraker driver" claim until we've shipped a second Moonraker printer
-
-**Done when:** The U1 experience is good enough that someone wanting to add a Bambu adapter can read the U1 implementation and identify the seams without asking. (This won't be objectively measurable until someone tries.)
+The U1 implementation is the proving ground for the safety model + event contract. When a second printer eventually appears, refactor along the seams the U1 implementation has proven, not along guessed seams.
 
 ---
 
 ## How to pick up this work cold
 
-1. **Read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md)** for the immutable system contracts (state machine, three contracts, acceptance criteria).
-2. **Read [`HERMES.md`](../HERMES.md)** for the agent's procedural rules.
-3. **Read this document** to find the next phase that's NEXT or QUEUED.
-4. **Read the cross-linked design doc for that phase** if one exists (e.g. `docs/PRINT-REQUEST-OBJECT.md` for Phase 2).
-5. **Check `git log --oneline main..v1.7-dev`** for in-flight work that hasn't merged yet.
-6. **Read the latest harness run** under `/appdata/hermes/snapmaker_u1/harness-runs/` for the current pass/fail status against gemma.
-
-If you find yourself starting a Phase that's already done, or skipping ahead, STOP and re-read the Depends-on list.
-
----
-
-## Open architectural questions parked for later
-
-These came up during planning but don't block any near-term phase:
-
-- **Per-user namespacing in `requests/`** if multiple Telegram users share one Hermes instance. Today's `request_id` keyspace is global; if two users hit the same instance, both see all requests. Add `users/<user_id>/requests/<request_id>/` when this becomes a real complaint.
-- **Hermes upstream issue [#23767](https://github.com/NousResearch/hermes-agent/issues/23767)** — token undercount on local models. We have direct repro evidence; file when convenient. Affects all small-model Hermes users.
-- **Hermes upstream — self-improvement hook bypassing skill protection.** Hook patched our SKILL.md mid-session, violating the "don't patch live" rule. We caught it, ported to workspace, redeployed. Worth filing upstream so other skill authors don't get bitten.
-- **Hermes upstream — silent provider fallback** masking model switches. Affects observability when the configured model isn't actually being used.
-- **Hermes upstream — `HERMES_SESSION_ID` env injection** for subprocess tools. Would enable cleaner request-ID provenance.
-- **Model routing guidance doc** (Brent's todo #14) — based on what we learned, which models work for which parts of the workflow.
+1. Read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the immutable system contracts.
+2. Read [`HERMES.md`](../HERMES.md) for the agent's procedural rules (Rules 1–8).
+3. Read [`docs/events.md`](events.md) for the public event contract.
+4. Check `git log --oneline main..v2.0-dev` for in-flight work that hasn't merged yet.
