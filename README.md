@@ -105,6 +105,25 @@ Every operator decision is concrete and tied to a specific artifact:
 
 If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
 
+## What an approval looks like
+
+Operator-facing approvals are tied to a specific `request_id` — the toolkit-generated identifier for the print job (shape `u1_YYYY_MMDD_xxxxxx`). The agent is required (per [`HERMES.md`](HERMES.md) Rule 7 and the bundled [skill contract](skills/3d-printer-slicing-automation/SKILL.md)) to include the `request_id` in every approval question. This makes the operator's "yes" unambiguous — it routes to that specific request, not "whatever was most recent."
+
+A Telegram exchange after a `Stand.stl` was sent:
+
+> **Bot:** Slicing complete for request `u1_2026_0627_1b977b`. Estimated time 1h 14m, 18g PETG, T1, 0.20mm Strength. Uploaded as `Stand.gcode`. Stage 1 captures the bed photo next.
+>
+> *(Stage 1 runs, photo arrives in chat)*
+>
+> **Bot:** Bed photo: `/opt/data/snapmaker_u1/bed_snapshot.jpg`
+> Bed clear and you want to start request `u1_2026_0627_1b977b`? (yes/no)
+>
+> **You:** yes
+>
+> **Bot:** Started. Request `u1_2026_0627_1b977b` is now printing.
+
+If a re-slice or plan change happened between the photo and the "yes," `can_start()` would refuse and the bot would re-ask with the new revision instead of starting on stale state. That's the safety property [`HERMES.md`](HERMES.md) Rule 8 ("Approvals are revision+hash bound") encodes.
+
 ## Quick Start
 
 If you have a U1 reachable on the LAN and want to try a slice:
@@ -123,7 +142,7 @@ python3 scripts/u1_slice_workflow.py path/to/your_model.stl --json-events --no-l
 
 For the full install (interpreter selection, Hermes skill install, U1 connection setup), see [Setup](#setup) below.
 
-For the design rationale, architecture, and acceptance criteria, see [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md).
+For the design rationale, architecture, and acceptance criteria, see [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md). For the public event contract (every event the workflow + audit log emit, with payload shapes), see [`docs/events.md`](docs/events.md).
 
 ## Roadmap
 

@@ -222,7 +222,13 @@ Splitting at the recording/enforcement seam means 3a can ship and be reviewed in
 
 ## Phase 4 — Capability modes
 
-**Status:** 📋 QUEUED
+**Status:** ⏭️ DEFERRED post-v2.0.0 (2026-06-27)
+
+**Why deferred:** Single-operator deployment. The three modes (`read_only`, `upload_only`, `operator_start`) target three different deployment postures, but only `operator_start` is in use today — and that IS the current behavior. Building the env var + `u1_capability.assert_capability()` helper + per-script gates would land code that nothing in the active deployment exercises. The safety story is complete without it: Phase 3's `can_start()` moat covers the actual print-safety properties. Capability modes are *posture flexibility*, not safety — useful when a second deployment posture actually shows up. Until then: skipping.
+
+**Resume when:** A real second deployment posture appears that needs read_only or upload_only enforcement (e.g. a public CI demo running without printer access, or a research bench running without operator approval).
+
+**Original scope (kept for reference if revived):**
 
 **Goal:** Pick the security posture per deployment. A public CI runs in `read_only`; a Hermes deployment runs in `operator_start`; a research bench can run in `trusted_local_start` if the operator accepts the risk.
 
@@ -254,28 +260,31 @@ Splitting at the recording/enforcement seam means 3a can ship and be reviewed in
 
 ## Phase 5 — Hermes skill operates on `request_id`
 
-**Status:** 📋 QUEUED
+**Status:** ✅ DONE (2026-06-27, SKILL.md + README updates)
 
-**Goal:** Hermes asks "approve start `u1_2026_0626_abc123`?" instead of "should I start this?" — specific, auditable, tied to the exact model/profile/G-code combination.
+**Goal:** Hermes asks "Bed clear and you want to start request `u1_2026_0627_abc123`? (yes/no)" instead of vague "yes/no" — specific, auditable, tied to the exact model/profile/G-code combination.
 
-**Deliverables:**
-- SKILL.md updates:
-  - When the workflow emits `request_created`, surface the request ID + summary to the operator verbatim
-  - When asking for approval, ALWAYS include the request ID in the question
-  - Operator replies map to request-ID-keyed actions (`approve upload u1_...`, `approve start u1_...`, `cancel u1_...`)
-- HERMES.md updates (new stable-tier rule):
-  - "Every approval ask MUST include the request_id. Operator replies are routed to the named request, never to whatever was 'most recent.'"
-- Workflow accepts approval commands by request_id and verifies the request hash before acting (defense against stale approvals)
-- Example agent reply matches what's in Phase 1 README intro
+**Done what (the lean cut):**
 
-**Done when:**
-- Harness validates: when operator says "approve start `u1_<id>`", workflow verifies the request hash and acts
-- "approve start" without a request_id → workflow refuses; agent re-asks with the ID
-- Stale request (>15 min since last update) → workflow asks for re-confirmation
+- **SKILL.md "Approval phrasing" section** added — a 3-row table showing the request_id-keyed question at every approval boundary (Stage 1 readiness, Stage 2 photo review, cancel). Includes the rule: NEVER ask "yes/no" without the `request_id`.
+- **SKILL.md operator-question templates** updated — the two pre-existing approval prompts ("Bed clear and you want to start? (yes/no)") now include the `request_id` placeholder + a pointer to the new section.
+- **README "What an approval looks like" section** added — short Telegram exchange showing what the operator actually sees end-to-end, anchored on the live test from 2026-06-27.
 
-**Depends on:** Phase 2 (request objects exist), Phase 4 (capability modes gate the approval).
+**Done what (already shipped by Phase 2 + 3):**
 
-**Cross-links:** [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md), [`HERMES.md`](../HERMES.md).
+- HERMES.md Rule 7 ("Operator approval is keyed to a specific `request_id`") — landed with Phase 2
+- HERMES.md Rule 8 ("Approvals are revision+hash bound") — landed with Phase 3b
+- Workflow + gate accept `--request-id` and verify via `can_start()` — Phase 3b
+- `request_id` in every event payload (request_created, request_resumed, readiness_card, etc.) — Phase 2
+
+**Explicitly DROPPED from original ROADMAP scope** (gold-plating for one-printer single-operator deployment):
+
+- **"approve start u1_xxx" reply-pattern parser** — operator's "yes" is unambiguous because there's only one printer = at most one in-flight request. Building a parser for `approve start <id>` syntax would add code that nothing exercises.
+- **Stale-request (>15 min) re-confirmation** — token TTL is already 5 min, and revision/hash drift detection catches plan changes. A second time-based check is redundant.
+
+**Live evidence (2026-06-27 Telegram test):** Cross-model validation of Phase 2 + 3b on `gpt-5.5` and `gemma4-26b-64k`. Both runs included the `request_id` in operator-facing context. The agent's exact phrasing varied (no SKILL.md guidance yet); Phase 5's SKILL.md changes lock that in for future runs.
+
+**Cross-links:** [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md) (Approval phrasing section), [`HERMES.md`](../HERMES.md) (Rules 7 + 8), [`README.md`](../README.md#what-an-approval-looks-like).
 
 ---
 
