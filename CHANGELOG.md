@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.0.1] — 2026-06-28
+
+Doc-only patch from an external review of the v2.0.0 release notes. No runtime or schema changes; no test additions; safe to apply by `git pull` alone.
+
+### Fixed
+
+- **Approval-token TTL drift.** README.md and `docs/DESIGN-CONTRACT.md` still said "5-min TTL" — v2.0.0 bumped it to 30 min and the CHANGELOG reflected that, but two reader-facing docs lagged. Now both say 30-min consistently.
+- **`start_gate_stage1_command` description.** `docs/events.md` claimed the emitted command includes `--operator`. v2.0.0 stopped baking `--operator` so the gate resolves operator identity from `U1_OPERATOR` at execution time (replay-safe). Doc now describes the actual emitted shape.
+- **README roadmap honesty.** Capability modes + Sandbox mode were listed as v2.0 "headline pieces" without indicating they're deferred. Now labeled inline `(Deferred — see CHANGELOG)` so the restraint reads as intentional, not as unfinished work.
+- **`u1_audit.py` PIPE_BUF comment.** Module docstring and append() comments leaned on PIPE_BUF for atomicity. PIPE_BUF is a pipe/FIFO concept; on regular files the `fcntl.flock` is what gives the guarantee. Comments now describe the flock-based scheme accurately.
+
+---
+
 ## [2.0.0] — 2026-06-28
 
 The **Safe AI Print Operator** release. Reframes the project around an explicit safety boundary between the AI agent (which can recommend, explain, and prepare a print) and the toolkit (which owns the final safety checks and refuses printer-affecting actions without operator approval tied to a specific request ID).
