@@ -37,12 +37,23 @@ def _load_dotenv_if_present() -> None:
     if _DOTENV_LOADED:
         return
     _DOTENV_LOADED = True
+    # Candidates in priority order:
+    #  1. cwd-walk: find a .env at cwd or any ancestor (developer convenience —
+    #     `cd repo; python3 script` Just Works)
+    #  2. Hermes runtime canonical location: /opt/data/.env. This is the
+    #     deployed runtime's env file; works regardless of where the
+    #     subprocess was spawned from (live harness regression 2026-06-28:
+    #     U1_OPERATOR was missing because Hermes invoked the workflow with
+    #     cwd=/tmp, where the cwd-walk found no .env).
+    candidates: list[Path] = []
     try:
         cur = Path.cwd().resolve()
+        for parent in [cur, *cur.parents]:
+            candidates.append(parent / ".env")
     except OSError:
-        return
-    for parent in [cur, *cur.parents]:
-        candidate = parent / ".env"
+        pass
+    candidates.append(Path("/opt/data/.env"))
+    for candidate in candidates:
         if not candidate.exists():
             continue
         try:

@@ -1486,3 +1486,101 @@ def test_med2_phase_not_clobbered_on_resume(tmp_path):
     after = _u1r.read_request(rid)
     assert after['phase'] == 'awaiting_start_approval', \
         f"MED-2 regression: initial write clobbered phase to {after['phase']!r}"
+
+
+# ============================================================================
+# Phase 3a — workflow emits audit rows
+# ============================================================================
+
+def test_phase3a_workflow_emits_audit_rows_on_resume(tmp_path, monkeypatch):
+    """When the workflow short-circuits via phase-aware resume, audit.jsonl
+    should contain at least request_resumed + readiness_card_replayed_from_resume,
+    and the rows should carry the operator identity from --operator."""
+    import u1_audit
+    import u1_request as _u1r
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    args.operator = 'telegram:brent'  # exercise the CLI flag path
+    run_workflow(args)
+    rows = list(u1_audit.read(rid))
+    events = [r['event'] for r in rows]
+    assert 'request_resumed' in events
+    assert 'readiness_card_replayed_from_resume' in events
+    # Operator stamped on every row
+    for r in rows:
+        assert r.get('operator') == 'telegram:brent', \
+            f'expected operator=telegram:brent, got {r.get("operator")!r} for event={r["event"]}'
+
+
+def test_replayed_readiness_audit_row_carries_gcode_hash(tmp_path):
+    """Live bug regression 2026-06-28: when the workflow resumes via
+    phase-aware skip, the readiness_card_replayed_from_resume audit row
+    MUST include gcode_hash. Without it, can_start() saw None on the audit
+    row and rejected the next Stage 2 dispatch as 'gcode regenerated since
+    operator reviewed' — even though nothing had drifted; the audit row
+    was just incomplete.
+
+    Operator hit this while waiting >5 min between Stage 1 and Stage 2:
+      Token expired → re-ran workflow → resumed via phase-aware skip
+      → new Stage 1 → said yes → can_start refused on phantom gcode_hash
+      mismatch."""
+    import u1_audit
+    import u1_request as _u1r
+    import u1_safety
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    # Seed the gcode_hash that a real slice would have produced. The seed
+    # function doesn't include it by default; this test specifically
+    # exercises the case where a real prior workflow run did slice + hash.
+    _real_gcode_hash = 'sha256:caaaaaaaaaaaa00000000000000000000000000000000000000000000000feed'
+    _u1r.write_request(rid, gcode_hash=_real_gcode_hash,
+                       safety={'bed_clear_check_required': True,
+                               'bed_clear_photo_captured': True})
+    args = _build_phase2_args(stl, tmp_path / 'out', rid)
+    run_workflow(args)
+    rows = list(u1_audit.read(rid))
+    replay_rows = [r for r in rows if r['event'] == 'readiness_card_replayed_from_resume']
+    assert replay_rows, 'expected at least one readiness_card_replayed_from_resume row'
+    last_replay = replay_rows[-1]
+    details = last_replay.get('details', {})
+    assert details.get('gcode_hash') == _real_gcode_hash, \
+        f"replayed audit row missing gcode_hash: {details!r} (the live bug — can_start refuses with None vs sha256:...)"
+    # And can_start should now be happy: replay row's gcode_hash matches
+    # the request's current gcode_hash → no drift detected.
+    req = _u1r.read_request(rid)
+    allowed, reason = u1_safety.can_start(req)
+    assert allowed, f'can_start refused after phase-aware-skip resume: {reason}'
+
+
+def test_phase3a_operator_falls_back_to_env(tmp_path, monkeypatch):
+    """When --operator is not passed, the workflow falls back to U1_OPERATOR
+    env var. When neither, it stamps 'unknown:cli'."""
+    import u1_audit
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    # No CLI operator, env set
+    monkeypatch.setenv('U1_OPERATOR', 'cron:nightly')
+    args.operator = None
+    run_workflow(args)
+    rows = list(u1_audit.read(rid))
+    assert any(r.get('operator') == 'cron:nightly' for r in rows)
+
+
+def test_phase3a_operator_unknown_when_no_cli_and_no_env(tmp_path, monkeypatch):
+    import u1_audit
+    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
+    out_dir = tmp_path / 'out'
+    args = _build_phase2_args(stl, out_dir, rid)
+    monkeypatch.delenv('U1_OPERATOR', raising=False)
+    args.operator = None
+    run_workflow(args)
+    rows = list(u1_audit.read(rid))
+    assert any(r.get('operator') == 'unknown:cli' for r in rows)
+
+
+def _build_phase2_args_with_operator(model_path, out_dir, request_id, *, operator=None):
+    """Wrap _build_phase2_args to allow setting the new --operator field."""
+    args = _build_phase2_args(model_path, out_dir, request_id)
+    args.operator = operator
+    return args

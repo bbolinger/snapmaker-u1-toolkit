@@ -32,8 +32,12 @@ from u1_config import get_u1_host, get_u1_port, get_data_dir
 
 # Approval-token TTL: how long after Stage 1's photo is captured can the
 # operator still approve a Stage 2 start. Short enough that the bed state
-# can't drift; long enough to type a one-line approval.
-APPROVAL_TTL_SEC = 300  # 5 minutes
+# can't drift meaningfully (no human will walk in, mess with the bed,
+# and walk out again in this window for a normal home/office deployment);
+# long enough for an operator to set the phone down, deal with something,
+# and come back to confirm. Tuned 2026-06-28 to 30 min after live
+# operator hit refusals on the original 5-min ceiling.
+APPROVAL_TTL_SEC = 1800  # 30 minutes
 
 # Brightness floor below which a photo is considered "too dark for operator
 # review" (cold review 2026-06-25 round 10). Tuned to catch the all-black
@@ -293,6 +297,59 @@ def start_print(host, port, filename):
     return post_json(f'http://{host}:{port}/printer/print/start', {'filename': filename})
 
 
+def _resolve_operator_for_gate(cli_operator: str | None) -> str:
+    """Phase 3b: resolve operator identity for audit + approval rows.
+
+    Same priority as the workflow's `_resolve_operator`: --operator CLI
+    flag > U1_OPERATOR env > 'unknown:gate' fallback. Kept distinct so
+    audit rows clearly attribute "where did this row come from."
+
+    Live harness regression 2026-06-28: force dotenv load here too — the
+    gate may run from any cwd, and u1_config's lazy loader hasn't fired
+    yet at this point in the call chain.
+    """
+    import os
+    if cli_operator:
+        return str(cli_operator).strip()
+    try:
+        import u1_config
+        u1_config._load_dotenv_if_present()
+    except Exception:
+        pass
+    env = os.environ.get('U1_OPERATOR', '').strip()
+    if env:
+        return env
+    return 'unknown:gate'
+
+
+def _audit_gate(request_id: str | None, event: str, operator: str, **details) -> None:
+    """Audit-emit wrapper that never raises out of the gate. Same defensive
+    pattern as the workflow's _audit — observability never breaks the moat."""
+    if not request_id:
+        return
+    try:
+        import u1_audit
+        u1_audit.append(request_id, event, operator=operator, **details)
+    except Exception:
+        pass
+
+
+def _mark_bed_clear_photo_captured(request_id: str | None) -> None:
+    """Phase 3b: when Stage 1 captures a usable real bed photo, stamp
+    safety.bed_clear_photo_captured=True on request.json so can_start() can
+    see that the bed-clear check has been satisfied. Best-effort."""
+    if not request_id:
+        return
+    try:
+        import u1_request
+        req = u1_request.read_request(request_id) or {}
+        safety = dict(req.get('safety') or {})
+        safety['bed_clear_photo_captured'] = True
+        u1_request.write_request(request_id, safety=safety)
+    except Exception:
+        pass
+
+
 def run_gate(filename: str,
              bed_clear: str = 'cancel',
              host=None,
@@ -301,11 +358,28 @@ def run_gate(filename: str,
              requested_material: str | None = None,
              approval_token: str | None = None,
              out_dir: Path | None = None,
-             start_func=start_print):
+             start_func=start_print,
+             request_id: str | None = None,
+             operator: str | None = None):
     host = host or get_u1_host()
     port = port or get_u1_port()
+    # Per-request token + photo storage (live bug 2026-06-28): if we have a
+    # request_id, prefer its request_dir so the bed_snapshot.jpg + approval
+    # token live inside the per-request folder. Prevents cross-request
+    # token leakage — the bug Brent hit when Gemma dispatched Stage 2 for
+    # a new request and the gate picked up a stale GLOBAL token from a
+    # prior unrelated session (88 min old, refused). With per-request
+    # storage, a new request without a Stage 1 capture has no token to
+    # find, so the gate refuses with a clearer signal.
+    if request_id and out_dir is None:
+        try:
+            import u1_request
+            out_dir = u1_request.ensure_request_dir(request_id)
+        except Exception:
+            out_dir = get_data_dir()
     out_dir = (out_dir or get_data_dir()).resolve()
     printer_filename = _normalize_filename(filename)
+    resolved_operator = _resolve_operator_for_gate(operator)
 
     status = query_state(host, port)
     blockers = preflight(status, intended_tool,
@@ -318,6 +392,16 @@ def run_gate(filename: str,
         token: str | None = None
         if snapshot['ok']:
             token = _write_approval_token(out_dir, snapshot)
+            # Phase 3b: mark the safety check satisfied. can_start() reads
+            # this when Stage 2 fires later.
+            _mark_bed_clear_photo_captured(request_id)
+            _audit_gate(request_id, 'stage1_photo_captured', resolved_operator,
+                        snapshot_path=snapshot.get('path'),
+                        approval_token=token)
+        else:
+            _audit_gate(request_id, 'stage1_photo_failed', resolved_operator,
+                        error=snapshot.get('error'),
+                        is_mock=snapshot.get('is_mock'))
         return {
             'stage': 'readiness',
             'filename': printer_filename,
@@ -347,6 +431,8 @@ def run_gate(filename: str,
     stored = _read_approval_token(out_dir)
     token_ok, token_reason = _approval_token_valid(stored, approval_token)
     if not token_ok:
+        _audit_gate(request_id, 'stage2_token_invalid', resolved_operator,
+                    reason=token_reason)
         return {
             'stage': 'start_attempt',
             'filename': printer_filename,
@@ -356,6 +442,8 @@ def run_gate(filename: str,
             'reason': f'approval token invalid: {token_reason}',
         }
     if blockers:
+        _audit_gate(request_id, 'stage2_preflight_blocked', resolved_operator,
+                    blockers=blockers)
         return {
             'stage': 'start_attempt',
             'filename': printer_filename,
@@ -364,6 +452,56 @@ def run_gate(filename: str,
             'ok': False, 'started': False,
             'reason': 'preflight blockers present at Stage 2',
         }
+
+    # Phase 3b: the moat. Before any printer-affecting action, verify the
+    # request's plan hasn't drifted since the operator reviewed the
+    # readiness card. can_start() reads the audit log + request.json.
+    # If no request_id was passed, we cannot apply the moat — the gate
+    # refuses rather than starting unguarded.
+    if not request_id:
+        _audit_gate(None, 'start_safety_check_failed', resolved_operator,
+                    reason='no --request-id passed to Stage 2')
+        return {
+            'stage': 'start_attempt',
+            'filename': printer_filename,
+            'blockers': blockers,
+            'snapshot': None,
+            'ok': False, 'started': False,
+            'reason': ('Stage 2 requires --request-id to verify plan stability. '
+                       'Re-run with --request-id <id>.'),
+        }
+    try:
+        import u1_request
+        import u1_safety
+        req = u1_request.read_request(request_id)
+    except Exception as exc:
+        _audit_gate(request_id, 'start_safety_check_failed', resolved_operator,
+                    reason=f'request.json unreadable: {exc}')
+        return {
+            'stage': 'start_attempt',
+            'filename': printer_filename,
+            'blockers': blockers,
+            'snapshot': None,
+            'ok': False, 'started': False,
+            'reason': f'safety check: request.json unreadable for {request_id}',
+        }
+    allowed, reason = u1_safety.can_start(req)
+    if not allowed:
+        _audit_gate(request_id, 'start_safety_check_failed', resolved_operator,
+                    reason=reason,
+                    current_revision=(req or {}).get('request_revision'),
+                    current_gcode_hash=(req or {}).get('gcode_hash'))
+        return {
+            'stage': 'start_attempt',
+            'filename': printer_filename,
+            'blockers': blockers,
+            'snapshot': None,
+            'ok': False, 'started': False,
+            'reason': f'safety check failed: {reason}',
+        }
+    _audit_gate(request_id, 'start_safety_check_passed', resolved_operator,
+                request_revision=(req or {}).get('request_revision'),
+                gcode_hash=(req or {}).get('gcode_hash'))
     # Sanity-only fresh capture so we don't fire blind into a state that
     # changed during the operator's review. We do NOT show this photo —
     # the operator already approved Stage 1's. We just refuse if this
@@ -379,6 +517,13 @@ def run_gate(filename: str,
             and not sanity_snapshot.get('ok'))
     )
     if sanity_blocks_start:
+        # M5 fix (cold review 2026-06-27): audit the sanity-capture refusal
+        # so the forensic timeline reflects WHY the start was blocked
+        # between start_safety_check_passed and 'nothing happened'.
+        _audit_gate(request_id, 'stage2_sanity_capture_failed', resolved_operator,
+                    error=sanity_snapshot.get('error'),
+                    is_mock=sanity_snapshot.get('is_mock'),
+                    brightness_check=sanity_snapshot.get('brightness_check'))
         return {
             'stage': 'start_attempt',
             'filename': printer_filename,
@@ -392,6 +537,21 @@ def run_gate(filename: str,
             ),
         }
     resp = start_func(host, port, printer_filename)
+    # Phase 3b: record the start approval as granted now that we've actually
+    # commanded the printer. record_approval binds the approval to the
+    # current revision + gcode_hash; can_start() on a future invocation
+    # would see this and verify drift against it. Also audit the start.
+    try:
+        import u1_request
+        u1_request.record_approval(request_id, kind='start',
+                                   operator=resolved_operator,
+                                   gcode_hash=(req or {}).get('gcode_hash'))
+    except Exception:
+        pass
+    _audit_gate(request_id, 'print_started', resolved_operator,
+                printer_storage_filename=printer_filename,
+                request_revision=(req or {}).get('request_revision'),
+                gcode_hash=(req or {}).get('gcode_hash'))
     return {
         'stage': 'start_attempt',
         'filename': printer_filename,
@@ -416,12 +576,23 @@ def main(argv=None):
     ap.add_argument('--requested-material', help='material to verify on intended_tool, e.g. PETG')
     ap.add_argument('--out-dir', type=Path, default=None,
                     help='Where to write the bed snapshot + approval token. Defaults to U1 data dir.')
+    ap.add_argument('--request-id', type=str, default=None,
+                    help='v2.0 Phase 3b: the Print Request Object ID this Stage is acting on. '
+                         'Stage 2 REQUIRES this — without it, can_start() has no request to verify '
+                         'and the gate refuses. Stage 1 uses it to stamp safety.bed_clear_photo_captured '
+                         'on the matching request.json. SKILL.md fills it in from the readiness card.')
+    ap.add_argument('--operator', type=str, default=None,
+                    help='v2.0 Phase 3a: operator identity for audit + approval rows '
+                         '(e.g. "telegram:brent"). Falls back to env U1_OPERATOR, '
+                         'then "unknown:gate".')
     a = ap.parse_args(argv)
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
                    requested_material=a.requested_material,
                    approval_token=a.approval_token,
-                   out_dir=a.out_dir)
+                   out_dir=a.out_dir,
+                   request_id=a.request_id,
+                   operator=a.operator)
     print(json.dumps(res, indent=2))
     return 0
 

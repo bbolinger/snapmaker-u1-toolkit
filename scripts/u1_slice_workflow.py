@@ -129,6 +129,46 @@ from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
 import u1_request
+import u1_audit
+
+
+def _resolve_operator(args) -> str:
+    """v3a: resolve operator identity for audit + approval rows.
+
+    Priority: --operator CLI flag > U1_OPERATOR env > 'unknown:cli'.
+    Never returns None or empty string. Operator strings are short labels
+    like 'telegram:brent' / 'cli:local' / 'harness:gemma'.
+
+    Live harness regression 2026-06-28: U1_OPERATOR is loaded from
+    /opt/data/.env via u1_config's lazy dotenv loader. That loader fires
+    on the first get_data_dir() call — which on the --fresh path runs
+    AFTER _resolve_operator. Force the dotenv load here so env-based
+    operator identity always lands."""
+    cli = getattr(args, 'operator', None)
+    if cli:
+        return str(cli).strip()
+    try:
+        import u1_config
+        u1_config._load_dotenv_if_present()
+    except Exception:
+        pass
+    env = os.environ.get('U1_OPERATOR', '').strip()
+    if env:
+        return env
+    return 'unknown:cli'
+
+
+def _audit(request_id: str, event: str, operator: str, **details):
+    """Wrapper around u1_audit.append that never raises out of the workflow.
+
+    Audit is observability — a failed disk write here must not break the
+    slice. (Same try/except pattern used for the H5 write_request sites in
+    Phase 2.) Returns the written record or None on failure."""
+    try:
+        return u1_audit.append(request_id, event, operator=operator, **details)
+    except Exception:
+        return None
+
 
 DEFAULT_OUT_BASE=ROOT/'artifacts'/'slice_workflow'
 
@@ -1436,6 +1476,10 @@ def run_workflow(args)->dict[str,Any]:
     # on-disk request, no recovery lookup needed on subsequent turns.
     args.request_id = request_id
 
+    # v3a: resolve operator identity. Used for every audit row + every
+    # approval record on this run.
+    operator = _resolve_operator(args)
+
     if args.out_dir:
         # argparse already returns Path via type=Path; no re-wrap needed (L6).
         out_dir = args.out_dir.resolve()
@@ -1457,6 +1501,10 @@ def run_workflow(args)->dict[str,Any]:
         'model_path': str(model),
         'model_hash': u1_request.compute_model_hash(model) if model.exists() else None,
         'out_dir': str(out_dir),
+        # v3a: stamp the operator on every write so the operator field is
+        # always current (catches the case where one invocation came from
+        # CLI and the next from Telegram against the same request_id).
+        'operator': operator,
     }
     # Merge any CLI args the operator has already answered so the request
     # reflects the latest decision state.
@@ -1488,6 +1536,12 @@ def run_workflow(args)->dict[str,Any]:
             'note': (f'Recovered in-flight request {request_id} from disk. '
                      f'Pre-existing answers: {_resumed_answers}'),
         }, args.json_events)
+        # v3a: forensic record of the resume (separate from the chatty
+        # agent-facing emit). Captures which phase we resumed from + the
+        # operator who triggered the resume.
+        _audit(request_id, 'request_resumed', operator,
+               resumed_from=_existing.get('phase', 'unknown'),
+               request_revision=_existing.get('request_revision', 1))
         # Backfill the args with the resumed answers so the rest of the
         # workflow walks through to the next unanswered prompt.
         for fld in ('orient', 'tool', 'material', 'profile', 'supports', 'upload_decision', 'nozzle'):
@@ -1523,6 +1577,23 @@ def run_workflow(args)->dict[str,Any]:
                                'Run Stage 1 to capture a real bed photo + approval token.'),
                     'command': _existing['start_gate_stage1_command'],
                 }, args.json_events)
+            # v3a: forensic record that the workflow short-circuited via
+            # the phase-aware resume (skipped Upload?/collision prompts).
+            # MUST include gcode_hash so can_start()'s drift check has a
+            # reviewed_gcode_hash to compare against. Live bug 2026-06-28:
+            # without this, can_start saw None on the audit row and
+            # rejected the start as "gcode regenerated since operator
+            # reviewed" — even though nothing had drifted; the audit row
+            # was just incomplete.
+            _existing_gcode_hash = _existing.get('gcode_hash')
+            if not _existing_gcode_hash:
+                # Fall back to the saved readiness_card_event's gcode_hash
+                # (set at the original readiness_card emit).
+                _existing_gcode_hash = (_existing.get('readiness_card_event') or {}).get('gcode_hash')
+            _audit(request_id, 'readiness_card_replayed_from_resume', operator,
+                   printer_storage_filename=_existing['printer_storage_filename'],
+                   request_revision=_existing.get('request_revision', 1),
+                   gcode_hash=_existing_gcode_hash)
             return {
                 'phase': 'awaiting_start_approval',
                 'request_id': request_id,
@@ -1538,6 +1609,11 @@ def run_workflow(args)->dict[str,Any]:
             'out_dir': str(out_dir),
             'note': f'New print request {request_id} created for {model.name}.',
         }, args.json_events)
+        # v3a: forensic record of new-request creation. model_hash is the
+        # cross-model recovery key (see Phase 2 content-hash design).
+        _audit(request_id, 'request_created', operator,
+               model_file=model.name,
+               model_hash=_request_fields.get('model_hash'))
 
     # === ANALYSIS PHASE ===
     # Always create the source-as-authored STL (no rotation applied).
@@ -2071,18 +2147,25 @@ def run_workflow(args)->dict[str,Any]:
     # context loss doesn't re-run the slice. If the agent loses context
     # AFTER COMMIT but BEFORE Stage 1, request.json knows the slice
     # finished + carries the gcode hash for the readiness card to recover.
+    _sliced_gcode_hash = u1_request.compute_model_hash(gcode) if gcode.exists() else None
     try:
         u1_request.write_request(
             request_id,
             phase='sliced',
             gcode_path=str(gcode),
-            gcode_hash=u1_request.compute_model_hash(gcode) if gcode.exists() else None,
+            gcode_hash=_sliced_gcode_hash,
             estimated_time=slice_res.get('time'),
             estimated_filament_g=slice_res.get('weight_g'),
             preview_image=str(preview) if preview.exists() else None,
         )
     except Exception:
         pass  # phase tracking is observability — never break the slice on disk-write failure
+    # v3a: forensic record of slicing completion. gcode_hash is what binds
+    # an approval to this exact output via can_start() in Phase 3b.
+    _audit(request_id, 'slicing_completed', operator,
+           gcode_hash=_sliced_gcode_hash,
+           estimated_time=slice_res.get('time'),
+           estimated_filament_g=slice_res.get('weight_g'))
     if args.cancel:
         emit({'stage':'cancelled'}, args.json_events); return {'cancelled': True, 'out_dir': str(out_dir)}
     if args.upload_only or args.yes:
@@ -2107,6 +2190,13 @@ def run_workflow(args)->dict[str,Any]:
             )
         except Exception:
             pass
+        # v3a: forensic record of upload. uploaded_filename is the printer
+        # storage filename Stage 2 will reference; capturing it here ties
+        # the audit trail to whatever Moonraker actually accepted.
+        _audit(request_id, 'upload_completed', operator,
+               uploaded_filename=up.get('uploaded_filename'),
+               moonraker_upload_ok=up.get('moonraker_upload_ok'),
+               dry_run=up.get('dry_run', False))
         # If the helper detected a collision and no resolution was supplied,
         # emit a structured need_input prompt + exit so the agent surfaces it.
         if up.get('cancelled'):
@@ -2171,9 +2261,23 @@ def run_workflow(args)->dict[str,Any]:
         _printer_filename = up.get('uploaded_filename') or gcode.name
         _tool_idx = slice_res.get('tool_idx', 0)
         _start_extruder = 'extruder' if _tool_idx == 0 else f'extruder{_tool_idx}'
+        # Phase 3b: pass --request-id on every gate invocation so Stage 1 can
+        # stamp safety.bed_clear_photo_captured and Stage 2 can call
+        # can_start() to verify plan stability. SKILL.md doesn't need to
+        # assemble it from chat memory — it's baked into the command the
+        # workflow emits.
+        #
+        # NB: we deliberately do NOT bake --operator here. The gate resolves
+        # operator from U1_OPERATOR env at execution time. Live harness
+        # regression 2026-06-28: when phase-aware-skip replays an OLD
+        # readiness_card_event from disk, the baked-in --operator from
+        # whenever the card was first written wins over current state. The
+        # env-resolved path is forward-compatible across replays + container
+        # restarts.
         _stage1_cmd = (
             f'python3 /opt/data/scripts/u1_print_start_gate.py {_printer_filename} '
-            f'--intended-tool {_start_extruder} --requested-material {_shell_quote(str(material))}'
+            f'--intended-tool {_start_extruder} --requested-material {_shell_quote(str(material))} '
+            f'--request-id {request_id}'
         )
         # Build the readiness_card payload once, then emit + persist together
         # so the phase-aware resume short-circuit upstream has the same
@@ -2252,6 +2356,19 @@ def run_workflow(args)->dict[str,Any]:
             )
         except Exception:
             pass
+        # v3a: forensic record that the workflow has reached its terminal
+        # state (either start-approval-ready or upload-only complete). This
+        # is the audit boundary BEFORE Stage 2 dispatch — anything Stage 2
+        # does in Phase 3b lands after this row.
+        # H6 fix (cold review 2026-06-27): read request.json ONCE — the prior
+        # version called read_request twice inline in the kwarg expression.
+        _post_readiness_req = u1_request.read_request(request_id) or {}
+        _audit(request_id,
+               'readiness_card_emitted' if _persist_phase == 'awaiting_start_approval' else 'upload_only_complete',
+               operator,
+               printer_storage_filename=_printer_filename,
+               gcode_hash=_sliced_gcode_hash,
+               request_revision=_post_readiness_req.get('request_revision'))
     return {'out_dir': str(out_dir), 'oriented_stl': str(chosen_stl), 'source_render': str(source_render), 'preview': str(preview), 'gcode': str(gcode), 'slice': slice_res, 'summary_file': str(summary_path)}
 
 def main(argv=None)->int:
@@ -2293,6 +2410,11 @@ def main(argv=None)->int:
     ap.add_argument('--fresh', action='store_true',
                     help='v2.0 Phase 2: ignore any prior in-flight request for this STL and start a brand-new one. '
                          'Useful when operator wants to restart the slicing decision from scratch.')
+    ap.add_argument('--operator', type=str, default=None,
+                    help='v2.0 Phase 3a: operator identity for audit/approval rows '
+                         '(e.g. "telegram:brent", "cli:local", "harness:gemma"). '
+                         'Falls back to env var U1_OPERATOR. When neither is set, '
+                         'audit rows stamp "unknown:<source>" where source is inferred from invocation.')
     ap.add_argument('--cancel', action='store_true')
     a=ap.parse_args(argv); res=run_workflow(a)
     if not a.json_events: print(json.dumps(res, indent=2))

@@ -36,7 +36,7 @@ When you pick this up cold: start by reading [`docs/DESIGN-CONTRACT.md`](DESIGN-
 
 ## Phase 2 — Print Request Object
 
-**Status:** 🔜 NEXT
+**Status:** ✅ DONE (commit `06a4972` on `v2.0-dev`, 2026-06-27 — live cross-model validated)
 
 **Goal:** Every print job becomes a first-class entity with a stable, human-readable `request_id`. Approval flows attach to that ID, not to a vague "yes." Solves the v1.7 implicit-state-cache problem more cleanly, AND lays the foundation for audit logging, capability modes, and the Hermes approval pattern.
 
@@ -125,44 +125,98 @@ LOWs got folded into the same commit, two are explicitly deferred below):
 
 ---
 
-## Phase 3 — Per-request `audit.jsonl`
+## Phase 3 — Audit log + safety-gate moat (LEAN)
 
-**Status:** 📋 QUEUED
+**Status:** 🔜 NEXT
 
-**Goal:** Defensible record of every operator-side action: who requested, what was selected, what checks passed, who approved, what actually happened. Makes the project easy to explain to skeptical users.
+**Goal:** Add the safety boundary around physical print-start actions. Per-request `audit.jsonl` for forensic evidence; `can_start()` precondition function as the single source of truth for "is this safe to dispatch"; approval blocks carrying `approved_revision` + `approved_gcode_hash` so the binding is documented. **No cosmetic churn, no Phase 4 leak, no defensive code for non-existent attack surfaces.**
 
-**Deliverables:**
-- `requests/<request_id>/audit.jsonl` — one line per event, append-only, never compressed
-- New event vocabulary (one per `event` field):
-  ```json
-  {"event":"request_created","request_id":"u1_...","model_hash":"sha256:...","profile":"..."}
-  {"event":"orientation_selected","request_id":"u1_...","orientation":"asauthored","reason":"orca_clean"}
-  {"event":"tool_material_checked","request_id":"u1_...","tool":"T1","material":"PETG","loaded_match":true}
-  {"event":"preview_generated","request_id":"u1_...","path":"requests/u1_.../preview.png"}
-  {"event":"bed_photo_captured","request_id":"u1_...","path":"requests/u1_.../bed.jpg"}
-  {"event":"operator_approved_upload","request_id":"u1_...","operator":"telegram:brent"}
-  {"event":"uploaded_only","request_id":"u1_...","gcode_hash":"sha256:..."}
-  {"event":"operator_approved_start","request_id":"u1_...","operator":"telegram:brent"}
-  {"event":"print_started","request_id":"u1_...","printer_job_id":"..."}
-  {"event":"first_layer_photo","request_id":"u1_...","path":"..."}
-  {"event":"completed","request_id":"u1_..."}
-  ```
-- Helpers `u1_audit.append(request_id, event_dict)` — atomic write (mkstemp + os.replace), survives concurrent crons
-- CLI tool to query `requests/*/audit.jsonl` for operator activity summaries
+**Design constraint (load-bearing):** This toolkit serves ONE operator (Brent) via Hermes routed to a small local LLM (gemma4-26b-64k). Every additional `request.json` field = more context burn for Gemma. Every extra HERMES.md rule = more chance Gemma drops it. Phase 3 is scoped at the minimum that delivers the safety moat without cosmetic tax. (See [feedback_lean_for_single_op_and_gemma in dev memory.)
 
-**Done when:**
-- Every printer-affecting action has an audit row
-- `audit.jsonl` survives the workflow crashing mid-print (atomic writes verified)
-- A new operator can read a finished request's audit.jsonl and reconstruct what happened
-- Test: forcibly kill the workflow mid-slice → no truncated audit lines
+This phase reached its lean shape on 2026-06-27 after a planning session weighed an expanded spec (schema versioning + migration framework + phase→status rename + folder substructure + capability_mode + auto-invalidation) against the project's single-operator + small-LLM constraints. Six items earned their cost; four were rejected as cosmetic or premature.
 
-**Depends on:** Phase 2 (request folder structure must exist).
+**Scope (6 deliverables — the lean cut):**
 
-**Cross-links:** [`scripts/u1_print_history.py`](../scripts/u1_print_history.py) (existing per-print history — distinct from audit, different purpose).
+1. **`scripts/u1_audit.py`** — `append(request_id, event_dict)` using `O_APPEND + fcntl.flock` (atomic line write, multi-process safe); `read(request_id, since=None, until=None)` chronological iterator; `fold(request_id) -> dict` state reconstructor.
+2. **`scripts/u1_safety.py`** — `can_start(request) -> (bool, reason)` precondition. Single source of truth. Every Stage 2 dispatch routes through it. Checks: status allows start, approval present, `approved_revision` matches current `request_revision`, `approved_gcode_hash` matches current `gcode_hash`, bed_clear photo captured if required.
+3. **`u1_request.py` extensions:**
+   - `schema_version: 1` field (one line of JSON, opens door for future revs without forcing a migration framework now)
+   - `request_revision` integer + `_bump_revision_if_changed(request_id, new_fields)` helper that bumps on plan-affecting changes (model / orient / scale / profile / material / tool / supports / new gcode hash)
+   - `approvals.upload` + `approvals.start` blocks: `{approved, approved_by, approved_at, approved_revision, approved_gcode_hash}` per approval
+   - `safety.bed_clear_check_required` + `safety.bed_clear_photo_captured` (just those two — `capability_mode` is Phase 4)
+   - Top-level `operator` field (just the string; no full `source` block with `source_type` + `original_filename`)
+4. **Workflow integration:**
+   - `--operator <id>` CLI flag + `U1_OPERATOR` env fallback (CLI wins) → workflow stamps `operator` field
+   - Audit emits at canonical decision points (request_created/resumed, orientation_selected, profile_selected, slicing_completed, bed_photo_captured, approval_recorded, upload_completed, print_dispatched)
+   - Revision bumps automatically when plan fields change (via helper)
+5. **Stage 2 (`u1_print_start_gate.py`) routes through `can_start()`** — audits `start_safety_check_passed` / `start_safety_check_failed` with reason. The existing token/preflight/sanity-capture checks remain (they're orthogonal); `can_start()` adds the revision/hash binding check.
+6. **One-shot migrator: `scripts/migrate_v0_to_v1.py`** — run-once script (not in-code framework). Walks existing requests; sets `schema_version=1`; converts `phase` field name in-place IF present (cheap rename without back-compat shim). Resilient (idempotent, safe to re-run). Documented in HERMES.md as "run after upgrade."
+
+**What's explicitly DROPPED from the expanded spec (and why):**
+
+| Dropped item | Why |
+|---|---|
+| `phase` → `status` rename with back-compat shim | Cosmetic. Costs every callsite + a shim that lives forever. The one-shot migrator does an in-place rename instead; no shim. Tests use new name; old name is gone after migration. |
+| Folder substructure (`input/working/output/images/`) | Cosmetic. Current flat layout zips fine. Adds path-management complexity + a migration story without a real burn. |
+| `capability_mode` field | Phase 4. Adding the field with nothing reading it is YAGNI. Phase 4 will add field + enforcement together. |
+| Auto-invalidation of approvals on revision/hash change (the `approval_invalidated` event) | Defends a flow that doesn't exist. Today no current code path mutates `request_revision` or `gcode_hash` after an approval lands. Build the data (the binding fields), let `can_start()` reject mismatches, add the auto-invalidation event when a real plan-mutation flow ships. |
+| In-code schema migration framework (`schema_migration_started` events, .bak files, conservative-defaults algorithm baked into every read) | Heavy machinery for a one-time event. One-shot migrator script is simpler, easier to audit, easier to skip when not needed. |
+| `source` block with `submitted_by` / `source_type` / `original_filename` | Single-operator project. Just `operator` as a top-level string is enough. Sub-structure is YAGNI. |
+| Audit-first-then-state as a refactor sweep | Documented as a guideline in HERMES.md. New code follows it. Existing Phase 2 callsites migrate opportunistically, not in a forced sweep. |
+
+**CLI surface (Fork B = show-only for v2.0.0):**
+- `python3 scripts/u1_audit.py show <request_id>` — chronological timeline.
+- `query`, `stats`, `prune` deferred to v2.1.
+
+**Done when (acceptance criteria — must all pass before commit):**
+
+Audit:
+- Each request has its own `audit.jsonl`
+- Writes use `O_APPEND + flock` (verified by concurrent-process test)
+- Canonical decision points emit audit lines
+- `u1_audit.py show <request_id>` displays the timeline
+
+Approval binding (data structure only — no auto-invalidation):
+- Upload + start approvals each store `approved_revision`, `approved_gcode_hash`, `approved_by`, `approved_at`
+- Revision bumps automatically on plan-affecting changes via `_bump_revision_if_changed`
+
+Start gate:
+- `can_start(request)` exists in `u1_safety.py`
+- Every Stage 2 start dispatch routes through it
+- Rejects: missing approval, mismatched revision, mismatched gcode_hash, missing bed photo (when required)
+- Pass + fail both audited as `start_safety_check_passed` / `start_safety_check_failed`
+
+Migration:
+- `scripts/migrate_v0_to_v1.py` rewrites existing Phase 2 requests in place (rename `phase` → `status`, add `schema_version=1`, add empty `approvals` block, add `safety` block with defaults). Idempotent.
+- New writes include `schema_version`, `request_revision`, `status`, `approvals`, `safety`, `operator`
+
+**Required tests (5 acceptance + sub-tests):**
+1. Approval present but `request_revision` bumped → `can_start()` returns `False` with "different request revision" reason.
+2. Approval present but `gcode_hash` differs from `approved_gcode_hash` → `can_start()` returns `False` with "different G-code" reason.
+3. Stage 2 dispatch with no approval → `can_start()` rejects; printer_start never called; `start_safety_check_failed` audited.
+4. Migrator script: pre-Phase-3 request.json (with `phase`, no `status`/`approvals`/`safety`) loads, migrator rewrites it idempotently, second run is a no-op.
+5. `u1_audit.py show` outputs chronological events with seq/ts/event/operator/details.
+
+Plus sub-tests: audit concurrency (multiprocessing fixture, two processes appending simultaneously); revision bump helper covers all plan-affecting fields; `can_start()` matrix covers every reject branch.
+
+**Depends on:** Phase 2 (request folder + content-hash recovery exist).
+
+**Cross-links:**
+- [`scripts/u1_print_history.py`](../scripts/u1_print_history.py) — existing per-print lifetime stats (distinct from audit; aggregate, not per-request).
+- [`scripts/u1_print_start_gate.py`](../scripts/u1_print_start_gate.py) — Stage 2 dispatcher rerouted through `can_start()`.
 
 **Notes:**
-- `operator` field: derive from Hermes session metadata when available, fall back to `cli` for direct-invocation. Don't fabricate — if unknown, use `unknown:<source>`.
-- Audit is APPEND-ONLY at the application level. Use file locks if multiple processes might append concurrently (cron + manual at the same time).
+- `operator` field never fabricated. When unknown, write `unknown:<source>` where source = `cli` / `hermes` / `harness`.
+- Audit log is APPEND-ONLY at the application level; flock guards multi-process tear.
+- The pattern is: `load → check → audit pass/fail → dispatch → audit result → update request.json`. No start command bypasses the check, including direct CLI use.
+
+**Why the lean shape:** The expanded spec read enterprise-shape — schema-migration frameworks, folder reorganization, field renames, defensive auto-invalidation for a flow that doesn't exist. For ONE operator + Gemma-4 downstream, every additional schema field is token burn for the small model, and every cosmetic refactor is a chance to drop something. The safety moat (`can_start()` + revision/hash binding + audit) is the win; everything else is gold-plating that adds tax without solving a problem Brent has actually hit.
+
+**Sub-phase split for commits (Option 3):**
+- **Phase 3a — recording layer** (audit + schema fields + migrator): `u1_audit.py`, schema_version/request_revision/approvals/safety fields, `--operator` flag, migrator script, audit emits at canonical points, tests for audit/migrate
+- **Phase 3b — enforcement layer** (the moat): `u1_safety.py`, `can_start()`, Stage 2 routing through it, `start_safety_check_passed/failed` audit events, HERMES.md Rule 8, tests for can_start matrix + Stage-2-bypass-attempt
+
+Splitting at the recording/enforcement seam means 3a can ship and be reviewed independently. 3b builds on 3a's data shape.
 
 ---
 
