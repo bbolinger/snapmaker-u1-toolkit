@@ -97,8 +97,31 @@ When you pick this up cold: start by reading [`docs/DESIGN-CONTRACT.md`](DESIGN-
 **Notes / open questions:**
 - Does the existing `<out_dir>/events.jsonl` migrate, or does the workflow write to BOTH `<out_dir>` and `requests/<id>/`? Suggest: migrate fully — out_dir becomes a synonym for `requests/<id>/`. Simpler.
 - Does the slice/collision short-circuit move into the request folder? Probably yes — `requests/<id>/slice_res.json`.
-- Request_id format: my pick is `u1_YYYY_MMDD_<6-hex>` — short, sortable, includes printer model. Keep open for review.
+- Request_id format: `u1_YYYY_MMDD_<6-hex>` — short, sortable, includes printer model. **UTC** timestamp (not local) so the sortability claim holds across operator timezones.
 - Concurrent operators on same Hermes instance: this design solves it by `request_id` being unique. The earlier "session-id keying" concern dissolves — every operator gets unique request IDs.
+
+**Cold-review punch-list** (two rounds during Phase 2 build, plus a third
+sweep before the v2.0-dev commit. The third sweep — 2026-06-27 — found two
+MED issues that landed before commit and seven LOW items; the safe-to-land
+LOWs got folded into the same commit, two are explicitly deferred below):
+
+| Item | Why deferred / disposition | When to revisit |
+|---|---|---|
+| **L1** — `_cli_show` used `__import__('sys').stderr` | Cosmetic; fixed during Phase 2 build (`import sys` at module top) | — DONE |
+| **L2** — `is_request_id` rejects uppercase hex | `secrets.token_hex` is guaranteed lowercase per Python docs; the asymmetry is a footgun if another path ever generates IDs differently. Add a normalization step OR a `is_request_id_loose()` variant when a real second generator appears. | Phase 5 or later |
+| **L3** — No `delete_request` / cleanup helper | Request directories accumulate forever. The retrieval path's TTL stops resume but not disk growth. Build a cleanup CLI (`u1_request.py prune --older-than 30d`) when audit log lands. **L12 (--fresh orphans) rolls into this.** | Phase 3 (audit lands first; cleanup CLI rides with it) |
+| **L4** — `find_recent_request_for_model` is O(n) over all requests | Fine for hundreds of entries. Pair with periodic cleanup or shard by date once a deployment has 10k+ requests. | Phase 3 (alongside the cleanup CLI) |
+| **L5** — Test fixture monkeypatches module attribute | Pattern works for the helper test file because nothing else imports `u1_request._data_dir`. As Phase 2 progresses and the workflow + harness import the module, audit whether any test could leak production data-dir state. | Phase 2 workflow integration (re-audit before commit) |
+| **L6** — `Path(args.out_dir).resolve()` redundant `Path()` wrap | Fixed in third sweep — argparse already returns Path, so the wrap is gone. | — DONE |
+| **L7** — Conftest `_isolated_data_dir` is `autouse=True` for every test | Polluting tests that don't import `u1_config` at all with an env var set. Cheap; scope it to specific test files if it ever causes a real issue. | Phase 5 or later (only if it bites) |
+| **L8** — `_cli_show` raises uncaught `ValueError` on bad ID | Fixed in third sweep — try/except + non-zero exit + stderr message. | — DONE |
+| **L9** — Read-merge-write race in `write_request` between concurrent invocations | NOT FIXED in this sweep — locking a JSON file races with `os.replace`; sidecar lock is cleaner but over-engineering for a code path with no current concurrent writers. **Becomes real when the audit-log writer joins in Phase 3** — both will touch `request.json`. Solve then with a fcntl-based sidecar lock OR by switching `request.json` to append-only event log + reduce-to-snapshot. | Phase 3 (audit-log writer adds the concurrency) |
+| **L10** — f-string with embedded dict comprehension in `request_resumed` note | Fixed in third sweep — hoisted to a named local for readability. | — DONE |
+| **L11** — `_cli_list` sorted by filesystem `mtime` not `updated_at` | Fixed in third sweep — uses `req['updated_at']` first, falls back to `mtime`. Now consistent with `find_recent_request_for_model`'s ordering. | — DONE |
+| **L12** — `--fresh` accumulates orphan request directories | NOT FIXED in this sweep — needs a policy decision (delete-on-supersede vs. mark `superseded` with retention) that conflicts with the standing "preserve historical data" rule. Rolls into **L3** cleanup CLI. | Phase 3 (with L3) |
+| **L13** — Rule 6 ("don't re-extract") is aspirational Hermes-side guidance | Not a fix target — the workflow already defends via content-hash recovery regardless of Hermes' compliance. Verified live 2026-06-27. | — N/A |
+| **MED-1** — `ensure_request_dir` self-heal only chowned the immediate request_id dir, missing the `requests/` parent it just created | Fixed in third sweep — chown walks up from new dir, bounded to `_data_dir()` ceiling (test verifies it doesn't escape the data_dir subtree). | — DONE |
+| **MED-2** — Initial `write_request` clobbered `phase` on resume, overwriting forward progress with `analysis` | Fixed in third sweep — guard on `_existing.get('phase')` preserves monotone forward progress. Verified the phase-aware skip depends on this. | — DONE |
 
 ---
 

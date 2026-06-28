@@ -16,6 +16,17 @@ from unittest.mock import patch
 
 import pytest
 
+
+# v2.0 Phase 2: every test gets a fresh SNAPMAKER_U1_DATA_DIR pointing at
+# a tmp dir, so request.json files from one test don't leak into another
+# (and don't accidentally trigger find_recent_request_for_model hits in
+# integration tests). u1_config.get_data_dir reads this env var first.
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path, monkeypatch):
+    """Per-test data dir so requests/ + state files are sandboxed."""
+    monkeypatch.setenv('SNAPMAKER_U1_DATA_DIR', str(tmp_path / '_data_dir'))
+    yield
+
 # Real-Orca test harness (added 2026-06-26). When pytest runs from
 # claude-code-simple (Alpine/musl), the bundled Orca appimage can't execute
 # directly. Tests marked with @pytest.mark.real_orca instead use the shim
