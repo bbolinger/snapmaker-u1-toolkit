@@ -12,9 +12,9 @@ goes to the agent). `audit.jsonl` is permanent and trimmable only via
 intentional retention policy — never rewritten in the normal path.
 
 Concurrency: `append()` uses `O_APPEND + fcntl.flock` so two processes
-hitting the same request_id interleave cleanly. Each call writes ONE line
-≤ PIPE_BUF, which POSIX guarantees as atomic at the kernel level. The
-flock is belt-and-suspenders.
+hitting the same request_id interleave cleanly. The whole count→write
+sequence runs under the exclusive lock, so `seq` is monotonic and no
+two writers can interleave bytes mid-line.
 
 Public surface:
   append(request_id, event, *, operator=None, **details) -> dict
@@ -60,9 +60,9 @@ def append(request_id: str, event: str, *, operator: str | None = None, **detail
     line as a dict so the caller can mirror it (e.g. into the workflow's
     own events.jsonl) without re-serializing.
 
-    Atomic line write via `O_APPEND + fcntl.flock`. Line length is bounded
-    by callers (no embedded blobs); single write() ≤ PIPE_BUF means the OS
-    won't interleave with another writer's bytes.
+    Atomic line write via `O_APPEND + fcntl.flock` — the lock spans
+    the count→write so seq stays monotonic and bytes from concurrent
+    writers don't interleave.
     """
     from u1_request import ensure_request_dir  # local import to avoid cycle
     ensure_request_dir(request_id)
@@ -101,9 +101,8 @@ def append(request_id: str, event: str, *, operator: str | None = None, **detail
             if k in record:
                 ordered[k] = record[k]
         line = json.dumps(ordered, separators=(',', ':'), default=str) + '\n'
-        # Single write call — atomic at the OS level for line ≤ PIPE_BUF (4 KB on Linux).
-        # If a caller passes a multi-megabyte blob via details, this guarantee fails;
-        # the caller's responsibility to keep entries small.
+        # Write happens under the exclusive flock; concurrent writers
+        # serialize cleanly and seq stays monotonic.
         os.write(fd, line.encode('utf-8'))
     finally:
         try:

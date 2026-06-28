@@ -22,7 +22,7 @@ A toolkit + workflow that turns "I have an STL, slice it for my U1" into a stage
 6. **Upload** to the U1's Moonraker storage with `print=false` (file lands; printer does NOT start)
 7. **Bed-clear photo** captured fresh by the U1's onboard camera, surfaced to the operator
 8. **Explicit operator approval** — yes/no on the real bed photo
-9. **Start** — only after approval, only via a token handed off from the photo step (5-min TTL)
+9. **Start** — only after approval, only via a token handed off from the photo step (30-min TTL)
 10. **Monitor** — first-layer photo, last-layer check, completion
 
 Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
@@ -152,8 +152,8 @@ Where the toolkit is going:
 - ✅ **v2.0 — Safe AI Print Operator** (shipped) — a 9-phase reframe that turns this from "Hermes slicer for the U1" into a staged, auditable, request-driven print-operator toolkit. The full plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md). Headline pieces:
   - **Print Request Objects** — every job gets a stable `request_id` + a durable `requests/<id>/request.json` record. Approval becomes "approve start `u1_2026_0626_abc123`," not vague "yes."
   - **Per-request `audit.jsonl`** — who requested, what was selected, what checks passed, who approved, what actually happened.
-  - **Capability modes** — `read_only` / `upload_only` / `operator_start`. Pick the security posture per deployment.
-  - **Sandbox mode** — full workflow without hardware, for CI and demos.
+  - **Capability modes** — `read_only` / `upload_only` / `operator_start`. Pick the security posture per deployment. *(Deferred — only `operator_start` is currently used; will land when a second deployment posture appears. See [`CHANGELOG.md`](CHANGELOG.md) → Deferred.)*
+  - **Sandbox mode** — full workflow without hardware, for CI and demos. *(Deferred — existing `--no-live-material` flag + dry-run upload already cover the meaningful workflow steps without a U1. See [`CHANGELOG.md`](CHANGELOG.md) → Deferred.)*
   - **JSON event contract** — formalize the event stream so any frontend (Telegram, web UI, MCP server) can wrap it without re-implementing.
   - v2.0 shipped as a single release after acceptance-testing end-to-end on `gemma4-26b-64k`. Full release notes in [`CHANGELOG.md`](CHANGELOG.md). Public event contract in [`docs/events.md`](docs/events.md).
 
