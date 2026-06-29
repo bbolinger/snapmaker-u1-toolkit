@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.1.0] — 2026-06-28
+
+**Multi-part / multi-plate kit support.** Send a zip of STLs (the common
+Printables shape) and the toolkit arranges them onto the bed, slices every
+plate Orca needs, uploads them all, and runs the safety gate on plate 1. The
+operator answers one consolidated form; nothing else changes about the safety
+model.
+
+### Added
+
+- **Kit ingest** ([`scripts/u1_kit.py`](scripts/u1_kit.py)). Extracts every STL
+  from a zip, measures each part's footprint, flags any too big for the bed, and
+  builds a `kit.parts[]` record. A single STL is just a kit of one.
+- **Arrange + multi-plate slice** ([`scripts/u1_arrange.py`](scripts/u1_arrange.py)).
+  One Orca call with `--arrange 1` lays all selected parts out; Orca auto-splits
+  overflow into `plate_1…plate_N.gcode`. No bin-packer or 3MF writer — Orca owns
+  layout (spike-verified on the real binary). `--allow-rotations` always on;
+  `--orient 1` when the operator picks auto-orient.
+- **Script-parsed decision form** ([`scripts/u1_form.py`](scripts/u1_form.py)).
+  After analysis the workflow emits one consolidated form (parts, orient, tool,
+  material, profile, supports, action). The operator answers in a single line,
+  any order; **the script parses + validates it — the model never interprets**.
+  The readiness card echoes the parse back for the operator to confirm before
+  the photo gate.
+- **Kit orchestrator** ([`scripts/u1_kit_workflow.py`](scripts/u1_kit_workflow.py)).
+  Drives ingest → form → arrange → upload-all → readiness → gate plate 1, reusing
+  the existing upload + Stage 1/2 gate. Plates 2…N are uploaded for the operator
+  to start from the Snapmaker app; the watchdog still photographs every plate
+  regardless of who started it.
+- **Auto-routing.** `u1_slice_workflow.py` detects a multi-STL zip and emits a
+  `kit_detected` event with the kit command — one entrypoint for the agent, the
+  script decides single-vs-kit.
+- **Skill docs** — `references/multipart-kits.md` (agent guide), HERMES.md Rule 9,
+  SKILL.md routing.
+- **Shared `build_stage1_command()`** in `u1_print_start_gate.py` so the single
+  and kit workflows can't drift on the Stage-1 command.
+
+### Changed
+
+- `request.json` gains **optional additive `kit` + `plates` fields** — NO
+  `schema_version` bump and NO migrator. Nothing branches on the version, and a
+  pre-v2.1 single-STL request keeps working untouched (absence of `plates` = one
+  plate = the top-level gcode). Leaner than the planned schema-v2 + migrator.
+- Top-level `gcode_hash` / approval / token stay bound to **plate 1**, so
+  `can_start()` and the Stage 1/2 moat validate it exactly as in v2.0 — the
+  safety core is unchanged.
+
+### Safety
+
+- Kit toolhead mapping mirrors the single workflow exactly (T0 → `extruder`,
+  T1 → `extruder1`, …) — a self-review caught and fixed a wrong-toolhead bug
+  before it shipped.
+
+### Validated
+
+- Live on the real Orca binary: 3-part kit → 1 arranged plate; 9 parts → 3
+  plates (overflow auto-split); full end-to-end (form → parse → arrange →
+  upload → readiness gating plate 1); content-hash recovery by re-send.
+- 470 unit + integration tests pass (1 skipped). The v2.0 single-STL flow and
+  its tests are untouched.
+
+---
+
 ## [2.0.1] — 2026-06-28
 
 Doc-only patch from an external review of the v2.0.0 release notes. No runtime or schema changes; no test additions; safe to apply by `git pull` alone.

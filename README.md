@@ -157,6 +157,8 @@ Where the toolkit is going:
   - **JSON event contract** — formalize the event stream so any frontend (Telegram, web UI, MCP server) can wrap it without re-implementing.
   - v2.0 shipped as a single release after acceptance-testing end-to-end on `gemma4-26b-64k`. Full release notes in [`CHANGELOG.md`](CHANGELOG.md). Public event contract in [`docs/events.md`](docs/events.md).
 
+- ✅ **v2.1 — Multi-part / multi-plate kits** (shipped) — send a zip of STLs (the common Printables shape) and the toolkit arranges them onto the bed, slices every plate Orca needs, uploads them all, and gates the start of plate 1. The operator answers one consolidated form (parts / orient / tool / material / profile / supports), which the **script** parses — the AI just relays it. Plates 2–N are uploaded for you to start from the Snapmaker app. See [`CHANGELOG.md`](CHANGELOG.md).
+
 The Snapmaker U1 is the first implementation. The safety model is portable — multi-printer support comes only after the U1 experience is solid, and only along seams that the U1 implementation has already proven.
 
 ---

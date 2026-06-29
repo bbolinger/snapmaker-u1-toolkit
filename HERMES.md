@@ -81,3 +81,7 @@ Workflow events carry `request_id`. Include it verbatim in every approval ask: "
 ## Rule 8 — Stage 2 dispatch uses the workflow's emitted command
 
 Use `start_gate_stage1_command` from the `readiness_card` event as your Stage 2 base; append `--bed-clear start --approval-token <token>`. If the gate refuses, surface its `reason` field verbatim and re-run `u1_slice_workflow.py <stl> --request-id <id>` to recover. Never assemble print-start commands from memory; never call Moonraker directly.
+
+## Rule 9 — Multi-part kits: follow `kit_detected`, relay the form verbatim
+
+A zip with several STLs is a kit. `u1_slice_workflow.py` emits `kit_detected` — tool-call its `command` (runs `u1_kit_workflow.py`). The kit form arrives as one `need_input` (`key: kit_form`): show its `form`, then relay the operator's reply VERBATIM into `--form-answers '<line>'` (the script parses it; you don't). Only **plate 1** is camera-gated; plates 2..N are uploaded for the operator to start from the Snapmaker app. Detail: `references/multipart-kits.md`.
