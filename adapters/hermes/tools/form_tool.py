@@ -133,3 +133,185 @@ registry.register(
     check_fn=check_form_requirements,
     emoji="📝",
 )
+
+
+# =============================================================================
+# Telegram class-level monkey-patch: install send_form + callback router
+# =============================================================================
+#
+# Hermes auto-imports tools/* at agent init. When THIS module is imported we
+# (a) register the LLM-facing `form` tool above, then (b) patch the
+# TelegramPlatform CLASS so any instance the gateway creates already has
+# `send_form` and a form-aware callback dispatcher. No edits to Hermes source.
+#
+# The dispatcher wraps the existing `_handle_callback_query`: if the
+# callback_data prefix belongs to our L1 renderer (t/s/a/z/n/p/e/S/X), we
+# route to `_u1_handle_form_callback`; otherwise we fall through to the
+# original (clarify, exec-approval, model picker, slash confirm).
+#
+# Failure mode is loud: if the patch can't apply (Hermes class moved, import
+# error), we log a warning and skip — `form` tool still works as text fallback.
+
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
+
+def _install_telegram_form_patch() -> None:
+    try:
+        from gateway.platforms.telegram import TelegramPlatform  # type: ignore
+    except ImportError as exc:
+        _logger.warning("u1 form patch: TelegramPlatform import failed (%s); "
+                        "form tool will only work via text fallback.", exc)
+        return
+    if getattr(TelegramPlatform, "_u1_form_patched", False):
+        return  # idempotent — already patched (re-import safe)
+    try:
+        import sys
+        # Make our vendored L1 renderer importable (lives next to this file).
+        _here = __file__
+        from pathlib import Path as _P
+        _tools_dir = str(_P(_here).resolve().parent)
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        import u1_form_telegram as _tg  # type: ignore
+    except Exception as exc:
+        _logger.warning("u1 form patch: L1 renderer import failed (%s); "
+                        "form tool will only work via text fallback.", exc)
+        return
+
+    # Per-instance state attached lazily. Keyed by form_id (uuid from gateway).
+    def _form_state(self):
+        if not hasattr(self, "_u1_form_state"):
+            self._u1_form_state = {}
+        return self._u1_form_state
+
+    def _rows_to_markup(rows):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row]
+            for row in rows
+        ])
+
+    async def _send_form(self, chat_id, form_schema, form_id, session_key, metadata=None):
+        """Render a form_schema as a sequence of inline-keyboard screens.
+
+        Stores per-form state under self._u1_form_state[form_id]. Operator taps
+        edit the message in place; on Submit we call resolve_gateway_form to
+        unblock the agent thread waiting on this form_id.
+        """
+        from telegram.constants import ParseMode  # type: ignore
+        form = _tg.new_form(form_schema)
+        screen = _tg.render_screen(form)
+        kwargs = {
+            "chat_id": int(chat_id),
+            "text": screen["text"],
+            "parse_mode": ParseMode.HTML,
+            "reply_markup": _rows_to_markup(screen["keyboard"]),
+        }
+        if hasattr(self, "_thread_kwargs_for_send"):
+            try:
+                kwargs.update(self._thread_kwargs_for_send(chat_id, None, metadata,
+                                                          reply_to_message_id=None))
+            except Exception:
+                pass
+        try:
+            msg = await self._send_message_with_thread_fallback(**kwargs) \
+                if hasattr(self, "_send_message_with_thread_fallback") \
+                else await self._bot.send_message(**kwargs)
+        except Exception as exc:
+            _logger.warning("u1 form: send failed: %s", exc)
+            from gateway.platforms.base import SendResult  # type: ignore
+            return SendResult(success=False, error=str(exc))
+        _form_state(self)[form_id] = {
+            "form": form, "schema": form_schema,
+            "session_key": session_key, "msg_id": msg.message_id,
+            "chat_id": int(chat_id),
+        }
+        from gateway.platforms.base import SendResult  # type: ignore
+        return SendResult(success=True, message_id=str(msg.message_id))
+
+    async def _u1_handle_form_callback(self, update, ctx) -> None:
+        q = update.callback_query
+        data = q.data or ""
+        # Find the form by message_id (per chat, a message hosts at most one form).
+        st = _form_state(self)
+        slot = next((s for s in st.values() if s["msg_id"] == q.message.message_id), None)
+        if slot is None:
+            await q.answer("Stale form")
+            return
+        await q.answer()
+        ev = _tg.apply_callback(slot["form"], data)
+        kind = ev["kind"]
+        if kind == "cancel":
+            try:
+                from tools import form_gateway as _fmod  # type: ignore
+                form_id = next((fid for fid, s in st.items() if s is slot), None)
+                if form_id:
+                    _fmod.cancel_gateway_form(form_id)
+                    st.pop(form_id, None)
+            except Exception:
+                pass
+            try:
+                await q.edit_message_text("Form cancelled.")
+            except Exception:
+                pass
+            return
+        if kind == "submit":
+            try:
+                from tools import form_gateway as _fmod  # type: ignore
+                form_id = next((fid for fid, s in st.items() if s is slot), None)
+                if form_id:
+                    _fmod.resolve_gateway_form(form_id, ev["answer"])
+                    st.pop(form_id, None)
+            except Exception as exc:
+                _logger.warning("u1 form: resolve failed: %s", exc)
+            try:
+                await q.edit_message_text("✅ Submitted — slicing in the background.")
+            except Exception:
+                pass
+            return
+        # rerender
+        screen = _tg.render_screen(slot["form"])
+        warning = ev.get("warning")
+        text = screen["text"] + (f"\n\n⚠ {warning}" if warning else "")
+        try:
+            from telegram.constants import ParseMode  # type: ignore
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                      reply_markup=_rows_to_markup(screen["keyboard"]))
+        except Exception as exc:
+            _logger.warning("u1 form: rerender edit failed: %s", exc)
+
+    # Wrap the existing callback dispatcher: form callbacks routed first,
+    # everything else falls through to the original handler.
+    _FORM_PREFIXES = {"t", "s", "a", "z", "n", "p", "e", "S", "X"}
+
+    def _looks_like_form_cb(data: str) -> bool:
+        if not data:
+            return False
+        head = data.split(":", 1)[0]
+        return head in _FORM_PREFIXES and (":" in data or data in ("S", "X"))
+
+    _orig_cb = TelegramPlatform._handle_callback_query
+
+    async def _wrapped_cb(self, update, ctx):
+        data = (update.callback_query.data if update and update.callback_query else "") or ""
+        # Only treat as form callback when the message_id matches a form slot we
+        # own — keeps us from snatching the four chars Hermes' OWN handlers
+        # might also use (defensive; Hermes uses prefixes like "cl:" / "ea:").
+        st = _form_state(self)
+        owns = update.callback_query and any(
+            s["msg_id"] == update.callback_query.message.message_id for s in st.values()
+        )
+        if _looks_like_form_cb(data) and owns:
+            return await _u1_handle_form_callback(self, update, ctx)
+        return await _orig_cb(self, update, ctx)
+
+    TelegramPlatform.send_form = _send_form
+    TelegramPlatform._u1_handle_form_callback = _u1_handle_form_callback
+    TelegramPlatform._handle_callback_query = _wrapped_cb
+    TelegramPlatform._u1_form_patched = True
+    _logger.info("u1 form patch: TelegramPlatform.send_form installed (no source edits).")
+
+
+_install_telegram_form_patch()
