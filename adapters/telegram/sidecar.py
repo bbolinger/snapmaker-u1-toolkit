@@ -131,11 +131,15 @@ def rebuild_schema(req: dict[str, Any]) -> dict[str, Any] | None:
 def submit_answer(request_id: str, answer: dict[str, Any], archive: str) -> dict[str, Any]:
     """Invoke ``u1_kit_workflow.py --request-id … --form-answers-json '<json>'``.
 
-    Returns a small result dict for the operator: {ok, phase, message, plate_count}.
+    Reads ``request.json`` for the outcome (authoritative source) rather than
+    parsing stdout — the workflow only prints its return dict when
+    ``--json-events`` is OFF, and with it ON the last stdout line is an event
+    (``stage`` field, not ``phase``). request.json carries the final phase +
+    plates + gated_plate regardless of stdout shape. Verified 2026-06-29.
     """
     cmd = [
         sys.executable, str(KIT_WORKFLOW), archive,
-        "--json-events", "--request-id", request_id,
+        "--request-id", request_id,
         "--form-answers-json", json.dumps(answer),
     ]
     try:
@@ -144,27 +148,27 @@ def submit_answer(request_id: str, answer: dict[str, Any], archive: str) -> dict
         return {"ok": False, "phase": "timeout", "message": "Slice timed out (>15m)."}
     if proc.returncode != 0:
         return {"ok": False, "phase": "error",
-                "message": f"Workflow rc={proc.returncode}\n{proc.stderr[-2000:]}"}
-    # Parse the LAST JSON line of stdout (the workflow's return dict).
-    last: dict[str, Any] = {}
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            last = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    if not last:
-        return {"ok": False, "phase": "no-output", "message": proc.stdout[-2000:]}
-    return {
-        "ok": True,
-        "phase": last.get("phase"),
-        "plate_count": last.get("plate_count"),
-        "gated_plate": last.get("gated_plate"),
-        "message": ("Submitted. Return to your main Hermes chat — the Stage-1 "
-                    "bed-photo approval happens there."),
-    }
+                "message": f"Workflow rc={proc.returncode}\n{(proc.stderr or proc.stdout)[-2000:]}"}
+
+    req = load_request(request_id) or {}
+    phase = req.get("phase")
+    plates = req.get("plates", []) or []
+    plate_count = len(plates)
+    gated = req.get("printer_storage_filename")
+
+    if phase == "awaiting_start_approval":
+        msg = (f"✅ Submitted ({plate_count} plate{'s' if plate_count != 1 else ''}). "
+               "Return to your main Hermes chat — the Stage-1 bed-photo approval happens there.")
+    elif phase == "complete":
+        msg = (f"✅ Uploaded ({plate_count} plate{'s' if plate_count != 1 else ''}). "
+               "Upload-only mode — start the print(s) from the Snapmaker app.")
+    elif phase == "slice_failed":
+        msg = f"❌ Slice failed: {req.get('last_error') or 'see events.jsonl'}"
+    else:
+        msg = f"Submitted. Phase: {phase or 'unknown'}"
+
+    return {"ok": True, "phase": phase, "plate_count": plate_count,
+            "gated_plate": gated, "message": msg}
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +263,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - live bot
             await q.edit_message_text("Not allowed.")
             return
         s = state[user.id]
-        ev = tg.apply_callback(s["form"], q.data)
+        try:
+            ev = tg.apply_callback(s["form"], q.data)
+        except Exception as exc:
+            logger.exception("apply_callback failed for user=%s data=%r", user.id, q.data)
+            await q.edit_message_text(
+                f"Form session error ({exc}). Re-open via the deep link.")
+            state.pop(user.id, None)
+            return
         kind = ev["kind"]
         if kind == "cancel":
             await q.edit_message_text("Form cancelled. Re-open via the deep link to retry.")

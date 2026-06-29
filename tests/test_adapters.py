@@ -258,3 +258,38 @@ def test_dc_answer_feeds_parse_answers_json():
     r = u1_form.parse_answers_json(ans, spec)
     assert r["ok"], r["errors"]
     assert r["values"]["parts"] == [2]
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes
+# --------------------------------------------------------------------------- #
+
+def test_tg_malformed_callback_returns_clean_warning_not_exception():
+    # Review MED-1: stale callback after redeploy, or out-of-range index, must
+    # not propagate an IndexError/ValueError — return a rerender with a warning.
+    form = tg.new_form(_schema())
+    # field index way out of range
+    ev = tg.apply_callback(form, "s:99:0")
+    assert ev["kind"] == "rerender" and "warning" in ev
+    # option index out of range for an existing field
+    ev = tg.apply_callback(form, "s:1:999")
+    assert ev["kind"] == "rerender" and "warning" in ev
+    # garbage shape
+    ev = tg.apply_callback(form, "garbage_data")
+    assert ev["kind"] == "rerender" and "warning" in ev
+    # non-int field index
+    ev = tg.apply_callback(form, "s:not_an_int:0")
+    assert ev["kind"] == "rerender" and "warning" in ev
+
+
+def test_tg_X_and_S_still_work_alongside_defensive_wrap():
+    # Make sure the defensive wrap didn't break the happy paths.
+    form = tg.new_form(_schema())
+    assert tg.apply_callback(form, "X")["kind"] == "cancel"
+    form2 = tg.new_form(_schema(n_parts=0))
+    # set required fields then submit
+    form2["selections"]["tool"] = 0
+    form2["selections"]["material"] = 0
+    form2["selections"]["profile"] = 0
+    form2["current"] = tg.REVIEW_FIELD
+    assert tg.apply_callback(form2, "S")["kind"] == "submit"
