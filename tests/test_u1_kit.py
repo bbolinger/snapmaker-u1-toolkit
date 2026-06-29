@@ -196,3 +196,26 @@ def test_build_kit_part_ids_unique_and_ordered(tmp_path):
     ids = [p["part_id"] for p in kit["parts"]]
     assert ids == ["01_m0", "02_m1", "03_m2"]
     assert len(set(ids)) == 3
+
+
+# --------------------------------------------------------------------------- #
+# kit detection (routing)
+# --------------------------------------------------------------------------- #
+
+def test_is_multi_part_archive_true_for_multi_stl_zip(tmp_path):
+    a = _write_cube(tmp_path / "a.stl", 20)
+    b = _write_cube(tmp_path / "b.stl", 25)
+    zp = _make_zip(tmp_path / "kit.zip", {"a.stl": a, "b.stl": b})
+    assert u1_kit.is_multi_part_archive(zp) is True
+    assert u1_kit.count_archive_stls(zp) == 2
+
+
+def test_is_multi_part_archive_false_for_single_stl_zip(tmp_path):
+    a = _write_cube(tmp_path / "a.stl", 20)
+    zp = _make_zip(tmp_path / "solo.zip", {"a.stl": a})
+    assert u1_kit.is_multi_part_archive(zp) is False
+
+
+def test_is_multi_part_archive_false_for_bare_stl(tmp_path):
+    a = _write_cube(tmp_path / "a.stl", 20)
+    assert u1_kit.is_multi_part_archive(a) is False
