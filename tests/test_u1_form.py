@@ -214,3 +214,91 @@ def test_echo_parse_resolves_profile_name_from_index():
     echo = u1_form.echo_parse(r["values"], _spec(n_parts=0))
     assert "profile=0.16 Optimal @Snapmaker U1 (0.4 nozzle)" in echo
     assert "#2" not in echo
+
+
+# --------------------------------------------------------------------------- #
+# build_form_schema (form-protocol §3)
+# --------------------------------------------------------------------------- #
+
+def test_build_form_schema_shape():
+    schema = u1_form.build_form_schema(_spec(n_parts=3))
+    assert schema["version"] == u1_form.FORM_SCHEMA_VERSION
+    assert schema["text_fallback"].startswith("Decide all at once")
+    fields = {f["id"]: f for f in schema["fields"]}
+    assert fields["parts"]["type"] == "multi_select"
+    assert fields["parts"]["default"] == "all"
+    assert {o["id"] for o in fields["parts"]["options"]} == {"01_part1", "02_part2", "03_part3"}
+    assert fields["tool"]["type"] == "single_select" and fields["tool"]["required"] is True
+    assert fields["profile"]["options"][1] == {"id": 2, "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)"}
+
+
+def test_build_form_schema_single_part_has_no_parts_field():
+    schema = u1_form.build_form_schema(_spec(n_parts=0))
+    assert "parts" not in {f["id"] for f in schema["fields"]}
+    assert schema["text_fallback"]  # text fallback always present
+
+
+# --------------------------------------------------------------------------- #
+# parse_answers_json (form-protocol §4) — must match the text parser
+# --------------------------------------------------------------------------- #
+
+def test_json_full_answer_by_ids():
+    r = u1_form.parse_answers_json(
+        {"parts": ["01_part1", "03_part3"], "orient": "auto", "tool": "T0",
+         "material": "PLA", "profile": 2, "supports": "no-supports", "action": "start"},
+        _spec(n_parts=3))
+    assert r["ok"], r["errors"]
+    v = r["values"]
+    assert v["parts"] == [1, 3]         # ids normalized to internal indices
+    assert v["orient"] == "auto" and v["tool"] == "T0" and v["material"] == "PLA"
+    assert v["profile"]["idx"] == 2 and v["supports"] == "no-supports" and v["action"] == "start"
+
+
+def test_json_parts_all_keyword():
+    r = u1_form.parse_answers_json({"parts": "all", "tool": "T0", "material": "PLA", "profile": 1}, _spec(n_parts=4))
+    assert r["ok"], r["errors"]
+    assert r["values"]["parts"] == [1, 2, 3, 4]
+
+
+def test_json_unknown_part_id_errors():
+    r = u1_form.parse_answers_json({"parts": ["99_ghost"], "tool": "T0", "material": "PLA", "profile": 1}, _spec(n_parts=3))
+    assert not r["ok"]
+    assert any("unknown part id" in e for e in r["errors"])
+
+
+def test_json_indices_in_parts_are_rejected_not_silently_accepted():
+    # JSON path is id-only; an integer index is NOT a valid id -> error (no drift).
+    r = u1_form.parse_answers_json({"parts": [1, 3], "tool": "T0", "material": "PLA", "profile": 1}, _spec(n_parts=3))
+    assert not r["ok"]
+    assert any("unknown part id" in e for e in r["errors"])
+
+
+def test_json_missing_required_fail_loudly():
+    r = u1_form.parse_answers_json({"parts": "all", "orient": "auto"}, _spec(n_parts=3))
+    assert not r["ok"]
+    j = " ".join(r["errors"])
+    assert "tool" in j and "material" in j and "profile" in j
+
+
+def test_json_defaults_applied():
+    r = u1_form.parse_answers_json({"tool": "T0", "material": "PLA", "profile": 1}, _spec(n_parts=0))
+    assert r["ok"], r["errors"]
+    v = r["values"]
+    assert v["orient"] == "as-authored" and v["supports"] == "no-supports" and v["action"] == "start"
+
+
+def test_json_bad_tool_errors():
+    spec = _spec(n_parts=0); spec["tools"] = ["T0", "T1"]
+    r = u1_form.parse_answers_json({"tool": "T3", "material": "PLA", "profile": 1}, spec)
+    assert not r["ok"]
+    assert any("tool T3 not offered" in e for e in r["errors"])
+
+
+def test_json_and_text_agree_on_same_answer():
+    # The two intakes must produce the same validated decision set.
+    spec = _spec(n_parts=3)
+    text = u1_form.parse_answers("parts 1,3 | auto | T0 | PLA | profile 2 | no-supports | start", spec)
+    js = u1_form.parse_answers_json(
+        {"parts": ["01_part1", "03_part3"], "orient": "auto", "tool": "T0",
+         "material": "PLA", "profile": 2, "supports": "no-supports", "action": "start"}, spec)
+    assert text["values"] == js["values"]
