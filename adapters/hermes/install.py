@@ -133,8 +133,13 @@ def _patch_run_py(run_py: Path, *, dry_run: bool) -> str:
     if dry_run:
         return "inserted (dry-run)"
     backup = run_py.with_suffix(run_py.suffix + ".u1-bak")
-    if not backup.exists():
-        shutil.copy2(run_py, backup)
+    # ALWAYS overwrite the backup so it captures the CURRENT pre-patch state.
+    # Under Hermes upgrade, pip-install replaces run.py, our marker disappears,
+    # and we re-run install — the backup MUST reflect the new Hermes version's
+    # clean run.py (not the original install's), so --uninstall restores the
+    # right thing. The marker-check above short-circuits when already applied,
+    # so this only fires when we're about to actually edit.
+    shutil.copy2(run_py, backup)
     run_py.write_text(new)
     return "inserted"
 
