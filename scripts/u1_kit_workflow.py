@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Multi-part kit workflow orchestrator — v2.1.0 (Option 2: separate seam).
 
 Drives the kit path end-to-end WITHOUT touching the single-STL workflow:
@@ -24,9 +25,82 @@ Two triggers, no session growth:
 """
 from __future__ import annotations
 
-import json
-import os
+# Bootstrap: env check happens BEFORE the heavy numpy/PIL-dependent imports
+# below (via u1_kit -> u1_orient -> numpy). Mirrors u1_slice_workflow's
+# _ensure_compat_python so the kit workflow is just as robust when invoked
+# via a `python3` that lacks deps (e.g. Hermes' /usr/bin/python3). Without
+# this, calling `python3 u1_kit_workflow.py ...` fails on the numpy import.
+import os, sys, subprocess
 from pathlib import Path
+
+
+def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> bool:
+    try:
+        proc = subprocess.run(
+            [python_path, "-c", f"import {', '.join(deps)}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _ensure_compat_python() -> None:
+    try:
+        import numpy  # noqa: F401
+        import PIL    # noqa: F401
+        return
+    except ImportError:
+        pass
+    missing = []
+    for dep in ("numpy", "PIL"):
+        try:
+            __import__(dep)
+        except ImportError:
+            missing.append("pillow" if dep == "PIL" else dep)
+    here = Path(__file__).resolve().parent
+    root = here.parent
+    candidates: list[str] = []
+    env_override = os.environ.get("U1_TOOLKIT_PYTHON")
+    if env_override:
+        candidates.append(env_override)
+    candidates.extend([
+        "/opt/hermes/.venv/bin/python",
+        str(root / "venv" / "bin" / "python"),
+        str(root / ".venv" / "bin" / "python"),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ])
+    for cand in candidates:
+        if not Path(cand).exists():
+            continue
+        if _check_python_has_deps(cand):
+            print(f"[env] current python lacks {', '.join(missing)}; switching to {cand}",
+                  file=sys.stderr)
+            os.execv(cand, [cand, __file__, *sys.argv[1:]])
+    msg = [
+        "ERROR: u1_kit_workflow.py needs numpy + PIL (Pillow).",
+        f"Missing on the current interpreter ({sys.executable}): {', '.join(missing)}",
+        "",
+        "Tried these alternative Python interpreters (none had the deps):",
+    ]
+    for c in candidates:
+        msg.append(f"  - {c}  ({'exists' if Path(c).exists() else 'not found'})")
+    msg += [
+        "",
+        "Fix one of these:",
+        f"  1. {sys.executable} -m pip install numpy pillow",
+        "  2. export U1_TOOLKIT_PYTHON=/path/to/python",
+    ]
+    print("\n".join(msg), file=sys.stderr)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    _ensure_compat_python()
+
+# === Heavy imports (numpy/PIL via u1_kit -> u1_orient) ===
+import json
 from typing import Any
 
 import u1_kit
