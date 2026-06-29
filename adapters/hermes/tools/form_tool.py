@@ -121,7 +121,7 @@ FORM_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error  # type: ignore
+from tools.registry import registry  # type: ignore
 
 registry.register(
     name="form",
