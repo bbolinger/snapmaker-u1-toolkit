@@ -204,3 +204,13 @@ def test_echo_parse_all_parts_collapses():
     r = u1_form.parse_answers("all | T0 | PLA | profile 1", _spec(n_parts=4))
     echo = u1_form.echo_parse(r["values"], _spec(n_parts=4))
     assert "parts=all (4)" in echo
+
+
+def test_echo_parse_resolves_profile_name_from_index():
+    # Review L1: the verification surface must show the profile NAME, not "#2",
+    # so the operator can actually verify the choice before the photo gate.
+    r = u1_form.parse_answers("T0 | PLA | profile 2", _spec(n_parts=0))
+    assert r["values"]["profile"] == {"idx": 2}  # parser stores index only
+    echo = u1_form.echo_parse(r["values"], _spec(n_parts=0))
+    assert "profile=0.16 Optimal @Snapmaker U1 (0.4 nozzle)" in echo
+    assert "#2" not in echo
