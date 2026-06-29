@@ -173,21 +173,39 @@ def run_kit_workflow(args) -> dict[str, Any]:
 
     # --- DECISION: emit the form, or parse the relayed answer ---
     answers = getattr(args, "form_answers", None)
-    if not answers:
-        form_text = u1_form.build_form(spec)
+    answers_json = getattr(args, "form_answers_json", None)
+    if not answers and not answers_json:
+        submit = {
+            "text": (f"python3 /opt/data/scripts/u1_kit_workflow.py {_shell_quote(str(archive))} "
+                     f"--json-events --request-id {request_id} --form-answers '<operator answer line>'"),
+            "json": (f"python3 /opt/data/scripts/u1_kit_workflow.py {_shell_quote(str(archive))} "
+                     f"--json-events --request-id {request_id} --form-answers-json '<json>'"),
+        }
+        schema = u1_form.build_form_schema(spec, submit=submit)
         _emit(events_file, {
             "stage": "need_input", "key": "kit_form", "request_id": request_id,
-            "form": form_text,
-            "next_command": (
-                f"python3 /opt/data/scripts/u1_kit_workflow.py {_shell_quote(str(archive))} "
-                f"--json-events --request-id {request_id} --form-answers '<operator answer line>'"
-            ),
+            "form": schema["text_fallback"],   # back-compat: text form stays present
+            "form_schema": schema,             # form-protocol: declarative schema for native renderers
+            "next_command": submit["text"],
             "instruction": ("Show the operator this form. Relay their reply VERBATIM into "
-                            "--form-answers (one quoted line). Do not interpret it yourself."),
+                            "--form-answers (one quoted line) — OR, if you rendered form_schema "
+                            "as a native control, submit the result via --form-answers-json. "
+                            "Do not interpret the answer yourself; the script parses it."),
         }, json_events)
         return {"phase": "awaiting_form", "request_id": request_id, "out_dir": str(out_dir)}
 
-    parsed = u1_form.parse_answers(answers, spec)
+    if answers_json:
+        try:
+            obj = json.loads(answers_json) if isinstance(answers_json, str) else answers_json
+        except (ValueError, TypeError) as exc:
+            _emit(events_file, {"stage": "form_rejected", "key": "kit_form",
+                                "request_id": request_id, "errors": [f"invalid --form-answers-json: {exc}"]},
+                  json_events)
+            return {"phase": "form_rejected", "request_id": request_id,
+                    "errors": [f"invalid --form-answers-json: {exc}"]}
+        parsed = u1_form.parse_answers_json(obj, spec)
+    else:
+        parsed = u1_form.parse_answers(answers, spec)
     if not parsed["ok"]:
         _emit(events_file, {
             "stage": "form_rejected", "key": "kit_form", "request_id": request_id,
@@ -362,6 +380,8 @@ def main(argv=None) -> int:
     ap.add_argument("model", help="zip of STLs (a kit) or a single model file")
     ap.add_argument("--json-events", action="store_true")
     ap.add_argument("--form-answers", default=None, help="operator's one-line answer, relayed verbatim")
+    ap.add_argument("--form-answers-json", default=None,
+                    help="structured answer (JSON) from a native-widget gateway; same validation as --form-answers")
     ap.add_argument("--request-id", default=None)
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--operator", default=None)

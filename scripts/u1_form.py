@@ -224,14 +224,26 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
 
         unrecognized.append(tok)
 
-    # Defaults for optional fields
+    return _finalize(values, spec, errors, unrecognized)
+
+
+def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
+              unrecognized: list[str] | None = None) -> dict[str, Any]:
+    """Shared validation core: apply defaults, check required fields, package
+    the result. Used by BOTH the text parser and the JSON parser so the two
+    intakes validate identically (form-protocol §2). ``values`` is the
+    partially-parsed decision set; mutated in place with defaults.
+    """
+    n_parts = len(spec.get("parts", []))
+    supports_allowed = set(spec.get("supports", ["supports", "no-supports", "overhangs"]))
+    actions_allowed = set(spec.get("actions", ["start", "upload-only"]))
+
     values.setdefault("orient", "as-authored")
     if n_parts:
         values.setdefault("parts", list(range(1, n_parts + 1)))
     values.setdefault("supports", "no-supports" if "no-supports" in supports_allowed else next(iter(supports_allowed)))
     values.setdefault("action", "start" if "start" in actions_allowed else next(iter(actions_allowed)))
 
-    # Required fields present?
     for f in REQUIRED_FIELDS:
         if f not in values:
             errors.append(f"missing required field: {f}")
@@ -239,7 +251,8 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
     if unrecognized:
         errors.append("unrecognized: " + ", ".join(repr(u) for u in unrecognized))
 
-    return {"ok": not errors, "values": values, "errors": errors, "unrecognized": unrecognized}
+    return {"ok": not errors, "values": values, "errors": errors,
+            "unrecognized": unrecognized or []}
 
 
 def _assign_profile(text: str, profiles: list, values: dict, errors: list) -> None:
@@ -296,6 +309,149 @@ def build_form(spec: dict[str, Any]) -> str:
     ex_parts = "parts 1,3 | " if parts else ""
     lines.append(f"Example: `{ex_parts}auto | T0 | PLA | profile 1 | no-supports | start`")
     return "\n".join(lines)
+
+
+FORM_SCHEMA_VERSION = 1
+
+
+def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build the declarative, platform-neutral form schema (form-protocol §3).
+
+    Consumers (Telegram/Discord/canvas adapters, or a big model) render the
+    fields as native controls and submit via ``--form-answers-json``; any
+    consumer can fall back to ``text_fallback`` + ``--form-answers``. Option ids
+    are stable for the life of the request (parts use ``part_id``; profiles use
+    their 1-based ``idx``).
+    """
+    fields: list[dict[str, Any]] = []
+    parts = spec.get("parts", [])
+    if parts:
+        fields.append({
+            "id": "parts", "type": "multi_select", "label": "Parts",
+            "options": [{"id": p["id"], "label": p.get("label", p["id"])} for p in parts],
+            "default": "all", "required": False,
+        })
+    fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
+                   "options": ["as-authored", "auto"], "default": "as-authored"})
+    tools = [str(t).upper() for t in spec.get("tools", [])]
+    if tools:
+        fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
+                       "options": [{"id": t, "label": t} for t in tools], "required": True})
+    mats = spec.get("materials", [])
+    if mats:
+        fields.append({"id": "material", "type": "single_select", "label": "Material",
+                       "options": [{"id": m, "label": m} for m in mats], "required": True})
+    profiles = spec.get("profiles", [])
+    if profiles:
+        fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
+                       "options": [{"id": p.get("idx"), "label": p.get("label")} for p in profiles],
+                       "required": True})
+    fields.append({"id": "supports", "type": "single_select", "label": "Supports",
+                   "options": list(spec.get("supports", ["supports", "no-supports", "overhangs"])),
+                   "default": "no-supports"})
+    fields.append({"id": "action", "type": "single_select", "label": "Action",
+                   "options": list(spec.get("actions", ["start", "upload-only"])), "default": "start"})
+
+    schema: dict[str, Any] = {
+        "version": FORM_SCHEMA_VERSION,
+        "fields": fields,
+        "text_fallback": build_form(spec),
+        "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports | start",
+    }
+    if submit:
+        schema["submit"] = submit
+    return schema
+
+
+def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """Parse a STRUCTURED answer (from a native-widget gateway) against ``spec``.
+
+    Mirrors ``parse_answers`` (text) but takes a dict. Normalizes to the SAME
+    internal decision set and runs the SAME ``_finalize`` validation core, so
+    both intakes are validated identically (form-protocol §4). ``parts`` are
+    stable ids or the literal ``"all"`` (NOT indices — a widget has the ids);
+    ``profile`` is the option id (1-based idx) or a name substring.
+    """
+    if not isinstance(obj, dict):
+        return {"ok": False, "values": {}, "errors": ["answer JSON must be an object"], "unrecognized": []}
+
+    parts_spec = spec.get("parts", [])
+    n_parts = len(parts_spec)
+    id_to_index = {p["id"]: i + 1 for i, p in enumerate(parts_spec)}
+    tools = [str(t).upper() for t in spec.get("tools", [])]
+    materials = {str(m).lower(): str(m) for m in spec.get("materials", [])}
+    profiles = spec.get("profiles", [])
+    supports_allowed = set(spec.get("supports", ["supports", "no-supports", "overhangs"]))
+    actions_allowed = set(spec.get("actions", ["start", "upload-only"]))
+
+    values: dict[str, Any] = {}
+    errors: list[str] = []
+
+    # parts: list of ids | "all"
+    if obj.get("parts") not in (None, ""):
+        pv = obj["parts"]
+        if pv == "all" or pv == ["all"]:
+            if n_parts:
+                values["parts"] = list(range(1, n_parts + 1))
+        elif isinstance(pv, list):
+            idxs: list[int] = []
+            for item in pv:
+                if item in id_to_index:
+                    idxs.append(id_to_index[item])
+                else:
+                    errors.append(f"unknown part id: {item!r}")
+            if idxs and not any("part id" in e for e in errors):
+                values["parts"] = sorted(set(idxs))
+        else:
+            errors.append("parts must be a list of ids or 'all'")
+
+    # orient
+    if obj.get("orient"):
+        o = str(obj["orient"]).lower()
+        if o in _ORIENT_AUTO:
+            values["orient"] = "auto"
+        elif o in _ORIENT_ASIS:
+            values["orient"] = "as-authored"
+        else:
+            errors.append(f"unknown orient {obj['orient']!r}")
+
+    # tool
+    if obj.get("tool"):
+        t = str(obj["tool"]).upper()
+        if tools and t not in tools:
+            errors.append(f"tool {t} not offered")
+        else:
+            values["tool"] = t
+
+    # material
+    if obj.get("material"):
+        m = str(obj["material"]).lower()
+        if m in materials:
+            values["material"] = materials[m]
+        else:
+            errors.append(f"material {obj['material']!r} not offered")
+
+    # profile: id (int idx) or name
+    if obj.get("profile") not in (None, ""):
+        _assign_profile(str(obj["profile"]), profiles, values, errors)
+
+    # supports
+    if obj.get("supports"):
+        s = _SUPPORTS.get(str(obj["supports"]).lower())
+        if s and s in supports_allowed:
+            values["supports"] = s
+        else:
+            errors.append(f"unknown/unsupported supports {obj['supports']!r}")
+
+    # action
+    if obj.get("action"):
+        a = _ACTIONS.get(str(obj["action"]).lower())
+        if a and a in actions_allowed:
+            values["action"] = a
+        else:
+            errors.append(f"unknown action {obj['action']!r}")
+
+    return _finalize(values, spec, errors)
 
 
 def echo_parse(values: dict[str, Any], spec: dict[str, Any]) -> str:
