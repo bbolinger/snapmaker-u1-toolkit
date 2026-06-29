@@ -36,7 +36,7 @@ def _kit_zip(tmp_path: Path, n=3) -> Path:
 
 
 def _args(model, **kw_):
-    base = dict(model=str(model), json_events=True, form_answers=None, request_id=None,
+    base = dict(model=str(model), json_events=True, form_answers=None, form_answers_json=None, request_id=None,
                 fresh=False, operator="test:unit", nozzle="0.4", out_dir=None,
                 live_upload=False, on_collision=None)
     base.update(kw_)
@@ -232,3 +232,41 @@ def test_resume_by_request_id_after_form(tmp_path, fake_profiles, fake_slice_upl
     ))
     assert r2["request_id"] == rid
     assert r2["phase"] == "awaiting_start_approval"
+
+
+# --------------------------------------------------------------------------- #
+# form-protocol: schema emission + --form-answers-json intake
+# --------------------------------------------------------------------------- #
+
+def test_form_event_includes_schema(tmp_path, fake_profiles, capsys):
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3)))
+    assert res["phase"] == "awaiting_form"
+    # the emitted need_input event carries both text + declarative schema
+    out = capsys.readouterr().out
+    import json as _j
+    events = [_j.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    form_ev = next(e for e in events if e.get("key") == "kit_form")
+    assert "form" in form_ev                      # text fallback retained
+    assert form_ev["form_schema"]["version"] == 1
+    ids = {f["id"] for f in form_ev["form_schema"]["fields"]}
+    assert {"parts", "tool", "material", "profile", "supports", "action"} <= ids
+    assert form_ev["form_schema"]["submit"]["json"]  # json submit template present
+
+
+def test_commit_via_form_answers_json(tmp_path, fake_profiles, fake_slice_upload):
+    res = kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 3),
+        form_answers_json='{"parts": ["01_part0", "03_part2"], "tool": "T0", '
+                          '"material": "PLA", "profile": 1, "supports": "no-supports", "action": "start"}',
+    ))
+    assert res["phase"] == "awaiting_start_approval"
+    rid = res["request_id"]
+    req = __import__("u1_request").read_request(rid)
+    assert req["kit"]["selected"] == ["01_part0", "03_part2"]
+    assert req["gcode_hash"] == "sha256:plate1"
+
+
+def test_form_answers_json_invalid_rejected(tmp_path, fake_profiles, fake_slice_upload):
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), form_answers_json="{not valid json"))
+    assert res["phase"] == "form_rejected"
+    assert any("invalid --form-answers-json" in e for e in res["errors"])
