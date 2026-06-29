@@ -89,6 +89,21 @@ def extract_all_stls(archive: Path, out_dir: Path) -> list[Path]:
         return extracted
 
 
+def count_archive_stls(archive: Path) -> int:
+    """Number of ``.stl`` entries in a zip (0 if not a zip or none present)."""
+    archive = Path(archive)
+    if not zipfile.is_zipfile(archive):
+        return 0
+    with zipfile.ZipFile(archive) as z:
+        return sum(1 for n in z.namelist() if n.lower().endswith(".stl"))
+
+
+def is_multi_part_archive(archive: Path) -> bool:
+    """True if the archive holds more than one STL — i.e. a kit that should be
+    routed to the kit workflow rather than the single-STL workflow."""
+    return count_archive_stls(archive) > 1
+
+
 def part_fits_bed(
     footprint_mm: tuple[float, float] | list[float],
     bed_mm: tuple[float, float] = DEFAULT_BED_MM,
