@@ -345,6 +345,38 @@ Stage 2 emits exactly ONE of: `print_started` (success), or a `*_failed` / `*_in
 
 ---
 
+## Multi-part kit events (`stage:` — v2.1.0)
+
+Emitted by the kit path. A zip with >1 STL is auto-detected; the single workflow
+emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
+
+- `kit_detected` — from `u1_slice_workflow.py` when the input zip holds multiple
+  STLs. Fields: `reason`, `command` (the `u1_kit_workflow.py` invocation to run),
+  `instruction`. The agent tool-calls `command`.
+- `kit_ingested` — `request_id`, `part_count`, `multi`, `oversized_part_ids`.
+- `need_input` with `key: "kit_form"` — the consolidated decision form.
+  Fields: `form` (numbered text to show the operator), `next_command` (carries
+  `--form-answers '<line>'`), `instruction`. The agent relays the operator's
+  reply VERBATIM into `--form-answers`; the script parses it.
+- `form_accepted` — `parsed` (the "I read: …" echo). / `form_rejected` —
+  `errors[]` + `form` (re-prompt).
+- `kit_slicing` → `kit_sliced` (`plate_count`) → `kit_uploaded` (`plates[]`,
+  `live`). `kit_slice_failed` (`error`, `instruction`) if Orca refuses (e.g. an
+  oversized part).
+- `kit_readiness_card` — the kit equivalent of `readiness_card`. Fields:
+  `part_count`, `selected_parts[]`, `plate_count`, `plates[]`
+  (`plate_idx`, `printer_storage_filename`, `gcode_hash`), `tool`, `material`,
+  `profile`, `orient`, `supports`, `parsed_echo`, `gated_plate`,
+  `start_gate_stage1_command`, `operator_guidance`. Only the **gated_plate**
+  (plate 1) goes through Stage 1/2; plates 2..N are started from the Snapmaker app.
+- `next_action_required` — same shape as the single path; carries the Stage-1
+  command for plate 1.
+
+**Audit twins:** `kit_ingested`, `kit_sliced`, `kit_readiness_card_emitted`,
+`kit_slice_failed` (`event:` vocabulary, in `audit.jsonl`).
+
+---
+
 ## Versioning
 
 The event contract is **additive**: new events can appear; existing events' field set can grow with optional fields. Consumers should ignore unknown stages and unknown fields.
@@ -353,13 +385,14 @@ Two changes would be **breaking** and require a major-version bump:
 1. Renaming an existing event (e.g. `stage: "uploaded"` → `stage: "upload_complete"`).
 2. Removing a previously-required field from an existing event.
 
-Neither is planned for v2.0.0. If either is ever needed, the version field on `request.json` (currently `schema_version: 1`) will bump in lockstep so consumers can branch on schema version.
+v2.1.0 added `kit` + `plates` as **optional additive** fields on `request.json` and the kit events above — additive, so no version bump (`schema_version` stays `1`). A breaking change (rename/removal) would bump `schema_version` in lockstep so consumers can branch on it.
 
 ---
 
 ## Cross-references
 
-- [`HERMES.md`](../HERMES.md) — the agent's procedural rules (Rules 1–8) for how to react to these events.
+- [`HERMES.md`](../HERMES.md) — the agent's procedural rules (Rules 1–9) for how to react to these events.
+- [`skills/3d-printer-slicing-automation/references/multipart-kits.md`](../skills/3d-printer-slicing-automation/references/multipart-kits.md) — agent guide for the multi-part kit flow.
 - [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md) — the bundled Hermes skill's operator-facing contract.
 - [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) — the immutable system contracts (operator / skill / agent).
 - [`docs/ROADMAP.md`](ROADMAP.md) — the 9-phase v2.0 plan.
