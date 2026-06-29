@@ -33,7 +33,6 @@ from typing import Any
 
 # Tunables (callers may monkey-patch for tests / different UX).
 PAGE_SIZE = 8                # buttons per screen when a field has > PAGE_SIZE options
-INLINE_OPTIONS_FOR_SINGLE = 6  # single-select fields ≤ this many opts render unpaginated
 REVIEW_FIELD = "__review__"
 
 
@@ -188,7 +187,22 @@ def apply_callback(form: dict[str, Any], data: str) -> dict[str, Any]:
     ``{"kind": "rerender"}``                 → caller edits the message in place
     ``{"kind": "submit", "answer": {...}}``  → caller invokes --form-answers-json
     ``{"kind": "cancel"}``                   → caller acknowledges + cleans up
+    ``{"kind": "rerender", "warning": ...}`` → stale/malformed callback (e.g. an
+                                              old button after a deploy/schema
+                                              change); the form continues.
     """
+    try:
+        return _apply_callback_inner(form, data)
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        # Stale callback_data after a redeploy, an out-of-range field/option
+        # index, or any other malformed input must not crash the bot — surface
+        # it as a clean rerender so the operator can keep going from the
+        # current screen rather than seeing an exception traceback.
+        return {"kind": "rerender",
+                "warning": f"Stale or invalid button ({exc}). Re-open the form via the deep link if this persists."}
+
+
+def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
     parts = data.split(":")
     kind = parts[0]
     fields = form["schema"]["fields"]
@@ -227,6 +241,9 @@ def apply_callback(form: dict[str, Any], data: str) -> dict[str, Any]:
 
     if kind == "t":
         oi = int(parts[2])
+        if oi < 0 or oi >= len(field["options"]):
+            return {"kind": "rerender",
+                    "warning": f"Stale button (option {oi} out of range for {fid!r})."}
         s = form["selections"][fid]
         s.discard(oi) if oi in s else s.add(oi)
         return {"kind": "rerender"}
@@ -246,6 +263,9 @@ def apply_callback(form: dict[str, Any], data: str) -> dict[str, Any]:
 
     if kind == "s":
         oi = int(parts[2])
+        if oi < 0 or oi >= len(field["options"]):
+            return {"kind": "rerender",
+                    "warning": f"Stale button (option {oi} out of range for {fid!r})."}
         form["selections"][fid] = oi
         form["current"] = _next_field(form)
         return {"kind": "rerender"}
