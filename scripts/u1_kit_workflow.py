@@ -256,7 +256,7 @@ def run_kit_workflow(args) -> dict[str, Any]:
                      f"--json-events --request-id {request_id} --form-answers-json '<json>'"),
         }
         schema = u1_form.build_form_schema(spec, submit=submit)
-        _emit(events_file, {
+        event: dict[str, Any] = {
             "stage": "need_input", "key": "kit_form", "request_id": request_id,
             "form": schema["text_fallback"],   # back-compat: text form stays present
             "form_schema": schema,             # form-protocol: declarative schema for native renderers
@@ -265,7 +265,21 @@ def run_kit_workflow(args) -> dict[str, Any]:
                             "--form-answers (one quoted line) — OR, if you rendered form_schema "
                             "as a native control, submit the result via --form-answers-json. "
                             "Do not interpret the answer yourself; the script parses it."),
-        }, json_events)
+        }
+        # Sidecar deep link (Level 3 escape hatch — adapters/telegram/sidecar.py).
+        # If a sidecar bot is configured, emit a tappable t.me link so the
+        # operator can switch to the sidecar DM and fill the form with native
+        # inline keyboards. The operator returns to the main chat for the
+        # Stage-1 photo gate; safety pipeline is identical to the typed path.
+        sidecar_bot = os.environ.get("U1_SIDECAR_BOT_USERNAME", "").strip().lstrip("@")
+        if sidecar_bot:
+            event["form_url"] = f"https://t.me/{sidecar_bot}?start={request_id}"
+            event["instruction"] += (
+                f"\n\nALSO: a tappable form is available — post this URL in chat and "
+                f"the operator can tap to fill the form with buttons in @{sidecar_bot}: "
+                f"{event['form_url']}"
+            )
+        _emit(events_file, event, json_events)
         return {"phase": "awaiting_form", "request_id": request_id, "out_dir": str(out_dir)}
 
     if answers_json:
