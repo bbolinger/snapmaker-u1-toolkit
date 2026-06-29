@@ -1461,6 +1461,26 @@ def run_workflow(args)->dict[str,Any]:
     for each answer.
     """
     model=Path(args.model).resolve()
+    # v2.1.0: detect a multi-part kit (a zip holding >1 STL) and redirect to
+    # the kit workflow. The single-STL flow below is entirely unchanged. This
+    # is the gate-detection principle: the SCRIPT detects the kit; the agent
+    # just runs the emitted command (one entrypoint to call, no zip-inspection
+    # judgment asked of a small model).
+    try:
+        import u1_kit
+        if u1_kit.is_multi_part_archive(model):
+            _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
+                        f'{_shell_quote(str(model))} --json-events')
+            emit({'stage': 'kit_detected',
+                  'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
+                  'command': _kit_cmd,
+                  'instruction': ('Run this command to drive the multi-part kit workflow. '
+                                  'It arranges all parts onto plate(s), uploads them, and '
+                                  'gates the start of plate 1.')},
+                 args.json_events)
+            return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
+    except Exception:
+        pass
     # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
     # request_id (explicit --request-id, recovery via content hash, or
     # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;

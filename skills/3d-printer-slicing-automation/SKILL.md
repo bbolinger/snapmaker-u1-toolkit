@@ -48,7 +48,7 @@ The workflow walks the operator through five prompts one at a time: **orient →
 ```bash
 python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
-If the messaging platform rejects raw `.stl` documents but accepts `.zip`, extract the STL/3MF from the ZIP first, then immediately run the same required workflow call on the extracted model path. See `references/telegram-stl-zip-ingest.md`.
+Pass a `.zip` straight to the same command — do NOT extract it yourself. The workflow inspects it: a zip with one model runs the normal single-part flow; a zip with **multiple STLs is a multi-part kit** and the workflow emits a `kit_detected` event whose `command` field runs `u1_kit_workflow.py`. When you see `kit_detected`, just tool-call that `command` verbatim and follow the kit flow (see `references/multipart-kits.md`). (Legacy single-STL zip ingest detail: `references/telegram-stl-zip-ingest.md`.)
 
 Optionally `--no-live-material` if Moonraker isn't reachable. Do not ask the user anything before this runs.
 
