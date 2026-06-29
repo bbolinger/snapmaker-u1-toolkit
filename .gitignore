@@ -42,3 +42,6 @@ profiles/user/
 tests/fixtures-v16/
 tests/experiments/v16-out/
 tests/experiments/v16-results.tsv
+
+# Internal-only design docs — NOT for the public repo (kept locally for us).
+docs/FORM-PROTOCOL.md
