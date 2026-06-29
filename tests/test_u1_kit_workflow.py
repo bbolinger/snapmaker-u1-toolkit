@@ -270,3 +270,27 @@ def test_form_answers_json_invalid_rejected(tmp_path, fake_profiles, fake_slice_
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), form_answers_json="{not valid json"))
     assert res["phase"] == "form_rejected"
     assert any("invalid --form-answers-json" in e for e in res["errors"])
+
+
+def test_form_event_emits_form_url_when_sidecar_configured(tmp_path, fake_profiles, capsys, monkeypatch):
+    # Sidecar deep link (Level 3 escape hatch) appears only when configured.
+    monkeypatch.setenv("U1_SIDECAR_BOT_USERNAME", "u1_sidecar_test_bot")
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2)))
+    assert res["phase"] == "awaiting_form"
+    import json as _j
+    out = capsys.readouterr().out
+    events = [_j.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    form_ev = next(e for e in events if e.get("key") == "kit_form")
+    assert "form_url" in form_ev
+    assert form_ev["form_url"].startswith("https://t.me/u1_sidecar_test_bot?start=")
+    assert form_ev["form_url"].endswith(res["request_id"])
+
+
+def test_form_event_omits_form_url_when_no_sidecar(tmp_path, fake_profiles, capsys, monkeypatch):
+    monkeypatch.delenv("U1_SIDECAR_BOT_USERNAME", raising=False)
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2)))
+    import json as _j
+    out = capsys.readouterr().out
+    events = [_j.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    form_ev = next(e for e in events if e.get("key") == "kit_form")
+    assert "form_url" not in form_ev   # no leak when not configured
