@@ -316,7 +316,15 @@ def echo_parse(values: dict[str, Any], spec: dict[str, Any]) -> str:
         bits.append(f"material={values['material']}")
     prof = values.get("profile")
     if prof:
-        bits.append("profile=" + (prof.get("label") or f"#{prof.get('idx')}"))
+        label = prof.get("label")
+        if not label:
+            # Resolve the human-readable name from the spec by index so the
+            # operator's verification line shows e.g. "0.20 Standard", not "#2".
+            for p in spec.get("profiles", []):
+                if p.get("idx") == prof.get("idx"):
+                    label = p.get("label")
+                    break
+        bits.append("profile=" + (label or f"#{prof.get('idx')}"))
     bits.append(f"supports={values.get('supports')}")
     bits.append(f"action={values.get('action')}")
     return "I read: " + ", ".join(bits)
