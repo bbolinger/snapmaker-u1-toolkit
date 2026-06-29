@@ -43,5 +43,7 @@ tests/fixtures-v16/
 tests/experiments/v16-out/
 tests/experiments/v16-results.tsv
 
-# Internal-only design docs — NOT for the public repo (kept locally for us).
+# Internal-only design/planning docs — NOT for the public repo (kept locally
+# for us). These stay out of public history via the squash-merge to main.
 docs/FORM-PROTOCOL.md
+docs/v2.1.0-multipart-kits-plan.md
