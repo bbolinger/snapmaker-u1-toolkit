@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.0.2] — 2026-06-30
+
+Two safety-gate hotfixes. Both are the **same bug class**: v2.0 single-flow assumptions baked into Stage-2 preconditions refuse legitimate multi-tool / forward-compatible workflows. No schema changes; safe to apply by `git pull` alone.
+
+### Fixed
+
+- **Stage-2 tool-change blocker rejected multi-tool prints.** `u1_print_start_gate.preflight()` compared the printer's *idle* active extruder to the gcode's target tool and refused to dispatch if they differed — but the U1 is a gcode-driven 4-tool changer and every multi-tool slice begins with a `T<N>` activation in the preamble. The check was unreachable for any non-default tool. Fix: read the gcode preamble (first ~50 lines) and accept the print if the gcode itself issues the expected `T<N>` macro. Single-tool prints on the default extruder still pass via the original path.
+- **`can_start()` refused every readiness event it didn't already know by name.** `_RESUMED_OR_EMITTED` hard-coded only the single-STL workflow's two event names. Any new workflow that emits a workflow-specific readiness event would be refused with "no readiness_card emitted yet" even after the operator reviewed the plan. Added forward-compat slot for the v2.1 kit workflow's `kit_readiness_card_emitted`; documented the rule that new readiness-emitting workflows must register here.
+
+---
+
 ## [2.0.1] — 2026-06-28
 
 Doc-only patch from an external review of the v2.0.0 release notes. No runtime or schema changes; no test additions; safe to apply by `git pull` alone.
