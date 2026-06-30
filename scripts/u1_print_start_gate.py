@@ -75,11 +75,54 @@ def run_tool_gate(host: str, port: int, material: str, intended_tool: str) -> tu
     return proc.returncode == 0, proc.stdout
 
 
+# Maps Klipper extruder section names to the T-command the slicer emits
+# in the gcode preamble. The U1's klipper config wraps T0/T1/T2/T3 as
+# macros that fire ACTIVATE_EXTRUDER + the physical carousel pickup, so
+# the gcode itself drives the tool change. Pre-activation is NOT required
+# on the U1 — what matters is that the gcode contains the right T<N>
+# activation in its preamble.
+_EXTRUDER_TO_T_COMMAND = {
+    'extruder':  'T0',
+    'extruder1': 'T1',
+    'extruder2': 'T2',
+    'extruder3': 'T3',
+}
+
+
+def _gcode_has_tool_activation(gcode_path: Path | None, expected_t: str,
+                               scan_lines: int = 500) -> tuple[bool, str | None]:
+    """Return (found, sample_line) — True if expected_t appears as a standalone
+    command in the gcode's first scan_lines.
+
+    Looks for the bare T-command (e.g. ``T1`` at start of line) or the
+    explicit M104/M109 with a matching T parameter, since OrcaSlicer emits
+    both. Conservative: requires word-boundary match so ``T10`` doesn't
+    falsely match ``T1``.
+    """
+    if gcode_path is None or not gcode_path.is_file():
+        return False, None
+    import re
+    # Match T1 at start of line OR M104/M109 ... T1 ... as a standalone token
+    pat = re.compile(rf'(?m)^(?:{re.escape(expected_t)}\b|M10[49]\b.*\b{re.escape(expected_t)}\b)')
+    try:
+        with gcode_path.open('r', encoding='utf-8', errors='ignore') as f:
+            buf = ''
+            for i, line in enumerate(f):
+                buf += line
+                if i >= scan_lines:
+                    break
+            m = pat.search(buf)
+            return (m is not None), (m.group(0) if m else None)
+    except Exception:
+        return False, None
+
+
 def preflight(status: dict[str, Any],
               intended_tool: str | None = None,
               requested_material: str | None = None,
               host: str | None = None,
-              port: int | None = None) -> list[str]:
+              port: int | None = None,
+              gcode_path: Path | None = None) -> list[str]:
     blockers = []
     ps = status.get('print_stats', {})
     vsd = status.get('virtual_sdcard', {})
@@ -102,8 +145,38 @@ def preflight(status: dict[str, Any],
     )
     if ps_state not in (None, 'standby', 'complete', 'ready') and not ps_cancelled_but_clean:
         blockers.append(f"print_stats state is {ps_state}")
-    if intended_tool and status.get('toolhead', {}).get('extruder') not in (None, intended_tool):
-        blockers.append(f"active tool is {status.get('toolhead', {}).get('extruder')}, expected {intended_tool}")
+    # Tool-activation check (replaces v2.0's idle-state check 2026-06-30):
+    # The original check refused if Klipper's `toolhead.extruder` (idle-state
+    # last-activated extruder) didn't already match intended_tool. That logic
+    # is correct for a single-extruder printer where the operator must
+    # manually pick which extruder is active before printing — but it's
+    # WRONG for the Snapmaker U1, which is a 4-tool changer where the gcode
+    # itself drives tool selection via macros that wrap T0/T1/T2/T3
+    # commands. The macros fire ACTIVATE_EXTRUDER + the physical carousel
+    # pickup at print start. Pre-activation is never required on the U1.
+    #
+    # Correct check for the U1: verify the gcode's preamble contains the
+    # expected T<N> activation command. Block only if missing — which would
+    # indicate a slicer misconfiguration (intended_tool doesn't match what
+    # the gcode actually targets).
+    if intended_tool:
+        expected_t = _EXTRUDER_TO_T_COMMAND.get(intended_tool)
+        if expected_t is None:
+            blockers.append(
+                f"unknown intended_tool '{intended_tool}' — expected one of "
+                f"{', '.join(sorted(_EXTRUDER_TO_T_COMMAND))}"
+            )
+        elif gcode_path is not None:
+            found, sample = _gcode_has_tool_activation(gcode_path, expected_t)
+            if not found:
+                blockers.append(
+                    f"gcode preamble does not activate {expected_t} "
+                    f"(intended_tool={intended_tool}) — slicer config "
+                    f"mismatch suspected. Re-slice with the correct tool."
+                )
+        # else: no gcode_path passed (legacy callers / CLI direct invocation)
+        # — skip the check rather than fail spuriously. Operator-facing
+        # workflow always passes gcode_path; bare CLI invocations don't.
     if requested_material and intended_tool and host and port is not None:
         ok, out = run_tool_gate(host, int(port), requested_material, intended_tool)
         if not ok:
@@ -382,9 +455,23 @@ def run_gate(filename: str,
     resolved_operator = _resolve_operator_for_gate(operator)
 
     status = query_state(host, port)
+    # Construct the local gcode path for the new preamble-activation check.
+    # The slice workflow writes plates to <out_dir>/slice/<printer_filename>.
+    # If the file doesn't exist (legacy layout / direct CLI test),
+    # _gcode_has_tool_activation returns (False, None) — but preflight only
+    # blocks on missing activation when intended_tool is set AND gcode_path
+    # is present. The "fail-open if no path" branch keeps CLI runs working.
+    _gcode_path: Path | None = None
+    try:
+        _candidate = out_dir / 'slice' / printer_filename
+        if _candidate.is_file():
+            _gcode_path = _candidate
+    except Exception:
+        _gcode_path = None
     blockers = preflight(status, intended_tool,
                          requested_material=requested_material,
-                         host=host, port=port)
+                         host=host, port=port,
+                         gcode_path=_gcode_path)
 
     if bed_clear != 'start':
         # Stage 1 — capture real photo, write token, return readiness.
