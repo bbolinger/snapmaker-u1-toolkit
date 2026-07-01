@@ -103,6 +103,33 @@ def test_no_form_answers_emits_first_turn_prompt(tmp_path, fake_profiles):
     assert req.get("form_profiles"), "Turn 1 must persist form_profiles for stable resolution"
 
 
+def test_turn1_form_profiles_not_clobbered_by_reinvocation(tmp_path, monkeypatch):
+    # First-write-wins guard: the profile list persisted at Turn 1 must
+    # survive a second no-answer invocation even if list_profiles has
+    # re-sorted between them. Without the guard, `profile 1` on a later
+    # --form-answers call resolves against a list the operator never saw.
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+        {"value": "A", "label": "A-label"},
+        {"value": "B", "label": "B-label"},
+    ])
+    zp = _kit_zip(tmp_path, 3)
+    r1 = kw.run_kit_workflow(_args(zp))
+    rid = r1["request_id"]
+    u1_request = __import__("u1_request")
+    persisted_1 = [p["value"] for p in u1_request.read_request(rid)["form_profiles"]]
+    assert persisted_1 == ["A", "B"]
+    # Flip the order — simulate history-driven re-sort
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+        {"value": "B", "label": "B-label"},
+        {"value": "A", "label": "A-label"},
+    ])
+    kw.run_kit_workflow(_args(zp, request_id=rid))
+    persisted_2 = [p["value"] for p in u1_request.read_request(rid)["form_profiles"]]
+    assert persisted_2 == ["A", "B"], (
+        "second Turn 1 invocation must NOT clobber the persisted profile list; "
+        f"got {persisted_2}")
+
+
 def test_bad_form_answers_rejected(tmp_path, fake_profiles):
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3), form_answers="gronk | flim"))
     assert res["phase"] == "form_rejected"

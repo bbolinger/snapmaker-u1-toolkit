@@ -1932,12 +1932,19 @@ def _emit_parts_prompt(events_file: Path | None, request_id: str, archive: Path,
     # Persist the profile list at Turn 1 so a subsequent --form-answers
     # one-liner call resolves `profile N` against the list the operator
     # was shown, not a freshly-rebuilt list that a history-driven re-sort
-    # might reorder between calls.
+    # might reorder between calls. FIRST WRITE WINS: if the request
+    # already carries form_profiles from a prior Turn 1 (or a legacy
+    # commit path), do not clobber — otherwise a second no-answer
+    # invocation with a re-sorted list_profiles would silently change
+    # what `profile N` resolves to.
     try:
-        _spec_for_persist = _build_form_spec(kit, nozzle)
-        if _spec_for_persist.get("_profiles_full"):
-            u1_request.write_request(
-                request_id, form_profiles=_spec_for_persist["_profiles_full"])
+        _existing = u1_request.read_request(request_id) or {}
+        if not _existing.get("form_profiles"):
+            _spec_for_persist = _build_form_spec(kit, nozzle)
+            if _spec_for_persist.get("_profiles_full"):
+                u1_request.write_request(
+                    request_id,
+                    form_profiles=_spec_for_persist["_profiles_full"])
     except Exception:
         pass
     thumb_path = out_dir / "parts_thumbnails.png"
@@ -3109,6 +3116,7 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "snapshot_path": None, "token": None,
                 "approval_ttl_seconds": None, "approval_expires_at": None,
+                "captured_at_utc": None,
                 "reason": f"could not import start-gate helpers: {exc}"}
     try:
         host = get_u1_host()
@@ -3116,12 +3124,14 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "snapshot_path": None, "token": None,
                 "approval_ttl_seconds": None, "approval_expires_at": None,
+                "captured_at_utc": None,
                 "reason": f"printer host/port unresolved: {exc}"}
     try:
         snapshot = _capture(out_dir, host, port, wait=5.0)
     except Exception as exc:
         return {"ok": False, "snapshot_path": None, "token": None,
                 "approval_ttl_seconds": None, "approval_expires_at": None,
+                "captured_at_utc": None,
                 "reason": f"capture raised: {type(exc).__name__}: {exc}"}
     if not snapshot.get("ok"):
         # capture_real_bed_photo already wrote a mock or dark image; carry
@@ -3130,6 +3140,7 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
                 "snapshot_path": snapshot.get("path"),
                 "token": None,
                 "approval_ttl_seconds": None, "approval_expires_at": None,
+                "captured_at_utc": snapshot.get("timestamp_utc"),
                 "reason": (snapshot.get("error")
                            or "bed photo failed the brightness gate")}
     try:
@@ -3138,6 +3149,7 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
         return {"ok": False, "snapshot_path": snapshot.get("path"),
                 "token": None,
                 "approval_ttl_seconds": None, "approval_expires_at": None,
+                "captured_at_utc": snapshot.get("timestamp_utc"),
                 "reason": f"token issuance failed: {exc}"}
     # expose the TTL deadline so the plan card
     # can warn the operator. Snapshot's timestamp_utc is the moment the
