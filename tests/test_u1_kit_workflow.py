@@ -6,12 +6,18 @@ against the real binary is done separately in hermes-agent-stack.
 """
 from __future__ import annotations
 
+import hashlib
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def _sha256_of(path: Path) -> str:
+    """Compute sha256:<hex> for a file, matching u1_kit_workflow's format."""
+    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 import u1_kit_workflow as kw
 from u1_orient import write_binary_stl
@@ -71,7 +77,7 @@ def fake_slice_upload(monkeypatch):
     monkeypatch.setattr(kw, "apply_supports_override", lambda p, en, od: Path("/tmp/process_ovr.json"))
     uploads = {"calls": []}
 
-    def fake_upload(gcode, on_collision=None):
+    def fake_upload(gcode, on_collision=None, material=None):
         uploads["calls"].append(Path(gcode).name)
         return {"uploaded_filename": Path(gcode).name, "moonraker_upload_ok": True}
 
@@ -83,13 +89,18 @@ def fake_slice_upload(monkeypatch):
 # ANALYSIS + DECISION
 # --------------------------------------------------------------------------- #
 
-def test_no_form_answers_emits_form(tmp_path, fake_profiles):
+def test_no_form_answers_emits_first_turn_prompt(tmp_path, fake_profiles):
+    # Staged flow: no answers → Turn 1 emits the parts prompt (previously a
+    # single form-emit).
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3)))
-    assert res["phase"] == "awaiting_form"
+    assert res["phase"] == "awaiting_parts"
     rid = res["request_id"]
-    # kit persisted
+    # kit persisted at ingest
     req = __import__("u1_request").read_request(rid)
     assert req["kit"]["part_count"] == 3
+    # profile list also persisted at Turn 1 so a later --form-answers
+    # one-liner resolves `profile N` against a stable list.
+    assert req.get("form_profiles"), "Turn 1 must persist form_profiles for stable resolution"
 
 
 def test_bad_form_answers_rejected(tmp_path, fake_profiles):
@@ -120,8 +131,10 @@ def test_commit_happy_path_gates_plate_1(tmp_path, fake_profiles, fake_slice_upl
     req = u1_request.read_request(rid)
     # plates recorded
     assert len(req["plates"]) == 2
-    # top-level gcode_hash bound to plate 1 (the gated plate)
-    assert req["gcode_hash"] == "sha256:plate1"
+    # top-level gcode_hash bound to plate 1 (the gated plate). The
+    # workflow re-hashes the renamed file, so match the file bytes.
+    plate1_path = Path(req["plates"][0]["gcode_path"])
+    assert req["gcode_hash"] == _sha256_of(plate1_path)
     assert req["printer_storage_filename"].endswith("_plate1.gcode")
     # selection persisted
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
@@ -238,19 +251,24 @@ def test_resume_by_request_id_after_form(tmp_path, fake_profiles, fake_slice_upl
 # form-protocol: schema emission + --form-answers-json intake
 # --------------------------------------------------------------------------- #
 
-def test_form_event_includes_schema(tmp_path, fake_profiles, capsys):
+def test_first_turn_prompt_carries_operator_needs(tmp_path, fake_profiles, capsys):
+    # Under the staged 6-turn flow, the single kit_form-with-schema event
+    # is deferred (form-mode button UX not yet wired). Turn 1 emits a
+    # `parts` need_input carrying the parts_thumbnail_grid + a listing +
+    # `next_command` options — enough for the operator to pick which
+    # STLs to include. This test guards those elements so a future
+    # refactor doesn't quietly break the operator's Turn 1 UX.
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3)))
-    assert res["phase"] == "awaiting_form"
-    # the emitted need_input event carries both text + declarative schema
+    assert res["phase"] == "awaiting_parts"
     out = capsys.readouterr().out
     import json as _j
     events = [_j.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
-    form_ev = next(e for e in events if e.get("key") == "kit_form")
-    assert "form" in form_ev                      # text fallback retained
-    assert form_ev["form_schema"]["version"] == 1
-    ids = {f["id"] for f in form_ev["form_schema"]["fields"]}
-    assert {"parts", "tool", "material", "profile", "supports", "action"} <= ids
-    assert form_ev["form_schema"]["submit"]["json"]  # json submit template present
+    parts_ev = next(e for e in events if e.get("key") == "parts")
+    assert "prompt" in parts_ev
+    assert "options" in parts_ev and parts_ev["options"]
+    assert "next_command" in parts_ev["options"][0]
+    # thumbnail grid render event fires before the need_input
+    assert any(e.get("kind") == "parts_thumbnail_grid" for e in events)
 
 
 def test_commit_via_form_answers_json(tmp_path, fake_profiles, fake_slice_upload):
@@ -263,7 +281,8 @@ def test_commit_via_form_answers_json(tmp_path, fake_profiles, fake_slice_upload
     rid = res["request_id"]
     req = __import__("u1_request").read_request(rid)
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
-    assert req["gcode_hash"] == "sha256:plate1"
+    plate1_path = Path(req["plates"][0]["gcode_path"])
+    assert req["gcode_hash"] == _sha256_of(plate1_path)
 
 
 def test_form_answers_json_invalid_rejected(tmp_path, fake_profiles, fake_slice_upload):

@@ -1929,6 +1929,17 @@ def _emit_parts_prompt(events_file: Path | None, request_id: str, archive: Path,
     parts_listing = _format_parts_listing(kit)
     # Render the STL thumbnail grid alongside the text listing.
     out_dir = u1_request.ensure_request_dir(request_id)
+    # Persist the profile list at Turn 1 so a subsequent --form-answers
+    # one-liner call resolves `profile N` against the list the operator
+    # was shown, not a freshly-rebuilt list that a history-driven re-sort
+    # might reorder between calls.
+    try:
+        _spec_for_persist = _build_form_spec(kit, nozzle)
+        if _spec_for_persist.get("_profiles_full"):
+            u1_request.write_request(
+                request_id, form_profiles=_spec_for_persist["_profiles_full"])
+    except Exception:
+        pass
     thumb_path = out_dir / "parts_thumbnails.png"
     thumb_result = _render_parts_thumbnail_grid(kit, thumb_path)
     if thumb_result.get("ok"):
