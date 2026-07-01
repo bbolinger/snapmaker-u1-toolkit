@@ -93,11 +93,73 @@ def run_tool_gate(host: str, port: int, material: str, intended_tool: str) -> tu
     return proc.returncode == 0, proc.stdout
 
 
+# Maps Klipper extruder section names to the T-command the slicer emits
+# in the gcode preamble. The U1's klipper config wraps T0/T1/T2/T3 as
+# macros that fire ACTIVATE_EXTRUDER + the physical carousel pickup, so
+# the gcode itself drives the tool change. Pre-activation is NOT required
+# on the U1 — what matters is that the gcode contains the right T<N>
+# activation in its preamble.
+_EXTRUDER_TO_T_COMMAND = {
+    'extruder':  'T0',
+    'extruder1': 'T1',
+    'extruder2': 'T2',
+    'extruder3': 'T3',
+}
+
+
+def _gcode_has_tool_activation(gcode_path: Path | None, expected_t: str,
+                               scan_lines: int = 3000) -> tuple[bool, str | None]:
+    """Return (found, sample_line) — True if expected_t appears as a standalone
+    command in the gcode's executable section.
+
+    Looks for the bare T-command (e.g. ``T1`` at start of line) or the
+    explicit M104/M109 with a matching T parameter, since OrcaSlicer emits
+    both. Conservative: requires word-boundary match so ``T10`` doesn't
+    falsely match ``T1``.
+
+    Scans starting from ``; EXECUTABLE_BLOCK_START`` when present — OrcaSlicer
+    puts a 900+ line config-comment header before any real gcode, so a naive
+    top-of-file scan (500 lines) misses the T-activation and false-flags
+    slicer-config-mismatch (verified live 2026-07-01 on request u1_2026_0701_986ba6:
+    T1 activation was at line 952 but the gate stopped scanning at 500).
+    Falls back to first ``scan_lines`` if the marker is absent.
+    """
+    if gcode_path is None or not gcode_path.is_file():
+        return False, None
+    import re
+    # Match T1 at start of line OR M104/M109 ... T1 ... as a standalone token
+    pat = re.compile(rf'(?m)^(?:{re.escape(expected_t)}\b|M10[49]\b.*\b{re.escape(expected_t)}\b)')
+    try:
+        with gcode_path.open('r', encoding='utf-8', errors='ignore') as f:
+            buf_lines: list[str] = []
+            in_exec = False
+            count = 0
+            for line in f:
+                if not in_exec:
+                    buf_lines.append(line)
+                    if line.strip().startswith('; EXECUTABLE_BLOCK_START'):
+                        in_exec = True
+                        buf_lines = [line]  # reset — scan from marker forward
+                        count = 0
+                    continue
+                buf_lines.append(line)
+                count += 1
+                if count >= scan_lines:
+                    break
+            buf = ''.join(buf_lines)
+            m = pat.search(buf)
+            return (m is not None), (m.group(0) if m else None)
+    except Exception:
+        return False, None
+
+
 def preflight(status: dict[str, Any],
               intended_tool: str | None = None,
               requested_material: str | None = None,
               host: str | None = None,
-              port: int | None = None) -> list[str]:
+              port: int | None = None,
+              gcode_path: Path | None = None,
+              accept_material_mismatch: bool = False) -> list[str]:
     blockers = []
     ps = status.get('print_stats', {})
     vsd = status.get('virtual_sdcard', {})
@@ -120,12 +182,58 @@ def preflight(status: dict[str, Any],
     )
     if ps_state not in (None, 'standby', 'complete', 'ready') and not ps_cancelled_but_clean:
         blockers.append(f"print_stats state is {ps_state}")
-    if intended_tool and status.get('toolhead', {}).get('extruder') not in (None, intended_tool):
-        blockers.append(f"active tool is {status.get('toolhead', {}).get('extruder')}, expected {intended_tool}")
+    # Tool-activation check (replaces v2.0's idle-state check 2026-06-30):
+    # The original check refused if Klipper's `toolhead.extruder` (idle-state
+    # last-activated extruder) didn't already match intended_tool. That logic
+    # is correct for a single-extruder printer where the operator must
+    # manually pick which extruder is active before printing — but it's
+    # WRONG for the Snapmaker U1, which is a 4-tool changer where the gcode
+    # itself drives tool selection via macros that wrap T0/T1/T2/T3
+    # commands. The macros fire ACTIVATE_EXTRUDER + the physical carousel
+    # pickup at print start. Pre-activation is never required on the U1.
+    #
+    # Correct check for the U1: verify the gcode's preamble contains the
+    # expected T<N> activation command. Block only if missing — which would
+    # indicate a slicer misconfiguration (intended_tool doesn't match what
+    # the gcode actually targets).
+    if intended_tool:
+        expected_t = _EXTRUDER_TO_T_COMMAND.get(intended_tool)
+        if expected_t is None:
+            blockers.append(
+                f"unknown intended_tool '{intended_tool}' — expected one of "
+                f"{', '.join(sorted(_EXTRUDER_TO_T_COMMAND))}"
+            )
+        elif gcode_path is not None:
+            found, sample = _gcode_has_tool_activation(gcode_path, expected_t)
+            if not found:
+                blockers.append(
+                    f"gcode preamble does not activate {expected_t} "
+                    f"(intended_tool={intended_tool}) — slicer config "
+                    f"mismatch suspected. Re-slice with the correct tool."
+                )
+        # else: no gcode_path passed (legacy callers / CLI direct invocation)
+        # — skip the check rather than fail spuriously. Operator-facing
+        # workflow always passes gcode_path; bare CLI invocations don't.
     if requested_material and intended_tool and host and port is not None:
         ok, out = run_tool_gate(host, int(port), requested_material, intended_tool)
         if not ok:
-            blockers.append(f"tool/material gate failed for {intended_tool} / {requested_material}: {out[-500:].strip()}")
+            # Brent design 2026-06-30 / Layer 3 override: the material
+            # check is loud-by-default, but the operator can take explicit
+            # responsibility via --accept-material-mismatch (audited in
+            # main() after the override fires). When the override is set,
+            # downgrade the blocker to an OVERRIDE_LINE so the caller can
+            # log the warning without refusing the start. The audit row
+            # captures expected_tool / expected_material / detected_tool /
+            # detected_material in main() because preflight() doesn't have
+            # request_id context.
+            label = (f"tool/material gate failed for {intended_tool} / "
+                     f"{requested_material}: {out[-500:].strip()}")
+            if accept_material_mismatch:
+                # Tag the line so callers (main) can route it to a warning
+                # log + audit instead of refusing the start.
+                blockers.append(f"[OVERRIDE:material_mismatch] {label}")
+            else:
+                blockers.append(label)
     return blockers
 
 
@@ -375,10 +483,14 @@ def run_gate(filename: str,
              intended_tool=None,
              requested_material: str | None = None,
              approval_token: str | None = None,
+             stage2_approval_nonce: str | None = None,
              out_dir: Path | None = None,
              start_func=start_print,
              request_id: str | None = None,
-             operator: str | None = None):
+             operator: str | None = None,
+             accept_material_mismatch: bool = False,
+             operator_text: str | None = None,
+             verification_method: str | None = None):
     host = host or get_u1_host()
     port = port or get_u1_port()
     # Per-request token + photo storage (live bug 2026-06-28): if we have a
@@ -400,9 +512,52 @@ def run_gate(filename: str,
     resolved_operator = _resolve_operator_for_gate(operator)
 
     status = query_state(host, port)
+    # Construct the local gcode path for the new preamble-activation check.
+    # The slice workflow writes plates to <out_dir>/slice/<printer_filename>.
+    # If the file doesn't exist (legacy layout / direct CLI test),
+    # _gcode_has_tool_activation returns (False, None) — but preflight only
+    # blocks on missing activation when intended_tool is set AND gcode_path
+    # is present. The "fail-open if no path" branch keeps CLI runs working.
+    _gcode_path: Path | None = None
+    try:
+        _candidate = out_dir / 'slice' / printer_filename
+        if _candidate.is_file():
+            _gcode_path = _candidate
+    except Exception:
+        _gcode_path = None
     blockers = preflight(status, intended_tool,
                          requested_material=requested_material,
-                         host=host, port=port)
+                         host=host, port=port,
+                         gcode_path=_gcode_path,
+                         accept_material_mismatch=accept_material_mismatch)
+    # Brent design 2026-06-30 / Layer 3 override: when --accept-material-mismatch
+    # is set, preflight tags the material-mismatch line with [OVERRIDE:...].
+    # Filter those out of the active blocker list + audit the override so it's
+    # visible forensically. The hardware safety isn't bypassed — just the
+    # mismatch refusal. Tool/material-temp damage is on the operator.
+    overrides_used: list[dict[str, Any]] = []
+    if accept_material_mismatch:
+        kept: list[str] = []
+        for line in blockers:
+            if line.startswith("[OVERRIDE:material_mismatch] "):
+                overrides_used.append({
+                    "kind": "material_mismatch",
+                    "blocker_text": line[len("[OVERRIDE:material_mismatch] "):],
+                })
+            else:
+                kept.append(line)
+        blockers = kept
+        if overrides_used and request_id:
+            _audit_gate(request_id, "operator_override", resolved_operator,
+                        override_kind="material_mismatch",
+                        reason="loaded_material_does_not_match_requested",
+                        verification_method=(verification_method
+                                             or "unspecified_manual"),
+                        operator_text=(operator_text
+                                       or "accept-material-mismatch"),
+                        expected_tool=intended_tool,
+                        expected_material=requested_material,
+                        blocker_text=overrides_used[0].get("blocker_text"))
 
     if bed_clear != 'start':
         # Stage 1 — capture real photo, write token, return readiness.
@@ -445,7 +600,8 @@ def run_gate(filename: str,
             ),
         }
 
-    # Stage 2 — verify token, re-check preflight, sanity-only re-capture, start.
+    # Stage 2 — verify token, verify nonce, re-check preflight, sanity-only
+    # re-capture, start.
     stored = _read_approval_token(out_dir)
     token_ok, token_reason = _approval_token_valid(stored, approval_token)
     if not token_ok:
@@ -459,6 +615,95 @@ def run_gate(filename: str,
             'ok': False, 'started': False,
             'reason': f'approval token invalid: {token_reason}',
         }
+
+    # single-use stage2 approval nonce.
+    # Kit workflow paths REQUIRE this nonce — the workflow only mints one
+    # inside _action_start() AFTER the operator answers yes to the fresh
+    # bed_clear_start prompt. This closes the direct-Stage-2 attack: an
+    # adversarial agent reading approval_token from request.json cannot
+    # fire Stage 2 without also going through the yes/no handler that
+    # mints the nonce. The nonce also binds to gcode_hash + revision, so
+    # a stale nonce from a prior slice can't gate a new one.
+    #
+    # Non-kit paths (single-STL workflow, direct CLI) don't mint nonces;
+    # for backward compat we only enforce when request_id is present AND
+    # the request state has any Stage 2 nonce persisted. Absent state +
+    # absent flag = legacy path, allowed (with audit).
+    if request_id:
+        try:
+            import u1_request
+            req_for_nonce = u1_request.read_request(request_id) or {}
+            safety_for_nonce = req_for_nonce.get('safety') or {}
+            expected_nonce = safety_for_nonce.get('stage2_approval_nonce')
+            binds = safety_for_nonce.get('stage2_approval_binds') or {}
+        except Exception:
+            expected_nonce = None
+            binds = {}
+            req_for_nonce = {}
+            safety_for_nonce = {}
+        if expected_nonce is not None:
+            problems: list[str] = []
+            if not stage2_approval_nonce:
+                problems.append("Stage 2 nonce required but not provided "
+                                "(--stage2-approval-nonce missing). Direct "
+                                "Stage 2 invocation attempted?")
+            elif stage2_approval_nonce != expected_nonce:
+                problems.append("Stage 2 nonce mismatch — either stale or "
+                                "forged. Refusing start.")
+            # Bind checks — nonce is only valid for the exact plan it was
+            # issued against.
+            current_revision = req_for_nonce.get('request_revision')
+            current_gcode_hash = req_for_nonce.get('gcode_hash')
+            plates_l = req_for_nonce.get('plates') or []
+            plate1_hash = plates_l[0].get('gcode_hash') if plates_l else None
+            # Prefer plate1 hash if present (kit path), else top-level.
+            effective_hash = plate1_hash or current_gcode_hash
+            if binds.get('request_revision') is not None:
+                if binds.get('request_revision') != current_revision:
+                    problems.append(
+                        f"nonce binds to revision {binds.get('request_revision')} "
+                        f"but current is {current_revision}. Plan changed after "
+                        "operator approval.")
+            if binds.get('gcode_hash') is not None:
+                if binds.get('gcode_hash') != effective_hash:
+                    problems.append(
+                        "nonce binds to a different gcode_hash — the slice "
+                        "changed after the operator's yes.")
+            if problems:
+                _audit_gate(request_id, 'stage2_nonce_rejected',
+                            resolved_operator, reasons=problems)
+                return {
+                    'stage': 'start_attempt',
+                    'filename': printer_filename,
+                    'blockers': blockers,
+                    'snapshot': None,
+                    'ok': False, 'started': False,
+                    'reason': ("Stage 2 nonce rejected: "
+                               + "; ".join(problems)),
+                }
+            # Consume the nonce (single-use). Wipe binds too so a replay
+            # attempt can't re-use them.
+            try:
+                new_safety = dict(safety_for_nonce)
+                new_safety.pop('stage2_approval_nonce', None)
+                new_safety.pop('stage2_approval_issued_at', None)
+                new_safety.pop('stage2_approval_binds', None)
+                u1_request.write_request(request_id, safety=new_safety)
+            except Exception:
+                pass
+            _audit_gate(request_id, 'stage2_nonce_verified',
+                        resolved_operator,
+                        nonce_prefix=stage2_approval_nonce[:8] + '...')
+        elif stage2_approval_nonce:
+            # Nonce was passed but request has no expected nonce — either
+            # legacy path (fine) or replay of already-consumed nonce
+            # (suspicious). Audit but allow so legacy tests / non-kit
+            # paths still work.
+            _audit_gate(request_id, 'stage2_nonce_unexpected',
+                        resolved_operator,
+                        note=('nonce passed but request state has no expected '
+                              'nonce — may be replay of consumed nonce; '
+                              'audited but allowed for legacy compat'))
     if blockers:
         _audit_gate(request_id, 'stage2_preflight_blocked', resolved_operator,
                     blockers=blockers)
@@ -590,6 +835,13 @@ def main(argv=None):
                          "'start': Stage 2 — operator's explicit approval; requires --approval-token from Stage 1.")
     ap.add_argument('--approval-token',
                     help='Token printed by Stage 1. Required for Stage 2; ties the start to the photo the operator reviewed.')
+    ap.add_argument('--stage2-approval-nonce', default=None,
+                    help=('Single-use nonce minted by u1_kit_workflow._action_start() '
+                          'AFTER the operator answers yes to the fresh bed_clear_start '
+                          'prompt. Kit paths REQUIRE this — without it, Stage 2 '
+                          'refuses even if the approval-token is valid. Consumed '
+                          'on successful start (single-use). Closes the direct-'
+                          'Stage-2 attack.'))
     ap.add_argument('--intended-tool', help='Klipper extruder name, e.g. extruder1 for T1')
     ap.add_argument('--requested-material', help='material to verify on intended_tool, e.g. PETG')
     ap.add_argument('--out-dir', type=Path, default=None,
@@ -603,14 +855,36 @@ def main(argv=None):
                     help='v2.0 Phase 3a: operator identity for audit + approval rows '
                          '(e.g. "telegram:brent"). Falls back to env U1_OPERATOR, '
                          'then "unknown:gate".')
+    # Brent design 2026-06-30 / Layer 3 override flags. The material-mismatch
+    # blocker is loud-by-default; the operator can take explicit responsibility
+    # by passing --accept-material-mismatch. The forensic-control guarantee
+    # comes from the audit row capturing --operator-text verbatim. The agent
+    # CAN fabricate this text (no software gate prevents it); session-log
+    # review is the post-hoc check.
+    ap.add_argument('--accept-material-mismatch', action='store_true',
+                    help=('Layer 3 override: operator explicitly accepts a '
+                          'material-mismatch (loaded filament does not match '
+                          'requested material). Audited. Requires '
+                          '--operator-text capturing the operator phrase.'))
+    ap.add_argument('--operator-text', default=None,
+                    help=('Layer 3 override: verbatim operator phrase '
+                          'authorizing the override. Audited.'))
+    ap.add_argument('--verification-method', default=None,
+                    choices=['manual', 'snapmaker_app', 'other_camera',
+                             'unspecified_manual'],
+                    help='Layer 3 override: how operator verified the override.')
     a = ap.parse_args(argv)
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
                    requested_material=a.requested_material,
                    approval_token=a.approval_token,
+                   stage2_approval_nonce=a.stage2_approval_nonce,
                    out_dir=a.out_dir,
                    request_id=a.request_id,
-                   operator=a.operator)
+                   operator=a.operator,
+                   accept_material_mismatch=a.accept_material_mismatch,
+                   operator_text=a.operator_text,
+                   verification_method=a.verification_method)
     print(json.dumps(res, indent=2))
     return 0
 
