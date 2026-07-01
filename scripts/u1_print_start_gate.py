@@ -511,6 +511,37 @@ def run_gate(filename: str,
     printer_filename = _normalize_filename(filename)
     resolved_operator = _resolve_operator_for_gate(operator)
 
+    # Fence 1 — test-operator refusal. If the resolved operator carries a
+    # test/dev/smoke prefix, refuse Stage 2 BEFORE any Moonraker call. This
+    # closes the "smoke-test accidentally runs a real print" failure that
+    # bit us on 2026-07-01: the tester runs the workflow with
+    # --operator smoke:xxx, extracts the emitted Stage 2 command, runs it,
+    # and the gate happily sends /printer/print/start to the real printer.
+    # No live printer traffic under a test-flavored operator, ever. Stage 1
+    # (bed_clear=='start' with no approval_token — the *capture* phase) is
+    # also refused; the whole gate is off-limits to test operators.
+    _TEST_OPERATOR_PREFIXES = ("smoke:", "test:", "dev:", "dry:", "mock:",
+                               "ci:", "fixture:")
+    _op_lc = (resolved_operator or "").lower()
+    if any(_op_lc.startswith(p) for p in _TEST_OPERATOR_PREFIXES):
+        _audit_gate(request_id, 'gate_refused_test_operator',
+                    resolved_operator, prefix_match=next(
+                        p for p in _TEST_OPERATOR_PREFIXES
+                        if _op_lc.startswith(p)))
+        result = {
+            'stage': 'gate_refused_test_operator',
+            'ok': False, 'started': False,
+            'operator': resolved_operator,
+            'reason': (
+                f"gate refuses --operator={resolved_operator!r}: prefix looks "
+                "like a test/dev/smoke operator. Live printer traffic is "
+                "not allowed from a test-flavored operator. If this is a "
+                "real print, use a non-test operator value."
+            ),
+        }
+        print(json.dumps(result, indent=2))
+        return
+
     status = query_state(host, port)
     # Construct the local gcode path for the new preamble-activation check.
     # The slice workflow writes plates to <out_dir>/slice/<printer_filename>.
