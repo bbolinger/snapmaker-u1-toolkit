@@ -1223,7 +1223,8 @@ def upload_only(gcode: Path, dry_run: bool=True)->dict[str,Any]:
     return _real_upload(gcode, on_collision=None)
 
 
-def _real_upload(gcode: Path, on_collision: str | None) -> dict[str, Any]:
+def _real_upload(gcode: Path, on_collision: str | None,
+                 material: str | None = None) -> dict[str, Any]:
     """Drive u1_upload_gcode.py with the audit 2026-06-26 return-code contract.
 
     Codes:
@@ -1235,10 +1236,20 @@ def _real_upload(gcode: Path, on_collision: str | None) -> dict[str, Any]:
 
     Workflow's human_summary derives from the actual contract, not from
     "rc != 0 = no file." Reads the latest_upload_result.json artifact for
-    granular truth (moonraker_upload_ok / remote_metadata_ok)."""
+    granular truth (moonraker_upload_ok / remote_metadata_ok).
+
+    ``material`` (Brent live-test 2026-07-01): passed as ``--material``
+    to u1_upload_gcode.py so its filament_type-vs-requested check compares
+    the gcode's material against what the WORKFLOW actually chose. Without
+    this, u1_upload_gcode.py falls back to its own hardcoded PETG default,
+    which false-flags any non-PETG print (e.g. T3/PLA) with a bogus
+    'filament_type does not include PETG: PLA' blocker.
+    """
     cmd = [sys.executable, str(HERE / 'u1_upload_gcode.py'), str(gcode)]
     if on_collision:
         cmd.extend(['--on-collision', on_collision])
+    if material:
+        cmd.extend(['--material', str(material)])
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     rc = proc.returncode
 
@@ -1474,9 +1485,13 @@ def run_workflow(args)->dict[str,Any]:
             emit({'stage': 'kit_detected',
                   'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
                   'command': _kit_cmd,
-                  'instruction': ('Run this command to drive the multi-part kit workflow. '
-                                  'It arranges all parts onto plate(s), uploads them, and '
-                                  'gates the start of plate 1.')},
+                  'instruction': ('Run this command via terminal. The kit workflow '
+                                  'walks the operator through a 3-turn staged Q&A '
+                                  '(parts → tool → confirm) — each turn emits one '
+                                  'need_input event with the next CLI flag baked '
+                                  'into its options. Follow the per-field staging '
+                                  'pattern the same way the single-STL workflow '
+                                  'does (Step 2 of the skill).')},
                  args.json_events)
             return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
     except Exception:
@@ -2196,7 +2211,8 @@ def run_workflow(args)->dict[str,Any]:
         if not args.live_upload:
             up = upload_only(gcode, dry_run=True)
         else:
-            up = _real_upload(gcode, on_collision=args.on_collision)
+            up = _real_upload(gcode, on_collision=args.on_collision,
+                              material=getattr(args, "material", None))
         emit({'stage':'uploaded', **up}, args.json_events)
         # H5 fix: persist upload-completed state. If agent loses context now,
         # request.json says phase='uploaded' so resume routes to Stage 1

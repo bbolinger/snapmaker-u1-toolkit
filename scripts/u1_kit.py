@@ -35,10 +35,16 @@ from u1_orient import (
 )
 import u1_request
 
-# Snapmaker U1 bed. Kept here as the single source for fit hints; the actual
-# arrange is Orca's job, this is only used to warn about a part that can never
-# fit (which Orca would reject anyway, but we want a clean operator message).
-DEFAULT_BED_MM: tuple[float, float] = (220.0, 220.0)
+# Snapmaker U1 bed in mm. Source: the OFFICIAL Snapmaker U1 OrcaSlicer
+# machine profile (verified 2026-06-30 against printable_area ['0.5x1',
+# '270.5x1', '270.5x271', '0.5x271'] in
+# /opt/data/tools/orcaslicer/.../profiles/Snapmaker/machine/Snapmaker U1
+# (0.4 nozzle).json). The U1 build volume is 270×270×270mm.
+#
+# This was wrong as (220, 220) until the 2026-06-30 audit. The wrong value
+# caused the bed-overflow guard to false-alarm + abort a valid kit print
+# (the actual gcode extent was 269×270mm — within the real 270 bed).
+DEFAULT_BED_MM: tuple[float, float] = (270.0, 270.0)
 # Clearance Orca needs around each part when arranging. Only used for fit hints.
 ARRANGE_MARGIN_MM: float = 5.0
 

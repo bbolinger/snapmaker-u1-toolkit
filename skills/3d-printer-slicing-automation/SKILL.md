@@ -1,6 +1,6 @@
 ---
 name: 3d-printer-slicing-automation
-description: "Snapmaker U1 staged slicing workflow: orient, render, slice, upload-only, and camera-gated starts."
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself."
 version: 2.1.0
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
@@ -48,7 +48,7 @@ The workflow walks the operator through five prompts one at a time: **orient →
 ```bash
 python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
-Pass a `.zip` straight to the same command — do NOT extract it yourself. The workflow inspects it: a zip with one model runs the normal single-part flow; a zip with **multiple STLs is a multi-part kit** and the workflow emits a `kit_detected` event whose `command` field runs `u1_kit_workflow.py`. When you see `kit_detected`, just tool-call that `command` verbatim and follow the kit flow (see `references/multipart-kits.md`). (Legacy single-STL zip ingest detail: `references/telegram-stl-zip-ingest.md`.)
+If the messaging platform rejects raw `.stl` but accepts `.zip` (single STL inside), extract the STL from the ZIP first, then run the workflow on the extracted model path. For zip archives with **multiple STLs (a kit)**, pass the ZIP DIRECTLY to `u1_slice_workflow.py` — the workflow emits `kit_detected` whose `command` field runs `u1_kit_workflow.py`. When you see `kit_detected`, tool-call that `command` verbatim via terminal. The kit workflow then drives a **3-turn staged Q&A**: parts → tool → confirm. Each turn emits a `need_input` event with options carrying baked-in `next_command` strings — same per-field pattern as Step 2 below (`references/multipart-kits.md`).
 
 Optionally `--no-live-material` if Moonraker isn't reachable. Do not ask the user anything before this runs.
 
@@ -105,44 +105,17 @@ If the operator picked "Upload only" instead, the workflow emits `{stage: "compl
 
 **HARD RULE — no readiness_card, no Stage 1.** If you do NOT have a `readiness_card` event in the JSON output you captured this turn, you CANNOT advance to Stage 1. Do not "attempt" Stage 1 by guessing the printer storage filename, the tool index, the material, or the command shape. The readiness_card is not optional context — it carries the exact command (with the right basename, the right `--intended-tool`, the right `--requested-material`) that Stage 1 expects. If your output appears truncated, re-run the workflow command and redirect stdout to a file (`> /tmp/u1_events.jsonl`), then read the file — do NOT compose a Stage 1 invocation from chat memory. This is anti-fabrication pattern #4 (state from chat memory) and pattern #6 (verification fabrication). Refuse with "I don't have the readiness_card from the uploaded run — I cannot advance to Stage 1 without it. Re-running the workflow with output captured to a file." and STOP.
 
-**Stage 1 — readiness + photo + token (mandatory).** Run the `start_gate_stage1_command` from the readiness card. This call NEVER starts the print. It returns:
-- `blockers`: array of preflight problems. Empty = ready.
-- `snapshot`: `{path, is_mock, fresh, brightness_mean, brightness_ok, brightness_check, brightness_check_reason, sha256, error}`.
-- `approval_token`: short hex string — REQUIRED for Stage 2. `null` if Stage 1 failed unrecoverably.
-- `approval_ttl_seconds`: how long the token is valid (1800s = 30 min).
-- `next_step`: the exact Stage 2 command with the token baked in.
+**Stage 1 — readiness + photo + token (mandatory).** Run the `start_gate_stage1_command` from the readiness card. It NEVER starts the print. It returns `blockers`, `snapshot` (with `path`), `approval_token` + `approval_ttl_seconds` (30 min), and `next_step`. Surface `snapshot.path` BARE in your reply text first (auto-attaches the photo), then ask the operator: *"Review the attached photo. Bed clear and you want to start request `<request_id>`? (yes/no)"*. Default = no. Field-level detail + the only two refusal conditions: `references/snapmaker-u1-safety-gates.md`.
 
-**FIRST, send the photo.** Always — before any verdict, before any condition you read off the event. The operator is the gatekeeper, and they need to see the image. The way to send it is to write `snapshot.path` (the absolute path) bare in your reply text — Hermes auto-attaches absolute paths. Do NOT wrap it in backticks or a code fence (gateway skips those). One sentence like `Bed photo: /opt/data/snapmaker_u1/bed_snapshot.jpg` and the image appears in the chat.
-
-**Then refuse only on real failures.** Only TWO conditions block a Stage 1 → Stage 2 progression:
-- `snapshot.is_mock: true` — the camera was unreachable; the file is a labeled mock, not bed evidence
-- `snapshot.brightness_check: "measured"` AND `snapshot.ok: false` — we measured a verifiably dark frame (LED never came on, camera blacked out)
-
-Everything else proceeds, including `snapshot.brightness_check: "deferred"` (PIL/Pillow wasn't available so we couldn't auto-classify, but the photo IS real — operator judges from the image itself). Do NOT refuse on a deferred brightness check; surface the deferred-reason as context but keep going.
-
-Surface every entry in `blockers` verbatim — those ARE blockers (paused, busy, wrong tool, wrong material loaded). An empty blockers array + a usable photo (real or deferred-brightness) means stage 2 is reachable.
-
-Then ask the user: "Review the attached photo. Bed clear and you want to start request `<request_id>`? (yes/no)". Substitute `<request_id>` with the value from the `readiness_card` event. Default = no. Do NOT decide bed clearance for the user. Their reply IS the gate.
-
-**Stage 2 — actual start (only after explicit approval AND a valid token).** If user said yes AND blockers is empty AND snapshot is usable, run the Stage-2 command. Use the `start_gate_stage1_command` the workflow emitted as your base — it already includes `--request-id` and `--operator`. Add `--bed-clear start` and `--approval-token <token>`:
-```bash
-python3 /opt/data/scripts/u1_print_start_gate.py <printer_storage_filename> \
-  --intended-tool extruder<N> --requested-material <material> \
-  --request-id u1_YYYY_MMDD_xxxxxx --operator <operator-id> \
-  --bed-clear start --approval-token <token-from-stage-1>
-```
-
-The gate validates the token (30-min TTL), re-runs preflight, takes a sanity-only fresh capture (NOT shown — operator already approved Stage 1's photo), AND routes through `can_start()` (v2.0 Phase 3b) to verify the print plan hasn't drifted since review. Stage 2 starts only if all four checks pass. If anything refuses, surface the gate's `reason` field verbatim. See `references/can-start-refusal-handling.md` for the reject branches + recovery procedure.
-
-**Expired-token recovery.** If Stage 2 refuses with `approval token invalid` / token age / TTL expired, the prior operator "yes" is spent and does NOT authorize a new start. Re-run the workflow for the same STL with `--request-id <request_id>` to recover the readiness card, then tool-call the emitted Stage-1 command verbatim. Surface the fresh bed photo and ask a new approval question with the same `request_id`. Only after a fresh "yes" may you run Stage 2 with the new token.
-
-**After Stage 2 succeeds:** report only the start result fields (`started`, `response`, `blockers`, filename/tool/material). Do **not** surface or attach the Stage-2 sanity snapshot path in the final message; that capture is an internal safety check, not a second operator-review artifact. The only bed photo the operator should review is Stage 1's approval photo.
+**Stage 2 — actual start.** Only after a fresh "yes" AND a valid token. Run `next_step` (or equivalently the Stage-1 base + `--bed-clear start --approval-token <token>`). On any refusal, surface `reason` verbatim. Token TTL, expired-token recovery, can_start() routing, and post-success reporting: `references/snapmaker-u1-safety-gates.md` and `references/can-start-refusal-handling.md`.
 
 DO NOT skip Stage 1. DO NOT invent a magic phrase. DO NOT pass `--bed-clear start` without the token AND the operator's explicit yes. Default = cancel.
 
+**Kit start-boundary guard (2026-07-01 incident).** For multi-part kit flows, the confirm/print-plan choice of `start` is **not** bed-clear approval, even if the kit workflow has already captured a bed photo and issued a token. If a kit `start` action emits `need_input` with `key`/`need: "bed_clear_start"`, surface the bed photo path if present, then ask that prompt and wait for the operator's yes/no. This event may not have normal `options`; when the operator answers yes, route via its `next_command_on_yes` verbatim, and when they answer no/cancel, stop without tool-calling. Only the follow-up yes for the same `request_id` may route to the next command that emits/runs Stage 2. If any kit confirm/refreshed-confirm event exposes a direct `stage2_command` or a `next_action_required` containing `--bed-clear start` before a dedicated `bed_clear_start` yes/no turn, fail closed and tell the operator the workflow is trying to collapse the separate bed-clear approval boundary. Do not run that Stage 2 command. After the Stage 2 `u1_print_start_gate.py ... --bed-clear start --approval-token ...` call returns `started: true`, report the started request and snapshot path; do **not** ask for another bed-clear confirmation because the dedicated `bed_clear_start` yes/no turn was already the final operator approval.
+
 ### Approval phrasing
 
-Every approval question to the operator includes the `request_id` verbatim. Example: "Bed clear and you want to start request `u1_2026_0627_abc123`? (yes/no)". See `references/approval-phrasing.md` for templates per boundary + the rationale.
+Every approval question to the operator includes the `request_id` verbatim. Detail + per-boundary templates: `references/approval-phrasing.md`.
 
 ### YOU MUST NOT
 
