@@ -299,11 +299,12 @@ def test_stage2_gate_refuses_mismatched_nonce(sandbox_requests, monkeypatch):
     "SMOKE:capitalized", "Fixture:auto",
 ])
 def test_stage2_gate_refuses_test_prefixed_operator(
-        sandbox_requests, monkeypatch, capsys, test_op):
-    """Fence 1: any --operator starting with smoke:/test:/dev:/dry:/mock:/
-    ci:/fixture: is refused BEFORE any Moonraker call. Test operators
-    can never send print traffic to a real printer regardless of nonce
-    validity, approval token, or preflight state."""
+        sandbox_requests, monkeypatch, test_op):
+    """Fence 1: any --operator starting with smoke:/test:/dry:/mock:/
+    fixture: is refused BEFORE any Moonraker call. Test operators can
+    never send print traffic to a real printer regardless of nonce
+    validity, approval token, or preflight state. Refusal is delivered
+    as a RETURN value (not a print) so main() is the only JSON writer."""
     import u1_print_start_gate as gate
     called = {"query_state": False, "start_func": False, "preflight": False}
     monkeypatch.setattr(gate, "query_state",
@@ -314,14 +315,13 @@ def test_stage2_gate_refuses_test_prefixed_operator(
                         lambda *a, **kw: called.__setitem__("start_func", True) or {"ok": True})
     rid = f"u1_test_gate_fence1_{test_op.replace(':', '_')}"
     _seed_request(sandbox_requests, rid)
-    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
-                  approval_token="test_token",
-                  stage2_approval_nonce="anything",
-                  request_id=rid,
-                  operator=test_op,
-                  out_dir=u1_request.request_dir(rid))
-    out = capsys.readouterr().out
-    payload = json.loads(out)
+    payload = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                            approval_token="test_token",
+                            stage2_approval_nonce="anything",
+                            request_id=rid,
+                            operator=test_op,
+                            out_dir=u1_request.request_dir(rid))
+    assert payload is not None, "run_gate must return the refusal dict, not None"
     assert payload["ok"] is False
     assert payload["started"] is False
     assert payload["stage"] == "gate_refused_test_operator"
@@ -386,3 +386,255 @@ def test_stage2_gate_refuses_hash_binding_mismatch(sandbox_requests, monkeypatch
                         out_dir=u1_request.request_dir(rid))
     assert res["ok"] is False
     assert "hash" in res["reason"].lower()
+
+
+# ─── Fresh audit 2026-07-01: kit request must require staged nonce ──────────
+
+def test_stage2_gate_refuses_kit_request_without_persisted_nonce(
+        sandbox_requests, monkeypatch):
+    """Kit-path close (fresh audit finding HIGH-1): a kit request that
+    reached Stage 2 via the legacy --form-answers one-liner never mints a
+    Stage 2 nonce. Absent nonce state on a kit request means the two-turn
+    boundary was bypassed. Gate refuses regardless of approval-token
+    validity. Single-STL requests keep the legacy token-only path."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_kit_no_nonce"
+    # Seed a KIT request (has `kit` and `plates` fields) but with NO
+    # stage2_approval_nonce in safety.
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1,
+                       "selected": ["p1"]},
+                  safety={"approval_token": "test_token"})
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {})
+    # No stage2_approval_nonce provided AND no nonce in safety
+    res = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                        approval_token="test_token",
+                        request_id=rid,
+                        out_dir=u1_request.request_dir(rid))
+    assert res["ok"] is False
+    assert res["started"] is False
+    assert "staged bed_clear_start" in res["reason"] or "nonce" in res["reason"].lower()
+
+
+def test_stage2_gate_allows_single_stl_request_without_persisted_nonce(
+        sandbox_requests, monkeypatch):
+    """Single-STL requests (no `kit` / `plates` field) MUST keep the
+    legacy token-only path — closing the kit hole must not break the
+    single-STL workflow's backward compat."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_single_stl_legacy"
+    _seed_request(sandbox_requests, rid,
+                  kit=None, plates=None,
+                  safety={"approval_token": "test_token"})
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    reached_query = {"hit": False}
+    monkeypatch.setattr(gate, "query_state",
+                        lambda h, p: (reached_query.__setitem__("hit", True) or {}))
+    monkeypatch.setattr(gate, "_read_approval_token",
+                        lambda d: {"token": "test_token"})
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "path": None,
+                                          "brightness_check": "deferred"})
+    monkeypatch.setattr(gate, "start_print",
+                        lambda *a, **kw: {"result": "ok"})
+    # Missing plate1.gcode etc — expect the gate to progress to preflight
+    # (proving the kit-check did not falsely block a single-STL request)
+    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                  approval_token="test_token",
+                  request_id=rid,
+                  out_dir=u1_request.request_dir(rid))
+    assert reached_query["hit"], (
+        "single-STL request without a nonce must NOT be blocked by the "
+        "kit-request check — legacy backward compat must hold")
+
+
+# ─── Fresh audit 2026-07-01: fence refusal must return dict, not print ──────
+
+def test_fence_refusal_returns_dict_no_bare_none(sandbox_requests, monkeypatch):
+    """Fence 1 refusal must RETURN the JSON payload, not print + return None.
+    If it returned None, main() would json.dumps(None) → 'null' as a
+    second output line, breaking any downstream JSON parser."""
+    import u1_print_start_gate as gate
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {"__should_not_reach": True})
+    res = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                        approval_token="test_token",
+                        request_id="u1_test_fence_shape",
+                        operator="smoke:shape",
+                        out_dir=sandbox_requests / "no_such_request")
+    assert res is not None, (
+        "run_gate must return the refusal dict; None causes main() to "
+        "print `null` as a second output line")
+    assert res["ok"] is False
+    assert res["started"] is False
+    assert res["stage"] == "gate_refused_test_operator"
+
+
+# ─── Fresh audit 2026-07-01: manual bed-check wires through the gate ────────
+
+def test_stage2_gate_skips_sanity_capture_when_manual_verification_fresh(
+        sandbox_requests, monkeypatch):
+    """Manual-bed-check wire-through (fresh audit finding MED-1): when
+    safety.manual_verification is True AND a Stage 2 nonce was minted
+    (proving the operator's fresh yes actually happened) AND
+    verification_method + operator_text are recorded, the Stage 2
+    mandatory sanity photo capture is SKIPPED with a loud audit row.
+    The human's yes is the load-bearing safety gate; the sanity capture
+    was scaffolding for the camera path. This is what actually rescues
+    manual override when the camera is the reason for the override."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_manual_wired"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "the_manual_nonce",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                      "manual_verification": True,
+                      "verification_method": "snapmaker_app",
+                      "operator_text": "start manual-bed-check",
+                      "override_confirmed_at": "2026-07-01T18:00:00+00:00",
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token",
+                        lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    # Camera call would fail (this is the whole point of manual override).
+    # If the wire-through works, this lambda should NEVER be called.
+    camera_called = {"hit": False}
+    def raise_if_hit(*a, **kw):
+        camera_called["hit"] = True
+        return {"ok": False, "is_mock": True, "error": "camera unreachable"}
+    monkeypatch.setattr(gate, "capture_real_bed_photo", raise_if_hit)
+    started = {"hit": False}
+    def fake_start(*a, **kw):
+        started["hit"] = True
+        return {"result": "ok"}
+    res = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                        approval_token="test_token",
+                        stage2_approval_nonce="the_manual_nonce",
+                        request_id=rid,
+                        operator="telegram:brent",
+                        start_func=fake_start,
+                        out_dir=u1_request.request_dir(rid))
+    assert not camera_called["hit"], (
+        "manual-verification path must skip the Stage 2 sanity capture; "
+        "camera was called anyway → override defeated exactly when the "
+        "operator needs it")
+    assert started["hit"], (
+        "manual-verification path with fresh nonce + all binds must "
+        "actually reach start_print — the whole point of the override")
+
+
+def test_stage2_gate_still_captures_sanity_when_no_manual_verification(
+        sandbox_requests, monkeypatch):
+    """Normal camera path (no manual_verification): sanity capture is
+    still mandatory. The wire-through must not accidentally short-
+    circuit the normal path."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_normal_camera"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "the_normal_nonce",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                      # NO manual_verification flag
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token",
+                        lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    camera_called = {"hit": False}
+    def real_capture(*a, **kw):
+        camera_called["hit"] = True
+        return {"ok": True, "path": None, "brightness_check": "deferred"}
+    monkeypatch.setattr(gate, "capture_real_bed_photo", real_capture)
+    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                  approval_token="test_token",
+                  stage2_approval_nonce="the_normal_nonce",
+                  request_id=rid,
+                  operator="telegram:brent",
+                  start_func=lambda *a, **kw: {"result": "ok"},
+                  out_dir=u1_request.request_dir(rid))
+    assert camera_called["hit"], (
+        "normal camera path must still call capture_real_bed_photo; "
+        "manual-verification wire-through must not over-reach")
+
+
+# ─── Fresh audit 2026-07-01: refresh-bed-photo cannot create a start path ───
+
+def test_refresh_bed_photo_does_not_directly_emit_stage2(sandbox_requests, monkeypatch):
+    """The refresh-bed-photo action must go through the SAME two-turn
+    bed_clear_start yes/no; it cannot mint a Stage 2 nonce on its own.
+    Otherwise the refresh path would be an alternate entry to Stage 2
+    that bypasses the operator's yes."""
+    import io
+    rid = "u1_test_refresh_no_direct_start"
+    # A request that has already reached the confirm point and has a
+    # persisted start_gate_stage1_command (so we don't fail on missing
+    # setup).
+    _seed_request(sandbox_requests, rid,
+                  phase="awaiting_print_start",
+                  start_gate_stage1_command="python3 u1_print_start_gate.py x.gcode --intended-tool extruder --requested-material PLA --request-id " + rid)
+    events = []
+    def fake_emit(events_file, event, json_events=False):
+        events.append(event)
+    orig_emit = kw._emit
+    kw._emit = fake_emit
+    # Stub the bed capture so the refresh action doesn't need a live printer.
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token",
+                        lambda out_dir: {
+                            "ok": True,
+                            "snapshot_path": str(sandbox_requests / "bed_snapshot.jpg"),
+                            "token": "refresh_token",
+                            "approval_ttl_seconds": 1800,
+                            "approval_expires_at": "2026-07-01T18:30:00+00:00",
+                            "captured_at_utc": "2026-07-01T18:00:00+00:00",
+                            "reason": None,
+                        })
+    args = SimpleNamespace(json_events=False, request_id=rid, operator="test:unit")
+    try:
+        kw._action_refresh_bed_photo(
+            args, None, rid,
+            Path("/tmp/no_archive.zip"),
+            {"parts": [{"part_id": "p1"}], "part_count": 1},
+            "test:unit", "0.4", "all", "T0", "PLA",
+            True, True, False, "refresh-bed-photo")
+    finally:
+        kw._emit = orig_emit
+    # The refresh must NOT emit a next_action_required carrying a
+    # Stage 2 command directly. It must emit the render + a fresh
+    # bed_clear_start need_input (same as _action_start).
+    for e in events:
+        if e.get("stage") == "next_action_required":
+            cmd = e.get("command", "")
+            assert "--stage2-approval-nonce" not in cmd, (
+                "refresh-bed-photo emitted a Stage 2 command directly; it "
+                "must route through the bed_clear_start yes/no first")
+    # And the request state must NOT have gained a stage2_approval_nonce
+    # from refresh alone (only from _action_start's fresh yes).
+    state = u1_request.read_request(rid)
+    assert not (state.get("safety") or {}).get("stage2_approval_nonce"), (
+        "refresh alone must not persist a Stage 2 nonce")
