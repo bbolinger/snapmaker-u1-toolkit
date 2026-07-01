@@ -511,17 +511,21 @@ def run_gate(filename: str,
     printer_filename = _normalize_filename(filename)
     resolved_operator = _resolve_operator_for_gate(operator)
 
-    # Fence 1 — test-operator refusal. If the resolved operator carries a
-    # test/dev/smoke prefix, refuse Stage 2 BEFORE any Moonraker call. This
-    # closes the "smoke-test accidentally runs a real print" failure that
-    # bit us on 2026-07-01: the tester runs the workflow with
-    # --operator smoke:xxx, extracts the emitted Stage 2 command, runs it,
-    # and the gate happily sends /printer/print/start to the real printer.
-    # No live printer traffic under a test-flavored operator, ever. Stage 1
-    # (bed_clear=='start' with no approval_token — the *capture* phase) is
-    # also refused; the whole gate is off-limits to test operators.
-    _TEST_OPERATOR_PREFIXES = ("smoke:", "test:", "dev:", "dry:", "mock:",
-                               "ci:", "fixture:")
+    # Fence 1 — test-operator refusal. If the resolved operator carries an
+    # unambiguously test-flavored prefix, refuse Stage 2 BEFORE any
+    # Moonraker call. Closes the "smoke test accidentally runs a real
+    # print" failure that bit us on 2026-07-01: tester runs the workflow
+    # with --operator smoke:xxx, extracts the emitted Stage 2 command,
+    # runs it, and the gate happily sends /printer/print/start to the
+    # real printer.
+    #
+    # Prefix choice: only prefixes that are IMPLAUSIBLE as production
+    # identity strings. `dev:` and `ci:` were considered but left out —
+    # a fork developer running real prints from a dev environment, or a
+    # legitimate CI/CD pipeline orchestrating real prints, would use
+    # those. The list here is the "no ambiguity" tier: nobody names their
+    # production operator `smoke:*` or `mock:*`.
+    _TEST_OPERATOR_PREFIXES = ("smoke:", "test:", "dry:", "mock:", "fixture:")
     _op_lc = (resolved_operator or "").lower()
     if any(_op_lc.startswith(p) for p in _TEST_OPERATOR_PREFIXES):
         _audit_gate(request_id, 'gate_refused_test_operator',
@@ -533,10 +537,13 @@ def run_gate(filename: str,
             'ok': False, 'started': False,
             'operator': resolved_operator,
             'reason': (
-                f"gate refuses --operator={resolved_operator!r}: prefix looks "
-                "like a test/dev/smoke operator. Live printer traffic is "
-                "not allowed from a test-flavored operator. If this is a "
-                "real print, use a non-test operator value."
+                f"gate refuses --operator={resolved_operator!r}: prefix is "
+                "in the test-flavored refusal set "
+                f"({', '.join(_TEST_OPERATOR_PREFIXES)}). Live printer "
+                "traffic is not allowed from a test-flavored operator. "
+                "If this is a real print, use a non-test operator value "
+                "(bare name, `human:*`, `dev:*`, `ci:*`, or your platform "
+                "adapter's identity all pass)."
             ),
         }
         print(json.dumps(result, indent=2))
