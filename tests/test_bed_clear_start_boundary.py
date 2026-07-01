@@ -293,6 +293,68 @@ def test_stage2_gate_refuses_mismatched_nonce(sandbox_requests, monkeypatch):
     assert "nonce" in res["reason"].lower()
 
 
+@pytest.mark.parametrize("test_op", [
+    "smoke:med1", "test:integration", "dev:brent",
+    "dry:sanity", "mock:printer", "ci:workflow",
+    "SMOKE:capitalized", "Fixture:auto",
+])
+def test_stage2_gate_refuses_test_prefixed_operator(
+        sandbox_requests, monkeypatch, capsys, test_op):
+    """Fence 1: any --operator starting with smoke:/test:/dev:/dry:/mock:/
+    ci:/fixture: is refused BEFORE any Moonraker call. Test operators
+    can never send print traffic to a real printer regardless of nonce
+    validity, approval token, or preflight state."""
+    import u1_print_start_gate as gate
+    called = {"query_state": False, "start_func": False, "preflight": False}
+    monkeypatch.setattr(gate, "query_state",
+                        lambda h, p: called.__setitem__("query_state", True) or {})
+    monkeypatch.setattr(gate, "preflight",
+                        lambda *a, **kw: called.__setitem__("preflight", True) or [])
+    monkeypatch.setattr(gate, "start_print",
+                        lambda *a, **kw: called.__setitem__("start_func", True) or {"ok": True})
+    rid = f"u1_test_gate_fence1_{test_op.replace(':', '_')}"
+    _seed_request(sandbox_requests, rid)
+    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                  approval_token="test_token",
+                  stage2_approval_nonce="anything",
+                  request_id=rid,
+                  operator=test_op,
+                  out_dir=u1_request.request_dir(rid))
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["started"] is False
+    assert payload["stage"] == "gate_refused_test_operator"
+    # No Moonraker or start-func call reached under a test operator.
+    assert not called["query_state"], (
+        f"gate reached query_state under operator {test_op!r}")
+    assert not called["start_func"], (
+        f"gate reached start_func under operator {test_op!r}")
+    assert not called["preflight"], (
+        f"gate reached preflight under operator {test_op!r}")
+
+
+def test_stage2_gate_allows_real_operator_prefixes(sandbox_requests, monkeypatch):
+    """Fence 1 must NOT over-block: production operator strings like
+    'telegram:brent', 'discord:ops', 'human:brent', bare 'brent', or an
+    unknown-shaped operator must proceed past the fence."""
+    import u1_print_start_gate as gate
+    called = {"query_state": False}
+    monkeypatch.setattr(gate, "query_state",
+                        lambda h, p: called.__setitem__("query_state", True) or {})
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: ["some blocker"])
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: None)
+    for op in ("telegram:brent", "discord:ops", "human:brent", "brent", "unknown:x"):
+        rid = f"u1_test_gate_fence1_pass_{op.replace(':','_')}"
+        _seed_request(sandbox_requests, rid)
+        gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                      approval_token="test_token",
+                      request_id=rid, operator=op,
+                      out_dir=u1_request.request_dir(rid))
+    assert called["query_state"], (
+        "gate short-circuited a production operator — Fence 1 over-blocks")
+
+
 def test_stage2_gate_refuses_hash_binding_mismatch(sandbox_requests, monkeypatch):
     """Nonce matches but gcode_hash binding drifted → refuse."""
     import u1_print_start_gate as gate

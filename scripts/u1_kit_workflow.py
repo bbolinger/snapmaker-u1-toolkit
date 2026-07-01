@@ -222,7 +222,8 @@ def _build_next_command(archive: Path, request_id: str, *,
                         action: str | None = None,
                         adjust: str | None = None,
                         no_live_upload: bool = False,
-                        no_live_material: bool = False) -> str:
+                        no_live_material: bool = False,
+                        operator: str | None = None) -> str:
     """Compose the kit_workflow.py next_command with accumulated flags.
 
     Mirrors the single-STL workflow's pattern: each next_command carries
@@ -259,6 +260,11 @@ def _build_next_command(archive: Path, request_id: str, *,
         parts_q.append("--no-live-upload")
     if no_live_material:
         parts_q.append("--no-live-material")
+    if operator:
+        # Preserve operator across the yes-command chain so test-prefixed
+        # operators (smoke:*, test:*, etc.) can't drop to the default
+        # `telegram:brent` and let Stage 2 fire against the real printer.
+        parts_q.append(f"--operator {_shell_quote(operator)}")
     return " ".join(parts_q)
 
 
@@ -2480,7 +2486,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         archive, request_id, parts=parts_answer, tool=tool_choice,
         material=material, orient=orient, profile=profile_slug,
         supports=supports, action=action, nozzle=nozzle,
-        no_live_upload=no_live_upload, no_live_material=no_live_material)
+        no_live_upload=no_live_upload, no_live_material=no_live_material,
+        operator=operator)
     yes_command_on_confirmed = _yes_base + " --bed-clear-confirmed"
 
     # Action handlers
@@ -2488,7 +2495,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         return _action_start(events_file, request_id, json_events,
                              yes_command=yes_command_on_confirmed,
                              bed_clear_confirmed=bool(
-                                 getattr(args, "bed_clear_confirmed", False)))
+                                 getattr(args, "bed_clear_confirmed", False)),
+                             operator=operator)
     # Layer 3 override: manual-bed-check. The operator explicitly takes
     # responsibility for bed verification via another method (looking at
     # printer, Snapmaker app, other camera). Hermes camera path failed but
@@ -3176,7 +3184,8 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
 def _action_start(events_file: Path | None, request_id: str,
                   json_events: bool,
                   yes_command: str | None = None,
-                  bed_clear_confirmed: bool = False) -> dict[str, Any]:
+                  bed_clear_confirmed: bool = False,
+                  operator: str | None = None) -> dict[str, Any]:
     """Operator picked `start` at the confirm gate.
 
     Two-turn safety boundary: stable
@@ -3344,6 +3353,8 @@ def _action_start(events_file: Path | None, request_id: str,
             f"--approval-token {token} "
             f"--stage2-approval-nonce {stage2_nonce}"
         )
+        if operator:
+            stage2_cmd += f" --operator {_shell_quote(operator)}"
         next_action = {
             "stage": "next_action_required",
             "request_id": request_id,
@@ -3754,6 +3765,8 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
         f"--approval-token {token} "
         f"--stage2-approval-nonce {stage2_nonce}"
     )
+    if operator:
+        stage2_cmd += f" --operator {_shell_quote(operator)}"
     next_action = {
         "stage": "next_action_required",
         "request_id": request_id,
