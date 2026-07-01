@@ -9,9 +9,10 @@ Two-stage design with approval-token handoff (audit response 2026-06-25):
   starts. The agent surfaces the photo to the operator.
 
   Stage 2 — explicit (--bed-clear=start --approval-token=<token>):
-  validates the token against the recent Stage-1 capture (TTL 5 min),
-  re-runs preflight + a sanity-only fresh capture, dispatches start
-  only if everything passes. Token absence forces full Stage 1 again.
+  validates the token against the recent Stage-1 capture (TTL:
+  APPROVAL_TTL_SEC, currently 30 minutes), re-runs preflight + a
+  sanity-only fresh capture, dispatches start only if everything
+  passes. Token absence forces full Stage 1 again.
 
 Why the token: prevents the agent from skipping the human's review by
 just re-invoking the gate twice in quick succession. The token ties the
@@ -532,7 +533,7 @@ def run_gate(filename: str,
                     resolved_operator, prefix_match=next(
                         p for p in _TEST_OPERATOR_PREFIXES
                         if _op_lc.startswith(p)))
-        result = {
+        return {
             'stage': 'gate_refused_test_operator',
             'ok': False, 'started': False,
             'operator': resolved_operator,
@@ -546,8 +547,6 @@ def run_gate(filename: str,
                 "adapter's identity all pass)."
             ),
         }
-        print(json.dumps(result, indent=2))
-        return
 
     status = query_state(host, port)
     # Construct the local gcode path for the new preamble-activation check.
@@ -667,6 +666,13 @@ def run_gate(filename: str,
     # for backward compat we only enforce when request_id is present AND
     # the request state has any Stage 2 nonce persisted. Absent state +
     # absent flag = legacy path, allowed (with audit).
+    # Initialized outside the if-request_id block so the
+    # manual-verification check downstream can reference them safely
+    # even when request_id is None (single-STL direct-CLI path).
+    req_for_nonce: dict[str, Any] = {}
+    safety_for_nonce: dict[str, Any] = {}
+    expected_nonce = None
+    binds: dict[str, Any] = {}
     if request_id:
         try:
             import u1_request
@@ -679,6 +685,36 @@ def run_gate(filename: str,
             binds = {}
             req_for_nonce = {}
             safety_for_nonce = {}
+        # Kit-path nonce requirement (closes the legacy-token bypass a
+        # fresh audit flagged 2026-07-01). Kit requests ALWAYS mint a
+        # nonce via _action_start() after the operator's fresh yes at
+        # bed_clear_start. An absent nonce on a kit request means the
+        # legacy --form-answers one-liner bypassed the two-turn
+        # boundary; refuse regardless of token validity. Single-STL
+        # requests (no `kit` / `plates` field) keep the legacy
+        # token-only path for backward compat.
+        is_kit_request = bool(
+            req_for_nonce.get('kit') or req_for_nonce.get('plates'))
+        if is_kit_request and expected_nonce is None:
+            _audit_gate(request_id, 'stage2_kit_missing_nonce',
+                        resolved_operator,
+                        reason='kit_request_without_staged_confirmation')
+            return {
+                'stage': 'start_attempt',
+                'filename': printer_filename,
+                'blockers': blockers,
+                'snapshot': None,
+                'ok': False, 'started': False,
+                'reason': (
+                    "Kit request requires the staged bed_clear_start "
+                    "confirmation before Stage 2. No Stage 2 nonce is "
+                    "persisted for this request, meaning the yes/no "
+                    "prompt was never issued or never answered. Re-run "
+                    "the kit workflow with --action start (without "
+                    "--bed-clear-confirmed) to get the yes/no prompt, "
+                    "answer yes, then run the Stage 2 command it emits."
+                ),
+            }
         if expected_nonce is not None:
             problems: list[str] = []
             if not stage2_approval_nonce:
@@ -803,20 +839,64 @@ def run_gate(filename: str,
     _audit_gate(request_id, 'start_safety_check_passed', resolved_operator,
                 request_revision=(req or {}).get('request_revision'),
                 gcode_hash=(req or {}).get('gcode_hash'))
-    # Sanity-only fresh capture so we don't fire blind into a state that
-    # changed during the operator's review. We do NOT show this photo —
-    # the operator already approved Stage 1's. We just refuse if this
-    # one is mock/dark too.
-    sanity_snapshot = capture_real_bed_photo(out_dir, host, port)
-    # Audit 2026-06-26: distinguish mock (camera never reached) and
-    # measured-dark from deferred-brightness-check (PIL unavailable but
-    # photo IS real). Only the first two should block — deferred allows
-    # the start because the operator already approved Stage 1's image.
-    sanity_blocks_start = (
-        sanity_snapshot.get('is_mock')
-        or (sanity_snapshot.get('brightness_check') == 'measured'
-            and not sanity_snapshot.get('ok'))
+    # Manual-verification path (Layer 3 override, wired 2026-07-01): if
+    # the operator's fresh yes at bed_clear_start was backed by a manual
+    # verification method (physical look at the bed / Snapmaker app /
+    # other camera), the mandatory Stage 2 sanity capture is REDUNDANT.
+    # The real safety gate is the human yes; the sanity capture was
+    # belt-and-suspenders scaffolding for the camera path.
+    #
+    # For that skip to be safe, ALL of these must hold:
+    #   * safety.manual_verification is True
+    #   * a fresh Stage 2 nonce was minted for this request (the fresh
+    #     yes actually happened — an old override_confirmed_at from a
+    #     prior slice must not carry forward)
+    #   * revision + gcode_hash binds match (already checked above; the
+    #     safety-check-passed audit implies they do)
+    #   * operator_text + verification_method are recorded
+    # Loud audit row so the forensic timeline distinguishes this from a
+    # normal Stage 2 sanity pass.
+    manual_ver = (safety_for_nonce or {}).get('manual_verification') is True
+    manual_ver_ok = (
+        manual_ver
+        and expected_nonce is not None
+        and (safety_for_nonce or {}).get('operator_text')
+        and (safety_for_nonce or {}).get('verification_method')
     )
+    if manual_ver_ok:
+        _audit_gate(request_id,
+                    'stage2_sanity_capture_skipped_manual_verification',
+                    resolved_operator,
+                    verification_method=safety_for_nonce.get(
+                        'verification_method'),
+                    operator_text=safety_for_nonce.get('operator_text'),
+                    override_confirmed_at=safety_for_nonce.get(
+                        'override_confirmed_at'),
+                    request_revision=(req or {}).get('request_revision'),
+                    gcode_hash=(req or {}).get('gcode_hash'),
+                    stage2_nonce_prefix=(expected_nonce or '')[:8])
+        sanity_snapshot = {
+            'ok': True,
+            'skipped': True,
+            'reason': 'manual verification path — sanity capture skipped',
+        }
+        sanity_blocks_start = False
+    else:
+        # Sanity-only fresh capture so we don't fire blind into a state
+        # that changed during the operator's review. We do NOT show this
+        # photo — the operator already approved Stage 1's. We just
+        # refuse if this one is mock/dark too.
+        sanity_snapshot = capture_real_bed_photo(out_dir, host, port)
+        # Audit 2026-06-26: distinguish mock (camera never reached) and
+        # measured-dark from deferred-brightness-check (PIL unavailable
+        # but photo IS real). Only the first two should block — deferred
+        # allows the start because the operator already approved Stage
+        # 1's image.
+        sanity_blocks_start = (
+            sanity_snapshot.get('is_mock')
+            or (sanity_snapshot.get('brightness_check') == 'measured'
+                and not sanity_snapshot.get('ok'))
+        )
     if sanity_blocks_start:
         # M5 fix (cold review 2026-06-27): audit the sanity-capture refusal
         # so the forensic timeline reflects WHY the start was blocked
