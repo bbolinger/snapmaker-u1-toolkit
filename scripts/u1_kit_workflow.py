@@ -3080,7 +3080,8 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
     Returns:
       {'ok': bool, 'snapshot_path': str | None, 'token': str | None,
        'approval_ttl_seconds': int | None,
-       'approval_expires_at': str | None, 'reason': str | None}
+       'approval_expires_at': str | None, 'captured_at_utc': str | None,
+       'reason': str | None}
 
     Fail-closed: if camera unreachable, brightness too dark, or any other
     failure, returns ok=False with a reason. The plan card omits the `start`
@@ -3145,6 +3146,7 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "token": token,
             "approval_ttl_seconds": int(APPROVAL_TTL_SEC),
             "approval_expires_at": expires_at,
+            "captured_at_utc": captured_ts,
             "reason": None}
 
 
@@ -3467,7 +3469,7 @@ def _action_refresh_bed_photo(args, events_file: Path | None, request_id: str,
         "approval_ttl_seconds": bed_result.get("approval_ttl_seconds"),
         "approval_expires_at": bed_result.get("approval_expires_at"),
         "refreshed_via": action_label,
-        "refreshed_at_utc": bed_result.get("approval_expires_at"),
+        "refreshed_at_utc": bed_result.get("captured_at_utc"),
     }
     u1_request.write_request(request_id, phase="awaiting_print_start",
                              safety=safety_block)
@@ -4234,7 +4236,10 @@ def main(argv=None) -> int:
     ap.add_argument("--nozzle", default="0.4")
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--live-upload", action="store_true",
-                    help="LEGACY no-op alias (live upload is now the default)")
+                    help=("In legacy --form-answers one-liner mode: opt IN to "
+                          "the real Moonraker upload (default is dry-run for "
+                          "CLI tests). In staged mode: no-op — live upload is "
+                          "the default; use --no-live-upload to opt out."))
     ap.add_argument("--no-live-upload", action="store_true",
                     help="Opt out of the real Moonraker upload (CLI smoke tests only)")
     ap.add_argument("--on-collision", choices=["rename", "overwrite", "cancel"], default=None)
