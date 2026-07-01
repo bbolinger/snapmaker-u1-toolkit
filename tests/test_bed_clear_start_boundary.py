@@ -294,8 +294,8 @@ def test_stage2_gate_refuses_mismatched_nonce(sandbox_requests, monkeypatch):
 
 
 @pytest.mark.parametrize("test_op", [
-    "smoke:med1", "test:integration", "dev:brent",
-    "dry:sanity", "mock:printer", "ci:workflow",
+    "smoke:med1", "test:integration",
+    "dry:sanity", "mock:printer",
     "SMOKE:capitalized", "Fixture:auto",
 ])
 def test_stage2_gate_refuses_test_prefixed_operator(
@@ -335,17 +335,22 @@ def test_stage2_gate_refuses_test_prefixed_operator(
 
 
 def test_stage2_gate_allows_real_operator_prefixes(sandbox_requests, monkeypatch):
-    """Fence 1 must NOT over-block: production operator strings like
-    'telegram:brent', 'discord:ops', 'human:brent', bare 'brent', or an
-    unknown-shaped operator must proceed past the fence."""
+    """Fence 1 must NOT over-block: production operator strings must proceed
+    past the fence. Includes:
+      * platform-adapter identities: `telegram:brent`, `discord:ops`
+      * generic identities: `human:brent`, bare `brent`, `unknown:x`
+      * developer / CI identities: `dev:my-fork`, `ci:release-pipeline` —
+        deliberately left off the fence list to avoid burning fork
+        developers or CI-orchestrated real prints (2026-07-01 ship-review)."""
     import u1_print_start_gate as gate
     called = {"query_state": False}
     monkeypatch.setattr(gate, "query_state",
                         lambda h, p: called.__setitem__("query_state", True) or {})
     monkeypatch.setattr(gate, "preflight", lambda *a, **kw: ["some blocker"])
     monkeypatch.setattr(gate, "_read_approval_token", lambda d: None)
-    for op in ("telegram:brent", "discord:ops", "human:brent", "brent", "unknown:x"):
-        rid = f"u1_test_gate_fence1_pass_{op.replace(':','_')}"
+    for op in ("telegram:brent", "discord:ops", "human:brent", "brent",
+               "unknown:x", "dev:my-fork", "ci:release-pipeline"):
+        rid = f"u1_test_gate_fence1_pass_{op.replace(':','_').replace('-','_')}"
         _seed_request(sandbox_requests, rid)
         gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
                       approval_token="test_token",
