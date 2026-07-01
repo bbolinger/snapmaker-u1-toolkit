@@ -431,6 +431,27 @@ read → slice → upload (print=false) → operator-approved start → quiet mo
 - Cancel/stop a print
 - Any movement/heating command
 
+### Test-operator fence (v2.1.0)
+
+`u1_print_start_gate.py` refuses Stage 2 (real printer start) BEFORE any Moonraker
+call if the `--operator` argument starts with an unambiguously test-flavored
+prefix: `smoke:`, `test:`, `dry:`, `mock:`, or `fixture:` (case-insensitive).
+
+The gate returns a `gate_refused_test_operator` payload and audits the refusal.
+No HTTP call reaches the printer, no photo is taken, no preflight runs. This
+closes the "smoke-test accidentally runs a real print" failure that motivated
+the fence (2026-07-01 postmortem in the v2.1.0 branch history).
+
+`u1_kit_workflow.py` also prints a highly visible TEST MODE banner to stderr
+at the top of every invocation under a test-flavored operator, so the tester
+sees the gate will refuse before any command runs.
+
+If you hit the fence for a legitimate print — e.g. you set `U1_OPERATOR=test:homelab`
+in your environment because that's your naming convention — change the operator
+string to something without a test prefix (`homelab`, `human:homelab`, etc.).
+The fence is deliberately narrow: identity strings starting with `dev:`, `ci:`,
+`telegram:`, `discord:`, `human:`, or bare names all proceed normally.
+
 ## Quick start — per-platform commands
 
 The 30-second flavor is in [Quick Start](#quick-start) above. This section has the per-platform install + first-status-probe commands.
