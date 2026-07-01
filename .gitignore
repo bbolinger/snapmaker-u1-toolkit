@@ -47,3 +47,4 @@ tests/experiments/v16-results.tsv
 # for us). These stay out of public history via the squash-merge to main.
 docs/FORM-PROTOCOL.md
 docs/v2.1.0-multipart-kits-plan.md
+docs/2026-*-*.md

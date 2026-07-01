@@ -20,7 +20,17 @@ from __future__ import annotations
 from typing import Any
 
 
-_RESUMED_OR_EMITTED = ('readiness_card_emitted', 'readiness_card_replayed_from_resume')
+_RESUMED_OR_EMITTED = (
+    'readiness_card_emitted',
+    'readiness_card_replayed_from_resume',
+    # v2.1 kit workflow emits its own readiness event name (kit-specific
+    # carries plate metadata + gated_plate selection). Added 2026-06-30:
+    # before this, can_start() refused EVERY kit Stage 2 with "no
+    # readiness_card emitted yet" because the kit emits a different event
+    # name than the single-STL workflow. Same class of bug as the v2.0
+    # active-tool blocker that assumed single-tool semantics.
+    'kit_readiness_card_emitted',
+)
 
 
 def can_start(
