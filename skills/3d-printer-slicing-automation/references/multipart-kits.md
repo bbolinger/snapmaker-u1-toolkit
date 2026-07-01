@@ -31,10 +31,35 @@ uploads them, and emits `kit_readiness_card`. The card's `parsed_echo`
 ("I read: …") is what the operator confirms — surface it.
 
 ## Trigger 2 — the photo gate (plate 1 only)
-The kit workflow gates **only plate 1** through the normal Stage 1/2 camera
-gate (`start_gate_stage1_command` in the readiness card). Run Stage 1, surface
-the bed photo, get the operator's yes/no, then Stage 2 — exactly the single-STL
-gate procedure. Nothing new here.
+The kit workflow gates **only plate 1** through a **two-turn bed-clear
+confirmation + nonce-bound Stage 2**:
+
+1. Operator picks `start` in the readiness card options → workflow emits
+   `need_input` with `key: "bed_clear_start"` + a fresh bed photo.
+2. Surface the photo + prompt VERBATIM. Wait for the operator's `yes` or `no`.
+3. On `yes`: tool-call the `next_command_on_yes` (which re-invokes the
+   workflow with `--bed-clear-confirmed`). The workflow validates the pending
+   confirmation, mints a single-use `stage2_approval_nonce`, and emits the
+   nonce-bound Stage 2 command.
+4. Run the emitted Stage 2 command. The gate consumes the nonce and starts
+   the print.
+
+Notes on the `start_gate_stage1_command` field also present in the
+readiness card: it's the Stage 1 camera-refresh command. **It does not
+authorize Stage 2.** For kit requests the gate refuses any Stage 2
+invocation that arrives without a nonce, so the legacy
+"run Stage 1 → get token → run Stage 2 with token" one-liner path is
+architecturally closed for kits. Kit Stage 2 always requires the
+staged bed_clear_start confirmation.
+
+The legacy `--form-answers` / `--form-answers-json` one-liner modes can
+still commit + slice + upload + emit the readiness card in a single
+CLI call. **They do NOT authorize kit Stage 2 on their own.** Kit
+print start still requires the staged bed_clear_start yes/no and
+the nonce-bound Stage 2 command. Attempting Stage 2 for a kit request
+without a persisted nonce returns
+`gate refuses: Kit request requires the staged bed_clear_start
+confirmation before Stage 2`.
 
 ## Plates 2..N
 If the kit needed multiple plates, they are **already uploaded** to the printer.

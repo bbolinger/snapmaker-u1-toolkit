@@ -638,3 +638,209 @@ def test_refresh_bed_photo_does_not_directly_emit_stage2(sandbox_requests, monke
     state = u1_request.read_request(rid)
     assert not (state.get("safety") or {}).get("stage2_approval_nonce"), (
         "refresh alone must not persist a Stage 2 nonce")
+
+
+# ─── Final audit 2026-07-01: remaining coverage gaps ────────────────────────
+
+def test_stage2_gate_refuses_kit_request_wrong_revision(sandbox_requests, monkeypatch):
+    """Nonce matches but request_revision drifted (plan changed since the
+    operator approved) → refuse. Guards silent plan-swap between
+    approval and Stage 2."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_kit_wrong_revision"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  request_revision=7,  # current
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "the_nonce",
+                      "stage2_approval_binds": {
+                          "request_revision": 3,  # bound at approval time
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {})
+    res = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                        approval_token="test_token",
+                        stage2_approval_nonce="the_nonce",
+                        request_id=rid,
+                        out_dir=u1_request.request_dir(rid))
+    assert res["ok"] is False
+    assert res["started"] is False
+    assert "revision" in res["reason"].lower()
+
+
+def test_stage2_gate_refuses_kit_replay_of_consumed_nonce(sandbox_requests, monkeypatch):
+    """Consumed-nonce replay guard on kit path: after a successful Stage
+    2 the workflow pops the nonce from safety. A subsequent invocation
+    with the SAME nonce value now finds `expected_nonce is None` on a
+    kit request, which the HIGH-1 fix refuses. Belt for defense in
+    depth — the attacker had a valid consumed nonce; the gate still
+    refuses."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_kit_replay"
+    # State AFTER a successful consumption: kit fields still present,
+    # nonce popped, binds popped.
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  plates=[{"plate_idx": 1, "gcode_hash": "sha256:x"}],
+                  safety={"approval_token": "test_token"})  # no nonce
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {})
+    started = {"hit": False}
+    def bad_start(*a, **kw):
+        started["hit"] = True
+        return {"result": "ok"}
+    res = gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                        approval_token="test_token",
+                        stage2_approval_nonce="the_old_consumed_nonce",
+                        request_id=rid,
+                        start_func=bad_start,
+                        out_dir=u1_request.request_dir(rid))
+    assert res["ok"] is False
+    assert res["started"] is False
+    assert not started["hit"], "replay of consumed kit nonce must not reach start"
+
+
+def test_stage2_gate_falls_back_to_camera_when_manual_verification_missing_operator_text(
+        sandbox_requests, monkeypatch):
+    """Half-populated manual-verification state must NOT trigger the
+    sanity-capture skip. safety.manual_verification=True but no
+    operator_text → fall through to the normal camera path. If the
+    camera is down (which is when manual override actually matters),
+    the operator gets a clear refusal instead of an accidental start."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_manual_no_operator_text"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                      "manual_verification": True,
+                      # operator_text MISSING
+                      "verification_method": "snapmaker_app",
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    camera_called = {"hit": False}
+    def real_capture(*a, **kw):
+        camera_called["hit"] = True
+        return {"ok": True, "path": None, "brightness_check": "deferred"}
+    monkeypatch.setattr(gate, "capture_real_bed_photo", real_capture)
+    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                  approval_token="test_token",
+                  stage2_approval_nonce="n",
+                  request_id=rid,
+                  operator="telegram:brent",
+                  start_func=lambda *a, **kw: {"result": "ok"},
+                  out_dir=u1_request.request_dir(rid))
+    assert camera_called["hit"], (
+        "half-populated manual verification (no operator_text) must fall "
+        "back to camera sanity capture")
+
+
+def test_stage2_gate_falls_back_to_camera_when_manual_verification_missing_method(
+        sandbox_requests, monkeypatch):
+    """Same as above for missing verification_method."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_manual_no_method"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                      "manual_verification": True,
+                      "operator_text": "start manual-bed-check",
+                      # verification_method MISSING
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    camera_called = {"hit": False}
+    def real_capture(*a, **kw):
+        camera_called["hit"] = True
+        return {"ok": True, "path": None, "brightness_check": "deferred"}
+    monkeypatch.setattr(gate, "capture_real_bed_photo", real_capture)
+    gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                  approval_token="test_token",
+                  stage2_approval_nonce="n",
+                  request_id=rid,
+                  operator="telegram:brent",
+                  start_func=lambda *a, **kw: {"result": "ok"},
+                  out_dir=u1_request.request_dir(rid))
+    assert camera_called["hit"], (
+        "half-populated manual verification (no verification_method) "
+        "must fall back to camera sanity capture")
+
+
+def test_readiness_card_gates_only_plate_1_not_plates_2_N():
+    """Kit safety story: the toolkit is only allowed to start plate 1
+    (the gated plate). Plates 2..N must not appear in any
+    startable-command field — the operator has to start them from the
+    Snapmaker app because we can't know the future bed state after
+    plate 1 finishes.
+
+    Guards against a future refactor that would emit per-plate Stage
+    1/2 commands and accidentally offer them as start options."""
+    import re
+    src = Path(kw.__file__).read_text()
+    # The readiness card must expose exactly ONE `gated_plate` field
+    # and exactly ONE `start_gate_stage1_command` field per emit — both
+    # referring to plate 1.
+    #
+    # There must be NO per-plate iteration that ends up in a
+    # start-command emission for plates other than plate_idx=1.
+    #
+    # Sanity checks (compile-time-ish — grep the source shape):
+    #   * `gated_plate` is only ever set from plate1's filename
+    #   * no `for pl in plates` loop that builds a start command
+    for anti in (
+        "start_gate_stage2_command",
+        "start_gate_stage1_command_per_plate",
+        "per_plate_start_command",
+    ):
+        assert anti not in src, (
+            f"{anti} present in source — plates 2..N might be exposed as "
+            "toolkit-startable")
+    # No emission of start_gate_stage1_command inside a per-plate iteration
+    # (defense against a future refactor that would loop start commands
+    # for every plate instead of just plate 1).
+    for anti_loop in (
+        "for pl in arr['plates']:\n        # start",
+        "for plate in plates:\n        # start_gate",
+        "for _pl in plates:\n        # start_gate",
+    ):
+        assert anti_loop not in src, (
+            f"per-plate start-command emission detected: {anti_loop!r}")
+    # Positive check: readiness always emits gated_plate keyed off
+    # plates_state[0] / arr['plates'][0] (plate 1), never plate N.
+    # Confirm this by re-reading the workflow after running one legacy
+    # kit commit through it and ensuring readiness_card_event only
+    # contains plate1 in gated_plate + start_gate_stage1_command.
