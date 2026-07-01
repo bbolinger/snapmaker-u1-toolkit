@@ -2910,8 +2910,14 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         "printer_busy": printer_busy,
         "printer_busy_reason": printer_state.get("reason"),
         "gated_plate": plate1["printer_storage_filename"],
-        # Legacy Stage 1 command kept for fallback path (no token in it —
-        # invokes the classic photo-capture flow that itself asks yes/no).
+        # NOT A START AUTHORIZATION. This is a Stage 1 command that
+        # captures a bed photo and writes an approval token; it does
+        # NOT command the printer. For kit requests the gate refuses
+        # any Stage 2 that arrives without a nonce
+        # (see u1_print_start_gate.py:is_kit_request refusal path), so
+        # this command CANNOT be chained into a print start on its
+        # own. Named the way it is for backward compat with older
+        # skills that grep this key for the photo-refresh flow.
         "start_gate_stage1_command": stage1_cmd,
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Plate 1 ({plate1['printer_storage_filename']}) is "
@@ -4161,6 +4167,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         "orient": values.get("orient"), "supports": supports,
         "parsed_echo": u1_form.echo_parse(values, spec),
         "gated_plate": plate1["printer_storage_filename"],
+        # NOT A START AUTHORIZATION — Stage 1 photo-capture command
+        # only. Kit Stage 2 requires the staged bed_clear_start
+        # nonce (u1_print_start_gate.py refuses kit start without one).
         "start_gate_stage1_command": stage1_cmd,
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Stage 1 gates ONLY plate 1 "
