@@ -2296,6 +2296,26 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
 def run_kit_workflow(args) -> dict[str, Any]:
     """Orchestrate the kit path. See module docstring for the staged flow."""
     operator = _resolve_operator(args)
+    # Fence 1 companion: visible stderr banner whenever the workflow is
+    # invoked under a test-prefixed operator. Same prefix list as
+    # u1_print_start_gate.py's gate refusal. Prevents the "oh it looked
+    # fine" self-deception that let 2026-07-01's smoke chain-fire a
+    # real print: any test operator now produces a big banner on every
+    # invocation so the tester can't miss that the gate will refuse.
+    _TEST_OPERATOR_PREFIXES = ("smoke:", "test:", "dry:", "mock:", "fixture:")
+    _op_lc = (operator or "").lower()
+    if any(_op_lc.startswith(p) for p in _TEST_OPERATOR_PREFIXES):
+        import sys as _sys
+        _sys.stderr.write(
+            f"\n{'=' * 68}\n"
+            f"TEST MODE: --operator={operator!r} carries a test-flavored "
+            f"prefix.\n"
+            f"u1_print_start_gate.py will REFUSE Stage 2 under this operator.\n"
+            f"No Moonraker traffic, no print start. If this is a real print,\n"
+            f"re-invoke with a non-test --operator value.\n"
+            f"{'=' * 68}\n\n"
+        )
+        _sys.stderr.flush()
     # Resilience: agents sometimes drop the model positional when re-invoking
     # the workflow (anti-pattern #4: paraphrase the verbatim next_command).
     # If --request-id is supplied AND request.json has a model_path, recover
