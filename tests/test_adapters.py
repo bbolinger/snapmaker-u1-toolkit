@@ -138,8 +138,11 @@ def test_tg_review_card_after_last_field_lists_all_and_offers_edit():
     assert "Review" in s["text"]
     assert "auto" in s["text"] and "T0" in s["text"]
     cbs = _ids_in_keyboard(s["keyboard"])
-    assert "S" in cbs and "X" in cbs            # Submit + Cancel
-    assert any(c.startswith("e:") for c in cbs)  # Edit buttons
+    # Action is a submit_choice now: two submit verbs (S:<f>:<o>) replace the
+    # bare Submit button; Cancel stays. Action gets no Edit row of its own.
+    assert any(c.startswith("S:") for c in cbs) and "X" in cbs
+    assert sum(c.startswith("S:") for c in cbs) == 2   # Upload only + Upload+Start
+    assert any(c.startswith("e:") for c in cbs)        # Edit buttons
 
 
 def test_tg_submit_blocks_when_required_unset_and_jumps_back():
@@ -887,3 +890,114 @@ def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkey
     rc = hermes_install.main(["--venv", str(venv), "--uninstall"])
     assert rc == 0
     assert run_py.read_text() == upgraded  # NOT clobbered by the stale backup
+
+
+# --------------------------------------------------------------------------- #
+# v2.2.1 form UX — merged head/material, submit-verbs, conditional parts
+# --------------------------------------------------------------------------- #
+
+def _heads_spec(n_parts=2):
+    return {
+        "parts": [{"id": f"{i:02d}_p{i}", "label": f"p{i}.stl (10x10mm)"}
+                  for i in range(1, n_parts + 1)],
+        "heads": [
+            {"tool": "T0", "channel": 0, "material": "PETG", "color": "white"},
+            {"tool": "T1", "channel": 1, "material": "PETG", "color": "black"},
+            {"tool": "T2", "channel": 2, "material": "PLA", "color": "orange"},
+        ],
+        "tool_materials": {"T0": "PETG", "T1": "PETG", "T2": "PLA"},
+        "profiles": [{"idx": 1, "label": "0.20 Strength Gyroid"},
+                     {"idx": 2, "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"}],
+        "supports": ["supports", "no-supports"], "actions": ["start", "upload-only"],
+    }
+
+
+def _fidx(schema, fid):
+    return [i for i, f in enumerate(schema["fields"]) if f["id"] == fid][0]
+
+
+def test_merged_head_drops_material_screen_and_labels_carry_color():
+    schema = u1_form.build_form_schema(_heads_spec())
+    ids = [f["id"] for f in schema["fields"]]
+    assert "material" not in ids           # merged into the head
+    tool_field = schema["fields"][_fidx(schema, "tool")]
+    assert tool_field["label"] == "Print head"
+    labels = [o["label"] for o in tool_field["options"]]
+    assert labels[0] == "Head 1 (T0) — PETG ⚪ white"
+    assert "🟠 orange" in labels[2]
+
+
+def test_merged_head_derives_material_from_head_in_parse():
+    spec = _heads_spec()
+    # Pick head T2 → material must resolve to PLA without a Material answer.
+    parsed = u1_form.parse_answers_json(
+        {"parts": "all", "tool": "T2", "profile": 1}, spec)
+    assert parsed["ok"], parsed["errors"]
+    assert parsed["values"]["material"] == "PLA"
+
+
+def test_profile_suffix_stripped():
+    schema = u1_form.build_form_schema(_heads_spec())
+    labels = [o["label"] for o in schema["fields"][_fidx(schema, "profile")]["options"]]
+    assert labels == ["0.20 Strength Gyroid", "0.20 Standard"]
+
+
+def test_single_part_skips_parts_screen():
+    spec = _heads_spec(n_parts=1)
+    schema = u1_form.build_form_schema(spec)
+    assert "parts" not in [f["id"] for f in schema["fields"]]
+    form = tg.new_form(schema)
+    assert form["current"] == "orient"     # straight past parts
+    # and the lone part still ends up selected by default in parse
+    parsed = u1_form.parse_answers_json({"tool": "T0", "profile": 1}, spec)
+    assert parsed["ok"] and parsed["values"]["parts"] == [1]
+
+
+def test_submit_verb_sets_action_and_submits():
+    schema = u1_form.build_form_schema(_heads_spec())
+    form = tg.new_form(schema)
+    # satisfy required screen fields
+    form["selections"]["tool"] = 0
+    form["selections"]["profile"] = 0
+    form["current"] = tg.REVIEW_FIELD
+    afi = _fidx(schema, "action")
+    # tap the "upload-only" verb (option index 1)
+    ev = tg.apply_callback(form, f"S:{afi}:1")
+    assert ev["kind"] == "submit"
+    assert ev["answer"]["action"] == "upload-only"
+    # and the "start" verb
+    form2 = tg.new_form(schema)
+    form2["selections"]["tool"] = 1
+    form2["selections"]["profile"] = 1
+    form2["current"] = tg.REVIEW_FIELD
+    ev2 = tg.apply_callback(form2, f"S:{afi}:0")
+    assert ev2["answer"]["action"] == "start"
+
+
+def test_submit_verb_still_blocks_on_missing_required():
+    schema = u1_form.build_form_schema(_heads_spec())
+    form = tg.new_form(schema)
+    form["current"] = tg.REVIEW_FIELD       # nothing picked
+    afi = _fidx(schema, "action")
+    ev = tg.apply_callback(form, f"S:{afi}:0")
+    assert ev["kind"] == "rerender" and "warning" in ev
+    assert form["current"] != tg.REVIEW_FIELD
+
+
+def test_offline_no_toolmap_keeps_tool_and_material_screens():
+    spec = {
+        "parts": [{"id": "01_a", "label": "a"}],
+        "tools": ["T0", "T1"], "materials": ["PLA", "PETG"],
+        "profiles": [{"idx": 1, "label": "p1"}],
+        "supports": ["supports", "no-supports"], "actions": ["start", "upload-only"],
+    }
+    ids = [f["id"] for f in u1_form.build_form_schema(spec)["fields"]]
+    assert "tool" in ids and "material" in ids   # fallback path unchanged
+
+
+def test_step_counter_excludes_submit_choice():
+    schema = u1_form.build_form_schema(_heads_spec())
+    form = tg.new_form(schema)   # at parts
+    txt = tg.render_screen(form)["text"]
+    # screen fields: parts, orient, tool, profile, supports = 5 (action excluded)
+    assert "Step 1 of 5" in txt

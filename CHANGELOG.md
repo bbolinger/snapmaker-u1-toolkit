@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased — v2.2 line]
 
+### Changed
+
+- **Form UX v2.2.1 — fewer, clearer screens (operator feedback 2026-07-02).**
+  - **Print head carries the filament.** When the live tool map is present, the
+    head screen shows each head's loaded material + colour
+    (`Head 2 (T1) — PETG ⚫ black`, read from `printer_reported`), and picking
+    the head sets the material — the separate Material screen is gone. Falls
+    back to generic T0–T3 + a Material screen when offline. The start gate still
+    physically re-verifies loaded material at print time.
+  - **Action → two submit verbs** on the review card (`⬆ Upload only` /
+    `▶ Upload + Start`) instead of its own screen.
+  - **Single-part kit skips the Parts screen** (nothing to choose).
+  - **Profile labels** drop the `@Snapmaker U1 (0.4 nozzle)` suffix that every
+    entry shared.
+  - Step counter now counts only the screens the operator taps through.
+
 ### Fixed
 
 - **Telegram form taps never reached the form handler** (live 2026-07-02).

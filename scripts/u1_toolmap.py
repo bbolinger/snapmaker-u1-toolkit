@@ -30,6 +30,50 @@ EXTRUDER_NAMES = ["extruder", "extruder1", "extruder2", "extruder3"]
 EXTRUDER_CHANNEL = {"extruder": 0, "extruder1": 1, "extruder2": 2, "extruder3": 3}
 CHANNEL_EXTRUDER = {v: k for k, v in EXTRUDER_CHANNEL.items()}
 
+_UNKNOWN_MATERIALS = {"", "UNKNOWN", "NONE"}
+
+
+def load_head_options(data_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Read ``latest_toolmap.json`` → ordered list of LOADED print heads, each
+    with its live material + colour, so a form can merge "which head?" and
+    "which filament?" into one screen (the printer already knows).
+
+    Source of truth is ``printer_reported`` (what the machine reports right
+    now) — the same field the start gate verifies — never the operator's
+    ``declared`` overlay, which can be stale. Only heads reporting a known
+    material and ``exists`` are returned: you cannot print from an empty head,
+    so an unloaded/unknown head is not an offerable choice. Returns ``[]`` when
+    the toolmap is missing/unreadable, so callers fall back to the generic
+    tool+material fields (and tests without a printer keep the old path).
+
+    Each head: ``{tool, channel, material, color, rgba, vendor}``.
+    """
+    base = data_dir or get_data_dir()
+    try:
+        summary = json.loads((Path(base) / "latest_toolmap.json").read_text())
+    except (OSError, ValueError):
+        return []
+    from u1_material_picker import rgba_to_color_name  # lazy: avoid import cycle
+
+    tools = summary.get("tools") or {}
+    heads: list[dict[str, Any]] = []
+    for name in EXTRUDER_NAMES:
+        t = tools.get(name) or {}
+        pr = t.get("printer_reported") or {}
+        material = str(pr.get("material") or "").strip().upper()
+        if material in _UNKNOWN_MATERIALS or pr.get("exists") is False:
+            continue
+        rgba = pr.get("color_rgba")
+        heads.append({
+            "tool": f"T{EXTRUDER_CHANNEL[name]}",
+            "channel": EXTRUDER_CHANNEL[name],
+            "material": material,
+            "color": rgba_to_color_name(rgba),
+            "rgba": rgba,
+            "vendor": pr.get("vendor"),
+        })
+    return heads
+
 
 def http_json(url: str, timeout: float = 8.0) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r:

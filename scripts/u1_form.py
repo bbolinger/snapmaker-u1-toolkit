@@ -292,6 +292,15 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
     values.setdefault("action", "start" if "start" in actions_allowed
                       else (actions_offered[0] if actions_offered else "start"))
 
+    # Merged head/material: when the head carries its loaded filament (live
+    # tool map), picking the head sets the material — no Material screen. Derive
+    # it here, in the shared core, so BOTH intakes satisfy the required-field
+    # check and downstream slice. The start gate still physically re-verifies
+    # loaded material at print time.
+    tool_materials = spec.get("tool_materials") or {}
+    if "material" not in values and values.get("tool") in tool_materials:
+        values["material"] = tool_materials[values["tool"]]
+
     for f in REQUIRED_FIELDS:
         if f not in values:
             errors.append(f"missing required field: {f}")
@@ -314,7 +323,7 @@ _MATERIAL_FAMILIES = {
 def _looks_like_material(low: str, materials: list[str]) -> bool:
     """Whether an (unmatched) bare token reads as a material name — either a
     known filament family or related by substring to an offered material."""
-    lead = re.split(r"[^a-z]", low, 1)[0]
+    lead = re.split(r"[^a-z]", low, maxsplit=1)[0]
     if lead in _MATERIAL_FAMILIES:
         return True
     for m in materials:
@@ -360,6 +369,34 @@ def _match_profile_name(text: str, profiles: list, values: dict,
         _set(values, "profile", prof, errors, tok if tok is not None else text)
         return True
     return False
+
+
+_COLOR_SWATCH = {
+    "white": "⚪", "black": "⚫", "gray": "⚫", "silver": "⚪", "beige": "⚪",
+    "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "cyan": "🔵",
+    "blue": "🔵", "purple": "🟣", "pink": "🩷", "brown": "🟤",
+}
+
+
+def _head_label(head: dict[str, Any]) -> str:
+    """One button label for a print head: 'Head 2 (T1) — PETG ⚫ black'.
+    Channel is 0-based on the wire (T0..T3); operators count from 1."""
+    swatch = _COLOR_SWATCH.get(str(head.get("color", "")).lower(), "⬤")
+    ch = head.get("channel", 0)
+    bits = f"Head {ch + 1} ({head.get('tool', f'T{ch}')}) — {head.get('material', '?')}"
+    color = head.get("color")
+    if color and color != "unknown":
+        bits += f" {swatch} {color}"
+    return _clean_label(bits)
+
+
+_PROFILE_SUFFIX_RE = re.compile(r"\s*@\s*Snapmaker\s*U1\s*\([^)]*\)\s*$", re.IGNORECASE)
+
+
+def _strip_profile_suffix(label: Any) -> str:
+    """Drop the '@Snapmaker U1 (0.4 nozzle)' noise every profile label carries —
+    it's on all of them, so it distinguishes nothing and just eats width."""
+    return _PROFILE_SUFFIX_RE.sub("", str(label)).strip() or str(label)
 
 
 def _clean_label(label: Any, max_len: int = 96) -> str:
@@ -486,7 +523,10 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     """
     fields: list[dict[str, Any]] = []
     parts = spec.get("parts", [])
-    if parts:
+    # A single-part kit has nothing to choose — the workflow still renders the
+    # thumbnail, but a one-option "which parts?" screen is pure friction. Skip
+    # the field; _finalize defaults parts to the whole (one-item) list.
+    if len(parts) > 1:
         fields.append({
             "id": "parts", "type": "multi_select", "label": "Parts",
             "options": [{"id": p["id"], "label": _clean_label(p.get("label", p["id"]))} for p in parts],
@@ -494,23 +534,38 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         })
     fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
                    "options": ["as-authored", "auto"], "default": "as-authored"})
-    tools = [str(t).upper() for t in spec.get("tools", [])]
-    if tools:
-        fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
-                       "options": [{"id": t, "label": t} for t in tools], "required": True})
-    mats = spec.get("materials", [])
-    if mats:
-        fields.append({"id": "material", "type": "single_select", "label": "Material",
-                       "options": [{"id": m, "label": m} for m in mats], "required": True})
+    # Print head: when the live tool map is available, each head option carries
+    # its loaded material + colour, so picking the head IS picking the filament
+    # (they must match anyway — the printer knows). The separate Material screen
+    # is dropped in that case. Falls back to generic T0–T3 + a Material screen
+    # when no tool map is present (offline / tests).
+    heads = spec.get("heads") or []
+    if heads:
+        fields.append({"id": "tool", "type": "single_select", "label": "Print head",
+                       "options": [{"id": h["tool"], "label": _head_label(h)} for h in heads],
+                       "required": True})
+    else:
+        tools = [str(t).upper() for t in spec.get("tools", [])]
+        if tools:
+            fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
+                           "options": [{"id": t, "label": t} for t in tools], "required": True})
+        mats = spec.get("materials", [])
+        if mats:
+            fields.append({"id": "material", "type": "single_select", "label": "Material",
+                           "options": [{"id": m, "label": m} for m in mats], "required": True})
     profiles = spec.get("profiles", [])
     if profiles:
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
-                       "options": [{"id": p.get("idx"), "label": _clean_label(p.get("label"))} for p in profiles],
+                       "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
                        "required": True})
     fields.append({"id": "supports", "type": "single_select", "label": "Supports",
                    "options": list(spec.get("supports", ["supports", "no-supports"])),
                    "default": "no-supports"})
+    # Action is a SUBMIT choice, not its own screen: the review card renders it
+    # as two verbs (Upload only / Upload + Start). Kept in the schema so parse
+    # + defaults + validation stay identical to the text intake.
     fields.append({"id": "action", "type": "single_select", "label": "Action",
+                   "submit_choice": True,
                    "options": list(spec.get("actions", ["start", "upload-only"])), "default": "start"})
 
     schema: dict[str, Any] = {

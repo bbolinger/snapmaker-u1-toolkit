@@ -1760,7 +1760,16 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         {"id": p["part_id"], "label": f"{p['filename']} ({p['footprint_mm'][0]:.0f}x{p['footprint_mm'][1]:.0f}mm)"}
         for p in kit["parts"]
     ]
-    return {
+    # Merged head/material: read the live tool map so the head screen carries
+    # each head's loaded filament + colour (and the separate Material screen is
+    # dropped). Empty when no tool map is present — then the schema falls back
+    # to generic T0–T3 + a Material screen (offline / tests).
+    try:
+        import u1_toolmap
+        heads = u1_toolmap.load_head_options()
+    except Exception:
+        heads = []
+    spec: dict[str, Any] = {
         "parts": parts,
         "tools": DEFAULT_TOOLS,
         "materials": DEFAULT_MATERIALS,
@@ -1770,6 +1779,10 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
         "_profiles_full": profiles_full,  # persisted at form-emit for index stability
     }
+    if heads:
+        spec["heads"] = heads
+        spec["tool_materials"] = {h["tool"]: h["material"] for h in heads}
+    return spec
 
 
 def run_kit_workflow(args) -> dict[str, Any]:
