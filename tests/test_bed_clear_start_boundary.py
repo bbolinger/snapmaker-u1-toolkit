@@ -47,13 +47,18 @@ def _seed_request(tmp_path: Path, request_id: str, **overrides):
 
 @pytest.fixture
 def sandbox_requests(tmp_path, monkeypatch):
-    """Redirect u1_request storage to tmp_path so tests don't touch real state."""
+    """Redirect u1_request storage to tmp_path so tests don't touch real state.
+
+    Also disables the pre-start grace period by default (0s) so unrelated
+    tests don't pay a 2-minute wait each. Tests that specifically exercise
+    the grace-period behavior override grace_seconds on the run_gate call."""
     root = tmp_path / "requests"
     root.mkdir()
     monkeypatch.setattr(u1_request, "_requests_root", lambda: root, raising=False)
     monkeypatch.setattr(u1_request, "request_dir",
                         lambda rid: root / rid, raising=False)
     (tmp_path / "bed_snapshot.jpg").write_bytes(b"stub")
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "0")
     yield tmp_path
 
 
@@ -844,3 +849,216 @@ def test_readiness_card_gates_only_plate_1_not_plates_2_N():
     # Confirm this by re-reading the workflow after running one legacy
     # kit commit through it and ensuring readiness_card_event only
     # contains plate1 in gated_plate + start_gate_stage1_command.
+
+
+# ─── Grace period (2026-07-01 postmortem): pre-start cancel window ──────────
+
+def test_grace_period_default_120s_from_env(monkeypatch):
+    """No CLI override + no env → default 120s."""
+    import u1_print_start_gate as gate
+    monkeypatch.delenv("U1_GRACE_PERIOD_SECONDS", raising=False)
+    assert gate._resolve_grace_seconds(None) == 120
+
+
+def test_grace_period_env_var_override(sandbox_requests, monkeypatch):
+    """Env var respected when CLI not set (sandbox fixture sets it to 0,
+    but this test overrides to a real value)."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "45")
+    assert gate._resolve_grace_seconds(None) == 45
+
+
+def test_grace_period_env_zero_disables(sandbox_requests, monkeypatch):
+    """`U1_GRACE_PERIOD_SECONDS=0` opts out (power users at the printer)."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "0")
+    assert gate._resolve_grace_seconds(None) == 0
+
+
+def test_grace_period_cli_overrides_env(sandbox_requests, monkeypatch):
+    """CLI arg wins over env."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "999")
+    assert gate._resolve_grace_seconds(30) == 30
+
+
+def test_grace_period_bad_env_falls_back_to_default(monkeypatch):
+    """Junk env value can't accidentally disable safety."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "not-an-int")
+    assert gate._resolve_grace_seconds(None) == 120
+
+
+def test_grace_period_negative_clamped_to_zero():
+    """Negative values clamp to 0 (disable), never to something dangerous."""
+    import u1_print_start_gate as gate
+    assert gate._resolve_grace_seconds(-30) == 0
+
+
+def test_grace_period_cancel_marker_prevents_start_func(sandbox_requests, monkeypatch):
+    """The load-bearing test: if the cancel marker appears within the
+    grace window, start_func is NEVER called. HTTP never reaches the
+    printer. This is the safety net for the 2026-07-01 postmortem."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_cancel"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    start_called = {"hit": False}
+    # sleep_fn: after 2 sim-seconds the "operator" touches the cancel marker
+    ticks = {"n": 0}
+    out_dir = u1_request.request_dir(rid)
+    cancel_marker = out_dir / "pre_start_cancel.marker"
+    def fake_sleep(sec):
+        ticks["n"] += 1
+        if ticks["n"] == 2:
+            cancel_marker.parent.mkdir(parents=True, exist_ok=True)
+            cancel_marker.write_text("cancel")
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_called.__setitem__("hit", True) or {"ok": True}),
+        grace_seconds=10, grace_sleep_fn=fake_sleep,
+        out_dir=out_dir)
+    assert not start_called["hit"], (
+        "cancel marker MUST prevent start_func — this is the 2026-07-01 "
+        "safety net the whole thing was built for")
+    assert res["ok"] is False
+    assert res["started"] is False
+    assert "cancelled during the pre-start grace" in res["reason"]
+
+
+def test_grace_period_expires_and_start_proceeds(sandbox_requests, monkeypatch):
+    """No cancel within window → after grace_seconds, start_func fires."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_proceed"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    start_called = {"hit": False}
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_called.__setitem__("hit", True) or {"result": "ok"}),
+        grace_seconds=3, grace_sleep_fn=lambda s: None,  # no-op sleep = instant
+        out_dir=u1_request.request_dir(rid))
+    assert start_called["hit"], "no cancel → must proceed to start_func after grace"
+    assert res["ok"] is True
+    assert res["started"] is True
+
+
+def test_grace_period_zero_skips_entirely(sandbox_requests, monkeypatch):
+    """grace_seconds=0 → no wait, no marker check, no audit rows for
+    the grace period. Opt-out for power users."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_zero"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    slept = {"n": 0}
+    def bad_sleep(s):
+        slept["n"] += 1
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: {"result": "ok"},
+        grace_seconds=0, grace_sleep_fn=bad_sleep,
+        out_dir=u1_request.request_dir(rid))
+    assert slept["n"] == 0, "grace_seconds=0 must skip the wait entirely"
+
+
+def test_grace_period_stale_marker_from_prior_run_is_cleared(sandbox_requests, monkeypatch):
+    """A leftover cancel marker from a PRIOR request must not
+    immediately cancel THIS run. Fresh window per invocation."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_stale"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    # Pre-seed a stale marker
+    out_dir = u1_request.request_dir(rid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stale = out_dir / "pre_start_cancel.marker"
+    stale.write_text("leftover")
+    start_called = {"hit": False}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_called.__setitem__("hit", True) or {"result": "ok"}),
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        out_dir=out_dir)
+    assert start_called["hit"], (
+        "stale cancel marker from prior run was not cleared — safety "
+        "net would falsely cancel every subsequent print")
