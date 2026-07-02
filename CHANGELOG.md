@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased — v2.2 line]
 
+### Fixed
+
+- **False "print starting" notification loop** (live 2026-07-02). A confused
+  agent that invoked the print-start flow with a placeholder/nonexistent
+  filename (gpt-5.5 looping on `x.gcode` / `wall_mount.gcode` from the skill
+  examples) fired a real operator "print starting in 120s" notification each
+  time — grace-period-paced, ~every 2 minutes, for over an hour — for prints
+  that could never happen. Two guards in `u1_print_start_gate`:
+  - **Fence 2:** the gcode must exist in the printer's storage (Moonraker
+    `files/metadata`) BEFORE the grace window + notification fire. A
+    confirmed-absent file (404) is a fast, silent refusal
+    (`gate_refused_file_missing`) — no notification. Fails open on a flaky
+    metadata query so a transient error never blocks a real print.
+  - **Loop guard:** a per-request cap (4) on grace notifications. A loop on a
+    *real* uploaded file (which the existence check can't catch) trips it and
+    the DM is suppressed (`pre_start_grace_notify_suppressed_loop_guard`); the
+    grace WAIT still runs, so the cancel safety net is untouched.
+
 ### Changed
 
 - **Form UX v2.2.1 — fewer, clearer screens (operator feedback 2026-07-02).**
