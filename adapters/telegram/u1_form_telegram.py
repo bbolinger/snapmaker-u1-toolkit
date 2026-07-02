@@ -29,6 +29,7 @@ Callback data convention (well under Telegram's 64-byte cap):
 """
 from __future__ import annotations
 
+import html
 from typing import Any
 
 # Tunables (callers may monkey-patch for tests / different UX).
@@ -39,6 +40,18 @@ REVIEW_FIELD = "__review__"
 # --------------------------------------------------------------------------- #
 # Pure core — no SDK
 # --------------------------------------------------------------------------- #
+
+def _esc(s: Any) -> str:
+    """HTML-escape a schema-derived string before interpolating it into
+    message text (which is sent with ParseMode.HTML). A part filename like
+    ``bracket<v2>.stl`` in a label would otherwise make Telegram reject the
+    whole send ("can't parse entities") — or inject markup into the card.
+
+    NOTE: only message TEXT is parsed as HTML. InlineKeyboardButton text is
+    plain — do not escape button labels (double-escaping shows raw entities).
+    """
+    return html.escape(str(s), quote=False)
+
 
 def _opt_id(opt: Any) -> Any:
     return opt["id"] if isinstance(opt, dict) else opt
@@ -153,7 +166,7 @@ def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]
     # Cancel always present
     rows.append([{"text": "✖ Cancel", "callback_data": "X"}])
 
-    label = field.get("label", field["id"])
+    label = _esc(field.get("label", field["id"]))
     hint = ""
     if is_multi:
         n = len(sel) if sel else 0
@@ -167,7 +180,9 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
     for fi, field in enumerate(form["schema"]["fields"]):
         echo = _selection_label_for(form, field)
-        lines.append(f"• <b>{field.get('label', field['id'])}</b>: {echo}")
+        # Message text is ParseMode.HTML → escape schema-derived strings.
+        # Button text is NOT parsed as HTML → leave the Edit label raw.
+        lines.append(f"• <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
         rows.append([{"text": f"✎ Edit {field.get('label', field['id'])}",
                       "callback_data": f"e:{fi}"}])
     rows.append([
@@ -199,7 +214,7 @@ def apply_callback(form: dict[str, Any], data: str) -> dict[str, Any]:
         # it as a clean rerender so the operator can keep going from the
         # current screen rather than seeing an exception traceback.
         return {"kind": "rerender",
-                "warning": f"Stale or invalid button ({exc}). Re-open the form via the deep link if this persists."}
+                "warning": f"Stale or invalid button ({_esc(exc)}). Re-open the form via the deep link if this persists."}
 
 
 def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
@@ -224,7 +239,8 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
                 if f.get("label", f["id"]) == missing[0]:
                     form["current"] = f["id"]
                     break
-            return {"kind": "rerender", "warning": f"Please answer: {', '.join(missing)}"}
+            return {"kind": "rerender",
+                    "warning": f"Please answer: {_esc(', '.join(missing))}"}
         return {"kind": "submit", "answer": answer_json(form)}
 
     fi = int(parts[1])
@@ -243,7 +259,7 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         oi = int(parts[2])
         if oi < 0 or oi >= len(field["options"]):
             return {"kind": "rerender",
-                    "warning": f"Stale button (option {oi} out of range for {fid!r})."}
+                    "warning": f"Stale button (option {oi} out of range for {_esc(repr(fid))})."}
         s = form["selections"][fid]
         s.discard(oi) if oi in s else s.add(oi)
         return {"kind": "rerender"}
@@ -265,7 +281,7 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         oi = int(parts[2])
         if oi < 0 or oi >= len(field["options"]):
             return {"kind": "rerender",
-                    "warning": f"Stale button (option {oi} out of range for {fid!r})."}
+                    "warning": f"Stale button (option {oi} out of range for {_esc(repr(fid))})."}
         form["selections"][fid] = oi
         form["current"] = _next_field(form)
         return {"kind": "rerender"}
