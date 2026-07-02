@@ -53,7 +53,7 @@ takes it from there:
    boundary on plate 1. Plates 2..N start from the Snapmaker app after it —
    the watchdog photographs every plate either way.
 
-The operator's confirm ride on a single-use nonce baked into the emitted
+The operator's confirm rides on a single-use nonce baked into the emitted
 command, so even the agent relaying your answers can't hand-assemble its way
 past the boundary. A single STL is just a kit of one — same entrypoint,
 auto-detected.
