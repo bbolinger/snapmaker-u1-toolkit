@@ -125,6 +125,7 @@ from u1_orient import orient_model, DEFAULT_ORCA, orca_env
 from u1_profile_picker import list_profiles
 from u1_material_picker import query_material_options, status_to_options
 from u1_upload_gcode import parse_gcode_metadata
+from u1_print_start_gate import build_stage1_command
 from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
@@ -1222,7 +1223,8 @@ def upload_only(gcode: Path, dry_run: bool=True)->dict[str,Any]:
     return _real_upload(gcode, on_collision=None)
 
 
-def _real_upload(gcode: Path, on_collision: str | None) -> dict[str, Any]:
+def _real_upload(gcode: Path, on_collision: str | None,
+                 material: str | None = None) -> dict[str, Any]:
     """Drive u1_upload_gcode.py with the audit 2026-06-26 return-code contract.
 
     Codes:
@@ -1234,10 +1236,20 @@ def _real_upload(gcode: Path, on_collision: str | None) -> dict[str, Any]:
 
     Workflow's human_summary derives from the actual contract, not from
     "rc != 0 = no file." Reads the latest_upload_result.json artifact for
-    granular truth (moonraker_upload_ok / remote_metadata_ok)."""
+    granular truth (moonraker_upload_ok / remote_metadata_ok).
+
+    ``material`` (Brent live-test 2026-07-01): passed as ``--material``
+    to u1_upload_gcode.py so its filament_type-vs-requested check compares
+    the gcode's material against what the WORKFLOW actually chose. Without
+    this, u1_upload_gcode.py falls back to its own hardcoded PETG default,
+    which false-flags any non-PETG print (e.g. T3/PLA) with a bogus
+    'filament_type does not include PETG: PLA' blocker.
+    """
     cmd = [sys.executable, str(HERE / 'u1_upload_gcode.py'), str(gcode)]
     if on_collision:
         cmd.extend(['--on-collision', on_collision])
+    if material:
+        cmd.extend(['--material', str(material)])
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     rc = proc.returncode
 
@@ -1460,6 +1472,55 @@ def run_workflow(args)->dict[str,Any]:
     for each answer.
     """
     model=Path(args.model).resolve()
+    # v2.1.0: detect a multi-part kit (a zip holding >1 STL) and redirect to
+    # the kit workflow. The single-STL flow below is entirely unchanged. This
+    # is the gate-detection principle: the SCRIPT detects the kit; the agent
+    # just runs the emitted command (one entrypoint to call, no zip-inspection
+    # judgment asked of a small model).
+    try:
+        import u1_kit
+        _is_kit = u1_kit.is_multi_part_archive(model)
+    except Exception as _kit_exc:
+        _is_kit = False
+        # A zip we couldn't inspect must NOT silently fall into the
+        # single-STL flow — that flow extracts the FIRST model only and
+        # would print a fraction of the kit with no warning.
+        if str(model).lower().endswith('.zip'):
+            emit({'stage': 'kit_detection_failed',
+                  'error': f'{type(_kit_exc).__name__}: {_kit_exc}',
+                  'instruction': ('Could not inspect this zip for multiple '
+                                  'STLs. Do NOT continue with the single-STL '
+                                  'flow — it would slice only the first '
+                                  'model. Surface this error to the '
+                                  'operator.')},
+                 args.json_events)
+            return {'phase': 'kit_detection_failed', 'model': str(model)}
+    if _is_kit:
+        # Carry invocation context into the kit command. --operator is baked
+        # ONLY when explicit on this CLI (env-resolved identity stays
+        # env-resolved, replay-safe) — this keeps a test-flavored operator
+        # sticky across the whole kit chain (Fence 1).
+        _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
+                    f'{_shell_quote(str(model))} --json-events')
+        _cli_op = getattr(args, 'operator', None)
+        if _cli_op:
+            _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
+        _nozzle = getattr(args, 'nozzle', None)
+        if _nozzle and str(_nozzle) != '0.4':
+            _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
+        emit({'stage': 'kit_detected',
+              'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
+              'command': _kit_cmd,
+              'instruction': ('Run this command via terminal. The kit workflow '
+                              'walks the operator through a staged Q&A '
+                              '(parts → orient → tool → material → profile → '
+                              'supports → confirm) — each turn emits one '
+                              'need_input event with the next CLI flag baked '
+                              'into its options. Follow the per-field staging '
+                              'pattern the same way the single-STL workflow '
+                              'does (Step 2 of the skill).')},
+             args.json_events)
+        return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
     # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
     # request_id (explicit --request-id, recovery via content hash, or
     # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;
@@ -2175,7 +2236,8 @@ def run_workflow(args)->dict[str,Any]:
         if not args.live_upload:
             up = upload_only(gcode, dry_run=True)
         else:
-            up = _real_upload(gcode, on_collision=args.on_collision)
+            up = _real_upload(gcode, on_collision=args.on_collision,
+                              material=getattr(args, "material", None))
         emit({'stage':'uploaded', **up}, args.json_events)
         # H5 fix: persist upload-completed state. If agent loses context now,
         # request.json says phase='uploaded' so resume routes to Stage 1
@@ -2274,10 +2336,11 @@ def run_workflow(args)->dict[str,Any]:
         # whenever the card was first written wins over current state. The
         # env-resolved path is forward-compatible across replays + container
         # restarts.
-        _stage1_cmd = (
-            f'python3 /opt/data/scripts/u1_print_start_gate.py {_printer_filename} '
-            f'--intended-tool {_start_extruder} --requested-material {_shell_quote(str(material))} '
-            f'--request-id {request_id}'
+        _stage1_cmd = build_stage1_command(
+            printer_filename=_printer_filename,
+            intended_tool=_start_extruder,
+            material=str(material),
+            request_id=request_id,
         )
         # Build the readiness_card payload once, then emit + persist together
         # so the phase-aware resume short-circuit upstream has the same

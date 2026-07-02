@@ -1,0 +1,216 @@
+"""Gateway-side form primitive — blocking event-based queue, mirrors
+``tools.clarify_gateway``.
+
+The ``form`` tool needs to present a multi-field schema as native UI on the
+host platform (e.g. Telegram inline keyboards) and block the agent thread
+until the user submits an answer. This module is the thread-safe primitive
+the gateway adapter and the agent thread coordinate through.
+
+Two paths from the platform adapter:
+  1. **Native UI** (button-driven): adapter renders the schema as inline
+     keyboards, handles taps in-place, and on Submit calls
+     ``resolve_gateway_form(form_id, answer_dict)`` to unblock the agent.
+  2. **Text fallback**: adapter shows the schema's ``text_fallback`` field
+     and the user types the one-line answer; the gateway's
+     ``_handle_message`` intercept resolves with the typed line (sets
+     ``answer = {"_text": "<line>"}``); the form tool can route through
+     ``u1_form.parse_answers`` itself.
+
+Module-level state (same shape as ``clarify_gateway``) so platform adapters
+call ``resolve_gateway_form`` without holding a back-reference to the
+``GatewayRunner`` instance.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# Default timeout for waiting on the operator's form submission. Long because
+# the operator may need time to think + edit fields before submitting.
+DEFAULT_FORM_TIMEOUT_SEC = 600
+
+
+# =========================================================================
+# Module-level state
+# =========================================================================
+
+@dataclass
+class _FormEntry:
+    """One pending form request inside a gateway session."""
+    form_id: str
+    session_key: str
+    schema: Dict[str, Any]
+    event: threading.Event = field(default_factory=threading.Event)
+    response: Optional[Dict[str, Any]] = None
+    awaiting_text: bool = False  # set when adapter falls back to text intake
+
+    def signature(self) -> Dict[str, object]:
+        return {
+            "form_id": self.form_id,
+            "session_key": self.session_key,
+            "schema_version": self.schema.get("version"),
+            "fields": [f.get("id") for f in self.schema.get("fields", [])],
+        }
+
+
+_lock = threading.RLock()
+_entries: Dict[str, _FormEntry] = {}
+_session_index: Dict[str, List[str]] = {}
+
+
+# =========================================================================
+# Public API — agent-thread side
+# =========================================================================
+
+def register(form_id: str, session_key: str, schema: Dict[str, Any]) -> _FormEntry:
+    """Register a pending form request and return the entry.
+
+    The caller (gateway form_callback) will then trigger the adapter's
+    ``send_form`` and block on ``wait_for_response(form_id, timeout)``.
+    """
+    entry = _FormEntry(form_id=form_id, session_key=session_key, schema=schema)
+    with _lock:
+        _entries[form_id] = entry
+        _session_index.setdefault(session_key, []).append(form_id)
+    return entry
+
+
+def wait_for_response(form_id: str, timeout: float) -> Optional[Dict[str, Any]]:
+    """Block on the entry's event until resolved or timeout fires.
+
+    Polls in 1-second slices so the agent's inactivity heartbeat keeps firing
+    (mirrors clarify_gateway). Returns the resolved answer dict, or ``None``
+    on timeout.
+    """
+    with _lock:
+        entry = _entries.get(form_id)
+    if entry is None:
+        return None
+
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover - optional
+        touch_activity_if_due = None
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if entry.event.wait(timeout=min(1.0, remaining)):
+            break
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(activity_state, "waiting for user form submission")
+
+    with _lock:
+        _entries.pop(form_id, None)
+        ids = _session_index.get(entry.session_key)
+        if ids and form_id in ids:
+            ids.remove(form_id)
+            if not ids:
+                _session_index.pop(entry.session_key, None)
+
+    return entry.response
+
+
+# =========================================================================
+# Public API — gateway / adapter side
+# =========================================================================
+
+def resolve_gateway_form(form_id: str, answer: Dict[str, Any]) -> bool:
+    """Unblock the agent thread waiting on ``form_id`` with the answer dict.
+
+    Returns True if an entry was found and resolved, False otherwise
+    (already resolved, expired, or never existed).
+    """
+    with _lock:
+        entry = _entries.get(form_id)
+        if entry is None:
+            return False
+    if not isinstance(answer, dict):
+        # Defensive: callers should always pass a dict (the --form-answers-json
+        # shape). Stringly types here would silently break downstream parsing.
+        logger.warning("resolve_gateway_form(%s): non-dict answer %r — coercing",
+                       form_id, type(answer))
+        answer = {"_raw": str(answer)}
+    entry.response = dict(answer)
+    entry.event.set()
+    return True
+
+
+def cancel_gateway_form(form_id: str) -> bool:
+    """Resolve the form with an empty dict — agent treats as 'user cancelled'."""
+    return resolve_gateway_form(form_id, {"_cancelled": True})
+
+
+def get_pending_for_session(session_key: str) -> Optional[_FormEntry]:
+    """Return the OLDEST pending form entry for a session, or None.
+
+    Used by the text-fallback intercept in ``_handle_message`` — when a form
+    is awaiting a free-form text response (operator typed instead of
+    tapping), the next user message in that session is captured.
+    """
+    with _lock:
+        ids = _session_index.get(session_key) or []
+        for fid in ids:
+            entry = _entries.get(fid)
+            if entry is None:
+                continue
+            if entry.awaiting_text:
+                return entry
+        return None
+
+
+def mark_awaiting_text(form_id: str) -> bool:
+    """Flip an entry into text-capture mode (operator typed instead of tapping)."""
+    with _lock:
+        entry = _entries.get(form_id)
+        if entry is None:
+            return False
+        entry.awaiting_text = True
+        return True
+
+
+def has_pending(session_key: str) -> bool:
+    """True when this session has at least one pending form entry."""
+    with _lock:
+        ids = _session_index.get(session_key) or []
+        return any(_entries.get(fid) is not None for fid in ids)
+
+
+def clear_session(session_key: str) -> int:
+    """Drop every pending form for a session (e.g. on session boundary).
+
+    Returns the count of cleared entries. Unblocks any waiting threads by
+    setting their events with ``response=None`` so they return ``None`` from
+    ``wait_for_response``.
+    """
+    cleared = 0
+    with _lock:
+        ids = list(_session_index.get(session_key) or [])
+        for fid in ids:
+            entry = _entries.pop(fid, None)
+            if entry is None:
+                continue
+            cleared += 1
+            entry.event.set()  # response stays None
+        _session_index.pop(session_key, None)
+    return cleared
+
+
+def get_form_timeout() -> float:
+    """Form-wait timeout, in seconds. Mirrors clarify's config-driven knob;
+    forms can take longer because they have more fields to fill in."""
+    import os
+    try:
+        return float(os.environ.get("U1_FORM_TIMEOUT_SEC", DEFAULT_FORM_TIMEOUT_SEC))
+    except (TypeError, ValueError):
+        return float(DEFAULT_FORM_TIMEOUT_SEC)

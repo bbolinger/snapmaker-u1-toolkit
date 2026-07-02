@@ -309,6 +309,26 @@ These fire from `scripts/u1_print_start_gate.py` and have no workflow twin — t
 
 Stage 2 emits exactly ONE of: `print_started` (success), or a `*_failed` / `*_invalid` / `*_blocked` row (refusal). Stage 1 emits exactly ONE of `stage1_photo_captured` (success) or `stage1_photo_failed` (camera problem).
 
+### Pre-start grace period (Stage 2, v2.1.0)
+
+After every safety check passes and BEFORE the HTTP call to the printer,
+Stage 2 opens a cancel window (default 120s; `U1_GRACE_PERIOD_SECONDS=0` or
+`--grace-seconds 0` disables). All rows land in `audit.jsonl`:
+
+| Event | Fires when | `details` fields |
+|---|---|---|
+| `event: "pre_start_grace_period_started"` | Window opens | `grace_seconds`, `cancel_marker` |
+| `event: "pre_start_grace_notify_sent"` | `$U1_GRACE_NOTIFY_CMD` exited 0 | `exit_code`, `stderr_tail` |
+| `event: "pre_start_grace_notify_failed"` | Notify command failed/timed out (window still runs) | `exit_code`, `stderr_tail` |
+| `event: "pre_start_grace_cancelled"` | Cancel marker appeared — no HTTP call. Checked every second, again after the final tick, and once more immediately before the start call | `cancel_marker`, `cancelled_after_wait_s` |
+| `event: "pre_start_grace_period_expired"` | Window closed with no cancel → proceeding to start | `grace_seconds`, `proceeded_to_start` |
+| `event: "gate_operator_unknown"` | Stage ran with no operator identity set (`unknown:gate`) — allowed, loudly audited | `note` |
+| `event: "gate_refused_test_operator"` | Fence 1: operator has a test-flavored prefix (`smoke:` / `test:` / `dry:` / `mock:` / `fixture:`) — refused before any Moonraker call | `prefix_match` |
+
+A grace-cancel refusal payload carries a `recovery` block (`instruction` +
+`stage1_command`): the slice and upload are still valid, so the cheap path
+back is a fresh Stage 1 (new photo + new yes), not a workflow re-run.
+
 ---
 
 ## Twin-pair table (quick cross-reference)
@@ -345,6 +365,55 @@ Stage 2 emits exactly ONE of: `print_started` (success), or a `*_failed` / `*_in
 
 ---
 
+## Multi-part kit events (`stage:` — v2.1.0)
+
+Emitted by the kit path. A zip with >1 STL is auto-detected; the single workflow
+emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
+
+- `kit_detected` — from `u1_slice_workflow.py` when the input zip holds multiple
+  STLs. Fields: `reason`, `command` (the `u1_kit_workflow.py` invocation to run;
+  carries an explicit `--operator` / non-default `--nozzle` from the invoking
+  CLI), `instruction`. The agent tool-calls `command`.
+- `kit_detection_failed` — from `u1_slice_workflow.py` when a `.zip` input
+  could not be inspected for multiple STLs. Fields: `error`, `instruction`.
+  The single-STL flow does NOT proceed (it would slice only the first model).
+- `kit_ingested` — `request_id`, `part_count`, `multi`, `oversized_part_ids`.
+- `need_input` with `key: "kit_form"` — the consolidated decision form.
+  Fields: `form` (numbered text to show the operator), `next_command` (carries
+  `--form-answers '<line>'`), `instruction`. The agent relays the operator's
+  reply VERBATIM into `--form-answers`; the script parses it.
+- `form_accepted` — `parsed` (the "I read: …" echo). / `form_rejected` —
+  `errors[]` + `form` (re-prompt).
+- `kit_slicing` → `kit_sliced` (`plate_count`) → `kit_uploaded` (`plates[]`,
+  `live`). `kit_slice_failed` (`error`, `instruction`) if Orca refuses (e.g. an
+  oversized part). `kit_upload_failed` (`failures[]`, `instruction`) when one
+  or more plates did NOT land on the printer (rc 2/4/5) — request phase moves
+  to `upload_failed`; nothing claims success.
+- `kit_readiness_card` — the kit equivalent of `readiness_card`. Fields:
+  `part_count`, `selected_parts[]`, `plate_count`, `plates[]`
+  (`plate_idx`, `printer_storage_filename`, `gcode_hash`), `tool`, `material`,
+  `profile`, `orient`, `supports`, `parsed_echo`, `gated_plate`,
+  `start_gate_stage1_command`, `operator_guidance`. Only the **gated_plate**
+  (plate 1) goes through Stage 1/2; plates 2..N are started from the Snapmaker app.
+- `next_action_required` — same shape as the single path; carries the Stage-1
+  command for plate 1.
+
+**Audit twins:** `kit_ingested`, `kit_sliced`, `kit_readiness_card_emitted`,
+`kit_slice_failed`, `kit_upload_failed`, `post_confirm_flags_backfilled`,
+`stage1_token_adopted_from_sidecar` (`event:` vocabulary, in `audit.jsonl`).
+
+### Form-protocol events (EXPERIMENTAL — not yet emitted)
+
+`u1_form.build_form_schema()` and the `adapters/` renderers (Telegram
+buttons, Discord, Hermes form_tool) implement a declarative `form_schema`
+consumed via `--form-answers-json`. The workflow does **not yet emit** a
+`form_schema`-bearing event — `--interaction-mode form` is parsed but
+unwired. The staged text flow above is the production path. Treat any
+`form_schema` field you see as experimental until this section says
+otherwise.
+
+---
+
 ## Versioning
 
 The event contract is **additive**: new events can appear; existing events' field set can grow with optional fields. Consumers should ignore unknown stages and unknown fields.
@@ -353,13 +422,14 @@ Two changes would be **breaking** and require a major-version bump:
 1. Renaming an existing event (e.g. `stage: "uploaded"` → `stage: "upload_complete"`).
 2. Removing a previously-required field from an existing event.
 
-Neither is planned for v2.0.0. If either is ever needed, the version field on `request.json` (currently `schema_version: 1`) will bump in lockstep so consumers can branch on schema version.
+v2.1.0 added `kit` + `plates` as **optional additive** fields on `request.json` and the kit events above — additive, so no version bump (`schema_version` stays `1`). A breaking change (rename/removal) would bump `schema_version` in lockstep so consumers can branch on it.
 
 ---
 
 ## Cross-references
 
-- [`HERMES.md`](../HERMES.md) — the agent's procedural rules (Rules 1–8) for how to react to these events.
+- [`HERMES.md`](../HERMES.md) — the agent's procedural rules (Rules 1–9) for how to react to these events.
+- [`skills/3d-printer-slicing-automation/references/multipart-kits.md`](../skills/3d-printer-slicing-automation/references/multipart-kits.md) — agent guide for the multi-part kit flow.
 - [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md) — the bundled Hermes skill's operator-facing contract.
 - [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) — the immutable system contracts (operator / skill / agent).
 - [`docs/ROADMAP.md`](ROADMAP.md) — the 9-phase v2.0 plan.
