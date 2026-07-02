@@ -298,3 +298,89 @@ def test_brightness_measurement_with_real_jpeg(tmp_path):
     bright_luma = g._measure_brightness(bright)
     assert dark_luma is not None and dark_luma < g.DARK_PHOTO_MEAN_LUMA
     assert bright_luma is not None and bright_luma > g.DARK_PHOTO_MEAN_LUMA
+
+
+# --------------------------------------------------------------------------- #
+# Fence 2 — file must exist on the printer BEFORE the grace notification
+# (kills the false "print starting" alarm loop; live 2026-07-02 gpt-5.5)
+# --------------------------------------------------------------------------- #
+
+def test_gate_refuses_missing_file_and_never_notifies(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'query_state', lambda h, p: idle())
+    monkeypatch.setattr(g, 'capture_real_bed_photo', _fake_capture(success=True))
+    rid = _seed_can_start_passing_request()
+    res1 = g.run_gate('x.gcode', bed_clear='cancel', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path, request_id=rid)
+    token = res1['approval_token']
+    notified = {'n': 0}
+    started = {'s': False}
+    res2 = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path,
+                      approval_token=token, request_id=rid,
+                      gcode_exists_fn=lambda *a: False,   # printer says: not there
+                      grace_notify_fn=lambda *a, **k: notified.__setitem__('n', notified['n'] + 1),
+                      start_func=lambda *a: started.__setitem__('s', True))
+    assert res2['stage'] == 'gate_refused_file_missing'
+    assert res2['started'] is False
+    assert notified['n'] == 0, 'a missing file must NOT fire the print-starting notification'
+    assert started['s'] is False, 'a missing file must never reach the printer'
+
+
+def test_gate_proceeds_when_file_exists(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'query_state', lambda h, p: idle())
+    monkeypatch.setattr(g, 'capture_real_bed_photo', _fake_capture(success=True))
+    rid = _seed_can_start_passing_request()
+    res1 = g.run_gate('x.gcode', bed_clear='cancel', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path, request_id=rid)
+    token = res1['approval_token']
+    started = {'s': False}
+    res2 = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path,
+                      approval_token=token, request_id=rid, grace_seconds=0,
+                      gcode_exists_fn=lambda *a: True,
+                      start_func=lambda *a: started.__setitem__('s', True) or {'result': 'ok'})
+    assert res2['started'] is True and started['s'] is True
+
+
+def test_gate_fails_open_when_existence_unverifiable(monkeypatch, tmp_path):
+    # A flaky metadata query (None) must NOT block a real print.
+    monkeypatch.setattr(g, 'query_state', lambda h, p: idle())
+    monkeypatch.setattr(g, 'capture_real_bed_photo', _fake_capture(success=True))
+    rid = _seed_can_start_passing_request()
+    res1 = g.run_gate('x.gcode', bed_clear='cancel', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path, request_id=rid)
+    token = res1['approval_token']
+    started = {'s': False}
+    res2 = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                      intended_tool='extruder1', out_dir=tmp_path,
+                      approval_token=token, request_id=rid, grace_seconds=0,
+                      gcode_exists_fn=lambda *a: None,   # couldn't verify
+                      start_func=lambda *a: started.__setitem__('s', True) or {'result': 'ok'})
+    assert res2['started'] is True
+
+
+def test_gcode_exists_on_printer_maps_404_to_false(monkeypatch):
+    import urllib.error
+    def _raise_404(url, timeout=10.0):
+        raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
+    monkeypatch.setattr(g, 'http_json', _raise_404)
+    assert g.gcode_exists_on_printer('h', 1, 'nope.gcode') is False
+
+
+def test_gcode_exists_on_printer_present_and_unreachable(monkeypatch):
+    monkeypatch.setattr(g, 'http_json', lambda url, timeout=10.0: {'result': {'size': 1}})
+    assert g.gcode_exists_on_printer('h', 1, 'real.gcode') is True
+    def _boom(url, timeout=10.0):
+        raise OSError('connection refused')
+    monkeypatch.setattr(g, 'http_json', _boom)
+    assert g.gcode_exists_on_printer('h', 1, 'real.gcode') is None   # fail open
+
+
+def test_grace_notify_loop_guard_caps_repeats():
+    rid = _seed_can_start_passing_request()
+    # First CAP calls allowed; the loop's (CAP+1)th and beyond are suppressed.
+    results = [g._grace_notify_allowed(rid) for _ in range(g.GRACE_NOTIFY_CAP + 2)]
+    assert results[:g.GRACE_NOTIFY_CAP] == [True] * g.GRACE_NOTIFY_CAP
+    assert results[g.GRACE_NOTIFY_CAP:] == [False, False]
+    # No request_id → always allowed (nothing to track).
+    assert g._grace_notify_allowed(None) is True
