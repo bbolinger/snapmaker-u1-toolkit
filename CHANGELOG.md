@@ -98,6 +98,37 @@ are fixed here. No schema changes.
   the form protocol. HOOK.yaml and the README cancel section describe the
   implemented behavior.
 
+### Fixed — review round 2
+
+- **Kit ingest could silently destroy a part.** The `__N` dedup rename never
+  checked whether the deduped name already existed as a distinct archive
+  entry — a kit holding `a/part.stl`, a genuine `part__1.stl`, and
+  `b/part.stl` overwrote the real `part__1.stl` and returned a duplicate
+  path (one part lost, one printed twice, no error). Dedup now checks every
+  name used so far.
+- **Ingest limits + clean rejection.** Caps on entry count (100), per-part
+  size (200MB), and total size (600MB) refuse a pathological kit zip before
+  it OOMs the workflow; a garbage/unparseable STL (or any ingest failure)
+  emits a `kit_rejected` event instead of a raw traceback. Windows-style
+  backslash entry names are sanitized (latent zip-slip on non-POSIX hosts).
+- **`start manual-bed-check` is refused when the camera worked.** The
+  Layer-3 override exists for the degraded-camera case; when a real photo +
+  token exist, the handler now refuses (`manual_bed_check_refused`, audited)
+  and points at the normal `start` path — nothing can route around the photo.
+- **The copy-verbatim yes-command contract is mechanically enforced.** The
+  `bed_clear_start` pending object's nonce (previously minted but never
+  checked) now rides the emitted `next_command_on_yes` as `--pending-nonce`
+  and is validated on the confirm call — a hand-assembled
+  `--bed-clear-confirmed` invocation is refused with a fresh-prompt
+  instruction.
+- `_normalize_filename` strips the `./x.gcode` form Moonraker rejects.
+- ~530 lines of explicitly-dead plate-preview renderers deleted from
+  `u1_kit_workflow.py` (recoverable via git history) — review attention
+  belongs on the safety-critical code.
+- Grace-notify timing reviewed and deliberately kept: the up-to-20s notify
+  latency delays the window's close in the OPERATOR'S favor (their countdown
+  starts when the DM lands, which is when the poll loop starts).
+
 ### Validated
 
 - Full suite green at this commit. Live re-validation of the grace-cancel

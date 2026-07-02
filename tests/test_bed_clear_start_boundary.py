@@ -149,7 +149,11 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
     rid = "u1_test_happy"
     _seed_request(sandbox_requests, rid)
     kw._action_start(None, rid, False, bed_clear_confirmed=False)
-    result = kw._action_start(None, rid, False, bed_clear_confirmed=True)
+    # The verbatim next_command_on_yes carries the pending nonce.
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True,
+                              pending_nonce=pn)
     assert result["phase"] == "awaiting_print_start"
     cmd = result["command"]
     assert "--bed-clear start" in cmd
@@ -221,11 +225,13 @@ def test_manual_bed_check_second_call_captures_both_timestamps(
         operator_text="start manual-bed-check",
         verification_method="snapmaker_app",
         bed_clear_confirmed=False)
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
     result = kw._action_start_manual_bed_check(
         None, rid, "test:unit", False,
         operator_text="start manual-bed-check",
         verification_method="snapmaker_app",
-        bed_clear_confirmed=True)
+        bed_clear_confirmed=True, pending_nonce=pn)
     assert result["phase"] == "awaiting_print_start"
     assert "--stage2-approval-nonce" in result["command"]
     state = u1_request.read_request(rid)
@@ -1348,3 +1354,50 @@ def test_grace_no_notify_cmd_still_works(sandbox_requests, monkeypatch):
         grace_notify_fn=bad_notify,
         out_dir=u1_request.request_dir(rid))
     assert notify_hit["n"] == 0, "no notify_cmd → notify_fn must not fire"
+
+
+# ─── Pending-nonce binding: only the VERBATIM yes-command can confirm ───────
+
+def test_action_start_confirm_without_pending_nonce_refused(sandbox_requests):
+    """A hand-assembled `--action start --bed-clear-confirmed` (no
+    --pending-nonce) must be refused — the confirm has to be the verbatim
+    next_command_on_yes emitted at the yes/no prompt."""
+    rid = "u1_test_nonce_hand"
+    _seed_request(sandbox_requests, rid)
+    first = kw._action_start(None, rid, False, bed_clear_confirmed=False)
+    assert first["phase"] == "awaiting_bed_clear_start"
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True)
+    assert result["phase"] == "bed_clear_approval_rejected"
+    assert any("nonce" in r for r in result["reasons"])
+
+
+def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys):
+    """The emitted next_command_on_yes must include --pending-nonce so the
+    copy-verbatim contract is mechanically enforced, not just documented."""
+    import io, json as _json
+    rid = "u1_test_nonce_cmd"
+    _seed_request(sandbox_requests, rid)
+    kw._action_start(None, rid, True, yes_command="python3 kit.py --action start --bed-clear-confirmed",
+                     bed_clear_confirmed=False)
+    out = capsys.readouterr().out
+    evs = [_json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    need = next(e for e in evs if e.get("stage") == "need_input")
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
+    assert f"--pending-nonce {pn}" in need["next_command_on_yes"]
+
+
+def test_manual_bed_check_refused_when_camera_verification_available(sandbox_requests):
+    """The Layer-3 manual override exists for the degraded-camera case. When
+    a real photo + token already exist, the override is refused so nothing
+    can route around the photo."""
+    rid = "u1_test_manual_guard"
+    _seed_request(sandbox_requests, rid,
+                  safety={"approval_token": "tok123",
+                          "bed_clear_photo_captured": True})
+    result = kw._action_start_manual_bed_check(
+        None, rid, "test:unit", False,
+        operator_text="start manual-bed-check",
+        verification_method="snapmaker_app",
+        bed_clear_confirmed=False)
+    assert result["phase"] == "manual_bed_check_refused"

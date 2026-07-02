@@ -601,538 +601,6 @@ def _render_plate_layout_from_stls(
             "part_count": len(tri_list), "error": None}
 
 
-def _render_plate_layout_from_gcode_m486(
-    plate_gcode_path: Path,
-    source_stl_paths: list[str] | list[Path],
-    out_path: Path,
-    *,
-    bed_mm: tuple[float, float] = (270.0, 270.0),
-    canvas_px: int = 900,
-    title: str | None = None,
-    label_below: str | None = None,
-    n_rotation_candidates: int = 72,
-) -> dict[str, Any]:
-    """Truth-source plate preview using M486 object markers from the slice
-    gcode + source STL geometry.
-
-    profile-independent renderer that reconstructs Orca's
-    ACTUAL slice arrangement (not the buggy --export-3mf packer):
-      1. Parse M486 A<name> / M486 S<idx> markers to identify per-object
-         gcode regions
-      2. Collect first-layer wall points per object → object centroid +
-         footprint bbox in world coordinates (matches actual print)
-      3. Match each object to a source STL by filename (angle_270.stl →
-         angle_270.stl)
-      4. Brute-force rotation candidates (72 evenly spaced) and pick the
-         one whose transformed source STL bbox maximizes IoU with the
-         gcode footprint bbox — 90-99% accurate on tested kits
-      5. Merge transformed source STL triangles + render via
-         render_view("top") with Lambertian shading
-
-    Requires the profile to have M486 emission enabled (some profiles
-    like Standard don't; the caller should fall back to layer-shadow
-    when this returns ok=False with 'no M486').
-
-    Returns ``{'ok', 'path', 'part_count', 'error'}``.
-    """
-    import re as _re
-    import math as _math
-    try:
-        import sys as _sys
-        import numpy as np  # type: ignore
-        from PIL import Image, ImageDraw  # type: ignore
-        here = Path(__file__).resolve().parent
-        tools_dir = (here.parent / "tools").resolve()
-        if str(tools_dir) not in _sys.path:
-            _sys.path.insert(0, str(tools_dir))
-        from _stl_render import parse_stl, render_view  # type: ignore
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": f"deps missing: {exc}"}
-
-    # Parse M486 object regions
-    G_RE = _re.compile(r"^G[01]\b")
-    X_RE = _re.compile(r"\bX(-?\d+(?:\.\d+)?)")
-    Y_RE = _re.compile(r"\bY(-?\d+(?:\.\d+)?)")
-    Z_RE = _re.compile(r"\bZ(-?\d+(?:\.\d+)?)")
-    E_RE = _re.compile(r"\bE(-?\d+(?:\.\d+)?)")
-    M486_A = _re.compile(r"^M486 A(.+?)\s*$")
-    M486_S = _re.compile(r"^M486 S(-?\d+)")
-    from collections import defaultdict as _dd
-    objects: dict[str, list[tuple[float, float]]] = _dd(list)
-    id_to_name: dict[int, str] = {}
-    current_id = None
-    current_type = None
-    first_layer_z = None
-    past_first_layer = False
-    prev_x = prev_y = None
-
-    try:
-        lines = plate_gcode_path.read_text().splitlines()
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": f"gcode read failed: {exc}"}
-
-    for ln in lines:
-        m_a = M486_A.match(ln)
-        if m_a:
-            if current_id is not None:
-                id_to_name[current_id] = m_a.group(1).strip()
-            continue
-        m_s = M486_S.match(ln)
-        if m_s:
-            new_id = int(m_s.group(1))
-            current_id = None if new_id < 0 else new_id
-            continue
-        if ln.startswith(";TYPE:"):
-            current_type = ln[6:].strip()
-            continue
-        if not G_RE.match(ln):
-            continue
-        z_m = Z_RE.search(ln)
-        if z_m:
-            z = float(z_m.group(1))
-            if first_layer_z is None:
-                first_layer_z = z
-            elif z > first_layer_z * 2.5:
-                past_first_layer = True
-        if past_first_layer:
-            break
-        x_m = X_RE.search(ln); y_m = Y_RE.search(ln); e_m = E_RE.search(ln)
-        nx = float(x_m.group(1)) if x_m else prev_x
-        ny = float(y_m.group(1)) if y_m else prev_y
-        # Strict Outer wall only — Inner walls / solid infill / bottom
-        # surface trace INTERIOR of the part, not the boundary. Including
-        # them distorts the rotation match toward interior fill patterns
-        # rather than the actual outer silhouette.
-        if (e_m and current_id is not None
-                and current_type == "Outer wall"
-                and nx is not None and ny is not None):
-            if float(e_m.group(1)) > 0:
-                name = id_to_name.get(current_id, "")
-                base = _re.sub(r"_id_\d+_copy_\d+$", "", name)
-                if base:
-                    objects[base].append((nx, ny))
-        prev_x, prev_y = nx, ny
-
-    if not objects:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": "no M486 markers (profile doesn't emit object labels)"}
-
-    # Match by filename base
-    source_by_name: dict[str, Path] = {}
-    for p in source_stl_paths:
-        sp = Path(p)
-        source_by_name[sp.name] = sp
-
-    def _center_xy(tris, use_centroid=True):
-        xy = tris[:, :, :2].reshape(-1, 2)
-        if use_centroid:
-            # Vertex CENTROID (mean) — better for asymmetric parts where
-            # the bbox center is offset from the visual centroid.
-            cx = float(xy[:, 0].mean())
-            cy = float(xy[:, 1].mean())
-        else:
-            cx = (xy[:, 0].min() + xy[:, 0].max()) / 2
-            cy = (xy[:, 1].min() + xy[:, 1].max()) / 2
-        flat = tris.reshape(-1, 3).copy()
-        flat[:, 0] -= cx; flat[:, 1] -= cy
-        return flat.reshape(tris.shape)
-
-    def _convex_hull_2d(pts):
-        """Andrew's monotone chain convex hull. Returns hull polygon (Nx2)."""
-        pts_sorted = sorted({(round(float(p[0]), 3), round(float(p[1]), 3))
-                             for p in pts})
-        if len(pts_sorted) < 3:
-            return np.array(pts_sorted, dtype=np.float32) if pts_sorted else np.zeros((0, 2), dtype=np.float32)
-        def cross(o, a, b):
-            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-        lower = []
-        for p in pts_sorted:
-            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-                lower.pop()
-            lower.append(p)
-        upper = []
-        for p in reversed(pts_sorted):
-            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-                upper.pop()
-            upper.append(p)
-        hull = lower[:-1] + upper[:-1]
-        return np.array(hull, dtype=np.float32)
-
-    def _densify_polygon(hull, spacing_mm=1.5):
-        """Interpolate along hull edges so distance-matching has enough
-        boundary samples. Returns dense (N, 2) point array."""
-        if len(hull) < 2:
-            return hull
-        pts = []
-        for i in range(len(hull)):
-            a = hull[i]; b = hull[(i + 1) % len(hull)]
-            d = float(np.linalg.norm(b - a))
-            n = max(1, int(d / spacing_mm))
-            for k in range(n):
-                t = k / n
-                pts.append(a + t * (b - a))
-        return np.array(pts, dtype=np.float32)
-
-    def _transform(tris, angle_rad, dx, dy):
-        c, s = _math.cos(angle_rad), _math.sin(angle_rad)
-        R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
-        T = np.array([dx, dy, 0], dtype=np.float32)
-        flat = tris.reshape(-1, 3)
-        return (flat @ R.T + T).reshape(tris.shape)
-
-    placed_tris: list[np.ndarray] = []
-    placed_count = 0
-    for name, pts in objects.items():
-        src = source_by_name.get(name)
-        if src is None or not src.exists():
-            continue
-        try:
-            tris = parse_stl(src)
-        except Exception:
-            continue
-        if tris.size == 0:
-            continue
-
-        # Center STL by vertex centroid (better than bbox center for
-        # asymmetric parts).
-        tris_c = _center_xy(tris, use_centroid=True)
-
-        # Gcode centroid (shape center-of-mass equivalent for perimeter
-        # samples). Align by centroid → best rotation search then finds
-        # the pure rotation (no residual translation error).
-        gc_pts = np.array(pts, dtype=np.float32)
-        gc_center = (float(gc_pts[:, 0].mean()),
-                     float(gc_pts[:, 1].mean()))
-        gc_pts_shifted = gc_pts - np.array(gc_center, dtype=np.float32)
-
-        # Use all STL vertices — NOT convex hull. Angle brackets and
-        # similar parts are non-convex (concavity between arms). Hull
-        # would fill that in, distorting the match. Dedupe rounded to
-        # 0.5mm to cut down count from ~5000 to ~500 unique boundary
-        # points.
-        stl_verts = tris_c[:, :, :2].reshape(-1, 2)
-        rounded = np.round(stl_verts * 2).astype(np.int32)
-        _uniq, uidx = np.unique(rounded, axis=0, return_index=True)
-        stl_boundary = stl_verts[uidx]
-        if len(stl_boundary) > 400:
-            step = len(stl_boundary) // 400
-            stl_boundary = stl_boundary[::step]
-
-        # Sub-sample gcode points to ~250
-        if len(gc_pts_shifted) > 250:
-            step = len(gc_pts_shifted) // 250
-            gc_pts_shifted = gc_pts_shifted[::step]
-
-        # Score every rotation by symmetric (bidirectional) mean of
-        # min-distances. Symmetric penalizes both "STL extends beyond
-        # gcode" AND "gcode extends beyond STL" — critical for correct
-        # 180°-vs-0° discrimination on asymmetric parts.
-        best_ang = 0.0
-        best_score = float("inf")
-        for i in range(n_rotation_candidates):
-            ang = 2 * _math.pi * i / n_rotation_candidates
-            c, s = _math.cos(ang), _math.sin(ang)
-            R = np.array([[c, -s], [s, c]], dtype=np.float32)
-            rot_boundary = stl_boundary @ R.T
-            # Gcode → nearest STL boundary
-            diffs_g = (gc_pts_shifted[:, None, :]
-                       - rot_boundary[None, :, :])
-            d2_g = (diffs_g * diffs_g).sum(-1)
-            md_g = np.sqrt(d2_g.min(axis=1))
-            # STL boundary → nearest gcode point
-            diffs_s = (rot_boundary[:, None, :]
-                       - gc_pts_shifted[None, :, :])
-            d2_s = (diffs_s * diffs_s).sum(-1)
-            md_s = np.sqrt(d2_s.min(axis=1))
-            # Symmetric mean
-            score = float(md_g.mean() + md_s.mean())
-            if score < best_score:
-                best_score = score
-                best_ang = ang
-
-        placed_tris.append(_transform(tris_c, best_ang,
-                                      gc_center[0], gc_center[1]))
-        placed_count += 1
-
-    if not placed_tris:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": "no source STLs matched the M486 object names"}
-
-    parts_merged = np.concatenate(placed_tris, axis=0).astype(np.float32)
-
-    fg = (232, 238, 245)
-    muted = (140, 150, 160)
-    big_font, small_font = _load_pil_fonts()
-    title_h = 50 if title else 0
-    disclaimer = ("Layout from slice gcode (M486 markers) with source STL "
-                  "geometry — profile-independent, matches actual print")
-    label_h = 32 if label_below else 0
-    label_h += 26  # disclaimer row
-    pad = 16
-    plot_size = canvas_px
-    canvas_w = plot_size + pad * 2
-    canvas_h = plot_size + pad * 2 + title_h + label_h
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (22, 26, 31))
-    draw = ImageDraw.Draw(canvas)
-    if title:
-        draw.text((pad, pad), title, fill=fg, font=big_font)
-
-    plate_img = render_view(
-        parts_merged, plot_size, plot_size,
-        view="top",
-        bg=(30, 34, 40),
-        model_top=(120, 190, 240),
-        model_bottom=(40, 90, 140),
-        pad=0.03,
-    )
-    canvas.paste(plate_img, (pad, pad + title_h))
-
-    y_cursor = pad + title_h + plot_size + pad
-    if label_below:
-        draw.text((pad, y_cursor), label_below, fill=fg, font=small_font)
-        y_cursor += 24
-    draw.text((pad, y_cursor), disclaimer, fill=muted, font=small_font)
-
-    try:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(out_path, format="PNG", optimize=True)
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": placed_count,
-                "error": f"save failed: {exc}"}
-
-    return {"ok": True, "path": str(out_path),
-            "part_count": placed_count, "error": None}
-
-
-def _parse_3mf_mesh(mesh_xml: str):
-    """Parse a 3MF `3D/Objects/*.model` file's mesh into an (N, 3, 3)
-    triangle array. Returns None on parse failure."""
-    try:
-        import re as _re
-        import numpy as np  # type: ignore
-    except Exception:
-        return None
-    verts: list[tuple[float, float, float]] = []
-    for m in _re.finditer(
-        r'<vertex\s+x="([-0-9.eE+]+)"\s+y="([-0-9.eE+]+)"\s+z="([-0-9.eE+]+)"',
-        mesh_xml,
-    ):
-        verts.append((float(m.group(1)), float(m.group(2)),
-                      float(m.group(3))))
-    if not verts:
-        return None
-    v_arr = np.array(verts, dtype=np.float32)
-    tris_idx: list[tuple[int, int, int]] = []
-    for m in _re.finditer(
-        r'<triangle\s+v1="(\d+)"\s+v2="(\d+)"\s+v3="(\d+)"',
-        mesh_xml,
-    ):
-        tris_idx.append((int(m.group(1)), int(m.group(2)),
-                         int(m.group(3))))
-    if not tris_idx:
-        return None
-    idx = np.array(tris_idx, dtype=np.int32)
-    return v_arr[idx]
-
-
-def _render_plate_layout_from_3mf(
-    source_stl_paths: list[str] | list[Path],
-    arrange_3mf: str | Path,
-    out_path: Path,
-    *,
-    bed_mm: tuple[float, float] = (270.0, 270.0),
-    canvas_px: int = 900,
-    title: str | None = None,
-    label_below: str | None = None,
-) -> dict[str, Any]:
-    """Truth-source plate preview from Orca's 3MF sidecar.
-
-    this is the profile-independent renderer we've been
-    chasing. Orca stamps exact per-item transform matrices into the 3MF
-    it emits alongside slicing/STL export. We:
-      1. Parse the 3MF's ``3D/3dmodel.model`` XML for each part's build
-         + component transform (row-major 3x4 matrix per 3MF spec)
-      2. Match each transform to a source STL by filename
-      3. Apply the composed transform (rotation + translation) to the
-         source STL's triangles
-      4. Merge all transformed triangles + a flat bed rectangle
-      5. Render via ``render_view("top")`` — same Lambertian shader that
-         produces the parts thumbnails
-
-    Because it uses source-STL geometry (not gcode extrusion polylines),
-    output quality is independent of infill choice — gyroid/rectilinear/
-    honeycomb all render identically clean.
-
-    Returns ``{'ok', 'path', 'part_count', 'error'}``.
-    """
-    import re as _re
-    import zipfile as _zip
-    try:
-        import sys as _sys
-        import numpy as np  # type: ignore
-        from PIL import Image, ImageDraw  # type: ignore
-        here = Path(__file__).resolve().parent
-        tools_dir = (here.parent / "tools").resolve()
-        if str(tools_dir) not in _sys.path:
-            _sys.path.insert(0, str(tools_dir))
-        from _stl_render import parse_stl, render_view  # type: ignore
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": f"deps missing: {exc}"}
-
-    mf_path = Path(arrange_3mf)
-    if not mf_path.exists():
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": f"arrange 3mf not found: {mf_path}"}
-
-    # Load meshes from the 3MF's own `3D/Objects/*.model` files rather
-    # than the source STLs — Orca may have normalized/centered the STL
-    # when it packed the mesh into the 3MF, and its transforms are
-    # designed to apply to THAT internal representation. Source STLs
-    # produced off-bed positions because their coordinate origins differed.
-    mesh_by_zip_path: dict[str, np.ndarray] = {}
-    try:
-        with _zip.ZipFile(mf_path) as zf:
-            top = zf.read("3D/3dmodel.model").decode("utf-8")
-            for name in zf.namelist():
-                if name.startswith("3D/Objects/") and name.endswith(".model"):
-                    mesh_xml = zf.read(name).decode("utf-8", errors="ignore")
-                    tris = _parse_3mf_mesh(mesh_xml)
-                    if tris is not None and tris.size > 0:
-                        # zip stores as '3D/Objects/foo.model' — the top
-                        # model references it as '/3D/Objects/foo.model'.
-                        mesh_by_zip_path[name] = tris
-                        mesh_by_zip_path["/" + name] = tris
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": f"3mf read failed: {exc}"}
-
-    # Parse component definitions (id → mesh path + optional local transform)
-    obj_to_path: dict[int, str] = {}
-    obj_to_local: dict[int, str] = {}
-    for m in _re.finditer(
-        r'<object\s+id="(\d+)"[^>]*>\s*<components>\s*<component[^/]*'
-        r'p:path="([^"]+)"[^/]*(?:transform="([^"]*)")?[^/]*/>',
-        top, _re.DOTALL,
-    ):
-        obj_id = int(m.group(1))
-        obj_to_path[obj_id] = m.group(2)
-        obj_to_local[obj_id] = m.group(3) or "1 0 0 0 1 0 0 0 1 0 0 0"
-
-    # Parse build items (arrangement — this is what Orca decided)
-    items: list[dict[str, Any]] = []
-    for m in _re.finditer(
-        r'<item\s+objectid="(\d+)"[^/]*transform="([^"]+)"[^/]*/>',
-        top,
-    ):
-        objid = int(m.group(1))
-        items.append({
-            "objectid": objid,
-            "build_transform": m.group(2),
-            "component_path": obj_to_path.get(objid, ""),
-            "component_local_transform": obj_to_local.get(
-                objid, "1 0 0 0 1 0 0 0 1 0 0 0"),
-        })
-
-    if not items:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": "no <build><item> in 3mf"}
-
-    def _parse_transform(t: str) -> tuple[np.ndarray, np.ndarray]:
-        nums = [float(x) for x in t.split()]
-        if len(nums) < 12:
-            return (np.eye(3, dtype=np.float32),
-                    np.zeros(3, dtype=np.float32))
-        rot = np.array(nums[:9], dtype=np.float32).reshape(3, 3)
-        trans = np.array([nums[9], nums[10], nums[11]], dtype=np.float32)
-        return rot, trans
-
-    placed_tris: list[np.ndarray] = []
-    placed_count = 0
-    for item in items:
-        comp_path = item["component_path"]
-        # Try both with and without leading slash. Use explicit `is None`
-        # checks — numpy arrays can't be used in truthy `or` fallback.
-        tris = mesh_by_zip_path.get(comp_path)
-        if tris is None:
-            tris = mesh_by_zip_path.get(comp_path.lstrip("/"))
-        if tris is None:
-            continue
-        b_rot, b_t = _parse_transform(item["build_transform"])
-        c_rot, c_t = _parse_transform(item["component_local_transform"])
-        # Composed transform (build applies after component-local):
-        # world = build_R @ (comp_R @ v + comp_t) + build_t
-        combined_rot = b_rot @ c_rot
-        combined_t = b_rot @ c_t + b_t
-        flat = tris.reshape(-1, 3)
-        world = flat @ combined_rot.T + combined_t
-        placed_tris.append(world.reshape(tris.shape))
-        placed_count += 1
-
-    if not placed_tris:
-        return {"ok": False, "path": None, "part_count": 0,
-                "error": "no source STLs matched the 3mf's items"}
-
-    parts_merged = np.concatenate(placed_tris, axis=0).astype(np.float32)
-
-    # Bed anchor: two flat triangles at z=0 covering the full bed so
-    # render_view auto-fit locks to the bed extent + gives us a bed
-    # background under parts. Colored slightly warmer than parts so the
-    # bed reads as bed rather than blending with the render.
-    bed_w, bed_h = float(bed_mm[0]), float(bed_mm[1])
-    bed_tris = np.array([
-        [[0.0, 0.0, 0.0], [bed_w, 0.0, 0.0], [0.0, bed_h, 0.0]],
-        [[bed_w, 0.0, 0.0], [bed_w, bed_h, 0.0], [0.0, bed_h, 0.0]],
-    ], dtype=np.float32)
-    merged = np.concatenate([bed_tris, parts_merged], axis=0)
-
-    fg = (232, 238, 245)
-    muted = (140, 150, 160)
-    big_font, small_font = _load_pil_fonts()
-    title_h = 50 if title else 0
-    disclaimer = "Layout from Orca's arrangement (source STL geometry, profile-independent)"
-    label_h = 32 if label_below else 0
-    label_h += 26  # disclaimer row
-    pad = 16
-    plot_size = canvas_px
-    canvas_w = plot_size + pad * 2
-    canvas_h = plot_size + pad * 2 + title_h + label_h
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (22, 26, 31))
-    draw = ImageDraw.Draw(canvas)
-    if title:
-        draw.text((pad, pad), title, fill=fg, font=big_font)
-
-    plate_img = render_view(
-        merged, plot_size, plot_size,
-        view="top",
-        bg=(30, 34, 40),
-        model_top=(120, 190, 240),
-        model_bottom=(40, 90, 140),
-        pad=0.03,
-    )
-    canvas.paste(plate_img, (pad, pad + title_h))
-
-    y_cursor = pad + title_h + plot_size + pad
-    if label_below:
-        draw.text((pad, y_cursor), label_below, fill=fg, font=small_font)
-        y_cursor += 24
-    draw.text((pad, y_cursor), disclaimer, fill=muted, font=small_font)
-
-    try:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(out_path, format="PNG", optimize=True)
-    except Exception as exc:
-        return {"ok": False, "path": None, "part_count": placed_count,
-                "error": f"save failed: {exc}"}
-
-    return {"ok": True, "path": str(out_path),
-            "part_count": placed_count, "error": None}
-
-
 def _render_plate_layout_from_gcode_layers(
     gcode_path: Path,
     out_path: Path,
@@ -1607,12 +1075,10 @@ def _render_and_inject_plate_preview(
     #     packer diverges from --slice on some inputs).
     #   • Raw gcode polyline — dense scribble, always works.
     #
-    # Dead-end renderers left in-file for reference (NOT in chain):
-    #   • _render_plate_layout_from_3mf — --export-3mf uses same buggy
-    #     packer as --export-stl.
-    #   • _render_plate_layout_from_gcode_m486 — M486 positions + rotate
-    #     source STLs; rotation matching is under-constrained and
-    #     produces visible overlaps.
+    # Dead-end renderers DELETED (rc2; recover via git history if ever
+    # needed): _render_plate_layout_from_3mf (--export-3mf uses the same
+    # buggy packer as --export-stl) and _render_plate_layout_from_gcode_m486
+    # (M486 rotation matching under-constrained, visible overlaps).
     layout = _render_plate_layout_from_m486_outer_walls(
         plate_gcode_path, plate_preview_path,
         bed_mm=bed_mm, title=title, label_below=label_below,
@@ -2379,9 +1845,27 @@ def run_kit_workflow(args) -> dict[str, Any]:
     events_file = out_dir / "events.jsonl"
 
     # --- ANALYSIS: ingest the kit (always, cheap, idempotent) ---
+    # Ingest failures (over-limit archive, unparseable/garbage STL, corrupt
+    # zip) are operator problems, not crashes: emit a clean kit_rejected
+    # event instead of dying with a traceback.
     parts_dir = out_dir / "parts"
-    stls = u1_kit.extract_all_stls(archive, parts_dir)
-    kit = u1_kit.build_kit(stls)
+    try:
+        stls = u1_kit.extract_all_stls(archive, parts_dir)
+        kit = u1_kit.build_kit(stls)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        _emit(events_file, {
+            "stage": "kit_rejected",
+            "request_id": request_id,
+            "error": reason[:600],
+            "instruction": ("This archive could not be ingested as a kit "
+                            "(bad/oversized entry or unparseable STL). "
+                            "Surface the error to the operator; do not "
+                            "retry with the same file."),
+        }, json_events)
+        _audit(request_id, "kit_rejected", operator, error=reason[:300])
+        return {"phase": "kit_rejected", "request_id": request_id,
+                "error": reason[:600]}
     _emit(events_file, {
         "stage": "kit_ingested",
         "request_id": request_id,
@@ -2572,7 +2056,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
                              yes_command=yes_command_on_confirmed,
                              bed_clear_confirmed=bool(
                                  getattr(args, "bed_clear_confirmed", False)),
-                             operator=operator)
+                             operator=operator,
+                             pending_nonce=getattr(args, "pending_nonce", None))
     # Layer 3 override: manual-bed-check. The operator explicitly takes
     # responsibility for bed verification via another method (looking at
     # printer, Snapmaker app, other camera). Hermes camera path failed but
@@ -2592,7 +2077,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
             op_text, v_method,
             yes_command=_manual_yes,
             bed_clear_confirmed=bool(
-                getattr(args, "bed_clear_confirmed", False)))
+                getattr(args, "bed_clear_confirmed", False)),
+            pending_nonce=getattr(args, "pending_nonce", None))
     # Brent design #3+#4: refresh-bed-photo / retry-photo / retry-camera —
     # all route to the same handler. Re-capture without re-slicing.
     if action in ("refresh-bed-photo", "retry-photo", "retry-camera"):
@@ -3314,7 +2800,8 @@ def _action_start(events_file: Path | None, request_id: str,
                   json_events: bool,
                   yes_command: str | None = None,
                   bed_clear_confirmed: bool = False,
-                  operator: str | None = None) -> dict[str, Any]:
+                  operator: str | None = None,
+                  pending_nonce: str | None = None) -> dict[str, Any]:
     """Operator picked `start` at the confirm gate.
 
     Two-turn safety boundary: stable
@@ -3423,7 +2910,10 @@ def _action_start(events_file: Path | None, request_id: str,
             # a hand-built version that omitted these
             # caused the workflow to restart at Turn 1 (awaiting_parts)
             # on the resume call.
-            "next_command_on_yes": yes_command or (
+            # The pending nonce rides the yes-command: the second call must
+            # present it, so only the VERBATIM emitted command can confirm —
+            # a hand-assembled --bed-clear-confirmed call is refused.
+            "next_command_on_yes": (yes_command or (
                 # Legacy fallback (state-recovery path) — the workflow's
                 # self-heal on --request-id may fill in missing args, but
                 # this is a defense-in-depth path; callers should always
@@ -3431,7 +2921,7 @@ def _action_start(events_file: Path | None, request_id: str,
                 f"python3 /opt/data/scripts/u1_kit_workflow.py "
                 f"--request-id {request_id} --action start "
                 f"--bed-clear-confirmed"
-            ),
+            )) + f" --pending-nonce {nonce}",
             "next_command_on_no": None,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
@@ -3458,6 +2948,12 @@ def _action_start(events_file: Path | None, request_id: str,
             if pending.get("prompt_key") != "bed_clear_start":
                 problems.append(f"pending.prompt_key={pending.get('prompt_key')!r}, "
                                 "expected 'bed_clear_start'")
+            if pending.get("nonce") and pending_nonce != pending.get("nonce"):
+                problems.append(
+                    "pending nonce missing/mismatched — the confirm call "
+                    "must be the VERBATIM next_command_on_yes emitted at "
+                    "the yes/no prompt (re-run --action start for a fresh "
+                    "prompt)")
             if pending.get("request_revision") != request_revision:
                 problems.append(
                     f"revision mismatch: pending={pending.get('request_revision')} "
@@ -3711,6 +3207,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
                                    verification_method: str,
                                    yes_command: str | None = None,
                                    bed_clear_confirmed: bool = False,
+                                   pending_nonce: str | None = None,
                                    ) -> dict[str, Any]:
     """Layer 3 override: bed verification by means other than the Hermes
     camera path.
@@ -3754,6 +3251,28 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
               json_events)
         return {"phase": "error", "request_id": request_id,
                 "error": "missing plate filename"}
+
+    # Degraded-verification guard: the manual override exists for the case
+    # where the camera path FAILED. When the confirm captured a real photo
+    # and issued a token, the normal `start` path is strictly stronger —
+    # refuse the override so an agent can't route around the photo, and
+    # hand back the right command instead of a dead end.
+    _safety_now = state.get("safety") or {}
+    if _safety_now.get("approval_token") and _safety_now.get("bed_clear_photo_captured"):
+        _audit(request_id, "operator_override_refused", operator,
+               override_kind="manual_bed_check",
+               reason="camera_verification_available",
+               verification_method=verification_method,
+               operator_text=operator_text)
+        _emit(events_file, {
+            "stage": "manual_bed_check_refused",
+            "request_id": request_id,
+            "reason": ("A real bed photo + approval token already exist for "
+                       "this request — manual verification is only for the "
+                       "degraded-camera case. Use the normal `start` action "
+                       "(fresh yes/no against the captured photo)."),
+        }, json_events)
+        return {"phase": "manual_bed_check_refused", "request_id": request_id}
 
     if not bed_clear_confirmed:
         # First-call path — audit the override attempt, mint pending, emit
@@ -3800,7 +3319,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
             },
             "prompt": prompt,
             "expected_answers": ["yes", "no"],
-            "next_command_on_yes": yes_command or (
+            "next_command_on_yes": (yes_command or (
                 # Legacy fallback (state-recovery path) — should never be
                 # taken; callers always pass yes_command with full context.
                 f"python3 /opt/data/scripts/u1_kit_workflow.py "
@@ -3808,7 +3327,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
                 f"--bed-clear-confirmed "
                 f"--operator-text {_shell_quote(operator_text)} "
                 f"--verification-method {_shell_quote(verification_method)}"
-            ),
+            )) + f" --pending-nonce {nonce}",
             "next_command_on_no": None,
         }
         _emit(events_file, need, json_events)
@@ -3831,6 +3350,11 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
     if pending:
         if not pending.get("manual_override"):
             problems.append("pending object is not a manual_override; refusing")
+        if pending.get("nonce") and pending_nonce != pending.get("nonce"):
+            problems.append(
+                "pending nonce missing/mismatched — the confirm call must be "
+                "the VERBATIM next_command_on_yes emitted at the yes/no "
+                "prompt")
         if pending.get("request_revision") != request_revision:
             problems.append(
                 f"revision mismatch: pending={pending.get('request_revision')} "
@@ -4435,6 +3959,11 @@ def main(argv=None) -> int:
                     help=("Set ONLY after the operator answers 'yes' to the "
                           "fresh bed-clear-and-start prompt. Never set on the "
                           "initial confirm-turn 'start' pick."))
+    ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
+                    help=("Single-use nonce from the emitted "
+                          "next_command_on_yes. The confirm call must present "
+                          "it — copy the emitted command VERBATIM; a "
+                          "hand-assembled confirm is refused."))
     # Layer 3 override metadata (per Brent design 2026-06-30). When the agent
     # surfaces an override option (start manual-bed-check / start
     # accept-material-mismatch), the operator's literal typed phrase goes
