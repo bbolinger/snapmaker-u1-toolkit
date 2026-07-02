@@ -452,6 +452,51 @@ string to something without a test prefix (`homelab`, `human:homelab`, etc.).
 The fence is deliberately narrow: identity strings starting with `dev:`, `ci:`,
 `telegram:`, `discord:`, `human:`, or bare names all proceed normally.
 
+### Pre-start grace period + Telegram cancel button (v2.1.0)
+
+After every safety check passes and before the gate HTTPs the printer's
+`/printer/print/start`, there's a **grace window** (default 120s, configurable
+via `U1_GRACE_PERIOD_SECONDS` env var or `--grace-seconds N`). During the
+window the gate:
+
+1. Fires an operator notification via `$U1_GRACE_NOTIFY_CMD` (a shell
+   command you configure). Env vars `U1_REQUEST_ID`, `U1_FILENAME`,
+   `U1_GRACE_SECONDS`, `U1_CANCEL_MARKER`, `U1_OPERATOR` are exported so
+   your command can templatize them.
+2. Polls a per-request marker file at `<out_dir>/pre_start_cancel.marker`
+   once per second.
+3. If the marker appears → refuses the print, no HTTP call, audit
+   `pre_start_grace_cancelled`.
+4. If it doesn't appear before the window expires → proceeds, audit
+   `pre_start_grace_period_expired`.
+
+**Hermes users get a one-tap cancel button:** ship a Telegram notification
+via `hermes send` and a Gateway hook that touches the marker when you reply
+`cancel <code>` in the DM. Zero LLM, zero agent-loop — the hook runs directly
+in the Hermes gateway process.
+
+Install:
+
+```bash
+# One-time — installs the hook into Hermes' actual HOOKS_DIR + restarts gateway
+bash tools/install_hermes_cancel_hook.sh
+
+# Per environment — point the gate at the notify script
+export U1_GRACE_NOTIFY_CMD=/absolute/path/to/tools/u1_grace_notify_hermes.sh
+```
+
+The notify script sends a Telegram DM. Reply `CANCEL` (or `STOP` or
+`ABORT`, exact match, case-insensitive) within the window and the print
+aborts before any HTTP call. Substrings don't match — "cancel that
+plan" is safe from unintended cancels. Multi-request setups (two
+concurrent grace windows) each write their own pending-state file so
+they don't race each other.
+
+Opt-out for power users at the printer: `U1_GRACE_PERIOD_SECONDS=0`
+disables the window. `U1_GRACE_NOTIFY_CMD` unset disables the
+notification but the wait still runs (in that case an SSH `touch
+<marker>` cancels).
+
 ## Quick start — per-platform commands
 
 The 30-second flavor is in [Quick Start](#quick-start) above. This section has the per-platform install + first-status-probe commands.
