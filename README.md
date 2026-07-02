@@ -440,7 +440,7 @@ prefix: `smoke:`, `test:`, `dry:`, `mock:`, or `fixture:` (case-insensitive).
 The gate returns a `gate_refused_test_operator` payload and audits the refusal.
 No HTTP call reaches the printer, no photo is taken, no preflight runs. This
 closes the "smoke-test accidentally runs a real print" failure that motivated
-the fence (2026-07-01 postmortem in the v2.1.0 branch history).
+the fence.
 
 `u1_kit_workflow.py` also prints a highly visible TEST MODE banner to stderr
 at the top of every invocation under a test-flavored operator, so the tester
@@ -649,7 +649,7 @@ Without either, the workflow fails closed at analysis time with a clear `setup_r
 
 ### Why ship empty (v1.4.x → v1.5.0)
 
-Earlier versions shipped 13 of my (Brent's) personal community profiles in `profiles/` as defaults. They were tuned for one bed surface (Textured PEI), one bed temp, specific filament brands (SUNLU PETG, HF White PETG), specific tool assignments. Running them silently on another U1 with different filaments or a different bed surface could ruin prints — and the toolkit had no way to warn the user that the profile underneath didn't match their setup.
+Earlier versions shipped 13 personal community profiles in `profiles/` as defaults. They were tuned for one bed surface (Textured PEI), one bed temp, specific filament brands (SUNLU PETG, HF White PETG), specific tool assignments. Running them silently on another U1 with different filaments or a different bed surface could ruin prints — and the toolkit had no way to warn the user that the profile underneath didn't match their setup.
 
 v1.5.0 moves those personal templates to `examples/profiles/` and points the picker at three honest sources: Snapmaker upstream (universal baseline), your printer's history (physics-validated on your hardware), and your own hand-tuned profiles. The agent's *Preset?* prompt now annotates each option with `source`, `has_supports` (read from the JSON's `enable_support` field), and `supports_status` (does picking "Add supports" auto-promote to a `_supports` sibling, already encode supports, or fail with a `no_supports_variant` warning).
 
@@ -742,7 +742,7 @@ The toolmap gate (`u1_toolmap.py`) then prevents you from accidentally slicing a
 
 ### Reference: example community profiles in `examples/profiles/`
 
-The 13 profiles I (Brent) used during development live in `examples/profiles/` as a shape reference. They're MIT-licensed and show what a working community-tuned profile looks like for the U1. **Do not use them as defaults** — they assume Textured PEI + specific filament brands. If you happen to share that setup, copy them into `profiles/user/` and they'll appear in the picker.
+The 13 profiles used during development live in `examples/profiles/` as a shape reference. They're MIT-licensed and show what a working community-tuned profile looks like for the U1. **Do not use them as defaults** — they assume Textured PEI + specific filament brands. If you happen to share that setup, copy them into `profiles/user/` and they'll appear in the picker.
 
 The naming convention so you can see the pattern:
 
@@ -798,7 +798,7 @@ Use this if you're slicing from CLI in a container, CI pipeline, or agent workfl
 > into upstream OrcaSlicer 2.4.0, so it has full U1 support — and its CLI is
 > the better-supported headless path. The Snapmaker fork's Windows CLI has
 > been observed to segfault when slicing with these profiles (verified
-> 2026-06-22 on `snapmaker-orca v2.3.4` Windows, exit code `-1073741819`).
+> `snapmaker-orca v2.3.4` Windows can exit code `-1073741819` on some models).
 
 ### Install — Linux (extracted AppImage)
 
@@ -843,7 +843,7 @@ Headless slicing needs **three** profiles in a specific load order:
 > **Pass each profile via its own `--load-settings` flag** (not one flag with
 > semicolon-separated paths). Both forms are documented in OrcaSlicer, but
 > the dual-flag form is the one verified-working in our test runs (Hermes
-> Windows smoke, 2026-06-22) and avoids quoting foot-guns on PowerShell.
+> Windows) and avoids quoting foot-guns on PowerShell.
 
 ```bash
 # Linux

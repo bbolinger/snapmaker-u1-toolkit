@@ -14,7 +14,7 @@ Contract with u1_print_start_gate.py + u1_grace_notify_hermes.sh:
         "cancel_marker": "/opt/data/.../pre_start_cancel.marker",
         "filename":      "plate1.gcode",
         "grace_seconds": 120,
-        "expires_at":    "2026-07-01T20:35:00+00:00"
+        "expires_at":    "<ISO timestamp>"
       }
     Multiple concurrent grace windows each write their own file so
     they can't race each other.
@@ -25,7 +25,7 @@ Contract with u1_print_start_gate.py + u1_grace_notify_hermes.sh:
     in the pending dir.
 
 Multiple pending windows + bare cancel: touch ALL current markers.
-Rationale — in Brent's setup this is the same U1 handling one job at a
+Rationale — in a typical single-U1 setup this is one job at a
 time; if somehow two windows are open at once, an operator's "cancel"
 is intended as "stop what's about to happen," not "guess which of
 several pending things to cancel." Preserves the trust-the-human
@@ -124,7 +124,7 @@ async def handle(event_type: str, context: dict) -> None:
               "platform": context.get("platform"),
               "user_id": context.get("user_id")})
         return
-    # Touch every active pending marker. In Brent's single-U1 setup
+    # Touch every active pending marker. In a single-U1 setup
     # there's normally only one; if multiple somehow exist, cancel-
     # means-cancel-all is the least surprising behavior.
     for state in pending:

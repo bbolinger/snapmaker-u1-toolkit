@@ -108,10 +108,9 @@ row is NEVER written.
 If the grace window expires with no cancel marker, the gate audits
 `pre_start_grace_period_expired` and proceeds to HTTP the printer.
 
-This is the mechanical safety net for the 2026-07-01 postmortem: if the
-skill (or any agent) chain-fires the yes-command → Stage 2 command in bad
-faith, the operator still gets a real-world notification with time to
-react before the printer starts moving material.
+This is the mechanical safety net: if the skill (or any agent) chain-fires
+the yes-command → Stage 2 command, the operator still gets a real-world
+notification with time to react before the printer starts moving material.
 
 ### After Stage 2 succeeds
 

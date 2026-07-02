@@ -9,7 +9,7 @@
 # What it does:
 #   1. Discovers Hermes' actual HOOKS_DIR by importing gateway.hooks.
 #      (The docs say ~/.hermes/hooks/ but the real path can differ per
-#      install — verified 2026-07-01 that this container uses
+#      install — some containers use
 #      /opt/data/hooks. Doing the discovery avoids the papercut of
 #      installing into the wrong dir.)
 #   2. Copies HOOK.yaml + handler.py into HOOKS_DIR/u1_grace_cancel/.
