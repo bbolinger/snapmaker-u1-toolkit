@@ -389,6 +389,14 @@ emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
   oversized part). `kit_upload_failed` (`failures[]`, `instruction`) when one
   or more plates did NOT land on the printer (rc 2/4/5) — request phase moves
   to `upload_failed`; nothing claims success.
+- `review_doc` — pre-print review document (v2.2). Fields: `path` (a
+  `review.md` in the request dir), `instruction`. The agent attaches the
+  file to the operator alongside the readiness card. Informational and
+  fail-soft: generation failure audits `review_doc_failed` and the flow
+  continues; `can_start()`'s drift check binds the doc's plan (revision +
+  gcode hash, stamped in its header) to the plan that prints. Emitted by
+  both kit paths and the single-STL flow; the readiness cards carry
+  `review_doc_path` too.
 - `kit_readiness_card` — the kit equivalent of `readiness_card`. Fields:
   `part_count`, `selected_parts[]`, `plate_count`, `plates[]`
   (`plate_idx`, `printer_storage_filename`, `gcode_hash`), `tool`, `material`,

@@ -27,7 +27,9 @@ If the answer doesn't validate, the workflow emits `form_rejected` with
 `errors` + the form again — show the errors and ask once more. Never guess.
 
 After a valid answer the workflow slices all selected parts onto plate(s),
-uploads them, and emits `kit_readiness_card`. The card's `parsed_echo`
+uploads them, and emits `kit_readiness_card` (preceded by a `review_doc`
+event — attach its `path` so the operator can read the flight plan before
+answering). The card's `parsed_echo`
 ("I read: …") is what the operator confirms — surface it.
 
 ## Trigger 2 — the photo gate (plate 1 only)
