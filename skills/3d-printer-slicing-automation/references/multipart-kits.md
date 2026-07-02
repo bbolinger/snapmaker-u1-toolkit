@@ -15,6 +15,11 @@ action).
 - **Relay their reply VERBATIM** into `--form-answers '<their line>'` on the
   command in `next_command`. Do NOT interpret, reorder, or normalize it — the
   script parses it. One quoted line.
+- **Form mode (v2.2, buttons):** when the `kit_form` event carries
+  `form_schema` + `form_id`, pass the schema to the form tool. When the
+  tool result says the answers file was written, tool-call the event's
+  `next_command` (it carries `--form-answers-from <form_id>`) VERBATIM.
+  Never read, restate, or reconstruct the answers — you never had them.
 - The operator answers all fields at once in any order, e.g.:
   `parts 1,3 | auto | T0 | PLA | profile 2 | no-supports | start`
   - `parts`: `all`, or `1,3,5`, or a range `1-4`

@@ -193,6 +193,27 @@ def _install_telegram_form_patch() -> None:
             for row in rows
         ])
 
+    def _u1_write_answers_file(form_id, answers):
+        """v2.2 file handoff: persist the collected answers where the
+        workflow's --form-answers-from can redeem them. The GATEWAY writes
+        this — the model never carries answer content. Mirrors
+        u1_form.write_answers_file (kept self-contained on purpose: the
+        adapter must not import the toolkit)."""
+        import json as _json
+        import os
+        import re as _re
+        if not _re.match(r"^[A-Za-z0-9_-]{6,64}$", str(form_id or "")):
+            raise ValueError(f"invalid form_id: {form_id!r}")
+        base = os.environ.get("U1_FORM_ANSWERS_DIR", "").strip() \
+            or "/opt/data/snapmaker_u1/form_answers"
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, f"{form_id}.json")
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            _json.dump(answers, fh, indent=2)
+        os.replace(tmp, path)
+        return path
+
     async def _send_form(self, chat_id, form_schema, form_id, session_key, metadata=None):
         """Render a form_schema as a sequence of inline-keyboard screens.
 
@@ -271,10 +292,21 @@ def _install_telegram_form_patch() -> None:
                 from tools import form_gateway as _fmod  # type: ignore
                 form_id = next((fid for fid, s in st.items() if s is slot), None)
                 if form_id:
+                    submit_spec = (slot.get("schema") or {}).get("submit") or {}
+                    payload = ev["answer"]
+                    if submit_spec.get("mode") == "file":
+                        # v2.2 handoff: answers go to DISK for the workflow
+                        # to redeem via --form-answers-from; the agent
+                        # thread gets a receipt only — no answer content
+                        # rides back through the model.
+                        target_id = submit_spec.get("form_id") or form_id
+                        path = _u1_write_answers_file(target_id, ev["answer"])
+                        payload = {"_answers_file_written": True,
+                                   "form_id": target_id, "path": path}
                     # False ⇒ the gateway entry is gone (agent's wait timed
                     # out and popped it) — nothing will run, so don't claim
                     # success. Drop the stale slot either way.
-                    resolved = bool(_fmod.resolve_gateway_form(form_id, ev["answer"]))
+                    resolved = bool(_fmod.resolve_gateway_form(form_id, payload))
                     st.pop(form_id, None)
             except Exception as exc:
                 _logger.warning("u1 form: resolve failed: %s", exc)
