@@ -87,6 +87,32 @@ readiness card, then tool-call the emitted Stage-1 command verbatim. Surface
 the fresh bed photo and ask a new approval question with the same
 `request_id`. Only after a fresh "yes" may you run Stage 2 with the new token.
 
+### Pre-start grace period (v2.1.0)
+
+After every safety check passes AND before `u1_print_start_gate.py` HTTPs
+the printer's `/printer/print/start`, the gate enters a **grace window**
+(default 120s, configurable via `U1_GRACE_PERIOD_SECONDS` env var or
+`--grace-seconds N`, `0` disables). The gate audit writes
+`pre_start_grace_period_started` to `<request_dir>/audit.jsonl` with
+`{grace_seconds, cancel_marker}` fields.
+
+**Adapter role:** watch the audit log for `pre_start_grace_period_started`
+and, on match, send the operator a loud notification (Telegram, Discord,
+whatever the channel is) with a cancel action. The cancel action must
+create the file at `cancel_marker` (any content). The gate polls once per
+second; when the file appears, the gate refuses with:
+`Operator cancelled during the pre-start grace period. No HTTP call was
+sent to the printer.` No print, no material burned, `print_started` audit
+row is NEVER written.
+
+If the grace window expires with no cancel marker, the gate audits
+`pre_start_grace_period_expired` and proceeds to HTTP the printer.
+
+This is the mechanical safety net for the 2026-07-01 postmortem: if the
+skill (or any agent) chain-fires the yes-command → Stage 2 command in bad
+faith, the operator still gets a real-world notification with time to
+react before the printer starts moving material.
+
 ### After Stage 2 succeeds
 
 Report only the start result fields (`started`, `response`, `blockers`,
