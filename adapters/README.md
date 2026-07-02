@@ -1,5 +1,10 @@
 # Reference adapters — form-protocol renderers
 
+> **EXPERIMENTAL.** The `form_schema` event is not yet emitted by
+> `u1_kit_workflow` (`--interaction-mode form` is parsed but unwired); the
+> staged text flow is the production path today. These adapters are reference
+> implementations ahead of that wiring.
+
 Optional, consumer-side reference code that renders the toolkit's `form_schema`
 (emitted on the `kit_form` event) as native UI on a chat surface, collects the
 operator's choices, and submits them back via
@@ -54,5 +59,6 @@ contract: collect → produce JSON → caller invokes `--form-answers-json`.
 The form-protocol is platform-neutral by design: the toolkit emits a schema,
 consumers render. Shipping reference renderers gives any bot author or host
 agent a working starting point on either of the two primary surfaces — without
-forcing the core toolkit to take a platform-SDK dependency. See
-`docs/FORM-PROTOCOL.md` (internal design doc) for the contract.
+forcing the core toolkit to take a platform-SDK dependency. The contract is
+what `u1_form.build_form_schema` emits and `u1_form.parse_answers_json`
+accepts (see `scripts/u1_form.py`).

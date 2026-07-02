@@ -16,7 +16,8 @@ owns the gates. Keeping ingest dumb is what lets the model stay dumb.
 
 Spike-verified facts this serves (§2 of the plan):
   - Orca arranges multiple positional STLs with ``--arrange 1`` headless.
-  - Overflow auto-splits into ``plate_N.gcode`` — we do not pack or split here.
+  - Orca does NOT auto-split overflow (2026-06-30 audit); u1_arrange owns
+    partitioning (first-fit-decreasing) — we still do not pack or split here.
   - ``--allow-rotations`` lets arrange rotate a part in-plane, so a part that
     only fits rotated still fits. ``part_fits_bed`` accounts for that.
 """
@@ -48,6 +49,41 @@ DEFAULT_BED_MM: tuple[float, float] = (270.0, 270.0)
 # Clearance Orca needs around each part when arranging. Only used for fit hints.
 ARRANGE_MARGIN_MM: float = 5.0
 
+# Ingest limits. Extraction reads each entry wholly into RAM and summarize_
+# part loads the STL into numpy — without caps a crafted kit zip (thousands
+# of entries, or one multi-GB STL of zeros) OOMs the workflow before any
+# human gate. Generous for real kits: the largest Printables kits are a few
+# dozen parts and well under 100MB per STL.
+MAX_KIT_PARTS = 100
+MAX_PART_BYTES = 200 * 1024 * 1024        # per extracted STL
+MAX_KIT_TOTAL_BYTES = 600 * 1024 * 1024   # sum of extracted STLs
+
+
+class KitIngestError(ValueError):
+    """Clean, operator-facing ingest refusal (bad archive / over limits).
+    The workflow catches this and emits kit_rejected instead of a traceback."""
+
+
+def _check_archive_limits(stl_infos: list) -> None:
+    """Refuse archives that exceed the ingest caps BEFORE extracting."""
+    if len(stl_infos) > MAX_KIT_PARTS:
+        raise KitIngestError(
+            f"kit has {len(stl_infos)} STL entries; the limit is "
+            f"{MAX_KIT_PARTS}. Split the archive.")
+    total = 0
+    for info in stl_infos:
+        if info.file_size > MAX_PART_BYTES:
+            raise KitIngestError(
+                f"entry {info.filename!r} is {info.file_size / 1e6:.0f}MB "
+                f"uncompressed; the per-part limit is "
+                f"{MAX_PART_BYTES / 1e6:.0f}MB.")
+        total += info.file_size
+    if total > MAX_KIT_TOTAL_BYTES:
+        raise KitIngestError(
+            f"kit is {total / 1e6:.0f}MB uncompressed across "
+            f"{len(stl_infos)} STLs; the limit is "
+            f"{MAX_KIT_TOTAL_BYTES / 1e6:.0f}MB.")
+
 
 def _sanitize(stem: str) -> str:
     """Filesystem/grammar-safe token from a filename stem (for part ids)."""
@@ -74,21 +110,32 @@ def extract_all_stls(archive: Path, out_dir: Path) -> list[Path]:
         return [extract_first_stl_from_3mf(archive, out_dir)]
 
     with zipfile.ZipFile(archive) as z:
-        stl_names = [n for n in z.namelist() if n.lower().endswith(".stl")]
-        if not stl_names:
+        stl_infos = [i for i in z.infolist()
+                     if i.filename.lower().endswith(".stl")]
+        if not stl_infos:
             # Defer to single-extract: handles nested .3mf / .model archives.
             return [extract_first_stl_from_3mf(archive, out_dir)]
+        _check_archive_limits(stl_infos)
 
         extracted: list[Path] = []
-        seen: dict[str, int] = {}
-        for n in stl_names:
-            base = Path(n).name
-            if base in seen:
-                seen[base] += 1
+        used: set[str] = set()
+        for info in stl_infos:
+            n = info.filename
+            # Basename-only defeats POSIX zip-slip; the backslash replace
+            # covers Windows-style entry names, where Path(...).name would
+            # return the whole "..\\..\\evil.stl" string.
+            base = Path(n.replace("\\", "/")).name
+            # Dedup against every name USED so far — not a per-name counter.
+            # The old `__N` scheme could collide with a genuine `part__1.stl`
+            # archive entry and silently overwrite it (one part lost, one
+            # duplicated) because write_bytes clobbers unconditionally.
+            if base in used:
                 p = Path(base)
-                base = f"{p.stem}__{seen[base]}{p.suffix}"
-            else:
-                seen[base] = 0
+                k = 1
+                while f"{p.stem}__{k}{p.suffix}" in used:
+                    k += 1
+                base = f"{p.stem}__{k}{p.suffix}"
+            used.add(base)
             out = out_dir / base
             out.write_bytes(z.read(n))
             extracted.append(out)

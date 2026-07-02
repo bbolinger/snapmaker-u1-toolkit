@@ -299,3 +299,92 @@ def test_notify_writes_per_request_files_not_shared(notify_env, tmp_path):
         for f in (file_a, file_b):
             if f.exists():
                 f.unlink()
+
+
+# ─── Code-scoped cancel (v2.1.0-rc2: `cancel <code>` is now implemented) ────
+
+def test_handler_code_scoped_cancel_touches_only_matching_window(sandbox_pending_dir):
+    handler, pending, tmp = sandbox_pending_dir
+    m_a = tmp / "marker_A.txt"
+    m_b = tmp / "marker_B.txt"
+    _seed_pending(pending, "u1_2026_0701_abc123", m_a)
+    _seed_pending(pending, "u1_2026_0701_zzz999", m_b)
+    _run(handler, "cancel abc123")
+    assert m_a.exists(), "code-matched window must be cancelled"
+    assert not m_b.exists(), "non-matching window must be untouched"
+
+
+def test_handler_code_with_no_match_cancels_nothing(sandbox_pending_dir):
+    # A typo'd code must not fall back to cancel-all — that would let a
+    # mistargeted cancel kill an unrelated print.
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_C.txt"
+    _seed_pending(pending, "u1_2026_0701_abc123", marker)
+    _run(handler, "cancel nope99")
+    assert not marker.exists()
+
+
+def test_handler_code_scoped_is_case_insensitive(sandbox_pending_dir):
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_D.txt"
+    _seed_pending(pending, "u1_2026_0701_ABC123", marker)
+    _run(handler, "CANCEL abc123")
+    assert marker.exists()
+
+
+def test_handler_prose_after_keyword_still_ignored(sandbox_pending_dir):
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_E.txt"
+    _seed_pending(pending, "u1_2026_0701_abc123", marker)
+    _run(handler, "cancel that plan for tomorrow")
+    assert not marker.exists()
+
+
+def test_handler_bare_cancel_still_cancels_all(sandbox_pending_dir):
+    handler, pending, tmp = sandbox_pending_dir
+    m_a = tmp / "marker_F.txt"
+    m_b = tmp / "marker_G.txt"
+    _seed_pending(pending, "u1_2026_0701_aaa111", m_a)
+    _seed_pending(pending, "u1_2026_0701_bbb222", m_b)
+    _run(handler, "cancel")
+    assert m_a.exists() and m_b.exists()
+
+
+# ─── Notify script: JSON safety + hook-receipt honesty ──────────────────────
+
+def test_notify_state_file_valid_json_with_hostile_filename(notify_env):
+    env, tmp = notify_env
+    env = dict(env)
+    env["U1_FILENAME"] = 'we"ird\nname\t|.gcode'
+    r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
+    assert r.returncode == 0, r.stderr
+    state_file = Path(f"/tmp/u1_pending_cancel/{env['U1_REQUEST_ID']}.json")
+    state = json.loads(state_file.read_text())  # must not raise
+    assert state["filename"] == env["U1_FILENAME"]
+
+
+def test_notify_message_advertises_ssh_fallback_without_hook_receipt(notify_env):
+    env, tmp = notify_env
+    env = dict(env)
+    env["U1_CANCEL_HOOK_RECEIPT"] = str(tmp / "no_such_receipt")
+    r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
+    assert r.returncode == 0, r.stderr
+    sent = (tmp / "hermes_calls.log").read_text()
+    assert "NOT detected" in sent
+    assert "Reply **CANCEL**" not in sent, (
+        "without the hook, promising reply-CANCEL is a lie — the reply "
+        "would silently do nothing")
+
+
+def test_notify_message_advertises_reply_cancel_with_code_when_hook_installed(notify_env):
+    env, tmp = notify_env
+    env = dict(env)
+    receipt = tmp / "receipt.json"
+    receipt.write_text('{"hook": "u1_grace_cancel"}')
+    env["U1_CANCEL_HOOK_RECEIPT"] = str(receipt)
+    r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
+    assert r.returncode == 0, r.stderr
+    sent = (tmp / "hermes_calls.log").read_text()
+    assert "Reply **CANCEL**" in sent
+    code = env["U1_REQUEST_ID"][-6:]
+    assert f"cancel {code}" in sent

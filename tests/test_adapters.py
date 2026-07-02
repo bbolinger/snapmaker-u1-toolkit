@@ -1,7 +1,9 @@
 """Tests for the reference form-protocol adapters (pure cores, no SDK needed)."""
 from __future__ import annotations
 
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,18 @@ sys.path.insert(0, str(_ADAPTERS / "discord"))
 import u1_form  # the core, to build a real schema
 import u1_form_telegram as tg
 import u1_form_discord as dc
+
+
+def _load_hermes_install():
+    """Import adapters/hermes/install.py under a non-clashing module name."""
+    path = _ADAPTERS / "hermes" / "install.py"
+    spec = importlib.util.spec_from_file_location("u1_hermes_install", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+hermes_install = _load_hermes_install()
 
 
 def _schema(n_parts=3, n_profiles=2):
@@ -293,3 +307,173 @@ def test_tg_X_and_S_still_work_alongside_defensive_wrap():
     form2["selections"]["profile"] = 0
     form2["current"] = tg.REVIEW_FIELD
     assert tg.apply_callback(form2, "S")["kind"] == "submit"
+
+
+# --------------------------------------------------------------------------- #
+# HTML escaping — message text is sent with ParseMode.HTML
+# --------------------------------------------------------------------------- #
+
+def test_tg_field_screen_escapes_html_in_label():
+    schema = _schema()
+    schema["fields"][0]["label"] = "<b>evil</b> & friends"
+    form = tg.new_form(schema)
+    s = tg.render_screen(form)
+    assert "<b>evil</b>" not in s["text"]
+    assert "&lt;b&gt;evil&lt;/b&gt; &amp; friends" in s["text"]
+
+
+def test_tg_review_card_escapes_labels_and_echo_but_not_button_text():
+    schema = _schema(n_parts=2)
+    schema["fields"][0]["label"] = "<i>Parts</i>"
+    schema["fields"][0]["options"][0]["label"] = "bracket<v2>.stl"
+    form = tg.new_form(schema)
+    form["selections"]["parts"] = {0}
+    form["current"] = tg.REVIEW_FIELD
+    s = tg.render_screen(form)
+    # Schema-derived strings in the message text are escaped entities...
+    assert "&lt;i&gt;Parts&lt;/i&gt;" in s["text"]
+    assert "bracket&lt;v2&gt;.stl" in s["text"]
+    # ...never raw markup that Telegram would reject / render.
+    assert "bracket<v2>.stl" not in s["text"]
+    assert "<i>Parts</i>" not in s["text"]
+    # InlineKeyboardButton text is NOT parsed as HTML — must stay raw
+    # (escaping there would show literal `&lt;` to the operator).
+    edit_texts = [b["text"] for row in s["keyboard"] for b in row
+                  if b["callback_data"].startswith("e:")]
+    assert any("<i>Parts</i>" in t for t in edit_texts)
+    assert not any("&lt;" in t for t in edit_texts)
+
+
+def test_tg_required_warning_escapes_field_labels():
+    schema = _schema()
+    for f in schema["fields"]:
+        if f["id"] == "tool":
+            f["label"] = "<b>Tool</b>"
+    form = tg.new_form(schema)
+    form["current"] = tg.REVIEW_FIELD
+    ev = tg.apply_callback(form, "S")
+    assert ev["kind"] == "rerender"
+    assert "<b>" not in ev["warning"]
+    assert "&lt;b&gt;Tool&lt;/b&gt;" in ev["warning"]
+
+
+# --------------------------------------------------------------------------- #
+# Hermes install.py — real copy + patch + verify path against a fake tree
+# --------------------------------------------------------------------------- #
+
+_STOCK_RUN_PY = (
+    "def start():\n"
+    "    if True:\n"
+    "        if True:\n"
+    "            agent.clarify_callback = _clarify_callback_sync\n"
+)
+
+
+def _fake_hermes(tmp_path, run_py_text=_STOCK_RUN_PY):
+    """Minimal Hermes venv layout install.py's discovery expects:
+    <venv>/lib/pythonX.Y/site-packages/{tools/, gateway/run.py} + <venv>/bin/python*.
+    """
+    venv = tmp_path / "hermes-venv"
+    sp = venv / "lib" / "python3.11" / "site-packages"
+    (sp / "tools").mkdir(parents=True)
+    (sp / "gateway").mkdir()
+    run_py = sp / "gateway" / "run.py"
+    run_py.write_text(run_py_text)
+    bin_dir = venv / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
+    return venv, sp, run_py
+
+
+def _stub_subprocess_run(calls):
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="OK: stubbed\n", stderr="")
+    return fake_run
+
+
+def test_install_copies_patches_and_verifies(tmp_path, monkeypatch):
+    """Non-dry-run install: exercises the real copy + patch + _verify source
+    build (where the %%-format TypeError crashed every install at [3/3])."""
+    venv, sp, run_py = _fake_hermes(tmp_path)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+
+    rc = hermes_install.main(["--venv", str(venv)])
+    assert rc == 0
+
+    # All three tool files landed; the renderer is single-sourced from
+    # adapters/telegram/ (the hermes tree keeps no copy).
+    tools = sp / "tools"
+    assert (tools / "form_gateway.py").read_bytes() == \
+        (_ADAPTERS / "hermes" / "tools" / "form_gateway.py").read_bytes()
+    assert (tools / "form_tool.py").read_bytes() == \
+        (_ADAPTERS / "hermes" / "tools" / "form_tool.py").read_bytes()
+    assert (tools / "u1_form_telegram.py").read_bytes() == \
+        (_ADAPTERS / "telegram" / "u1_form_telegram.py").read_bytes()
+    assert not (_ADAPTERS / "hermes" / "tools" / "u1_form_telegram.py").exists()
+
+    # run.py patched: marker present, anchor preserved, backup captured.
+    txt = run_py.read_text()
+    assert hermes_install.RUN_PY_MARKER in txt
+    assert hermes_install.RUN_PY_ANCHOR in txt
+    bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
+    assert bak.read_text() == _STOCK_RUN_PY
+
+    # verify step ran through the fake venv python with syntactically valid
+    # source (the old %-format bug raised TypeError before ever getting here).
+    assert len(calls) == 1
+    assert calls[0][0] == str(venv / "bin" / "python3")
+    assert calls[0][1] == "-c"
+    compile(calls[0][2], "<verify-src>", "exec")
+    assert repr(str(tools)) in calls[0][2]
+
+
+def test_install_rerun_is_idempotent(tmp_path, monkeypatch):
+    venv, sp, run_py = _fake_hermes(tmp_path)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    once = run_py.read_text()
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert run_py.read_text() == once  # marker guard: no double insert
+
+
+def test_install_aborts_before_copying_when_anchor_missing(tmp_path, monkeypatch):
+    """Unrecognized Hermes: the (read-only) anchor check must run BEFORE any
+    file copy — otherwise Hermes auto-imports the orphaned form tool."""
+    venv, sp, run_py = _fake_hermes(
+        tmp_path, run_py_text="def start():\n    pass  # layout changed upstream\n")
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    rc = hermes_install.main(["--venv", str(venv)])
+    assert rc == 2
+    assert list((sp / "tools").iterdir()) == []          # nothing copied
+    assert run_py.read_text().startswith("def start()")  # untouched
+    assert not run_py.with_suffix(run_py.suffix + ".u1-bak").exists()
+
+
+def test_uninstall_restores_backup_and_removes_it(tmp_path, monkeypatch):
+    venv, sp, run_py = _fake_hermes(tmp_path)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert hermes_install.main(["--venv", str(venv), "--uninstall"]) == 0
+    assert run_py.read_text() == _STOCK_RUN_PY
+    assert not run_py.with_suffix(run_py.suffix + ".u1-bak").exists()
+    assert list((sp / "tools").iterdir()) == []
+
+
+def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkeypatch):
+    """Upgrade scenario: pip replaced run.py (marker gone) but the old backup
+    still exists. --uninstall must NOT restore it — that would downgrade
+    run.py to the pre-upgrade Hermes version."""
+    venv, sp, run_py = _fake_hermes(tmp_path)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    upgraded = (
+        "# Hermes v2 — brand new run.py from pip\n"
+        "def start():\n"
+        "            agent.clarify_callback = _clarify_callback_sync\n"
+    )
+    run_py.write_text(upgraded)  # simulate `pip install -U hermes`
+    rc = hermes_install.main(["--venv", str(venv), "--uninstall"])
+    assert rc == 0
+    assert run_py.read_text() == upgraded  # NOT clobbered by the stale backup

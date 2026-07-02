@@ -1479,23 +1479,48 @@ def run_workflow(args)->dict[str,Any]:
     # judgment asked of a small model).
     try:
         import u1_kit
-        if u1_kit.is_multi_part_archive(model):
-            _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
-                        f'{_shell_quote(str(model))} --json-events')
-            emit({'stage': 'kit_detected',
-                  'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
-                  'command': _kit_cmd,
-                  'instruction': ('Run this command via terminal. The kit workflow '
-                                  'walks the operator through a 3-turn staged Q&A '
-                                  '(parts → tool → confirm) — each turn emits one '
-                                  'need_input event with the next CLI flag baked '
-                                  'into its options. Follow the per-field staging '
-                                  'pattern the same way the single-STL workflow '
-                                  'does (Step 2 of the skill).')},
+        _is_kit = u1_kit.is_multi_part_archive(model)
+    except Exception as _kit_exc:
+        _is_kit = False
+        # A zip we couldn't inspect must NOT silently fall into the
+        # single-STL flow — that flow extracts the FIRST model only and
+        # would print a fraction of the kit with no warning.
+        if str(model).lower().endswith('.zip'):
+            emit({'stage': 'kit_detection_failed',
+                  'error': f'{type(_kit_exc).__name__}: {_kit_exc}',
+                  'instruction': ('Could not inspect this zip for multiple '
+                                  'STLs. Do NOT continue with the single-STL '
+                                  'flow — it would slice only the first '
+                                  'model. Surface this error to the '
+                                  'operator.')},
                  args.json_events)
-            return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
-    except Exception:
-        pass
+            return {'phase': 'kit_detection_failed', 'model': str(model)}
+    if _is_kit:
+        # Carry invocation context into the kit command. --operator is baked
+        # ONLY when explicit on this CLI (env-resolved identity stays
+        # env-resolved, replay-safe) — this keeps a test-flavored operator
+        # sticky across the whole kit chain (Fence 1).
+        _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
+                    f'{_shell_quote(str(model))} --json-events')
+        _cli_op = getattr(args, 'operator', None)
+        if _cli_op:
+            _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
+        _nozzle = getattr(args, 'nozzle', None)
+        if _nozzle and str(_nozzle) != '0.4':
+            _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
+        emit({'stage': 'kit_detected',
+              'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
+              'command': _kit_cmd,
+              'instruction': ('Run this command via terminal. The kit workflow '
+                              'walks the operator through a staged Q&A '
+                              '(parts → orient → tool → material → profile → '
+                              'supports → confirm) — each turn emits one '
+                              'need_input event with the next CLI flag baked '
+                              'into its options. Follow the per-field staging '
+                              'pattern the same way the single-STL workflow '
+                              'does (Step 2 of the skill).')},
+             args.json_events)
+        return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
     # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
     # request_id (explicit --request-id, recovery via content hash, or
     # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;
