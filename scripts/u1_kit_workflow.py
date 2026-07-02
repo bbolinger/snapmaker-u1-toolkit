@@ -2465,6 +2465,8 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                         f"by your answer (preset value overridden)"]
                        if supports in ("supports", "no_supports") else None),
             operator=operator,
+            reference=u1_review_doc.build_reference(
+                profile_slug, material, nozzle=nozzle, out_dir=out_dir),
         ))
         _emit(events_file, {
             "stage": "review_doc", "request_id": request_id,
@@ -3895,6 +3897,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                        "supports": supports,
                        "parts": ", ".join(p["part_id"] for p in selected)},
             operator=operator,
+            reference=u1_review_doc.build_reference(
+                profile_slug, material, nozzle=nozzle, out_dir=out_dir),
         ))
         _emit(events_file, {
             "stage": "review_doc", "request_id": request_id,
