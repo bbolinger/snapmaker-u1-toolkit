@@ -149,7 +149,11 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
     rid = "u1_test_happy"
     _seed_request(sandbox_requests, rid)
     kw._action_start(None, rid, False, bed_clear_confirmed=False)
-    result = kw._action_start(None, rid, False, bed_clear_confirmed=True)
+    # The verbatim next_command_on_yes carries the pending nonce.
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True,
+                              pending_nonce=pn)
     assert result["phase"] == "awaiting_print_start"
     cmd = result["command"]
     assert "--bed-clear start" in cmd
@@ -221,11 +225,13 @@ def test_manual_bed_check_second_call_captures_both_timestamps(
         operator_text="start manual-bed-check",
         verification_method="snapmaker_app",
         bed_clear_confirmed=False)
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
     result = kw._action_start_manual_bed_check(
         None, rid, "test:unit", False,
         operator_text="start manual-bed-check",
         verification_method="snapmaker_app",
-        bed_clear_confirmed=True)
+        bed_clear_confirmed=True, pending_nonce=pn)
     assert result["phase"] == "awaiting_print_start"
     assert "--stage2-approval-nonce" in result["command"]
     state = u1_request.read_request(rid)
@@ -478,6 +484,37 @@ def test_fence_refusal_returns_dict_no_bare_none(sandbox_requests, monkeypatch):
     assert res["ok"] is False
     assert res["started"] is False
     assert res["stage"] == "gate_refused_test_operator"
+
+
+# ─── Unset operator passes the fence — a DECISION, loudly audited ──────────
+
+def test_unset_operator_passes_fence_with_loud_audit(sandbox_requests, monkeypatch):
+    """`unknown:gate` (no --operator, no U1_OPERATOR) deliberately PASSES
+    Fence 1 — refusing every bare CLI run would tax legitimate local use.
+    The trade-off: a smoke test that forgot to set an operator is not
+    fenced. That gap is a decision, not an accident, and it must leave a
+    gate_operator_unknown audit row."""
+    import u1_print_start_gate as gate
+    monkeypatch.delenv("U1_OPERATOR", raising=False)
+    audits = []
+    monkeypatch.setattr(gate, "_audit_gate",
+                        lambda rid, event, op=None, **kw: audits.append(event))
+    reached_query = {"hit": False}
+
+    def _query(h, p):
+        reached_query["hit"] = True
+        raise RuntimeError("stop after fence — this test only pins the fence")
+
+    monkeypatch.setattr(gate, "query_state", _query)
+    try:
+        gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                      approval_token="tok", request_id="u1_test_unknown_op",
+                      out_dir=sandbox_requests / "no_such_request")
+    except RuntimeError:
+        pass
+    assert reached_query["hit"], "unknown:gate must NOT be refused by Fence 1"
+    assert "gate_operator_unknown" in audits
+    assert "gate_refused_test_operator" not in audits
 
 
 # ─── Manual bed-check wires through the gate ───────────────────────────────
@@ -946,6 +983,105 @@ def test_grace_period_cancel_marker_prevents_start_func(sandbox_requests, monkey
     assert "cancelled during the pre-start grace" in res["reason"]
 
 
+def test_grace_cancel_during_final_tick_still_prevents_start(sandbox_requests, monkeypatch):
+    """TOCTOU race pin: the DM counts the window down, so an operator
+    racing the deadline lands their CANCEL during the LAST sleep tick.
+    The final re-check after the loop must still catch it — no HTTP."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_lasttick"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    start_called = {"hit": False}
+    ticks = {"n": 0}
+    out_dir = u1_request.request_dir(rid)
+    cancel_marker = out_dir / "pre_start_cancel.marker"
+
+    def fake_sleep(sec):
+        ticks["n"] += 1
+        if ticks["n"] == 3:  # grace_seconds=3 → this is the LAST tick
+            cancel_marker.parent.mkdir(parents=True, exist_ok=True)
+            cancel_marker.write_text("cancel")
+
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_called.__setitem__("hit", True) or {"ok": True}),
+        grace_seconds=3, grace_sleep_fn=fake_sleep,
+        out_dir=out_dir)
+    assert not start_called["hit"], (
+        "a CANCEL during the final sleep tick was silently lost — the "
+        "operator was promised the full window")
+    assert res["ok"] is False and res["started"] is False
+
+
+def test_grace_cancel_refusal_offers_stage1_recovery(sandbox_requests, monkeypatch):
+    """Usability moat-crossing: a grace-cancel must not dead-end. The slice
+    and upload are still valid — the refusal payload hands the operator the
+    fresh-photo Stage 1 command so restarting costs one photo + one yes,
+    not a whole re-run."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_recovery"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    out_dir = u1_request.request_dir(rid)
+    cancel_marker = out_dir / "pre_start_cancel.marker"
+
+    def fake_sleep(sec):
+        cancel_marker.parent.mkdir(parents=True, exist_ok=True)
+        cancel_marker.write_text("cancel")
+
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        intended_tool="T1", requested_material="PLA",
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: {"ok": True},
+        grace_seconds=5, grace_sleep_fn=fake_sleep,
+        out_dir=out_dir)
+    assert res["ok"] is False
+    rec = res.get("recovery")
+    assert rec, "cancel refusal must carry a recovery block"
+    assert "stage1_command" in rec and rid in rec["stage1_command"]
+    assert "--intended-tool T1" in rec["stage1_command"]
+
+
 def test_grace_period_expires_and_start_proceeds(sandbox_requests, monkeypatch):
     """No cancel within window → after grace_seconds, start_func fires."""
     import u1_print_start_gate as gate
@@ -1218,3 +1354,50 @@ def test_grace_no_notify_cmd_still_works(sandbox_requests, monkeypatch):
         grace_notify_fn=bad_notify,
         out_dir=u1_request.request_dir(rid))
     assert notify_hit["n"] == 0, "no notify_cmd → notify_fn must not fire"
+
+
+# ─── Pending-nonce binding: only the VERBATIM yes-command can confirm ───────
+
+def test_action_start_confirm_without_pending_nonce_refused(sandbox_requests):
+    """A hand-assembled `--action start --bed-clear-confirmed` (no
+    --pending-nonce) must be refused — the confirm has to be the verbatim
+    next_command_on_yes emitted at the yes/no prompt."""
+    rid = "u1_test_nonce_hand"
+    _seed_request(sandbox_requests, rid)
+    first = kw._action_start(None, rid, False, bed_clear_confirmed=False)
+    assert first["phase"] == "awaiting_bed_clear_start"
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True)
+    assert result["phase"] == "bed_clear_approval_rejected"
+    assert any("nonce" in r for r in result["reasons"])
+
+
+def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys):
+    """The emitted next_command_on_yes must include --pending-nonce so the
+    copy-verbatim contract is mechanically enforced, not just documented."""
+    import io, json as _json
+    rid = "u1_test_nonce_cmd"
+    _seed_request(sandbox_requests, rid)
+    kw._action_start(None, rid, True, yes_command="python3 kit.py --action start --bed-clear-confirmed",
+                     bed_clear_confirmed=False)
+    out = capsys.readouterr().out
+    evs = [_json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    need = next(e for e in evs if e.get("stage") == "need_input")
+    pn = (u1_request.read_request(rid)["safety"]
+          ["pending_bed_clear_start"]["nonce"])
+    assert f"--pending-nonce {pn}" in need["next_command_on_yes"]
+
+
+def test_manual_bed_check_refused_when_camera_verification_available(sandbox_requests):
+    """The Layer-3 manual override exists for the degraded-camera case. When
+    a real photo + token already exist, the override is refused so nothing
+    can route around the photo."""
+    rid = "u1_test_manual_guard"
+    _seed_request(sandbox_requests, rid,
+                  safety={"approval_token": "tok123",
+                          "bed_clear_photo_captured": True})
+    result = kw._action_start_manual_bed_check(
+        None, rid, "test:unit", False,
+        operator_text="start manual-bed-check",
+        verification_method="snapmaker_app",
+        bed_clear_confirmed=False)
+    assert result["phase"] == "manual_bed_check_refused"

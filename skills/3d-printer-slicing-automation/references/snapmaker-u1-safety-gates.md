@@ -87,6 +87,11 @@ readiness card, then tool-call the emitted Stage-1 command verbatim. Surface
 the fresh bed photo and ask a new approval question with the same
 `request_id`. Only after a fresh "yes" may you run Stage 2 with the new token.
 
+The yes/no prompt's `next_command_on_yes` carries a single-use
+`--pending-nonce`. Run it VERBATIM — the workflow refuses a confirm call
+that doesn't present the nonce, so a hand-assembled
+`--bed-clear-confirmed` command cannot pass the boundary.
+
 ### Pre-start grace period (v2.1.0)
 
 After every safety check passes AND before `u1_print_start_gate.py` HTTPs
@@ -108,9 +113,17 @@ row is NEVER written.
 If the grace window expires with no cancel marker, the gate audits
 `pre_start_grace_period_expired` and proceeds to HTTP the printer.
 
+If the operator DID cancel, the refusal payload includes a `recovery`
+block with `instruction` + `stage1_command`. Relay it: the slice and
+upload are still valid, so the way back is re-running Stage 1 (fresh bed
+photo + fresh yes) — do NOT restart the whole workflow.
+
 This is the mechanical safety net: if the skill (or any agent) chain-fires
 the yes-command → Stage 2 command, the operator still gets a real-world
 notification with time to react before the printer starts moving material.
+Be honest about what it guarantees: the two-turn yes/no is procedure the
+agent follows, but the grace window + single-use nonce are the parts the
+scripts enforce even against a misbehaving agent.
 
 ### After Stage 2 succeeds
 

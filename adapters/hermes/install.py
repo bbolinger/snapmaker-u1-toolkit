@@ -6,13 +6,17 @@ Idempotent — safe to re-run after Hermes upgrades.
 What this does:
   1. Detects the Hermes ``site-packages`` (auto-finds ``gateway/`` and ``tools/``
      under ``/opt/hermes/.venv`` by default; override with ``--venv``).
-  2. Copies three files from ``adapters/hermes/tools/`` next to this script
-     into Hermes' ``tools/``:
-       - form_gateway.py   (blocking primitive; mirrors clarify_gateway)
+  2. Copies three files into Hermes' ``tools/``:
+       - form_gateway.py   (blocking primitive; mirrors clarify_gateway;
+                            from ``adapters/hermes/tools/``)
        - form_tool.py      (LLM-facing form tool + class-level monkey-patch
                             of TelegramPlatform — adds send_form + callback
-                            routing without editing telegram.py)
-       - u1_form_telegram.py (the L1 pure renderer the patch's send_form calls)
+                            routing without editing telegram.py; from
+                            ``adapters/hermes/tools/``)
+       - u1_form_telegram.py (the L1 pure renderer the patch's send_form
+                            calls; single-sourced from the sibling
+                            ``adapters/telegram/`` directory — no copy is
+                            kept in the hermes tree)
      Copies are content-hashed; unchanged files are skipped.
   3. Edits ``gateway/run.py`` ONCE to wire ``agent.form_callback`` — this is
      the single source edit we can't sidestep, because callbacks are wired
@@ -146,11 +150,14 @@ def _patch_run_py(run_py: Path, *, dry_run: bool) -> str:
 
 def _verify(venv_python: Path, tools_dir: Path) -> str:
     """Import each patched/new module; surface errors with file context."""
-    src = ("import sys; sys.path.insert(0, %r); "
+    # NB: this string is Python source for a subprocess. Avoid %-formatting
+    # inside it — a previous version mixed an outer `%` with an inner
+    # `'%s.%s' % (...)` and crashed with "not enough arguments".
+    src = ("import sys; sys.path.insert(0, {tools_dir!r}); "
            "from tools import form_gateway, form_tool; "
            "import u1_form_telegram; "
-           "print('OK: %s.%s loaded' % (form_gateway.__name__, form_tool.__name__))"
-           % (str(tools_dir),))
+           "print('OK: ' + form_gateway.__name__ + '.' + form_tool.__name__ + ' loaded')"
+           ).format(tools_dir=str(tools_dir))
     proc = subprocess.run([str(venv_python), "-c", src],
                           text=True, capture_output=True, timeout=30)
     if proc.returncode != 0:
@@ -183,6 +190,13 @@ def main(argv=None) -> int:
 
     here = Path(__file__).resolve().parent
     src_tools = here / "tools"
+    # u1_form_telegram.py (the L1 pure renderer) is single-sourced from the
+    # sibling adapters/telegram/ directory — the hermes tree carries no copy.
+    src_files = {
+        "form_gateway.py": src_tools / "form_gateway.py",
+        "form_tool.py": src_tools / "form_tool.py",
+        "u1_form_telegram.py": here.parent / "telegram" / "u1_form_telegram.py",
+    }
 
     print(f"venv:           {venv}")
     print(f"site-packages:  {sp}")
@@ -200,20 +214,41 @@ def main(argv=None) -> int:
                     tgt.unlink()
                     print(f"removed       {tgt}")
         bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
-        if bak.exists():
+        # Only restore the backup when OUR patch is actually present in the
+        # current run.py. If Hermes was upgraded since install, pip replaced
+        # run.py (marker gone) — restoring the old backup would DOWNGRADE
+        # run.py to the pre-upgrade version. Leave it alone in that case.
+        if RUN_PY_MARKER not in run_py.read_text():
+            print(f"note: u1 marker not present in {run_py}; leaving run.py alone")
+            print("      (Hermes was likely upgraded since install — the patch is already gone).")
+            if bak.exists():
+                print(f"note: stale backup left at {bak}; delete it manually if unwanted")
+        elif bak.exists():
             if a.dry_run:
                 print(f"would restore {run_py} from {bak}")
             else:
                 shutil.copy2(bak, run_py)
-                print(f"restored      {run_py} from {bak}")
+                bak.unlink()
+                print(f"restored      {run_py} from {bak} (backup removed)")
         else:
-            print(f"note: no backup at {bak}; manually verify run.py has no u1 marker")
+            print(f"note: marker present but no backup at {bak}; remove the "
+                  f"marked block from run.py manually")
         return 0
 
-    # Install
+    # Install.
+    # Pre-flight (read-only): verify the run.py anchor BEFORE copying any
+    # files. Hermes auto-imports tools/*, so copying first and then failing
+    # the anchor check would leave a partial install — the form tool would
+    # register while run.py stays unwired.
+    run_txt = run_py.read_text()
+    if RUN_PY_MARKER not in run_txt and RUN_PY_ANCHOR not in run_txt:
+        print(f"ERROR: anchor {RUN_PY_ANCHOR!r} not found in gateway/run.py.")
+        print("       Hermes may have changed the clarify wiring layout. Aborting")
+        print("       before copying anything — no files were modified.")
+        return 2
+
     print("[1/3] copy tools/")
-    for name in ("form_gateway.py", "form_tool.py", "u1_form_telegram.py"):
-        src = src_tools / name
+    for name, src in src_files.items():
         if not src.exists():
             raise SystemExit(f"source missing: {src}")
         tgt = tools_dir / name
@@ -229,6 +264,8 @@ def main(argv=None) -> int:
     status = _patch_run_py(run_py, dry_run=a.dry_run)
     print(f"  {status}: {run_py}")
     if status == "anchor-not-found":
+        # Unreachable in practice (pre-flight above checks the same strings),
+        # kept as a belt-and-braces guard against races.
         print()
         print(f"  ERROR: anchor {RUN_PY_ANCHOR!r} not found in gateway/run.py.")
         print("         Hermes may have changed the clarify wiring layout. Aborting.")

@@ -23,12 +23,13 @@ from typing import Any
 _RESUMED_OR_EMITTED = (
     'readiness_card_emitted',
     'readiness_card_replayed_from_resume',
-    # v2.1 kit workflow emits its own readiness event name (kit-specific
-    # carries plate metadata + gated_plate selection). Added 2026-06-30:
-    # before this, can_start() refused EVERY kit Stage 2 with "no
-    # readiness_card emitted yet" because the kit emits a different event
-    # name than the single-STL workflow. Same class of bug as the v2.0
-    # active-tool blocker that assumed single-tool semantics.
+    # Forward-compat for workflows that emit a workflow-specific readiness
+    # event name (e.g. the v2.1 multi-part kit workflow emits
+    # `kit_readiness_card_emitted` because it carries plate metadata + the
+    # operator-selected gated_plate). Same bug class as the v2.0 active-tool
+    # blocker that assumed single-tool semantics — any new readiness-emitting
+    # workflow must be added here or can_start() will refuse Stage 2 with
+    # "no readiness_card emitted yet".
     'kit_readiness_card_emitted',
 )
 
