@@ -206,6 +206,55 @@ def test_full_sweep_silent_when_everything_matches(tmp_path):
     assert "no deviations detected" in text.lower()
 
 
+def test_envelope_flags_out_of_range_nozzle_temp(tmp_path):
+    # A Reddit speed profile can match itself perfectly and still run 275°C
+    # on a material whose declared range tops out at 260 — the envelope
+    # check is the layer that catches it.
+    g = tmp_path / "hot.gcode"
+    g.write_text("""G28
+; CONFIG_BLOCK_START
+; nozzle_temperature = 275,275
+; nozzle_temperature_initial_layer = 250
+; layer_height = 0.2
+; CONFIG_BLOCK_END
+""")
+    plates = _plates(tmp_path)
+    plates[0]["gcode_path"] = str(g)
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", plates, state={},
+        reference={"layer_height": "0.2"},
+        envelope={"material": "PETG", "nozzle_low": 220.0, "nozzle_high": 260.0})
+    text = Path(doc).read_text()
+    assert "Material sanity" in text
+    assert "outside PETG's declared range (220–260°C)" in text
+    assert "275,275" in text
+    # the in-range first-layer temp is NOT named in the warning
+    assert "First-layer nozzle temp `250`" not in text
+
+
+def test_envelope_confirms_in_range_quietly(tmp_path):
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", _plates(tmp_path),  # 220,220
+        state={}, reference={"layer_height": "0.2"},
+        envelope={"material": "PETG", "nozzle_low": 220.0, "nozzle_high": 260.0})
+    text = Path(doc).read_text()
+    assert "within PETG's declared range" in text
+    assert "⚠ **Material sanity" not in text
+
+
+def test_no_envelope_no_section(tmp_path):
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", _plates(tmp_path),
+        state={}, reference={"layer_height": "0.2"}, envelope={})
+    assert "Material sanity" not in Path(doc).read_text()
+
+
+def test_temps_outside_parses_lists_and_skips_garbage():
+    assert u1_review_doc._temps_outside("275,240", 220, 260) == [275.0]
+    assert u1_review_doc._temps_outside("240,245", 220, 260) == []
+    assert u1_review_doc._temps_outside("nil,270", 220, 260) == [270.0]
+
+
 def test_norm_collapses_per_filament_lists():
     assert u1_review_doc._norm(["240", "240"]) == "240"
     assert u1_review_doc._norm("240,240") == "240"

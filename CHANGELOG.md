@@ -22,6 +22,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `review_doc_failed` and never block the flow. Emitted as a `review_doc`
   event by both kit paths and the single-STL workflow; readiness cards carry
   `review_doc_path`.
+- **Preset-deviation markers + full-config sweep.** Every setting present in
+  both the gcode and the chosen preset (process + filament, inheritance
+  flattened) is compared: curated rows flag inline (`240` ⚠ *preset: 230*),
+  everything else that deviates renders in an "Other deviations" table —
+  ironing, retraction, any of the ~300 keys. Deviations-only output is
+  self-curating; ids/provenance metadata are excluded as noise. Baseline is
+  the preset the operator PICKED (integrity, not orthodoxy — a custom
+  profile is compared against itself, not against Snapmaker stock).
+- **Material-envelope sanity check.** Nozzle temps in the gcode are checked
+  against the range the material's own filament profile declares
+  (`nozzle_temperature_range_low/high`) — the layer that catches a custom
+  profile that matches itself perfectly but runs 275°C on a 220–260 material.
+  In-range prints a quiet confirmation; no declared range, no invented norm.
+- The doc also now states that the chosen material is re-verified against
+  what is physically loaded at start time (the gate check that already
+  existed, made visible).
 
 ---
 

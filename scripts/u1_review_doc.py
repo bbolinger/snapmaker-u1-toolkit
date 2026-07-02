@@ -114,6 +114,50 @@ def build_reference(profile_slug: str | None, material: str | None,
     return ref
 
 
+def build_material_envelope(material: str | None, nozzle: str = "0.4",
+                            out_dir: Path | None = None) -> dict[str, Any]:
+    """Resolve the MATERIAL's declared temperature envelope from its
+    filament profile (``nozzle_temperature_range_low`` / ``_high``).
+
+    This powers the third trust layer: preset integrity says "the gcode
+    matches what you picked"; the envelope says "what you picked is sane
+    for this material" — which is the question a Reddit speed profile
+    can't answer about itself. Only DECLARED ranges are used; where the
+    profile format declares no range (bed temps), no norm is invented.
+    Best-effort: returns {} on any resolution problem."""
+    if not material or out_dir is None:
+        return {}
+    try:
+        import json as _json
+        from u1_slice_workflow import filament_path, _materialize_flat_filament
+        flat = _materialize_flat_filament(
+            filament_path(material, nozzle=nozzle), Path(out_dir))
+        data = _json.loads(Path(flat).read_text())
+        low = _norm(data.get("nozzle_temperature_range_low"))
+        high = _norm(data.get("nozzle_temperature_range_high"))
+        if not low or not high:
+            return {}
+        return {"material": str(material),
+                "nozzle_low": float(low.split(",")[0]),
+                "nozzle_high": float(high.split(",")[0])}
+    except Exception:
+        return {}
+
+
+def _temps_outside(value: str, low: float, high: float) -> list[float]:
+    """Parse a config temp value ("240" / "240,245") and return any parts
+    outside [low, high]. Unparseable parts are skipped, not flagged."""
+    out = []
+    for part in str(value).split(","):
+        try:
+            t = float(part.strip())
+        except ValueError:
+            continue
+        if t < low or t > high:
+            out.append(t)
+    return out
+
+
 def _read_bounded(path: Path, chunk: int = 512_000) -> str:
     """Head+tail read so a 200MB gcode never becomes a memory bomb. The
     config block lives at the tail; header metadata at the head."""
@@ -213,6 +257,7 @@ def generate(
     overrides: list[str] | None = None,
     operator: str | None = None,
     reference: dict[str, str] | None = None,
+    envelope: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``<out_dir>/review.md`` and audit its sha256. Returns the path.
 
@@ -321,6 +366,35 @@ def generate(
                 L.append(f"| `{key}` | `{got}` ⚠ | `{ref_v}` |")
             if len(others) > len(shown):
                 L.append(f"| _…and {len(others) - len(shown)} more_ | | |")
+        # Material-envelope sanity (v2.2): a custom preset can match itself
+        # perfectly and still be wild for the material. Check the gcode's
+        # nozzle temps against the range the material's own filament
+        # profile declares. In-range prints a quiet confirmation; out-of-
+        # range gets its own distinctly-worded flag. No declared range =
+        # no section (norms are never invented here).
+        if envelope and envelope.get("nozzle_low") is not None:
+            lo, hi = envelope["nozzle_low"], envelope["nozzle_high"]
+            mat = envelope.get("material", "this material")
+            bad: list[str] = []
+            for cfg_key, label in (("nozzle_temperature", "Nozzle temp"),
+                                   ("nozzle_temperature_initial_layer",
+                                    "First-layer nozzle temp")):
+                v = config.get(cfg_key)
+                if v is None:
+                    continue
+                outside = _temps_outside(v, lo, hi)
+                if outside:
+                    bad.append(f"{label} `{v}`°C")
+            L.append("")
+            if bad:
+                L.append(f"⚠ **Material sanity:** {'; '.join(bad)} — "
+                         f"outside {mat}'s declared range "
+                         f"({lo:.0f}–{hi:.0f}°C). This can be intentional "
+                         f"(speed profiles run hot), but it is exactly the "
+                         f"kind of thing to notice before saying yes.")
+            else:
+                L.append(f"_Material sanity: nozzle temps are within "
+                         f"{mat}'s declared range ({lo:.0f}–{hi:.0f}°C)._")
     else:
         L.append("_Config block not found in the gcode — settings table "
                  "unavailable for this slice (older Orca build?). The "
