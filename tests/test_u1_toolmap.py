@@ -133,3 +133,42 @@ def test_load_material_map_with_non_object_root_fails_closed(tmp_path, capsys):
     bad.write_text("[]")
     mmap = u1_toolmap.load_material_map(bad)
     assert all(t["material"] == "unknown" for t in mmap["tools"].values())
+
+
+# --------------------------------------------------------------------------- #
+# load_head_options — merged head/material screen source (v2.2.1)
+# --------------------------------------------------------------------------- #
+
+def _write_toolmap(data_dir, tools):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "latest_toolmap.json").write_text(json.dumps({"tools": tools}))
+
+
+def test_load_head_options_reads_printer_reported(tmp_path):
+    _write_toolmap(tmp_path, {
+        "extruder":  {"printer_reported": {"material": "PETG", "color_rgba": "FFFFFFFF", "exists": True, "vendor": "Generic"}},
+        "extruder1": {"printer_reported": {"material": "PETG", "color_rgba": "000000FF", "exists": True}},
+        "extruder2": {"printer_reported": {"material": "PLA",  "color_rgba": "F78E0EFF", "exists": True, "vendor": "Polymaker"}},
+        "extruder3": {"printer_reported": {"material": "unknown", "exists": True}},
+    })
+    heads = u1_toolmap.load_head_options(data_dir=tmp_path)
+    tools = [h["tool"] for h in heads]
+    assert tools == ["T0", "T1", "T2"]         # unknown head T3 not offered
+    assert heads[0]["material"] == "PETG" and heads[0]["color"] == "white"
+    assert heads[1]["color"] == "black"
+    assert heads[2]["material"] == "PLA" and heads[2]["color"] == "orange"
+
+
+def test_load_head_options_skips_empty_heads(tmp_path):
+    _write_toolmap(tmp_path, {
+        "extruder":  {"printer_reported": {"material": "PLA", "color_rgba": "FFFFFFFF", "exists": True}},
+        "extruder1": {"printer_reported": {"material": "PETG", "exists": False}},   # not loaded
+        "extruder2": {"printer_reported": {"material": "", "exists": True}},        # unknown
+    })
+    heads = u1_toolmap.load_head_options(data_dir=tmp_path)
+    assert [h["tool"] for h in heads] == ["T0"]
+
+
+def test_load_head_options_missing_toolmap_returns_empty(tmp_path):
+    # No file → [] so the form falls back to generic tool+material fields.
+    assert u1_toolmap.load_head_options(data_dir=tmp_path) == []

@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 
 # The renderer's complete callback vocabulary — and nothing else. Anchored so
 # a native Hermes callback (multi-char prefix + colon) can never match.
-FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|[azne]:\d+|[SX])$"
+# S:<f>:<o> is a submit-verb (sets the Action option, then submits).
+FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|[SX])$"
 
 
 def _load_renderer():

@@ -61,12 +61,22 @@ def _opt_label(opt: Any) -> str:
     return str(opt["label"] if isinstance(opt, dict) else opt)
 
 
+def _is_screen_field(f: dict[str, Any]) -> bool:
+    """A field that gets its own screen. ``submit_choice`` fields (e.g. Action)
+    are rendered as verbs on the review card, never a standalone screen."""
+    return not f.get("submit_choice")
+
+
+def _first_screen_field(fields: list[dict[str, Any]]) -> str:
+    return next((f["id"] for f in fields if _is_screen_field(f)), REVIEW_FIELD)
+
+
 def new_form(schema: dict[str, Any]) -> dict[str, Any]:
-    """Initial form state: cursor at the first field, empty selections."""
+    """Initial form state: cursor at the first screen field, empty selections."""
     fields = schema["fields"]
     return {
         "schema": schema,
-        "current": fields[0]["id"] if fields else REVIEW_FIELD,
+        "current": _first_screen_field(fields),
         "selections": {f["id"]: (set() if f["type"] == "multi_select" else None) for f in fields},
         "pages": {f["id"]: 0 for f in fields},
     }
@@ -81,12 +91,16 @@ def _field_index(form: dict[str, Any], fid: str) -> int:
 
 
 def _next_field(form: dict[str, Any]) -> str:
-    """Advance the cursor: next field, or REVIEW_FIELD when past the end."""
+    """Advance the cursor to the next SCREEN field, or REVIEW_FIELD past the end
+    (submit_choice fields never get a screen — they're verbs on the review)."""
     fields = form["schema"]["fields"]
     if form["current"] == REVIEW_FIELD:
         return REVIEW_FIELD
     idx = _field_index(form, form["current"])
-    return fields[idx + 1]["id"] if idx + 1 < len(fields) else REVIEW_FIELD
+    for f in fields[idx + 1:]:
+        if _is_screen_field(f):
+            return f["id"]
+    return REVIEW_FIELD
 
 
 def _paginate(opts: list, page: int, size: int) -> tuple[list, int, int]:
@@ -178,27 +192,52 @@ def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]
         else:
             hint = f"  ({n} of {len(field['options'])} selected)"
         tip = "\n<i>Tap options to toggle \u2714, then Next \u279c</i>"
+    # Step counter runs over SCREEN fields only (submit_choice fields have no
+    # screen), so "Step 2 of 4" matches what the operator actually taps through.
+    screen_fields = [f for f in form["schema"]["fields"] if _is_screen_field(f)]
+    step_pos = next((i for i, f in enumerate(screen_fields) if f["id"] == field["id"]), fi)
     text = (f"<b>{label}</b>{hint}{tip}"
-            f"\n<i>Step {fi + 1} of {len(form['schema']['fields'])}</i>")
+            f"\n<i>Step {step_pos + 1} of {len(screen_fields)}</i>")
     return {"text": text, "keyboard": rows}
+
+
+# Submit-verb button styling per action option id.
+_SUBMIT_VERBS = {
+    "upload-only": "\u2b06 Upload only",
+    "start": "\u25b6 Upload + Start",
+}
 
 
 def _render_review(form: dict[str, Any]) -> dict[str, Any]:
     lines = ["<b>Review</b>", ""]
     rows: list[list[dict[str, str]]] = []
     for fi, field in enumerate(form["schema"]["fields"]):
+        if not _is_screen_field(field):
+            continue  # submit_choice (Action) is the verb row below, not a line
         echo = _selection_label_for(form, field)
-        # Message text is ParseMode.HTML → escape schema-derived strings.
-        # Button text is NOT parsed as HTML → leave the Edit label raw.
-        lines.append(f"• <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
-        rows.append([{"text": f"✎ Edit {field.get('label', field['id'])}",
+        # Message text is ParseMode.HTML \u2192 escape schema-derived strings.
+        # Button text is NOT parsed as HTML \u2192 leave the Edit label raw.
+        lines.append(f"\u2022 <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
+        rows.append([{"text": f"\u270e Edit {field.get('label', field['id'])}",
                       "callback_data": f"e:{fi}"}])
-    rows.append([
-        {"text": "✅ Submit", "callback_data": "S"},
-        {"text": "✖ Cancel", "callback_data": "X"},
-    ])
+    # Action becomes the submit verbs: each option submits with that action.
+    submit_field = next((f for f in form["schema"]["fields"] if f.get("submit_choice")), None)
+    if submit_field:
+        sfi = _field_index(form, submit_field["id"])
+        verb_row = [
+            {"text": _SUBMIT_VERBS.get(_opt_id(opt), f"Submit ({_opt_id(opt)})"),
+             "callback_data": f"S:{sfi}:{oi}"}
+            for oi, opt in enumerate(submit_field["options"])
+        ]
+        rows.append(verb_row)
+        rows.append([{"text": "\u2716 Cancel", "callback_data": "X"}])
+    else:
+        rows.append([
+            {"text": "\u2705 Submit", "callback_data": "S"},
+            {"text": "\u2716 Cancel", "callback_data": "X"},
+        ])
     lines.append("")
-    lines.append("<i>Submit runs the same safety pipeline as the typed form (slicer warnings → readiness card → Stage-1 photo gate). The buttons only collect — they never bypass.</i>")
+    lines.append("<i>Submit runs the same safety pipeline as the typed form (slicer warnings \u2192 readiness card \u2192 Stage-1 photo gate). The buttons only collect \u2014 they never bypass.</i>")
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
@@ -234,10 +273,17 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         return {"kind": "cancel"}
 
     if kind == "S":
-        # Validate required fields are answered before letting submit through.
+        # A submit-verb (S:<action_field>:<option>) also SETS the action before
+        # submitting; a bare "S" (legacy / no submit_choice field) just submits.
+        if len(parts) == 3:
+            afi, aoi = int(parts[1]), int(parts[2])
+            afield = fields[afi]
+            if afield.get("submit_choice") and 0 <= aoi < len(afield["options"]):
+                form["selections"][afield["id"]] = aoi
+        # Validate required SCREEN fields are answered before submit.
         missing = []
         for f in fields:
-            if f.get("required"):
+            if f.get("required") and _is_screen_field(f):
                 val = form["selections"][f["id"]]
                 if (f["type"] == "multi_select" and not val) or (f["type"] != "multi_select" and val is None):
                     missing.append(f.get("label", f["id"]))
