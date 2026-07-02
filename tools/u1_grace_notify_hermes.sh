@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # u1_grace_notify_hermes.sh — sample U1_GRACE_NOTIFY_CMD script for Hermes users.
 #
 # Point U1_GRACE_NOTIFY_CMD at this file, e.g. in your env:
