@@ -599,17 +599,32 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                 grace_seconds=grace_seconds,
                 cancel_marker=cancel_marker,
                 operator=resolved_operator)
+    # Contract with the Hermes gateway hook + notify script: the notify
+    # script wrote /tmp/u1_pending_cancel_marker with the marker path so
+    # a Telegram CANCEL reply routes to the right marker. Clean that up
+    # on ANY exit path (cancel OR expire) so a stale entry doesn't cause
+    # the next print to spuriously abort on some unrelated CANCEL later.
+    def _clear_pending_state() -> None:
+        try:
+            pending = Path('/tmp/u1_pending_cancel_marker')
+            if pending.exists():
+                pending.unlink()
+        except OSError:
+            pass
+
     for _ in range(int(grace_seconds)):
         if cancel_marker.exists():
             _audit_gate(request_id, 'pre_start_grace_cancelled',
                         resolved_operator,
                         cancel_marker=str(cancel_marker),
                         cancelled_after_wait_s=None)
+            _clear_pending_state()
             return False
         _sleep(1)
     _audit_gate(request_id, 'pre_start_grace_period_expired',
                 resolved_operator, grace_seconds=grace_seconds,
                 proceeded_to_start=True)
+    _clear_pending_state()
     return True
 
 

@@ -24,6 +24,19 @@ set -eu
 HERMES_BIN="${HERMES_BIN:-hermes}"
 DEST="${U1_GRACE_NOTIFY_DEST:-telegram}"
 
+# Write the pending-cancel state file that the Hermes gateway hook
+# (tools/hermes_hooks/u1_grace_cancel/) watches. When you reply CANCEL
+# in the DM, the hook reads this file and touches the marker.
+mkdir -p "$(dirname /tmp/u1_pending_cancel_marker)"
+cat > /tmp/u1_pending_cancel_marker <<EOF
+{
+  "request_id": "${U1_REQUEST_ID}",
+  "cancel_marker": "${U1_CANCEL_MARKER}",
+  "filename": "${U1_FILENAME}",
+  "grace_seconds": ${U1_GRACE_SECONDS}
+}
+EOF
+
 read -r -d '' MSG <<EOF || true
 ⚠️ Snapmaker U1 print starting in ${U1_GRACE_SECONDS}s
 
@@ -31,10 +44,7 @@ File:     ${U1_FILENAME}
 Request:  ${U1_REQUEST_ID}
 Operator: ${U1_OPERATOR}
 
-To CANCEL, SSH to the host and run:
-  touch ${U1_CANCEL_MARKER}
-
-If you do nothing, the print starts when the window expires.
+Reply **CANCEL** to abort. Ignore this message to let it start.
 EOF
 
 exec "${HERMES_BIN}" send --to "${DEST}" "${MSG}"

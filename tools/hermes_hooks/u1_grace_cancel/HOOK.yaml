@@ -1,0 +1,13 @@
+name: u1_grace_cancel
+description: |
+  Snapmaker U1 pre-start grace-period cancel button.
+  When the print-start-gate opens a grace window and the notify script
+  writes /tmp/u1_pending_cancel_marker with the marker path, this hook
+  watches for a CANCEL / STOP / ABORT message from the operator. On
+  match it touches the marker file, which the gate is polling once per
+  second — the gate then refuses the print with `Operator cancelled
+  during the pre-start grace period. No HTTP call was sent to the
+  printer.` NO AI in the loop; the gateway calls this handler directly
+  when the message arrives.
+events:
+  - agent:start
