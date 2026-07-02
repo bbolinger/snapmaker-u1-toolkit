@@ -532,35 +532,43 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
             "options": [{"id": p["id"], "label": _clean_label(p.get("label", p["id"]))} for p in parts],
             "default": "all", "required": False,
         })
-    fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
-                   "options": ["as-authored", "auto"], "default": "as-authored"})
-    # Print head: when the live tool map is available, each head option carries
-    # its loaded material + colour, so picking the head IS picking the filament
-    # (they must match anyway — the printer knows). The separate Material screen
-    # is dropped in that case. Falls back to generic T0–T3 + a Material screen
-    # when no tool map is present (offline / tests).
+    # Setup screen (v2.2.1): print head + orientation + supports render TOGETHER
+    # on one screen (group="setup"). Head first, then the two toggles. When the
+    # live tool map is available each head option carries its loaded material +
+    # colour, so picking the head IS picking the filament and the separate
+    # Material screen is dropped; offline it falls back to generic T0–T3 + a
+    # Material control (still inside the setup group).
+    _GROUP = "setup"
+    _GLABEL = "Print head & layout"
     heads = spec.get("heads") or []
     if heads:
         fields.append({"id": "tool", "type": "single_select", "label": "Print head",
+                       "group": _GROUP, "group_label": _GLABEL,
                        "options": [{"id": h["tool"], "label": _head_label(h)} for h in heads],
                        "required": True})
     else:
         tools = [str(t).upper() for t in spec.get("tools", [])]
         if tools:
             fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
+                           "group": _GROUP, "group_label": _GLABEL,
                            "options": [{"id": t, "label": t} for t in tools], "required": True})
         mats = spec.get("materials", [])
         if mats:
             fields.append({"id": "material", "type": "single_select", "label": "Material",
+                           "group": _GROUP,
                            "options": [{"id": m, "label": m} for m in mats], "required": True})
+    fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
+                   "group": _GROUP,
+                   "options": ["as-authored", "auto"], "default": "as-authored"})
+    fields.append({"id": "supports", "type": "single_select", "label": "Supports",
+                   "group": _GROUP,
+                   "options": list(spec.get("supports", ["supports", "no-supports"])),
+                   "default": "no-supports"})
     profiles = spec.get("profiles", [])
     if profiles:
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
                        "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
                        "required": True})
-    fields.append({"id": "supports", "type": "single_select", "label": "Supports",
-                   "options": list(spec.get("supports", ["supports", "no-supports"])),
-                   "default": "no-supports"})
     # Action is a SUBMIT choice, not its own screen: the review card renders it
     # as two verbs (Upload only / Upload + Start). Kept in the schema so parse
     # + defaults + validation stay identical to the text intake.

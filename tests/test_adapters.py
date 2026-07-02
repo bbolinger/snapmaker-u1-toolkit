@@ -50,6 +50,10 @@ def _ids_in_keyboard(keyboard):
     return [b["callback_data"] for row in keyboard for b in row]
 
 
+def _fi(schema, fid):
+    return [i for i, f in enumerate(schema["fields"]) if f["id"] == fid][0]
+
+
 def test_tg_new_form_starts_at_first_field():
     form = tg.new_form(_schema())
     assert form["current"] == form["schema"]["fields"][0]["id"]  # "parts" (multi)
@@ -78,20 +82,25 @@ def test_tg_multi_toggle_marks_in_place_and_done_advances():
     # ✔ on the toggled rows
     assert any(b["text"].startswith("✔") and b["callback_data"] == "t:0:0" for row in kb for b in row)
     assert not any(b["text"].startswith("✔") and b["callback_data"] == "t:0:1" for row in kb for b in row)
-    # Done → advance to next field (orient)
+    # Next → advance to the next SCREEN (the setup group starts at 'tool')
     tg.apply_callback(form, "n:0")
-    assert form["current"] == "orient"
+    assert form["current"] == "tool"
 
 
-def test_tg_single_select_advances_immediately():
-    form = tg.new_form(_schema())
-    # advance past parts
-    tg.apply_callback(form, "n:0")
-    assert form["current"] == "orient"
-    # tap orient: single-select advances to tool
-    ev = tg.apply_callback(form, "s:1:0")
+def test_tg_single_select_in_group_does_not_advance_but_ungrouped_does():
+    schema = _schema()
+    form = tg.new_form(schema)
+    tg.apply_callback(form, "n:%d" % _fi(schema, "parts"))   # into the setup group
+    assert form["current"] == "tool"
+    # a grouped single_select is a radio — tap marks, does NOT advance
+    ev = tg.apply_callback(form, "s:%d:0" % _fi(schema, "tool"))
     assert ev["kind"] == "rerender"
     assert form["current"] == "tool"
+    assert form["selections"]["tool"] == 0
+    # an UNGROUPED single_select (profile) still advances on tap
+    form["current"] = "profile"
+    tg.apply_callback(form, "s:%d:0" % _fi(schema, "profile"))
+    assert form["current"] == tg.REVIEW_FIELD
 
 
 def test_tg_all_and_none_shortcuts():
@@ -106,21 +115,19 @@ def test_tg_paginates_long_fields():
     # Profile field with 16 options should paginate
     schema = _schema(n_parts=2, n_profiles=16)
     form = tg.new_form(schema)
+    pf = _fi(schema, "profile")
     # Jump cursor to profile to inspect its screen
     form["current"] = "profile"
     s = tg.render_screen(form)
     cbs = _ids_in_keyboard(s["keyboard"])
-    # Page 1/2 navigation present (no Prev on first page; Next present)
-    assert any(c == f"p:4:1" for c in cbs)  # next page; profile is field index 4
-    # Only PAGE_SIZE option buttons on this page
-    opt_cbs = [c for c in cbs if c.startswith("s:4:")]
+    assert any(c == f"p:{pf}:1" for c in cbs)   # next page present
+    opt_cbs = [c for c in cbs if c.startswith(f"s:{pf}:")]
     assert len(opt_cbs) == tg.PAGE_SIZE
-    # Navigate to page 1
-    tg.apply_callback(form, "p:4:1")
+    tg.apply_callback(form, f"p:{pf}:1")
     s2 = tg.render_screen(form)
     cbs2 = _ids_in_keyboard(s2["keyboard"])
-    assert any(c == "p:4:0" for c in cbs2)  # Prev present
-    opt_cbs2 = [c for c in cbs2 if c.startswith("s:4:")]
+    assert any(c == f"p:{pf}:0" for c in cbs2)  # Prev present
+    opt_cbs2 = [c for c in cbs2 if c.startswith(f"s:{pf}:")]
     assert len(opt_cbs2) == 16 - tg.PAGE_SIZE
 
 
@@ -146,14 +153,30 @@ def test_tg_review_card_after_last_field_lists_all_and_offers_edit():
 
 
 def test_tg_submit_blocks_when_required_unset_and_jumps_back():
-    form = tg.new_form(_schema())
-    # advance straight to review without setting tool/material/profile
+    schema = _schema()
+    form = tg.new_form(schema)
+    # tap a submit verb straight from review without setting tool/material/profile
     form["current"] = tg.REVIEW_FIELD
-    ev = tg.apply_callback(form, "S")
+    ev = tg.apply_callback(form, "S:%d:0" % _fi(schema, "action"))
     assert ev["kind"] == "rerender"
     assert "warning" in ev and ("Tool" in ev["warning"] or "Material" in ev["warning"])
     # form cursor should land on a required-but-unset field, not stay at review
     assert form["current"] != tg.REVIEW_FIELD
+
+
+def test_tg_bare_S_on_verb_schema_rerenders_to_pick_a_verb():
+    # Safety: a stale/injected bare "S" must NOT submit with a silently
+    # defaulted (start) action — it re-shows the review so the operator picks
+    # an explicit verb.
+    schema = _schema(n_parts=0)
+    form = tg.new_form(schema)
+    for f in schema["fields"]:
+        if f.get("required"):
+            form["selections"][f["id"]] = 0
+    form["current"] = tg.REVIEW_FIELD
+    ev = tg.apply_callback(form, "S")
+    assert ev["kind"] == "rerender" and "Upload" in ev["warning"]
+    assert form["current"] == tg.REVIEW_FIELD
 
 
 def test_tg_submit_with_all_required_yields_answer_json():
@@ -164,9 +187,8 @@ def test_tg_submit_with_all_required_yields_answer_json():
     form["selections"]["material"] = 0          # PLA
     form["selections"]["profile"] = 1           # profile2
     form["selections"]["supports"] = 1          # no-supports
-    form["selections"]["action"] = 0            # start
     form["current"] = tg.REVIEW_FIELD
-    ev = tg.apply_callback(form, "S")
+    ev = tg.apply_callback(form, "S:%d:0" % _fi(form["schema"], "action"))   # start verb
     assert ev["kind"] == "submit"
     a = ev["answer"]
     assert a["parts"] == ["01_p1", "03_p3"]
@@ -175,9 +197,10 @@ def test_tg_submit_with_all_required_yields_answer_json():
 
 
 def test_tg_edit_from_review_returns_to_that_field():
-    form = tg.new_form(_schema())
+    schema = _schema()
+    form = tg.new_form(schema)
     form["current"] = tg.REVIEW_FIELD
-    tg.apply_callback(form, "e:2")  # tool is field 2
+    tg.apply_callback(form, "e:%d" % _fi(schema, "tool"))
     assert form["current"] == "tool"
 
 
@@ -204,23 +227,22 @@ def test_tg_full_walkthrough_feeds_parse_answers_json():
     }
     schema = u1_form.build_form_schema(spec)
     form = tg.new_form(schema)
-    # parts: tap option 0, Done
-    tg.apply_callback(form, "t:0:0")
-    tg.apply_callback(form, "n:0")
-    # orient: pick auto (option 1)
-    tg.apply_callback(form, "s:1:1")
-    # tool: T0
-    tg.apply_callback(form, "s:2:0")
-    # material: PLA
-    tg.apply_callback(form, "s:3:0")
-    # profile: Opt
-    tg.apply_callback(form, "s:4:1")
-    # supports: no-supports
-    tg.apply_callback(form, "s:5:1")
-    # action: start
-    tg.apply_callback(form, "s:6:0")
+
+    def fi(fid):
+        return _fi(schema, fid)
+    # parts: tap option 0, Next
+    tg.apply_callback(form, "t:%d:0" % fi("parts"))
+    tg.apply_callback(form, "n:%d" % fi("parts"))
+    # setup group: tool/material/orient/supports are radios (no advance)
+    tg.apply_callback(form, "s:%d:0" % fi("tool"))       # T0
+    tg.apply_callback(form, "s:%d:0" % fi("material"))   # PLA
+    tg.apply_callback(form, "s:%d:1" % fi("orient"))     # auto
+    tg.apply_callback(form, "s:%d:1" % fi("supports"))   # no-supports
+    assert form["current"] == "tool"                     # still on the group
+    tg.apply_callback(form, "n:%d" % fi("tool"))         # shared Next -> profile
+    tg.apply_callback(form, "s:%d:1" % fi("profile"))    # Opt (advances)
     assert form["current"] == tg.REVIEW_FIELD
-    ev = tg.apply_callback(form, "S")
+    ev = tg.apply_callback(form, "S:%d:0" % fi("action"))   # start verb
     assert ev["kind"] == "submit"
     r = u1_form.parse_answers_json(ev["answer"], spec)
     assert r["ok"], r["errors"]
@@ -310,7 +332,7 @@ def test_tg_X_and_S_still_work_alongside_defensive_wrap():
     form2["selections"]["material"] = 0
     form2["selections"]["profile"] = 0
     form2["current"] = tg.REVIEW_FIELD
-    assert tg.apply_callback(form2, "S")["kind"] == "submit"
+    assert tg.apply_callback(form2, "S:%d:0" % _fi(form2["schema"], "action"))["kind"] == "submit"
 
 
 # --------------------------------------------------------------------------- #
@@ -355,7 +377,7 @@ def test_tg_required_warning_escapes_field_labels():
             f["label"] = "<b>Tool</b>"
     form = tg.new_form(schema)
     form["current"] = tg.REVIEW_FIELD
-    ev = tg.apply_callback(form, "S")
+    ev = tg.apply_callback(form, "S:%d:0" % _fi(schema, "action"))
     assert ev["kind"] == "rerender"
     assert "<b>" not in ev["warning"]
     assert "&lt;b&gt;Tool&lt;/b&gt;" in ev["warning"]
@@ -947,7 +969,7 @@ def test_single_part_skips_parts_screen():
     schema = u1_form.build_form_schema(spec)
     assert "parts" not in [f["id"] for f in schema["fields"]]
     form = tg.new_form(schema)
-    assert form["current"] == "orient"     # straight past parts
+    assert form["current"] == "tool"       # straight past parts, into the setup group
     # and the lone part still ends up selected by default in parse
     parsed = u1_form.parse_answers_json({"tool": "T0", "profile": 1}, spec)
     assert parsed["ok"] and parsed["values"]["parts"] == [1]
@@ -999,5 +1021,55 @@ def test_step_counter_excludes_submit_choice():
     schema = u1_form.build_form_schema(_heads_spec())
     form = tg.new_form(schema)   # at parts
     txt = tg.render_screen(form)["text"]
-    # screen fields: parts, orient, tool, profile, supports = 5 (action excluded)
-    assert "Step 1 of 5" in txt
+    # screens: parts, setup-group (head+orient+supports), profile = 3
+    assert "Step 1 of 3" in txt
+
+
+# --------------------------------------------------------------------------- #
+# v2.2.1 Increment 2 — grouped screen (head + orient + supports on one screen)
+# --------------------------------------------------------------------------- #
+
+def test_setup_group_renders_head_orient_supports_on_one_screen():
+    schema = u1_form.build_form_schema(_heads_spec())
+    # order + grouping
+    assert [f["id"] for f in schema["fields"]] == \
+        ["parts", "tool", "orient", "supports", "profile", "action"]
+    form = tg.new_form(schema)
+    screens = [[f["id"] for f in sc] for sc in tg._screens(form)]
+    assert screens == [["parts"], ["tool", "orient", "supports"], ["profile"]]
+    # advance into the group
+    tg.apply_callback(form, "n:%d" % _fi(schema, "parts"))
+    assert form["current"] == "tool"
+    s = tg.render_screen(form)
+    assert "Print head &amp; layout" in s["text"]   # group title (HTML-escaped &)
+    # all three sub-fields' labels present
+    for lbl in ("Print head", "Orientation", "Supports"):
+        assert lbl in s["text"]
+    cbs = _ids_in_keyboard(s["keyboard"])
+    # exactly one shared Next, one Cancel
+    assert sum(c.startswith("n:") for c in cbs) == 1
+    assert cbs.count("X") == 1
+
+
+def test_group_radio_marks_without_advancing_shared_next_advances():
+    schema = u1_form.build_form_schema(_heads_spec())
+    form = tg.new_form(schema)
+    tg.apply_callback(form, "n:%d" % _fi(schema, "parts"))
+    for fid, oi in (("tool", 1), ("orient", 1), ("supports", 0)):
+        tg.apply_callback(form, "s:%d:%d" % (_fi(schema, fid), oi))
+        assert form["current"] == "tool", f"{fid} tap must not leave the group"
+        assert form["selections"][fid] == oi
+    # radio state renders (● on picked, ○ on others)
+    kb_text = " ".join(b["text"] for row in tg.render_screen(form)["keyboard"] for b in row)
+    assert "●" in kb_text and "○" in kb_text
+    # shared Next advances past the whole group
+    tg.apply_callback(form, "n:%d" % _fi(schema, "tool"))
+    assert form["current"] == "profile"
+
+
+def test_group_step_counter_counts_screens_not_fields():
+    schema = u1_form.build_form_schema(_heads_spec())   # 2 parts
+    form = tg.new_form(schema)
+    assert "Step 1 of 3" in tg.render_screen(form)["text"]   # parts / setup / profile
+    tg.apply_callback(form, "n:%d" % _fi(schema, "parts"))
+    assert "Step 2 of 3" in tg.render_screen(form)["text"]   # the group is ONE step
