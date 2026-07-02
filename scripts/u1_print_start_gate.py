@@ -477,6 +477,62 @@ def _mark_bed_clear_photo_captured(request_id: str | None) -> None:
         pass
 
 
+def _resolve_grace_seconds(cli_override: int | None) -> int:
+    """Grace-period source order: CLI arg → env var → default 120.
+
+    Values are ints (seconds). 0 disables the grace period entirely
+    (opt-out for power users standing at the printer). Anything <0 is
+    clamped to 0. Env var must parse as int; junk values fall back to
+    the default so a bad env can't accidentally disable safety."""
+    import os as _os
+    if cli_override is not None:
+        return max(0, int(cli_override))
+    env_val = _os.environ.get('U1_GRACE_PERIOD_SECONDS', '').strip()
+    if env_val:
+        try:
+            return max(0, int(env_val))
+        except ValueError:
+            pass
+    return 120  # default ON — see feedback_dev_branch_until_tested
+
+
+def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
+                                 request_id: str | None,
+                                 resolved_operator: str,
+                                 sleep_fn=None) -> bool:
+    """Wait up to grace_seconds for cancel_marker to appear on disk.
+
+    Returns True if the caller should proceed to start_func, False if
+    the operator cancelled during the grace window (no HTTP call
+    should follow). Audit rows on both start and end. ``sleep_fn`` is
+    injected for tests so they don't actually sleep."""
+    import time as _time
+    _sleep = sleep_fn or _time.sleep
+    # Fresh window: any leftover marker from a prior request must be
+    # cleared before we start listening.
+    if cancel_marker.exists():
+        try:
+            cancel_marker.unlink()
+        except OSError:
+            pass
+    _audit_gate(request_id, 'pre_start_grace_period_started',
+                resolved_operator,
+                grace_seconds=grace_seconds,
+                cancel_marker=str(cancel_marker))
+    for _ in range(int(grace_seconds)):
+        if cancel_marker.exists():
+            _audit_gate(request_id, 'pre_start_grace_cancelled',
+                        resolved_operator,
+                        cancel_marker=str(cancel_marker),
+                        cancelled_after_wait_s=None)
+            return False
+        _sleep(1)
+    _audit_gate(request_id, 'pre_start_grace_period_expired',
+                resolved_operator, grace_seconds=grace_seconds,
+                proceeded_to_start=True)
+    return True
+
+
 def run_gate(filename: str,
              bed_clear: str = 'cancel',
              host=None,
@@ -491,7 +547,9 @@ def run_gate(filename: str,
              operator: str | None = None,
              accept_material_mismatch: bool = False,
              operator_text: str | None = None,
-             verification_method: str | None = None):
+             verification_method: str | None = None,
+             grace_seconds: int | None = None,
+             grace_sleep_fn=None):
     host = host or get_u1_host()
     port = port or get_u1_port()
     # Per-request token + photo storage (live bug 2026-06-28): if we have a
@@ -917,6 +975,31 @@ def run_gate(filename: str,
                 "I can't verify nothing changed since you approved."
             ),
         }
+    # Human safety net: last-chance cancel window before we HTTP the
+    # printer. Adapters (Hermes / Telegram) tail the audit log; when
+    # they see pre_start_grace_period_started, they send an operator
+    # notification with a cancel UI that touches cancel_marker_file
+    # within the grace window. Default 120s (opt-out via
+    # U1_GRACE_PERIOD_SECONDS=0 or --grace-seconds 0). Motivated by
+    # 2026-07-01 postmortem: without this the operator learns about an
+    # unauthorized start only when the first-layer camera cron fires.
+    _resolved_grace = _resolve_grace_seconds(grace_seconds)
+    if _resolved_grace > 0:
+        cancel_marker = out_dir / 'pre_start_cancel.marker'
+        if not _wait_pre_start_grace_period(
+                cancel_marker, _resolved_grace, request_id,
+                resolved_operator, sleep_fn=grace_sleep_fn):
+            return {
+                'stage': 'start_attempt',
+                'filename': printer_filename,
+                'blockers': blockers,
+                'snapshot': sanity_snapshot,
+                'ok': False, 'started': False,
+                'reason': (
+                    'Operator cancelled during the pre-start grace '
+                    'period. No HTTP call was sent to the printer.'),
+                'cancel_marker': str(cancel_marker),
+            }
     resp = start_func(host, port, printer_filename)
     # Phase 3b: record the start approval as granted now that we've actually
     # commanded the printer. record_approval binds the approval to the
@@ -991,6 +1074,16 @@ def main(argv=None):
                     choices=['manual', 'snapmaker_app', 'other_camera',
                              'unspecified_manual'],
                     help='Layer 3 override: how operator verified the override.')
+    ap.add_argument('--grace-seconds', type=int, default=None,
+                    help=('Human safety net (default 120s): after ALL '
+                          'checks pass, the gate waits this many seconds '
+                          'before HTTPing the printer. Adapter tails the '
+                          'audit log for pre_start_grace_period_started, '
+                          'sends the operator a cancel notification, and '
+                          'touches <out_dir>/pre_start_cancel.marker on '
+                          'cancel. Use 0 to disable (opt-out for power '
+                          'users standing at the printer). Overrides env '
+                          'U1_GRACE_PERIOD_SECONDS.'))
     a = ap.parse_args(argv)
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
@@ -1002,7 +1095,8 @@ def main(argv=None):
                    operator=a.operator,
                    accept_material_mismatch=a.accept_material_mismatch,
                    operator_text=a.operator_text,
-                   verification_method=a.verification_method)
+                   verification_method=a.verification_method,
+                   grace_seconds=a.grace_seconds)
     print(json.dumps(res, indent=2))
     return 0
 
