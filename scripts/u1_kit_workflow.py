@@ -2413,15 +2413,55 @@ def run_kit_workflow(args) -> dict[str, Any]:
         "start manual-bed-check", "start-manual-bed-check",
         "refresh-bed-photo", "retry-photo", "retry-camera",
     }
+    _kit_payload: dict[str, Any] = {"parts": kit["parts"],
+                                    "part_count": kit["part_count"]}
+    if _action_now and _action_now in _post_confirm_actions:
+        # write_request replaces `kit` wholesale — preserve the confirm's
+        # selected/orient_mode keys or the post-confirm backfill below
+        # (and the refresh handler's state guard) loses its inputs.
+        _existing_kit = (u1_request.read_request(request_id) or {}).get("kit") or {}
+        for _k in ("selected", "orient_mode"):
+            if _k in _existing_kit:
+                _kit_payload[_k] = _existing_kit[_k]
     _persist_kwargs = dict(
         model_file=archive.name, model_path=str(archive),
         model_hash=u1_request.compute_model_hash(archive) if archive.exists() else None,
         out_dir=str(out_dir), operator=operator,
-        kit={"parts": kit["parts"], "part_count": kit["part_count"]},
+        kit=_kit_payload,
     )
     if not _action_now or _action_now not in _post_confirm_actions:
         _persist_kwargs["phase"] = "kit_analysis"
     u1_request.write_request(request_id, **_persist_kwargs)
+
+    # Post-confirm resume: a post-confirm action with missing turn flags
+    # must NOT fall back into the staged Q&A — that path re-slices and
+    # re-uploads, the exact "hand-built command fell back to Turn 1" bug.
+    # Backfill missing answers from the persisted confirm state (explicit
+    # CLI flags always win; downstream guards still validate drift).
+    if _action_now and _action_now in _post_confirm_actions:
+        _state = u1_request.read_request(request_id) or {}
+        _kit_state = _state.get("kit") or {}
+        _backfilled: list[str] = []
+        if not getattr(args, "parts", None):
+            _sel = _kit_state.get("selected") or []
+            _id2idx = {p["part_id"]: i + 1 for i, p in enumerate(kit["parts"])}
+            _idxs = [str(_id2idx[pid]) for pid in _sel if pid in _id2idx]
+            if _idxs:
+                args.parts = ("all" if len(_idxs) == kit["part_count"]
+                              else ",".join(_idxs))
+                _backfilled.append("parts")
+        for _field, _persisted_val in (
+                ("orient", _kit_state.get("orient_mode")),
+                ("tool", _state.get("tool")),
+                ("material", _state.get("material")),
+                ("profile", _state.get("profile")),
+                ("supports", _state.get("supports"))):
+            if not getattr(args, _field, None) and _persisted_val:
+                setattr(args, _field, _persisted_val)
+                _backfilled.append(_field)
+        if _backfilled:
+            _audit(request_id, "post_confirm_flags_backfilled", operator,
+                   action=_action_now, fields=_backfilled)
 
     # ── LEGACY: one-liner power-user path (CLI tests + scripted runs) ──
     answers = getattr(args, "form_answers", None)
@@ -2671,6 +2711,20 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
     # Upload each plate. Plate 1 is the gated one.
     live_upload = not no_live_upload
     kit_stem = u1_kit._sanitize(archive.stem)
+    # Plate filenames are deterministic ({kit_stem}_plateN.gcode), so an
+    # adjust → re-confirm on the SAME request always collides with its own
+    # earlier upload — rc=5 dead-ended the advertised adjust option. When
+    # THIS request already uploaded a given filename, overwriting it is
+    # re-uploading our own plate; collisions with anything else still ask.
+    _own_prior_names: set[str] = set()
+    try:
+        _prev_req = u1_request.read_request(request_id) or {}
+        for _p in (_prev_req.get("plates") or []):
+            _n = _p.get("printer_storage_filename")
+            if _n:
+                _own_prior_names.add(_n)
+    except Exception:
+        pass
     plates_state: list[dict[str, Any]] = []
     upload_failures: list[dict[str, Any]] = []
     upload_warnings: list[dict[str, Any]] = []
@@ -2708,8 +2762,11 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             "error": injection.get("error"),
         })
         # ── NOW upload (gcode has thumbnail baked in) ──
+        _oc = getattr(args, "on_collision", None)
+        if _oc is None and named.name in _own_prior_names:
+            _oc = "overwrite"
         up = (_real_upload(named,
-                            on_collision=getattr(args, "on_collision", None),
+                            on_collision=_oc,
                             material=material)
               if live_upload else
               {"dry_run": True, "uploaded_filename": named.name,
@@ -2781,8 +2838,22 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
               json_events)
         _audit(request_id, "kit_upload_failed", operator,
                failure_count=len(upload_failures))
+        # Keep the two hash-binding surfaces consistent: plates[0].gcode_hash
+        # (nonce binds) and top-level gcode_hash (can_start) must not point
+        # at different slices. Sync the top-level binding to the new plate 1
+        # and clear any approval/nonce from a PRIOR confirm — that yes was
+        # for a plan whose upload succeeded, not this one. (write_request
+        # replaces `safety` wholesale, so merge over the current block.)
+        _cur_safety = dict(((u1_request.read_request(request_id) or {})
+                            .get("safety") or {}))
+        _cur_safety.update({"approval_token": None,
+                            "stage2_approval_nonce": None,
+                            "stage2_approval_binds": None})
         u1_request.write_request(request_id, phase="upload_failed",
-                                 plates=plates_state)
+                                 plates=plates_state,
+                                 gcode_hash=(plates_state[0]["gcode_hash"]
+                                             if plates_state else None),
+                                 safety=_cur_safety)
         return {"phase": "upload_failed",
                 "request_id": request_id,
                 "out_dir": str(out_dir),
@@ -2988,6 +3059,22 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                 "reason": "bed_verification_degraded",
                 "hermes_failure_reason": bed_result.get("reason"),
             },
+        })
+    if printer_busy:
+        # Busy printer: the plates are uploaded but no bed photo was taken.
+        # Offer the refresh path so the operator can gate plate 1 once the
+        # printer idles — without this option the documented busy→idle
+        # recovery flow was unreachable (agents copy commands verbatim).
+        options.append({
+            "label": ("Refresh bed photo — once the printer is idle, "
+                      "re-capture the bed and continue to start (no "
+                      "re-slice)"),
+            "value": "refresh-bed-photo",
+            "next_command": _build_next_command(
+                archive, request_id, parts=parts_answer, tool=tool_choice,
+                material=material, orient=orient, profile=profile_slug,
+                supports=supports, action="refresh-bed-photo", nozzle=nozzle,
+                no_live_upload=no_live_upload, no_live_material=no_live_material),
         })
     options.append({
         "label": "Upload only — stage the G-code, do not print",
@@ -3255,6 +3342,26 @@ def _action_start(events_file: Path | None, request_id: str,
     state = u1_request.read_request(request_id) or {}
     safety = state.get("safety") or {}
     token = safety.get("approval_token")
+    if not token:
+        # Legacy-path loop-closer: when the confirm never persisted a token
+        # (bed capture failed → operator ran the emitted Stage 1 command),
+        # Stage 1 wrote its token to the request-dir sidecar only. Without
+        # adopting it here, --action start re-emitted the Stage 1 command
+        # forever: Stage 1 → start → Stage 1 → … Fail-closed still holds —
+        # the gate re-validates token TTL + photo binding at Stage 2.
+        try:
+            from u1_print_start_gate import _read_approval_token
+            _sidecar = _read_approval_token(u1_request.request_dir(request_id))
+            if _sidecar and _sidecar.get("token"):
+                token = _sidecar["token"]
+                safety = dict(safety)
+                safety["approval_token"] = token
+                safety.setdefault("bed_clear_photo_captured", True)
+                u1_request.write_request(request_id, safety=safety)
+                _audit(request_id, "stage1_token_adopted_from_sidecar",
+                       operator, token_first8=token[:8])
+        except Exception:
+            pass
     plate_filename = state.get("printer_storage_filename")
     tool = state.get("tool", "T0")
     material = state.get("material", "PETG")
@@ -3578,9 +3685,16 @@ def _action_refresh_bed_photo(args, events_file: Path | None, request_id: str,
         "options": [{
             "label": "Start — I'll ask you to confirm bed-clear before the print fires",
             "value": "start",
+            # Carry the FULL persisted answer set — a start command missing
+            # orient/profile/supports would fall back into the staged Q&A
+            # and re-slice (the Turn-1 fallback bug class).
             "next_command": _build_next_command(
                 archive, request_id, parts=parts_answer, tool=tool_choice,
-                material=material, action="start", nozzle=nozzle,
+                material=material,
+                orient=(state.get("kit") or {}).get("orient_mode"),
+                profile=state.get("profile"),
+                supports=state.get("supports"),
+                action="start", nozzle=nozzle,
                 no_live_upload=no_live_upload,
                 no_live_material=no_live_material),
         }],
@@ -4122,6 +4236,16 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     kit_stem = u1_kit._sanitize(archive.stem)
     live = bool(getattr(args, "live_upload", False))
     plates_state: list[dict[str, Any]] = []
+    upload_failures: list[dict[str, Any]] = []
+    # Same own-prior-name overwrite rule as the staged path: re-uploading
+    # this request's own deterministic plate names must not rc=5 dead-end.
+    _own_prior_names: set[str] = set()
+    try:
+        for _p in ((u1_request.read_request(request_id) or {}).get("plates") or []):
+            if _p.get("printer_storage_filename"):
+                _own_prior_names.add(_p["printer_storage_filename"])
+    except Exception:
+        pass
     for pl in arr["plates"]:
         idx = pl["plate_idx"]
         src = Path(pl["gcode_path"])
@@ -4139,10 +4263,27 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             arrange_3mf=pl.get("arrange_3mf"),
             source_stls=pl.get("source_stls"),
         )
+        _oc = getattr(args, "on_collision", None)
+        if _oc is None and named.name in _own_prior_names:
+            _oc = "overwrite"
         up = _real_upload(named,
-                          on_collision=getattr(args, "on_collision", None),
+                          on_collision=_oc,
                           material=material) if live else {
             "dry_run": True, "uploaded_filename": named.name, "moonraker_upload_ok": None}
+        # Same rc contract as the staged path (H1): rc 2/4/5 = file did NOT
+        # land; rc=3 = landed with state warnings for Stage 2. Ignoring the
+        # rc here meant a dead Moonraker still produced kit_uploaded +
+        # "all plates on the printer".
+        if live:
+            _rc = int(up.get("returncode", -1) or -1)
+            if _rc in (2, 4, 5) or up.get("moonraker_upload_ok") is False:
+                upload_failures.append({
+                    "plate_idx": idx,
+                    "filename": named.name,
+                    "returncode": _rc,
+                    "moonraker_upload_ok": up.get("moonraker_upload_ok"),
+                    "human_summary": up.get("human_summary"),
+                })
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
         plates_state.append({
@@ -4156,6 +4297,23 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             "preview_path": layout.get("path"),
             "thumbnail_injection": injection,
         })
+    if upload_failures:
+        _emit(events_file, {"stage": "kit_upload_failed",
+                            "request_id": request_id,
+                            "failures": upload_failures,
+                            "instruction": ("One or more plates did not land "
+                                            "on the printer. Fix the underlying "
+                                            "issue (printer reachable? storage "
+                                            "full? filename collision?), then "
+                                            "re-send the form answers.")},
+              json_events)
+        _audit(request_id, "kit_upload_failed", operator,
+               failure_count=len(upload_failures))
+        u1_request.write_request(request_id, phase="upload_failed",
+                                 plates=plates_state)
+        return {"phase": "upload_failed", "request_id": request_id,
+                "failures": upload_failures}
+
     _emit(events_file, {"stage": "kit_uploaded", "request_id": request_id,
                         "plates": [p["printer_storage_filename"] for p in plates_state],
                         "live": live}, json_events)
@@ -4207,7 +4365,12 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         _emit(events_file, next_action, json_events)
     else:
         _emit(events_file, {"stage": "complete", "request_id": request_id,
-                            "reason": "Upload-only: all plates on the printer; start from the Snapmaker app."}, json_events)
+                            "reason": ("Upload-only: all plates on the printer; "
+                                       "start from the Snapmaker app."
+                                       if live else
+                                       "Upload-only DRY RUN: plates sliced "
+                                       "locally, nothing sent to the printer "
+                                       "(pass --live-upload to send).")}, json_events)
 
     u1_request.write_request(
         request_id,
