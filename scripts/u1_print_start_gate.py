@@ -600,13 +600,15 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                 cancel_marker=cancel_marker,
                 operator=resolved_operator)
     # Contract with the Hermes gateway hook + notify script: the notify
-    # script wrote /tmp/u1_pending_cancel_marker with the marker path so
-    # a Telegram CANCEL reply routes to the right marker. Clean that up
-    # on ANY exit path (cancel OR expire) so a stale entry doesn't cause
-    # the next print to spuriously abort on some unrelated CANCEL later.
+    # script wrote /tmp/u1_pending_cancel/<request_id>.json so a
+    # `cancel <code>` reply in Telegram routes to the right marker.
+    # Clean up our OWN entry on ANY exit path (cancel OR expire) so a
+    # stale entry doesn't cause the next unrelated print to abort on
+    # some later `cancel <code>` — and so multiple concurrent grace
+    # windows don't step on each other.
     def _clear_pending_state() -> None:
         try:
-            pending = Path('/tmp/u1_pending_cancel_marker')
+            pending = Path(f'/tmp/u1_pending_cancel/{request_id}.json')
             if pending.exists():
                 pending.unlink()
         except OSError:
