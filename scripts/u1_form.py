@@ -414,9 +414,14 @@ _FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
 
 def new_form_id() -> str:
-    """Opaque single-form token (filename-safe, unguessable)."""
+    """Opaque single-form token (filename-safe, unguessable).
+
+    Alphanumeric only: token_urlsafe's alphabet includes '-', and a LEADING
+    dash turns ``--form-answers-from <id>`` into an argparse flag (live
+    v2.2 finding: '-hNjdN7HGrTf'). Prefix guarantees a letter first.
+    """
     import secrets
-    return secrets.token_urlsafe(9)
+    return "f" + secrets.token_hex(5)
 
 
 def answers_dir() -> "Path":

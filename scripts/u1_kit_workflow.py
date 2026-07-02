@@ -2003,7 +2003,7 @@ def run_kit_workflow(args) -> dict[str, Any]:
         redeem_cmd = _build_next_command(
             archive, request_id, nozzle=nozzle,
             no_live_upload=no_live_upload,
-            no_live_material=no_live_material) + f" --form-answers-from {form_id}"
+            no_live_material=no_live_material) + f" --form-answers-from={form_id}"  # = form: legacy ids may start with "-"
         if not no_live_upload:
             redeem_cmd += " --live-upload"
         _emit(events_file, {

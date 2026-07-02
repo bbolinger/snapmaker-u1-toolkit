@@ -14,10 +14,21 @@ What the patch adds (no Hermes source edits):
   * ``_u1_handle_form_callback`` — applies taps to the form state machine,
     edits the message in place, and on Submit resolves the agent thread
     blocked in ``tools.form_gateway``.
-  * a wrapped ``_handle_callback_query`` — routes callbacks that belong to
-    a form we own (matched by chat_id + message_id, not just prefix) to the
-    form handler; everything else falls through to Hermes' original
-    (clarify ``cl:``, exec-approval ``ea:``, model picker ``mp:``…).
+  * a PATTERN-SCOPED ``CallbackQueryHandler`` registered directly on the
+    adapter's live PTB Application (negative group, raises
+    ``ApplicationHandlerStop``) — taps on form buttons never reach Hermes'
+    native dispatcher, everything else is untouched.
+
+Why registration instead of swapping ``_handle_callback_query`` on the
+class: the adapter runs ``add_handler(CallbackQueryHandler(
+self._handle_callback_query))`` at ``connect()`` — that bound method
+captured the ORIGINAL function, so a later class-attribute swap is
+invisible to PTB. Live v2.2 finding (2026-07-02): with the swap approach
+every button press routed to the native handler, toggles never rendered,
+and the form sat untouched until its 600s timeout. The form callback
+vocabulary is exclusively single-char prefixes (``t: s: p: a: z: n: e:
+S X``) while Hermes' own callbacks are all multi-char + colon (``cl:``,
+``ea:``, ``mp:``…), so the pattern can never shadow a native callback.
 
 File handoff: when the schema carries ``submit: {mode: "file", form_id}``,
 the GATEWAY writes ``<U1_FORM_ANSWERS_DIR>/<form_id>.json`` on Submit and
@@ -30,6 +41,10 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+
+# The renderer's complete callback vocabulary — and nothing else. Anchored so
+# a native Hermes callback (multi-char prefix + colon) can never match.
+FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|[azne]:\d+|[SX])$"
 
 
 def _load_renderer():
@@ -100,13 +115,6 @@ def ensure_patched(adapter_cls) -> bool:
     if getattr(adapter_cls, "_u1_form_patched", False):
         return True
 
-    _orig_cb = getattr(adapter_cls, "_handle_callback_query", None)
-    if _orig_cb is None:
-        logger.warning("u1-form: %s has no _handle_callback_query — the "
-                       "callback hook point moved in this hermes-agent "
-                       "build; form tool will only work via text fallback.",
-                       adapter_cls.__name__)
-        return False
     try:
         _tg = _load_renderer()
     except Exception as exc:
@@ -127,6 +135,34 @@ def ensure_patched(adapter_cls) -> bool:
             for row in rows
         ])
 
+    def _ensure_cb_handler(self) -> None:
+        """Register the form callback handler on the LIVE PTB Application.
+
+        Idempotent per Application object: a reconnect builds a fresh
+        ``self._app`` (losing our handler with the old one), so the flag
+        lives on the app, not the adapter — the next send_form re-registers.
+        Negative group + ``ApplicationHandlerStop`` keep matched taps away
+        from Hermes' native dispatcher without touching its registration.
+        """
+        app = getattr(self, "_app", None)
+        if app is None:
+            logger.warning("u1-form: adapter has no _app — taps cannot be "
+                           "routed; form will time out. (hook point moved?)")
+            return
+        if getattr(app, "_u1_form_cb_handler", None) is not None:
+            return
+        from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler  # type: ignore
+
+        async def _entry(update, ctx, _self=self):
+            await _u1_handle_form_callback(_self, update, ctx)
+            raise ApplicationHandlerStop
+
+        handler = CallbackQueryHandler(_entry, pattern=FORM_CB_PATTERN)
+        app.add_handler(handler, group=-11)
+        app._u1_form_cb_handler = handler
+        logger.info("u1-form: callback handler registered on live PTB app "
+                    "(group -11, pattern-scoped).")
+
     async def _send_form(self, chat_id, form_schema, form_id, session_key, metadata=None):
         """Render a form_schema as a sequence of inline-keyboard screens.
 
@@ -135,6 +171,7 @@ def ensure_patched(adapter_cls) -> bool:
         unblock the agent thread waiting on this form_id.
         """
         from telegram.constants import ParseMode  # type: ignore
+        _ensure_cb_handler(self)  # before send: no tap may beat the handler
         form = _tg.new_form(form_schema)
         screen = _tg.render_screen(form)
         kwargs = {
@@ -242,37 +279,13 @@ def ensure_patched(adapter_cls) -> bool:
         except Exception as exc:
             logger.warning("u1-form: rerender edit failed: %s", exc)
 
-    # Wrap the existing callback dispatcher: form callbacks routed first,
-    # everything else falls through to the original handler.
-    _FORM_PREFIXES = {"t", "s", "a", "z", "n", "p", "e", "S", "X"}
-
-    def _looks_like_form_cb(data: str) -> bool:
-        if not data:
-            return False
-        head = data.split(":", 1)[0]
-        return head in _FORM_PREFIXES and (":" in data or data in ("S", "X"))
-
-    async def _wrapped_cb(self, update, ctx):
-        data = (update.callback_query.data if update and update.callback_query else "") or ""
-        # Only treat as form callback when (chat_id, message_id) matches a form
-        # slot we own — keeps us from snatching callbacks Hermes' OWN handlers
-        # use (their prefixes are all multi-char + colon: cl:, ea:, mp:, gt:…),
-        # and keeps concurrent forms in different chats apart (Telegram
-        # message_ids are only unique per chat). `message` can be None on old
-        # callbacks — guard before dereferencing.
-        st = _form_state(self)
-        msg = update.callback_query.message if update and update.callback_query else None
-        owns = msg is not None and any(
-            s["chat_id"] == msg.chat_id and s["msg_id"] == msg.message_id
-            for s in st.values()
-        )
-        if _looks_like_form_cb(data) and owns:
-            return await _u1_handle_form_callback(self, update, ctx)
-        return await _orig_cb(self, update, ctx)
-
+    # NOTE deliberately NOT touching adapter_cls._handle_callback_query —
+    # PTB holds the bound method it captured at connect(); replacing the
+    # class attribute after that is a silent no-op (the v2.2 live bug).
+    # Routing happens via _ensure_cb_handler's pattern-scoped registration.
     adapter_cls.send_form = _send_form
     adapter_cls._u1_handle_form_callback = _u1_handle_form_callback
-    adapter_cls._handle_callback_query = _wrapped_cb
+    adapter_cls._u1_ensure_cb_handler = _ensure_cb_handler
     adapter_cls._u1_form_patched = True
     logger.info("u1-form: %s.send_form installed on the live adapter class "
                 "(no source edits).", adapter_cls.__name__)

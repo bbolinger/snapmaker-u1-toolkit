@@ -155,12 +155,14 @@ def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]
             nav.append({"text": "Next ›", "callback_data": f"p:{fi}:{page + 1}"})
         rows.append(nav)
 
-    # Multi-select action row: All / None / Done
+    # Multi-select action row: Select all / Clear / Next. "Next ➜" (not
+    # "Done") — operators read "Done" next to "All" as submit-ish and can't
+    # tell it only advances a step (live operator feedback 2026-07-02).
     if is_multi:
         rows.append([
-            {"text": "All", "callback_data": f"a:{fi}"},
-            {"text": "None", "callback_data": f"z:{fi}"},
-            {"text": "✅ Done", "callback_data": f"n:{fi}"},
+            {"text": "Select all", "callback_data": f"a:{fi}"},
+            {"text": "Clear", "callback_data": f"z:{fi}"},
+            {"text": "Next ➜", "callback_data": f"n:{fi}"},
         ])
 
     # Cancel always present
@@ -168,10 +170,16 @@ def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]
 
     label = _esc(field.get("label", field["id"]))
     hint = ""
+    tip = ""
     if is_multi:
         n = len(sel) if sel else 0
-        hint = f"  ({n} selected)"
-    text = f"<b>{label}</b>{hint}\n<i>Step {fi + 1} of {len(form['schema']['fields'])}</i>"
+        if n == 0 and field.get("default") == "all":
+            hint = f"  (none picked \u2192 all {len(field['options'])})"
+        else:
+            hint = f"  ({n} of {len(field['options'])} selected)"
+        tip = "\n<i>Tap options to toggle \u2714, then Next \u279c</i>"
+    text = (f"<b>{label}</b>{hint}{tip}"
+            f"\n<i>Step {fi + 1} of {len(form['schema']['fields'])}</i>")
     return {"text": text, "keyboard": rows}
 
 

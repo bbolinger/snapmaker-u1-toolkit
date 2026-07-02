@@ -22,9 +22,22 @@ import pytest
 # (and don't accidentally trigger find_recent_request_for_model hits in
 # integration tests). u1_config.get_data_dir reads this env var first.
 @pytest.fixture(autouse=True)
-def _isolated_data_dir(tmp_path, monkeypatch):
+def _isolated_data_dir(tmp_path, monkeypatch, request):
     """Per-test data dir so requests/ + state files are sandboxed."""
     monkeypatch.setenv('SNAPMAKER_U1_DATA_DIR', str(tmp_path / '_data_dir'))
+    # Deterministic interaction mode: u1_config._load_dotenv_if_present()
+    # falls back to /opt/data/.env, so an operator running the suite on a
+    # box with U1_INTERACTION_MODE=form live (e.g. during v2.2 form testing)
+    # silently flips every staged-flow test into form mode (live 2026-07-02:
+    # two "failures" that were really env leakage). Kill the fallback for
+    # tests and scrub anything already loaded into this process; tests that
+    # want form mode set U1_INTERACTION_MODE explicitly. Exemption: the
+    # loader's own tests (test_u1_config.py) exercise the real walk with
+    # their own tmp .env files.
+    if request.node.fspath.basename != 'test_u1_config.py':
+        import u1_config
+        monkeypatch.setattr(u1_config, '_load_dotenv_if_present', lambda: None)
+    monkeypatch.delenv('U1_INTERACTION_MODE', raising=False)
     yield
 
 # Real-Orca test harness (added 2026-06-26). When pytest runs from

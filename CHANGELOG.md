@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased — v2.2 line]
 
+### Fixed
+
+- **Telegram form taps never reached the form handler** (live 2026-07-02).
+  The plugin swapped `_handle_callback_query` on the adapter class, but PTB
+  captured the bound method at `connect()` — the swap was invisible, every
+  tap routed to Hermes' native dispatcher, and forms sat untouched until the
+  600s timeout, after which the agent fell back to free-text questioning.
+  The patch now registers its own pattern-scoped `CallbackQueryHandler`
+  (group −11, `ApplicationHandlerStop`) on the live PTB application at
+  `send_form` time — timing-independent, reconnect-safe, and the native
+  dispatcher is never touched.
+- **`form_id` could start with `-`** (`token_urlsafe` alphabet), turning
+  `--form-answers-from <id>` into an argparse flag. New ids are
+  alphanumeric (`f` + hex); `next_command` now uses the
+  `--form-answers-from=<id>` form so legacy persisted ids keep working.
+- **Multi-select affordance** (operator feedback): action row is now
+  `Select all / Clear / Next ➜` (was `All / None / ✅ Done`), the header
+  shows `(n of N selected)` or `(none picked → all N)`, plus a
+  "tap to toggle ✔" hint — so the checkbox behavior is discoverable and
+  "Done" no longer reads as submit.
+- **Skill contract:** on form timeout/cancel/error the agent must resume
+  the staged one-line text flow — never dump all fields as free-text
+  questions in a single message.
+
 ### Added
 
 - **Pre-print review document** ([`scripts/u1_review_doc.py`](scripts/u1_review_doc.py)).
