@@ -156,6 +156,41 @@ def parse_gcode_config(path: Path) -> dict[str, str]:
     return out
 
 
+# Keys that legitimately differ between a profile file and the gcode's
+# config block without meaning anything changed about the PRINT — ids,
+# provenance, display metadata. Comparing them would bury real deviations
+# in noise.
+_SWEEP_IGNORE_EXACT = {
+    "name", "from", "inherits", "version", "notes", "is_custom_defined",
+    "print_settings_id", "filament_settings_id", "printer_settings_id",
+    "printer_model", "printer_variant", "setting_id",
+}
+_SWEEP_IGNORE_SUFFIXES = ("_id", "_ids", "_settings_id", "_notes")
+_SWEEP_IGNORE_PREFIXES = ("compatible_", "_u1_")
+
+
+def _sweep_deviations(config, reference, skip_keys):
+    """Full-config sweep: every key present in BOTH the gcode config and the
+    preset reference (minus curated keys already shown and known-noisy
+    metadata) whose normalized values differ. This is what catches the
+    "little nuances" — ironing, retraction, flow tweaks — that the curated
+    table doesn't display. Deviations-only output is self-curating: a
+    normal print yields zero to a handful of rows."""
+    out = []
+    for key in sorted(config):
+        if key in skip_keys or key in _SWEEP_IGNORE_EXACT:
+            continue
+        if key.endswith(_SWEEP_IGNORE_SUFFIXES) or key.startswith(_SWEEP_IGNORE_PREFIXES):
+            continue
+        ref_v = reference.get(key)
+        if ref_v is None:
+            continue
+        got = _norm(config[key])
+        if got != ref_v:
+            out.append((key, got, ref_v))
+    return out
+
+
 def _first(config: dict[str, str], keys: list[str]) -> str | None:
     for k in keys:
         v = config.get(k)
@@ -264,12 +299,28 @@ def generate(
                     cell = f"`{v}` ⚠ *preset: `{ref_v}`*"
                     deviations += 1
             L.append(f"| {label} | {cell} |")
+        others: list = []
         if reference:
+            curated_keys = {k for _, keys in _KEY_SETTINGS for k in keys}
+            others = _sweep_deviations(config, reference, curated_keys)
+            total = deviations + len(others)
             L.append("")
-            L.append(f"_{deviations} setting(s) differ from the chosen "
-                     f"preset (marked ⚠)._" if deviations else
-                     "_All key settings match the chosen preset — no "
-                     "deviations detected._")
+            L.append(f"_{total} setting(s) differ from the chosen "
+                     f"preset (marked ⚠)._" if total else
+                     "_Every setting in the sliced gcode matches the chosen "
+                     "preset — no deviations detected._")
+        if others:
+            L.append("")
+            L.append("**Other deviations from the preset** (full-config "
+                     "sweep — every remaining setting matches):")
+            L.append("")
+            L.append("| Setting | In this print | Preset |")
+            L.append("|---|---|---|")
+            shown = others[:20]
+            for key, got, ref_v in shown:
+                L.append(f"| `{key}` | `{got}` ⚠ | `{ref_v}` |")
+            if len(others) > len(shown):
+                L.append(f"| _…and {len(others) - len(shown)} more_ | | |")
     else:
         L.append("_Config block not found in the gcode — settings table "
                  "unavailable for this slice (older Orca build?). The "

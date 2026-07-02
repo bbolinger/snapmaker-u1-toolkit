@@ -156,6 +156,56 @@ def test_no_deviations_says_so_explicitly(tmp_path):
     assert "⚠" not in text
 
 
+def test_full_sweep_catches_non_curated_tweaks(tmp_path):
+    # "Various other little things": settings OUTSIDE the curated table —
+    # ironing, retraction, flow — must still surface when they deviate.
+    g = tmp_path / "tweaked.gcode"
+    g.write_text("""G28
+; CONFIG_BLOCK_START
+; layer_height = 0.2
+; ironing_type = top surfaces
+; retraction_length = 1.2
+; flow_ratio = 0.95
+; print_settings_id = whatever
+; CONFIG_BLOCK_END
+""")
+    plates = _plates(tmp_path)
+    plates[0]["gcode_path"] = str(g)
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", plates, state={},
+        reference={"layer_height": "0.2",
+                   "ironing_type": "no ironing",
+                   "retraction_length": "0.8",
+                   "flow_ratio": "0.95",
+                   "print_settings_id": "different-but-noise"})
+    text = Path(doc).read_text()
+    assert "Other deviations from the preset" in text
+    assert "`ironing_type` | `top surfaces` ⚠ | `no ironing`" in text
+    assert "`retraction_length` | `1.2` ⚠ | `0.8`" in text
+    # matching + noisy keys stay out
+    assert "flow_ratio" not in text.split("Other deviations")[1]
+    assert "print_settings_id" not in text
+    assert "2 setting(s) differ" in text
+
+
+def test_full_sweep_silent_when_everything_matches(tmp_path):
+    g = tmp_path / "clean.gcode"
+    g.write_text("""G28
+; CONFIG_BLOCK_START
+; layer_height = 0.2
+; ironing_type = no ironing
+; CONFIG_BLOCK_END
+""")
+    plates = _plates(tmp_path)
+    plates[0]["gcode_path"] = str(g)
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", plates, state={},
+        reference={"layer_height": "0.2", "ironing_type": "no ironing"})
+    text = Path(doc).read_text()
+    assert "Other deviations" not in text
+    assert "no deviations detected" in text.lower()
+
+
 def test_norm_collapses_per_filament_lists():
     assert u1_review_doc._norm(["240", "240"]) == "240"
     assert u1_review_doc._norm("240,240") == "240"
