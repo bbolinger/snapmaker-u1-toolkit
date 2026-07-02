@@ -139,16 +139,20 @@ def test_part_fits_bed_oversized_both_axes_does_not_fit():
     assert u1_kit.part_fits_bed((300, 300)) is False
 
 
-def test_part_fits_bed_long_thin_fits_via_rotation():
-    # 213 x 10 doesn't fit as-is in X (usable 215) — wait, it does. Use a case
-    # that only fits when rotated: too long in Y, thin in X.
-    # usable = 215 x 215. A 10 x 214 part fits as-is; a 214 x 10 fits as-is too.
-    # The rotation branch matters when one axis just exceeds and the other is
-    # tiny relative to the OTHER usable dim — but with a square bed both axes
-    # share the limit. Verify the rotation path is at least consistent:
-    assert u1_kit.part_fits_bed((10, 214)) is True
-    assert u1_kit.part_fits_bed((214, 10)) is True
-    assert u1_kit.part_fits_bed((216, 10)) is False  # exceeds usable on the long axis
+def test_part_fits_bed_long_thin_at_default_bed_limits():
+    # U1 bed is 270 x 270 (DEFAULT_BED_MM), usable 265 x 265 after the 5mm
+    # arrange margin. On a square bed both orientations share the limit.
+    assert u1_kit.part_fits_bed((10, 264)) is True
+    assert u1_kit.part_fits_bed((264, 10)) is True
+    assert u1_kit.part_fits_bed((266, 10)) is False  # exceeds usable on the long axis
+
+
+def test_part_fits_bed_rotation_branch_on_rectangular_bed():
+    # A rectangular bed actually exercises the 90°-rotation branch: 240 x 90
+    # fails as-is on a 100 x 300 bed (usable 95 x 295) but fits rotated.
+    bed = (100.0, 300.0)
+    assert u1_kit.part_fits_bed((240, 90), bed_mm=bed) is True   # only via rotation
+    assert u1_kit.part_fits_bed((240, 96), bed_mm=bed) is False  # too wide either way
 
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +183,7 @@ def test_build_kit_single_part_is_not_multi(tmp_path):
 def test_build_kit_flags_oversized_part(tmp_path):
     paths = [
         _write_cube(tmp_path / "ok.stl", 20),
-        # 300x300 footprint cannot fit a 220 bed even rotated.
+        # 300x300 footprint cannot fit the 270 bed even rotated.
         (lambda p: (write_binary_stl(p, _box_tris(300, 300, 10), name="big"), p)[1])(
             tmp_path / "toobig.stl"
         ),
