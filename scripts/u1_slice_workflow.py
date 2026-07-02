@@ -2371,6 +2371,9 @@ def run_workflow(args)->dict[str,Any]:
                     str(profile), str(material),
                     nozzle=str(getattr(args, 'nozzle', '0.4')),
                     out_dir=gcode.parent),
+                envelope=u1_review_doc.build_material_envelope(
+                    str(material), nozzle=str(getattr(args, 'nozzle', '0.4')),
+                    out_dir=gcode.parent),
             ))
             emit({'stage': 'review_doc',
                   'request_id': getattr(args, 'request_id', None),
