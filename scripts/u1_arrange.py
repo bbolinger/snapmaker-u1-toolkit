@@ -427,7 +427,7 @@ def arrange_slice(
        - If overflow: fall to phase 2.
 
     2. **Manual partition + per-plate slice.** Bin-pack STLs by footprint
-       area (first-fit-decreasing, target 55 percent bed fill), invoke
+       area (first-fit-decreasing, target 50 percent bed fill), invoke
        Orca once per partition, validate each plate against the bed,
        collect results. ``was_split`` is True; ``partition`` lists the
        part-IDs assigned to each plate.

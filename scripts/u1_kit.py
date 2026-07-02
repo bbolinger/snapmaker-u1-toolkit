@@ -16,7 +16,8 @@ owns the gates. Keeping ingest dumb is what lets the model stay dumb.
 
 Spike-verified facts this serves (§2 of the plan):
   - Orca arranges multiple positional STLs with ``--arrange 1`` headless.
-  - Overflow auto-splits into ``plate_N.gcode`` — we do not pack or split here.
+  - Orca does NOT auto-split overflow (2026-06-30 audit); u1_arrange owns
+    partitioning (first-fit-decreasing) — we still do not pack or split here.
   - ``--allow-rotations`` lets arrange rotate a part in-plane, so a part that
     only fits rotated still fits. ``part_fits_bed`` accounts for that.
 """
