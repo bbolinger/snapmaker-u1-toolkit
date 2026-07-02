@@ -6,13 +6,117 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [2.1.0] — 2026-06-28
+## [2.1.0-rc2] — 2026-07-02
+
+Review-driven hardening of rc1. An external deep review (4 parallel passes:
+kit workflow, safety gate + grace-cancel, form/arrange/kit scripts, adapters)
+found bugs that contradicted rc1's own safety claims; all release blockers
+are fixed here. No schema changes.
+
+### Fixed — safety
+
+- **Test-operator fence is now sticky.** Only 2 of 15 emitted `next_command`s
+  carried `--operator`, so a `smoke:*` run silently resolved to the production
+  env operator by confirm time and Stage 2 fired a real print — the exact
+  incident class Fence 1 was built to close. `_build_next_command` now stamps
+  the explicit CLI operator into every emitted command (env-resolved identity
+  stays env-resolved, replay-safe). The kit redirect in `u1_slice_workflow.py`
+  carries `--operator`/`--nozzle` too, and a zip that fails kit inspection
+  emits `kit_detection_failed` instead of silently slicing only the first model.
+- **`cancel <code>` is implemented, not just documented.** The hook matched
+  only bare keywords: `cancel abc123` (the documented form) cancelled nothing,
+  and bare `cancel` touched every window. Now: bare keyword = cancel all;
+  `cancel <code>` = cancel only the matching request; unknown code = cancel
+  nothing (logged). The gate re-checks the marker after the final grace tick
+  and immediately before the start call (a last-second CANCEL was silently
+  lost). The notify DM only promises reply-to-cancel when the installer's
+  receipt shows the hook actually loaded — otherwise it gives the SSH
+  fallback. Pending-state JSON is written via `json` (a filename with a quote
+  made that request uncancellable). Installer verifies `u1_grace_cancel`
+  specifically, not any `hook(s) loaded` line.
+- **Form parser fails loud instead of silently mis-parsing.** Duplicate
+  fields with different values are conflicts (was silent last-wins, which
+  also made parsing order-dependent). Unoffered material-family tokens
+  (`PETG` with only PLA offered) error as a material problem instead of
+  substring-matching a profile name. A bare integer on a multi-part kit is an
+  ambiguity error (staged mode reads `3` as part 3; form mode read it as
+  profile 3). Part ranges bounds-check before expansion (`parts 1-30000000`
+  built a 275MB error string). Part/profile labels are sanitized before
+  rendering (zip entry names could inject fake form lines).
+- **`supports=overhangs` removed from every offer.** `enable_support` is
+  binary in the profile patch — the option was accepted, echoed on the
+  readiness card, and silently ignored (printed without supports). It now
+  errors as not-offered until a real overhangs-only override exists.
+- **Orca nonzero-rc tolerance narrowed to the verified overflow rc (154).**
+  Any other rc raises even when a plate file exists — a truncated plate that
+  happened to sit within bed extent was hashed and uploaded as a good slice.
+  A plate with zero extrusion moves reports "bad or truncated slice output"
+  instead of the misleading "extent overflow".
+- **Unset operator identity (`unknown:gate`) still passes Fence 1** — now an
+  explicit, tested decision with a loud `gate_operator_unknown` audit row.
+
+### Fixed — usability (refusals now hand back a path forward)
+
+- **Grace-cancel refusal carries `recovery.stage1_command`** — slice and
+  upload are still valid, so restarting costs one fresh photo + one fresh
+  yes, not a workflow re-run.
+- **`adjust` → re-confirm no longer bricks on a filename collision**:
+  re-uploading this request's own deterministic plate name defaults to
+  overwrite (collisions with anything else still ask).
+- **Post-confirm actions resume from persisted state.** An `--action` command
+  missing turn flags backfills parts/orient/tool/material/profile/supports
+  from the confirm state (audited) instead of falling back into the staged
+  Q&A and re-slicing. `refresh-bed-photo` is now actually offered on the
+  printer-busy card and its emitted command carries the full answer set.
+- **Legacy `--form-answers` path honesty**: upload rc is checked (a dead
+  Moonraker no longer yields "all plates on the printer"), dry-run completion
+  says DRY RUN, and `--action start` adopts the Stage-1 sidecar token instead
+  of re-emitting Stage 1 forever.
+
+### Fixed — adapters (still EXPERIMENTAL; `form_schema` not yet emitted)
+
+- `install.py` verify step crashed with a `%`-format `TypeError` on every
+  non-dry-run install; the run.py anchor is checked before any files are
+  copied (no more partial installs); `--uninstall` only restores the backup
+  when the patch marker is present (no more downgrading an upgraded Hermes).
+- Telegram form tool: slots matched on `(chat_id, message_id)` (message ids
+  are per-chat; cross-chat collisions could mutate the wrong form); a submit
+  after gateway timeout says the form expired instead of "✅ Submitted";
+  schema-derived text is HTML-escaped (a part named `bracket<v2>.stl` killed
+  the send).
+- The byte-identical duplicate renderer under `adapters/hermes/tools/` is
+  gone — the installer sources `adapters/telegram/u1_form_telegram.py`.
+
+### Added
+
+- **GitHub Actions CI** (`.github/workflows/tests.yml`) — pytest on push/PR,
+  Python 3.11 + 3.12. rc1 was tagged with 4 failing tests (bed-size constant
+  fixed 220→270 without updating its test; arrange fixtures predated the
+  bed-overflow guard) — CI makes that class impossible to miss again.
+- `docs/events.md` now documents the grace-period audit events,
+  `kit_upload_failed`, `kit_detection_failed`, and the experimental status of
+  the form protocol. HOOK.yaml and the README cancel section describe the
+  implemented behavior.
+
+### Validated
+
+- Full suite green at this commit. Live re-validation of the grace-cancel
+  path on real hardware is the remaining gate before v2.1.0 final.
+
+---
+
+## [2.1.0-rc1] — 2026-06-30
 
 **Multi-part / multi-plate kit support.** Send a zip of STLs (the common
 Printables shape) and the toolkit arranges them onto the bed, slices every
 plate Orca needs, uploads them all, and runs the safety gate on plate 1. The
 operator answers one consolidated form; nothing else changes about the safety
 model.
+
+*(Scope note, added at rc2: this entry was written at the kit-workflow
+milestone. rc1's tag also contained the pre-start grace period + Telegram
+cancel hook, the Fence 1 test-operator refusal, and the experimental
+form-protocol adapters tree — those are documented in the rc2 entry above.)*
 
 ### Added
 
@@ -64,7 +168,9 @@ model.
 - Live on the real Orca binary: 3-part kit → 1 arranged plate; 9 parts → 3
   plates (overflow auto-split); full end-to-end (form → parse → arrange →
   upload → readiness gating plate 1); content-hash recovery by re-send.
-- 470 unit + integration tests pass (1 skipped). The v2.0 single-STL flow and
+- 470 unit + integration tests passed at the kit-workflow milestone (the
+  grace-cancel + Fence 1 commits landed after this count — see rc2 for the
+  honest accounting). The v2.0 single-STL flow and
   its tests are untouched.
 
 ---
