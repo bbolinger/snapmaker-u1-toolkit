@@ -452,6 +452,17 @@ string to something without a test prefix (`homelab`, `human:homelab`, etc.).
 The fence is deliberately narrow: identity strings starting with `dev:`, `ci:`,
 `telegram:`, `discord:`, `human:`, or bare names all proceed normally.
 
+Two sharp edges, decided deliberately (rc2):
+
+- An explicit `--operator` now rides **every** command the kit workflow
+  emits, so a `smoke:*` identity can't silently drop back to your
+  production `U1_OPERATOR` mid-chain. Env-resolved identity is never baked
+  into commands (replay-safe).
+- An **unset** operator (`unknown:gate`) passes the fence — refusing every
+  bare CLI run would tax legitimate local use — but leaves a loud
+  `gate_operator_unknown` audit row. If your smoke tests might run with no
+  operator set, set one (`smoke:whatever`) so the fence can catch them.
+
 ### Pre-start grace period + Telegram cancel button (v2.1.0)
 
 After every safety check passes and before the gate HTTPs the printer's
@@ -486,11 +497,23 @@ export U1_GRACE_NOTIFY_CMD=/absolute/path/to/tools/u1_grace_notify_hermes.sh
 ```
 
 The notify script sends a Telegram DM. Reply `CANCEL` (or `STOP` or
-`ABORT`, exact match, case-insensitive) within the window and the print
-aborts before any HTTP call. Substrings don't match — "cancel that
-plan" is safe from unintended cancels. Multi-request setups (two
-concurrent grace windows) each write their own pending-state file so
-they don't race each other.
+`ABORT`, case-insensitive) within the window and the print aborts before
+any HTTP call — a bare keyword cancels **every** active grace window;
+`cancel <code>` (the code is the last 6 chars of the request id, shown in
+the DM) cancels **only** that request, and a code that matches nothing
+cancels nothing. Prose doesn't match — "cancel that plan" is safe from
+unintended cancels. Multi-request setups (two concurrent grace windows)
+each write their own pending-state file so they don't race each other.
+
+Honesty guard: the DM only promises reply-to-cancel when the installer's
+receipt file shows the hook actually loaded — otherwise it gives the SSH
+`touch <marker>` fallback instead of a reply that would silently do
+nothing.
+
+Cancelled by mistake, or the bed was actually fine? The refusal payload
+carries a `recovery.stage1_command`: the slice and upload are still
+valid, so restarting costs one fresh bed photo + one fresh yes — not a
+workflow re-run.
 
 Opt-out for power users at the printer: `U1_GRACE_PERIOD_SECONDS=0`
 disables the window. `U1_GRACE_NOTIFY_CMD` unset disables the

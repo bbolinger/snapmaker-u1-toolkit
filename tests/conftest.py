@@ -64,8 +64,19 @@ def hermes_visible_tmp(request):
     (where the Orca shim docker-execs to). Auto-cleaned after the test.
 
     Use this for any test that calls the real Orca shim — pytest's default
-    tmp_path is under /tmp which Hermes can't see."""
-    _HERMES_VISIBLE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp_path is under /tmp which Hermes can't see.
+
+    Skips (not errors) when the Hermes stack isn't present: this fixture is
+    a DEPENDENCY of real_orca, so pytest sets it up BEFORE real_orca's own
+    skip check runs — on a host without the /appdata mount (e.g. GitHub
+    Actions) the mkdir raised PermissionError and the job went red even
+    though every runnable test passed."""
+    if not _HAS_REAL_ORCA:
+        pytest.skip("real Orca unreachable (no Hermes container or shim not working)")
+    try:
+        _HERMES_VISIBLE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        pytest.skip(f"hermes-visible tmp unavailable ({exc}) — no /appdata mount")
     scratch = _HERMES_VISIBLE_TMP_ROOT / f"{request.node.name}-{uuid.uuid4().hex[:8]}"
     scratch.mkdir(parents=True, exist_ok=True)
     try:

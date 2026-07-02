@@ -19,18 +19,24 @@ typed path.
 | File | Role |
 |------|------|
 | `tools/form_gateway.py` | Gateway-side blocking primitive (mirrors `tools/clarify_gateway.py`). Thread-safe registry of pending forms, `register()` / `wait_for_response()` / `resolve_gateway_form()` / `clear_session()` / `get_form_timeout()`. |
-| `tools/form_tool.py` | LLM-facing tool definition. Registers `name="form"` via `tools.registry.registry.register(...)` (Hermes' own plugin entry point — anything dropped in `tools/` is auto-discovered). Schema description + thin dispatcher to a platform-provided callback. |
-| `patches/` *(next)* | Anchor-based edits for `gateway/run.py` (`agent.form_callback = …`) and `gateway/platforms/telegram.py` (`send_form` method + form callback-data routing). |
-| `install.py` *(next)* | Idempotent installer: copy the two `tools/` files, copy `u1_form_telegram.py` (the L1 renderer this patch's `send_form` calls), apply the two file edits, verify imports. |
+| `tools/form_tool.py` | LLM-facing tool definition. Registers `name="form"` via `tools.registry.registry.register(...)` (Hermes' own plugin entry point — anything dropped in `tools/` is auto-discovered). Schema description + thin dispatcher to a platform-provided callback. Also carries the class-level monkey-patch of `TelegramPlatform` (`send_form` + form callback routing — no edits to `telegram.py`). |
+| `install.py` | Idempotent installer: copies the two `tools/` files plus `u1_form_telegram.py` (the L1 renderer this patch's `send_form` calls) into Hermes' `tools/`, applies the single anchor-based `gateway/run.py` edit (`agent.form_callback = …`), verifies imports. `--dry-run` and `--uninstall` supported. |
+
+The L1 renderer `u1_form_telegram.py` is **single-sourced** from the sibling
+[`adapters/telegram/`](../telegram/) directory — this tree keeps no copy.
+`install.py` reads it from `../telegram/u1_form_telegram.py` at install time,
+so run the installer from a full checkout of the toolkit repo (not from a
+copied-out `hermes/` directory alone).
 
 ## Status
 
 - ✅ `tools/form_gateway.py` — written, mirrors clarify_gateway in pattern + thread safety.
 - ✅ `tools/form_tool.py` — written, registers via Hermes' tool registry.
-- ⏳ Telegram adapter `send_form` + callback routing — the next file.
-- ⏳ `gateway/run.py` wiring (`agent.form_callback`) — the next edit.
-- ⏳ `install.py` — applies the above to a target Hermes install.
+- ✅ Telegram adapter `send_form` + callback routing — class-level monkey-patch inside `tools/form_tool.py` (a separate `patches/` directory was never needed).
+- ✅ `gateway/run.py` wiring (`agent.form_callback`) — applied by `install.py` (anchor-based, marker-guarded, backup + restore on `--uninstall`).
+- ✅ `install.py` — applies the above to a target Hermes install.
 - ⏳ Live verification in Brent's chat.
+- ⏳ Upstream: the `form_schema` event is not yet emitted by `u1_kit_workflow` (see `adapters/README.md`); this patch is a reference implementation ahead of that wiring.
 
 ## Why this shape
 

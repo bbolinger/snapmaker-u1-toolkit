@@ -309,6 +309,26 @@ These fire from `scripts/u1_print_start_gate.py` and have no workflow twin — t
 
 Stage 2 emits exactly ONE of: `print_started` (success), or a `*_failed` / `*_invalid` / `*_blocked` row (refusal). Stage 1 emits exactly ONE of `stage1_photo_captured` (success) or `stage1_photo_failed` (camera problem).
 
+### Pre-start grace period (Stage 2, v2.1.0)
+
+After every safety check passes and BEFORE the HTTP call to the printer,
+Stage 2 opens a cancel window (default 120s; `U1_GRACE_PERIOD_SECONDS=0` or
+`--grace-seconds 0` disables). All rows land in `audit.jsonl`:
+
+| Event | Fires when | `details` fields |
+|---|---|---|
+| `event: "pre_start_grace_period_started"` | Window opens | `grace_seconds`, `cancel_marker` |
+| `event: "pre_start_grace_notify_sent"` | `$U1_GRACE_NOTIFY_CMD` exited 0 | `exit_code`, `stderr_tail` |
+| `event: "pre_start_grace_notify_failed"` | Notify command failed/timed out (window still runs) | `exit_code`, `stderr_tail` |
+| `event: "pre_start_grace_cancelled"` | Cancel marker appeared — no HTTP call. Checked every second, again after the final tick, and once more immediately before the start call | `cancel_marker`, `cancelled_after_wait_s` |
+| `event: "pre_start_grace_period_expired"` | Window closed with no cancel → proceeding to start | `grace_seconds`, `proceeded_to_start` |
+| `event: "gate_operator_unknown"` | Stage ran with no operator identity set (`unknown:gate`) — allowed, loudly audited | `note` |
+| `event: "gate_refused_test_operator"` | Fence 1: operator has a test-flavored prefix (`smoke:` / `test:` / `dry:` / `mock:` / `fixture:`) — refused before any Moonraker call | `prefix_match` |
+
+A grace-cancel refusal payload carries a `recovery` block (`instruction` +
+`stage1_command`): the slice and upload are still valid, so the cheap path
+back is a fresh Stage 1 (new photo + new yes), not a workflow re-run.
+
 ---
 
 ## Twin-pair table (quick cross-reference)
@@ -351,8 +371,12 @@ Emitted by the kit path. A zip with >1 STL is auto-detected; the single workflow
 emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
 
 - `kit_detected` — from `u1_slice_workflow.py` when the input zip holds multiple
-  STLs. Fields: `reason`, `command` (the `u1_kit_workflow.py` invocation to run),
-  `instruction`. The agent tool-calls `command`.
+  STLs. Fields: `reason`, `command` (the `u1_kit_workflow.py` invocation to run;
+  carries an explicit `--operator` / non-default `--nozzle` from the invoking
+  CLI), `instruction`. The agent tool-calls `command`.
+- `kit_detection_failed` — from `u1_slice_workflow.py` when a `.zip` input
+  could not be inspected for multiple STLs. Fields: `error`, `instruction`.
+  The single-STL flow does NOT proceed (it would slice only the first model).
 - `kit_ingested` — `request_id`, `part_count`, `multi`, `oversized_part_ids`.
 - `need_input` with `key: "kit_form"` — the consolidated decision form.
   Fields: `form` (numbered text to show the operator), `next_command` (carries
@@ -362,7 +386,9 @@ emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
   `errors[]` + `form` (re-prompt).
 - `kit_slicing` → `kit_sliced` (`plate_count`) → `kit_uploaded` (`plates[]`,
   `live`). `kit_slice_failed` (`error`, `instruction`) if Orca refuses (e.g. an
-  oversized part).
+  oversized part). `kit_upload_failed` (`failures[]`, `instruction`) when one
+  or more plates did NOT land on the printer (rc 2/4/5) — request phase moves
+  to `upload_failed`; nothing claims success.
 - `kit_readiness_card` — the kit equivalent of `readiness_card`. Fields:
   `part_count`, `selected_parts[]`, `plate_count`, `plates[]`
   (`plate_idx`, `printer_storage_filename`, `gcode_hash`), `tool`, `material`,
@@ -373,7 +399,18 @@ emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
   command for plate 1.
 
 **Audit twins:** `kit_ingested`, `kit_sliced`, `kit_readiness_card_emitted`,
-`kit_slice_failed` (`event:` vocabulary, in `audit.jsonl`).
+`kit_slice_failed`, `kit_upload_failed`, `post_confirm_flags_backfilled`,
+`stage1_token_adopted_from_sidecar` (`event:` vocabulary, in `audit.jsonl`).
+
+### Form-protocol events (EXPERIMENTAL — not yet emitted)
+
+`u1_form.build_form_schema()` and the `adapters/` renderers (Telegram
+buttons, Discord, Hermes form_tool) implement a declarative `form_schema`
+consumed via `--form-answers-json`. The workflow does **not yet emit** a
+`form_schema`-bearing event — `--interaction-mode form` is parsed but
+unwired. The staged text flow above is the production path. Treat any
+`form_schema` field you see as experimental until this section says
+otherwise.
 
 ---
 

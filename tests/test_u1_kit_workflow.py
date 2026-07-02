@@ -7,6 +7,7 @@ against the real binary is done separately in hermes-agent-stack.
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -317,3 +318,204 @@ def test_form_answers_json_invalid_rejected(tmp_path, fake_profiles, fake_slice_
     assert res["phase"] == "form_rejected"
     assert any("invalid --form-answers-json" in e for e in res["errors"])
 
+
+
+# --------------------------------------------------------------------------- #
+# Fence stickiness: explicit CLI operator must ride every emitted command
+# --------------------------------------------------------------------------- #
+
+def _stdout_events(capsys):
+    evs = []
+    for line in capsys.readouterr().out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                evs.append(json.loads(line))
+            except Exception:
+                pass
+    return evs
+
+
+def _emitted_commands(evs):
+    cmds = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("next_command", "command", "yes_command") and isinstance(v, str):
+                    cmds.append(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for item in o:
+                walk(item)
+
+    walk(evs)
+    return cmds
+
+
+def test_explicit_cli_operator_sticky_in_every_emitted_command(tmp_path, fake_profiles, capsys):
+    # 2026-07-01 incident class: a smoke:* operator dropped out of one
+    # next_command, the agent copied it verbatim, and the chain resolved to
+    # the production env operator — Fence 1 passed and a real print fired.
+    # Every kit-workflow command emitted under an explicit operator must
+    # carry it.
+    kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3), operator="smoke:sticky"))
+    cmds = [c for c in _emitted_commands(_stdout_events(capsys))
+            if "u1_kit_workflow.py" in c]
+    assert cmds, "expected at least one emitted kit-workflow command"
+    for c in cmds:
+        assert "--operator smoke:sticky" in c, c
+
+
+def test_env_resolved_operator_is_not_baked_into_commands(tmp_path, fake_profiles, capsys, monkeypatch):
+    # Replay-safety (v2.0.0 decision): identity that came from U1_OPERATOR
+    # env resolves at execution time; it is NOT frozen into commands.
+    monkeypatch.setenv("U1_OPERATOR", "telegram:someone")
+    kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3), operator=None))
+    cmds = [c for c in _emitted_commands(_stdout_events(capsys))
+            if "u1_kit_workflow.py" in c]
+    assert cmds
+    for c in cmds:
+        assert "--operator" not in c, c
+
+
+# --------------------------------------------------------------------------- #
+# v2.1.0-rc2 state-machine fixes: collision, backfill, upload honesty, sidecar
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def recording_upload(monkeypatch):
+    """Like fake_slice_upload's uploader but records on_collision per call
+    and lets tests script per-call results."""
+    calls = {"uploads": [], "result": None}
+
+    def fake_upload(gcode, on_collision=None, material=None):
+        calls["uploads"].append({"name": Path(gcode).name,
+                                 "on_collision": on_collision})
+        if calls["result"]:
+            return dict(calls["result"], uploaded_filename=Path(gcode).name)
+        return {"uploaded_filename": Path(gcode).name,
+                "moonraker_upload_ok": True, "returncode": 0}
+
+    monkeypatch.setattr(kw, "_real_upload", fake_upload)
+    return calls
+
+
+def _fake_arrange(monkeypatch, n_plates=1):
+    def fake_arrange(paths, out_dir, *, tool, material, profile, nozzle,
+                     auto_orient, allow_rotations, process_path_override=None):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plates = []
+        for i in range(1, n_plates + 1):
+            g = out_dir / f"plate_{i}.gcode"
+            g.write_text(f"; plate {i}\nT0\nG1 X10 Y10 E1\n")
+            plates.append({"plate_idx": i, "gcode_path": str(g),
+                           "gcode_hash": f"sha256:plate{i}", "metadata": {}})
+        return {"plate_count": n_plates, "plates": plates, "cmd": ["orca"]}
+
+    monkeypatch.setattr(kw.u1_arrange, "arrange_slice", fake_arrange)
+    monkeypatch.setattr(kw, "profile_path", lambda slug: Path("/tmp/process.json"))
+    monkeypatch.setattr(kw, "apply_supports_override",
+                        lambda p, en, od: Path("/tmp/process_ovr.json"))
+
+
+def test_reupload_of_own_plate_defaults_to_overwrite(tmp_path, fake_profiles,
+                                                     recording_upload, monkeypatch):
+    # adjust -> re-confirm re-slices to the SAME deterministic plate name.
+    # First upload: no collision default. Second (same request): overwrite —
+    # rc=5 previously dead-ended the advertised adjust option.
+    _fake_arrange(monkeypatch)
+    zp = _kit_zip(tmp_path, 2)
+    ans = "all | T0 | PLA | profile 1 | no-supports | start"
+    r1 = kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
+    rid = r1["request_id"]
+    assert recording_upload["uploads"][0]["on_collision"] is None
+    kw.run_kit_workflow(_args(zp, request_id=rid, form_answers=ans,
+                              live_upload=True))
+    assert recording_upload["uploads"][1]["on_collision"] == "overwrite"
+
+
+def test_legacy_upload_failure_does_not_claim_uploaded(tmp_path, fake_profiles,
+                                                       recording_upload, monkeypatch):
+    # A dead Moonraker (rc=4) previously still emitted kit_uploaded and
+    # phase=complete "all plates on the printer".
+    _fake_arrange(monkeypatch)
+    recording_upload["result"] = {"moonraker_upload_ok": False, "returncode": 4}
+    res = kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 2), live_upload=True,
+        form_answers="all | T0 | PLA | profile 1 | no-supports | upload-only"))
+    assert res["phase"] == "upload_failed"
+    assert res["failures"]
+
+
+def test_post_confirm_action_backfills_from_persisted_state(tmp_path, fake_profiles,
+                                                            recording_upload, monkeypatch):
+    # A post-confirm --action with missing turn flags must resume from
+    # persisted state, NOT fall back into the staged Q&A (which re-slices).
+    _fake_arrange(monkeypatch)
+    import u1_request
+    zp = _kit_zip(tmp_path, 2)
+    ans = "all | T0 | PLA | profile 1 | no-supports | start"
+    r1 = kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
+    rid = r1["request_id"]
+    # persisted confirm state exists; now invoke with ONLY the action flag
+    res = kw.run_kit_workflow(_args(zp, request_id=rid, action="start"))
+    assert res["phase"] not in ("awaiting_parts", "awaiting_orient",
+                                "awaiting_tool", "awaiting_preset",
+                                "awaiting_supports"), res
+    # no second slice happened: staged Q&A fallback would have re-sliced
+    st = u1_request.read_request(rid) or {}
+    assert st.get("phase") != "kit_analysis"
+
+
+def test_action_start_adopts_stage1_sidecar_token(tmp_path, fake_profiles, monkeypatch):
+    # Legacy loop-closer: confirm never persisted a token (bed capture
+    # failed), operator ran the emitted Stage 1 command which wrote the
+    # sidecar. --action start must adopt it and proceed to the yes/no
+    # prompt instead of re-emitting Stage 1 forever.
+    import json as _json
+    import u1_request
+    rid = "u1_2026_0701_a1b2c3"
+    u1_request.write_request(
+        rid, phase="awaiting_start_approval",
+        printer_storage_filename="kit_plate1.gcode",
+        tool="T0", material="PLA",
+        plates=[{"plate_idx": 1, "gcode_hash": "sha256:x",
+                 "printer_storage_filename": "kit_plate1.gcode"}],
+        start_gate_stage1_command="python3 gate.py kit_plate1.gcode",
+        safety={"approval_token": None})
+    rd = u1_request.request_dir(rid)
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "bed_snapshot.approval_token.json").write_text(
+        _json.dumps({"token": "sidecartoken123", "timestamp_utc": "2026-07-01T00:00:00Z"}))
+    res = kw._action_start(None, rid, False, yes_command="echo yes",
+                           operator="test:unit")
+    assert res["phase"] == "awaiting_bed_clear_start", res
+    st = u1_request.read_request(rid)
+    assert st["safety"]["approval_token"] == "sidecartoken123"
+
+
+def test_garbage_stl_in_zip_emits_kit_rejected_not_traceback(tmp_path, fake_profiles, capsys):
+    # A .stl entry full of garbage used to escape as a raw ValueError
+    # traceback from build_kit. It must be a clean kit_rejected event.
+    import zipfile as _zf
+    zp = tmp_path / "bad.zip"
+    with _zf.ZipFile(zp, "w") as z:
+        z.writestr("a.stl", "this is not an stl at all")
+        z.writestr("b.stl", "neither is this")
+    res = kw.run_kit_workflow(_args(zp))
+    assert res["phase"] == "kit_rejected"
+    stages = [e.get("stage") for e in _stdout_events(capsys)]
+    assert "kit_rejected" in stages
+
+
+def test_over_limit_zip_emits_kit_rejected(tmp_path, fake_profiles, capsys, monkeypatch):
+    import u1_kit as _uk
+    monkeypatch.setattr(_uk, "MAX_KIT_PARTS", 2)
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3)))
+    assert res["phase"] == "kit_rejected"
+    evs = _stdout_events(capsys)
+    rej = next(e for e in evs if e.get("stage") == "kit_rejected")
+    assert "limit is 2" in rej["error"]

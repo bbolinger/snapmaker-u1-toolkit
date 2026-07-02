@@ -23,7 +23,10 @@ Field grammar (all order-independent, ``|`` / ``;`` / newline separated):
   - material : a token from the offered materials      (REQUIRED)
   - profile  : ``profile N`` / ``preset N`` / bare ``N`` (1-based index), or a
                profile name substring                  (REQUIRED)
-  - supports : ``supports`` | ``no-supports`` | ``overhangs`` (default: no-supports)
+  - supports : ``supports`` | ``no-supports`` (default: no-supports).
+               ``overhangs`` is recognized but rejected as not-offered —
+               enable_support is binary in the profile patch; a distinct
+               overhangs-only mode is not implemented (do not offer it).
   - action   : ``start`` | ``upload-only``             (default: start; nothing
                physically starts without the separate Stage-1 photo + yes)
 
@@ -33,7 +36,7 @@ Spec shape (assembled by the workflow from analysis):
     'tools':     ['T0', 'T1', ...],
     'materials': ['PLA', 'PETG', ...],
     'profiles':  [{'idx': 1, 'label': '0.20 Standard ...'}, ...],
-    'supports':  ['supports', 'no-supports', 'overhangs'],
+    'supports':  ['supports', 'no-supports'],
     'actions':   ['start', 'upload-only'],
   }
 """
@@ -44,7 +47,7 @@ from typing import Any
 
 REQUIRED_FIELDS = ("tool", "material", "profile")
 
-_ORIENT_AUTO = {"auto", "auto-orient", "autoorient", "orient"}
+_ORIENT_AUTO = {"auto", "auto-orient", "autoorient"}
 _ORIENT_ASIS = {"as-authored", "asauthored", "as authored", "authored", "as-is", "asis"}
 _SUPPORTS = {
     "supports": "supports",
@@ -82,8 +85,25 @@ def _split_fields(line: str) -> list[str]:
     return [t.strip() for t in raw if t.strip()]
 
 
+def _set(values: dict, key: str, val: Any, errors: list, tok: str) -> None:
+    """Conflict-checked field assignment. The same field given twice with the
+    SAME value is harmless repetition; a different value is a conflict and
+    must fail loudly — silent last-wins is how a relayed correction-plus-
+    original picks the wrong one."""
+    if key in values and values[key] != val:
+        errors.append(
+            f"{key} given twice with different values "
+            f"({values[key]!r} then {tok!r}) — send one value per field"
+        )
+        return
+    values[key] = val
+
+
 def _expand_selection(text: str, n_parts: int) -> tuple[list[int] | None, str | None]:
-    """Expand a selection token to 1-based indices. Returns (indices, error)."""
+    """Expand a selection token to 1-based indices. Returns (indices, error).
+
+    Bounds are validated BEFORE expansion — `parts 1-30000000` must be a
+    cheap error, not a multi-hundred-MB set + error string."""
     text = text.strip().lower()
     if text in ("all", "*", "everything"):
         return list(range(1, n_parts + 1)), None
@@ -100,14 +120,16 @@ def _expand_selection(text: str, n_parts: int) -> tuple[list[int] | None, str | 
             lo, hi = int(m.group(1)), int(m.group(2))
             if lo > hi:
                 lo, hi = hi, lo
+            if lo < 1 or hi > n_parts:
+                return None, f"part range {atom!r} out of range 1-{n_parts}"
             picked.update(range(lo, hi + 1))
         elif atom.isdigit():
-            picked.add(int(atom))
+            idx = int(atom)
+            if idx < 1 or idx > n_parts:
+                return None, f"part number out of range 1-{n_parts}: {idx}"
+            picked.add(idx)
         else:
             return None, f"bad part token {atom!r}"
-    bad = [i for i in picked if i < 1 or i > n_parts]
-    if bad:
-        return None, f"part number(s) out of range 1-{n_parts}: {sorted(bad)}"
     if not picked:
         return None, "no parts selected"
     return sorted(picked), None
@@ -127,7 +149,7 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
     profiles = spec.get("profiles", [])
     parts = spec.get("parts", [])
     n_parts = len(parts)
-    supports_allowed = set(spec.get("supports", ["supports", "no-supports", "overhangs"]))
+    supports_allowed = set(spec.get("supports", ["supports", "no-supports"]))
     actions_allowed = set(spec.get("actions", ["start", "upload-only"]))
 
     values: dict[str, Any] = {}
@@ -139,10 +161,10 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
 
         # orient
         if low in _ORIENT_AUTO:
-            values["orient"] = "auto"
+            _set(values, "orient", "auto", errors, tok)
             continue
         if low in _ORIENT_ASIS:
-            values["orient"] = "as-authored"
+            _set(values, "orient", "as-authored", errors, tok)
             continue
 
         # supports
@@ -151,7 +173,7 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             if mapped not in supports_allowed:
                 errors.append(f"supports option {mapped!r} not offered")
             else:
-                values["supports"] = mapped
+                _set(values, "supports", mapped, errors, tok)
             continue
 
         # action
@@ -160,7 +182,7 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             if mapped not in actions_allowed:
                 errors.append(f"action {mapped!r} not offered")
             else:
-                values["action"] = mapped
+                _set(values, "action", mapped, errors, tok)
             continue
 
         # tool (T0..T3)
@@ -170,13 +192,13 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             if tools and tool not in tools:
                 errors.append(f"tool {tool} not offered (have {', '.join(tools)})")
             else:
-                values["tool"] = tool
+                _set(values, "tool", tool, errors, tok)
             continue
 
         # bare selection keyword: "all" / "*" / "everything"
         if low in ("all", "*", "everything"):
             if n_parts:
-                values["parts"] = list(range(1, n_parts + 1))
+                _set(values, "parts", list(range(1, n_parts + 1)), errors, tok)
             # single-part job: 'all' is harmless and means the one part — consume it
             continue
 
@@ -190,23 +212,32 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
                 if err:
                     errors.append(err)
                 else:
-                    values["parts"] = idxs
+                    _set(values, "parts", idxs, errors, tok)
             continue
 
         # explicit profile prefix: "profile 2" / "preset slug"
         mpr = _PROFILE_PREFIX_RE.match(tok)
         if mpr:
-            _assign_profile(mpr.group(1).strip(), profiles, values, errors)
+            _assign_profile(mpr.group(1).strip(), profiles, values, errors, tok=tok)
             continue
 
         # bare material token
         if low in materials_lower:
-            values["material"] = materials_lower[low]
+            _set(values, "material", materials_lower[low], errors, tok)
             continue
 
-        # bare integer -> profile index (NOT a part list; lists carry , or -)
+        # bare integer: on a single-part job it can only mean a profile index.
+        # On a multi-part kit it's genuinely ambiguous — the staged flow reads
+        # "3" as part 3, so silently reading it as PROFILE 3 here would print
+        # ALL parts at a different profile. Ambiguity fails loudly.
         if _INT_RE.match(tok):
-            _assign_profile(tok, profiles, values, errors)
+            if n_parts:
+                errors.append(
+                    f"bare number {tok!r} is ambiguous on a kit (part or "
+                    f"profile?) — say 'profile {tok}' or 'parts {tok}'"
+                )
+            else:
+                _assign_profile(tok, profiles, values, errors, tok=tok)
             continue
 
         # multi-number list/range with no prefix -> part selection
@@ -215,11 +246,21 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             if err:
                 errors.append(err)
             else:
-                values["parts"] = idxs
+                _set(values, "parts", idxs, errors, tok)
+            continue
+
+        # material-looking token that isn't offered: fail loudly as a material
+        # problem. Without this, a mistyped/unoffered material (e.g. "PETG"
+        # when only PLA is loaded) falls through to the profile-substring
+        # matcher and silently becomes a PROFILE choice ("0.20 PETG Strong").
+        if _looks_like_material(low, materials):
+            errors.append(
+                f"material {tok!r} not offered (have {', '.join(materials) or 'none'})"
+            )
             continue
 
         # profile name substring (last resort, before giving up)
-        if _match_profile_name(tok, profiles, values):
+        if _match_profile_name(tok, profiles, values, errors, tok=tok):
             continue
 
         unrecognized.append(tok)
@@ -235,14 +276,21 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
     partially-parsed decision set; mutated in place with defaults.
     """
     n_parts = len(spec.get("parts", []))
-    supports_allowed = set(spec.get("supports", ["supports", "no-supports", "overhangs"]))
+    supports_allowed = set(spec.get("supports", ["supports", "no-supports"]))
     actions_allowed = set(spec.get("actions", ["start", "upload-only"]))
 
+    # Defaults fall back to the FIRST OFFERED option (spec list order) so a
+    # spec without the standard default gets a deterministic one, not
+    # whatever a set iterator yields this run.
+    supports_offered = list(spec.get("supports", ["supports", "no-supports"]))
+    actions_offered = list(spec.get("actions", ["start", "upload-only"]))
     values.setdefault("orient", "as-authored")
     if n_parts:
         values.setdefault("parts", list(range(1, n_parts + 1)))
-    values.setdefault("supports", "no-supports" if "no-supports" in supports_allowed else next(iter(supports_allowed)))
-    values.setdefault("action", "start" if "start" in actions_allowed else next(iter(actions_allowed)))
+    values.setdefault("supports", "no-supports" if "no-supports" in supports_allowed
+                      else (supports_offered[0] if supports_offered else "no-supports"))
+    values.setdefault("action", "start" if "start" in actions_allowed
+                      else (actions_offered[0] if actions_offered else "start"))
 
     for f in REQUIRED_FIELDS:
         if f not in values:
@@ -255,22 +303,52 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
             "unrecognized": unrecognized or []}
 
 
-def _assign_profile(text: str, profiles: list, values: dict, errors: list) -> None:
+# Common filament family names. A bare token that leads with one of these is
+# operator material intent — it must never silently become a profile match.
+_MATERIAL_FAMILIES = {
+    "pla", "petg", "pet", "pctg", "abs", "asa", "tpu", "tpe", "pc", "pa",
+    "nylon", "pva", "hips", "ppa", "pp",
+}
+
+
+def _looks_like_material(low: str, materials: list[str]) -> bool:
+    """Whether an (unmatched) bare token reads as a material name — either a
+    known filament family or related by substring to an offered material."""
+    lead = re.split(r"[^a-z]", low, 1)[0]
+    if lead in _MATERIAL_FAMILIES:
+        return True
+    for m in materials:
+        ml = m.lower()
+        if ml and (low in ml or ml in low):
+            return True
+    return False
+
+
+def _assign_profile(text: str, profiles: list, values: dict, errors: list,
+                    *, tok: str | None = None) -> None:
     """Resolve a profile token (index or name) into values['profile']."""
     text = text.strip()
+    tok = tok if tok is not None else text
     if _INT_RE.match(text):
         idx = int(text)
         valid = {int(p.get("idx", i + 1)) for i, p in enumerate(profiles)}
         if profiles and idx not in valid:
             errors.append(f"profile index {idx} out of range 1-{len(profiles)}")
             return
-        values["profile"] = {"idx": idx}
+        label = None
+        for i, p in enumerate(profiles):
+            if int(p.get("idx", i + 1)) == idx:
+                label = p.get("label")
+                break
+        prof = {"idx": idx, "label": label} if label else {"idx": idx}
+        _set(values, "profile", prof, errors, tok)
         return
-    if not _match_profile_name(text, profiles, values):
+    if not _match_profile_name(text, profiles, values, errors, tok=tok):
         errors.append(f"profile {text!r} not found in the offered list")
 
 
-def _match_profile_name(text: str, profiles: list, values: dict) -> bool:
+def _match_profile_name(text: str, profiles: list, values: dict,
+                        errors: list, *, tok: str | None = None) -> bool:
     """Substring (case-insensitive) match against profile labels. Returns hit."""
     low = text.strip().lower()
     if not low or not profiles:
@@ -278,9 +356,22 @@ def _match_profile_name(text: str, profiles: list, values: dict) -> bool:
     hits = [p for p in profiles if low in str(p.get("label", "")).lower()]
     if len(hits) == 1:
         p = hits[0]
-        values["profile"] = {"idx": int(p.get("idx", profiles.index(p) + 1)), "label": p.get("label")}
+        prof = {"idx": int(p.get("idx", profiles.index(p) + 1)), "label": p.get("label")}
+        _set(values, "profile", prof, errors, tok if tok is not None else text)
         return True
     return False
+
+
+def _clean_label(label: Any, max_len: int = 96) -> str:
+    """Sanitize an operator-facing label. Part labels come from zip entry
+    names — a filename containing `|`, `;`, or newlines could otherwise
+    inject fake form lines (a spoofed ACTION: row) into the text the
+    operator reads and the answer grammar splits on."""
+    text = str(label)
+    text = re.sub(r"[|;\r\n\t]+", " ", text)
+    text = "".join(ch for ch in text if ch.isprintable())
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text[:max_len] if len(text) > max_len else text
 
 
 def build_form(spec: dict[str, Any]) -> str:
@@ -290,7 +381,7 @@ def build_form(spec: dict[str, Any]) -> str:
     if parts:
         lines.append(f"PARTS ({len(parts)}) — `all` or e.g. `parts 1,3,5` / `parts 1-{len(parts)}`:")
         for i, p in enumerate(parts, 1):
-            lines.append(f"  {i}. {p.get('label', p.get('id'))}")
+            lines.append(f"  {i}. {_clean_label(p.get('label', p.get('id')))}")
     lines.append("ORIENT: `as-authored` (default) | `auto`")
     tools = spec.get("tools", [])
     if tools:
@@ -302,7 +393,7 @@ def build_form(spec: dict[str, Any]) -> str:
     if profiles:
         lines.append("PROFILE (`profile N`):")
         for p in profiles:
-            lines.append(f"  {p.get('idx')}. {p.get('label')}")
+            lines.append(f"  {p.get('idx')}. {_clean_label(p.get('label'))}")
     lines.append("SUPPORTS: " + " | ".join(spec.get("supports", ["no-supports"])))
     lines.append("ACTION: " + " | ".join(spec.get("actions", ["start", "upload-only"])))
     lines.append("")
@@ -328,7 +419,7 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     if parts:
         fields.append({
             "id": "parts", "type": "multi_select", "label": "Parts",
-            "options": [{"id": p["id"], "label": p.get("label", p["id"])} for p in parts],
+            "options": [{"id": p["id"], "label": _clean_label(p.get("label", p["id"]))} for p in parts],
             "default": "all", "required": False,
         })
     fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
@@ -344,10 +435,10 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     profiles = spec.get("profiles", [])
     if profiles:
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
-                       "options": [{"id": p.get("idx"), "label": p.get("label")} for p in profiles],
+                       "options": [{"id": p.get("idx"), "label": _clean_label(p.get("label"))} for p in profiles],
                        "required": True})
     fields.append({"id": "supports", "type": "single_select", "label": "Supports",
-                   "options": list(spec.get("supports", ["supports", "no-supports", "overhangs"])),
+                   "options": list(spec.get("supports", ["supports", "no-supports"])),
                    "default": "no-supports"})
     fields.append({"id": "action", "type": "single_select", "label": "Action",
                    "options": list(spec.get("actions", ["start", "upload-only"])), "default": "start"})
@@ -381,7 +472,7 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
     tools = [str(t).upper() for t in spec.get("tools", [])]
     materials = {str(m).lower(): str(m) for m in spec.get("materials", [])}
     profiles = spec.get("profiles", [])
-    supports_allowed = set(spec.get("supports", ["supports", "no-supports", "overhangs"]))
+    supports_allowed = set(spec.get("supports", ["supports", "no-supports"]))
     actions_allowed = set(spec.get("actions", ["start", "upload-only"]))
 
     values: dict[str, Any] = {}

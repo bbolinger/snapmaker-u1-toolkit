@@ -234,9 +234,17 @@ def _install_telegram_form_patch() -> None:
     async def _u1_handle_form_callback(self, update, ctx) -> None:
         q = update.callback_query
         data = q.data or ""
-        # Find the form by message_id (per chat, a message hosts at most one form).
+        msg = q.message
+        if msg is None:  # old/inaccessible callback — Telegram may omit message
+            await q.answer("Stale form")
+            return
+        # Find the form by (chat_id, message_id). Telegram message_ids are
+        # per-chat counters, so message_id alone can collide across two
+        # concurrent forms in different chats.
         st = _form_state(self)
-        slot = next((s for s in st.values() if s["msg_id"] == q.message.message_id), None)
+        slot = next((s for s in st.values()
+                     if s["chat_id"] == msg.chat_id and s["msg_id"] == msg.message_id),
+                    None)
         if slot is None:
             await q.answer("Stale form")
             return
@@ -258,16 +266,25 @@ def _install_telegram_form_patch() -> None:
                 pass
             return
         if kind == "submit":
+            resolved = False
             try:
                 from tools import form_gateway as _fmod  # type: ignore
                 form_id = next((fid for fid, s in st.items() if s is slot), None)
                 if form_id:
-                    _fmod.resolve_gateway_form(form_id, ev["answer"])
+                    # False ⇒ the gateway entry is gone (agent's wait timed
+                    # out and popped it) — nothing will run, so don't claim
+                    # success. Drop the stale slot either way.
+                    resolved = bool(_fmod.resolve_gateway_form(form_id, ev["answer"]))
                     st.pop(form_id, None)
             except Exception as exc:
                 _logger.warning("u1 form: resolve failed: %s", exc)
             try:
-                await q.edit_message_text("✅ Submitted — slicing in the background.")
+                if resolved:
+                    await q.edit_message_text("✅ Submitted — slicing in the background.")
+                else:
+                    await q.edit_message_text(
+                        "⚠ This form expired — the agent stopped waiting for it. "
+                        "Nothing was submitted; please re-send the request.")
             except Exception:
                 pass
             return
@@ -296,12 +313,17 @@ def _install_telegram_form_patch() -> None:
 
     async def _wrapped_cb(self, update, ctx):
         data = (update.callback_query.data if update and update.callback_query else "") or ""
-        # Only treat as form callback when the message_id matches a form slot we
-        # own — keeps us from snatching the four chars Hermes' OWN handlers
-        # might also use (defensive; Hermes uses prefixes like "cl:" / "ea:").
+        # Only treat as form callback when (chat_id, message_id) matches a form
+        # slot we own — keeps us from snatching the four chars Hermes' OWN
+        # handlers might also use (defensive; Hermes uses prefixes like "cl:" /
+        # "ea:"), and keeps concurrent forms in different chats apart (Telegram
+        # message_ids are only unique per chat). `message` can be None on old
+        # callbacks — guard before dereferencing.
         st = _form_state(self)
-        owns = update.callback_query and any(
-            s["msg_id"] == update.callback_query.message.message_id for s in st.values()
+        msg = update.callback_query.message if update and update.callback_query else None
+        owns = msg is not None and any(
+            s["chat_id"] == msg.chat_id and s["msg_id"] == msg.message_id
+            for s in st.values()
         )
         if _looks_like_form_cb(data) and owns:
             return await _u1_handle_form_callback(self, update, ctx)
