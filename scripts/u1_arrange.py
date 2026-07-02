@@ -83,10 +83,19 @@ _TARGET_PLATE_FILL = 0.50
 # the printer's physical print-area clipping behavior on the U1 firmware.
 _BRIM_SLOP_MM = 3.0
 
+# The one nonzero Orca rc we tolerate when a plate file was still written:
+# bed-overflow ("return -102"), verified 2026-07-01 with the 8-part angles kit.
+_ORCA_OVERFLOW_RC = 154
+
 
 class BedOverflowError(RuntimeError):
     """Raised when a sliced plate exceeds the bed dimensions even after
     manual partitioning (e.g. a single part is too big for the bed)."""
+
+
+class MultipleInternalPlatesError(RuntimeError):
+    """Raised when one Orca invocation writes >1 plate_*.gcode internally —
+    we don't trust Orca's internal split; the caller partitions manually."""
 
 
 def _gcode_extrusion_xy_extent(path: Path) -> dict[str, float] | None:
@@ -372,11 +381,13 @@ def _run_orca_one_plate(
         # overflowing arrangement. Verified 2026-07-01 smoke test with the
         # 8-part angles kit: plain --slice 0 rc=154 + 17MB gcode on disk.
         # The 2026-06-30 audit's manual partitioner is designed for exactly
-        # this case, but only ran when Orca returned rc=0 with an overflow.
-        # When a plate WAS written despite the non-zero rc, treat as
-        # overflow warning and let the caller (arrange_slice) validate
-        # extent + partition manually.
-        if not plates_found:
+        # this case: let the caller (arrange_slice) validate extent +
+        # partition manually. That tolerance is ONLY for the verified
+        # overflow rc — any other nonzero rc (crash, per-object slice
+        # failure) must raise even if a plate file exists, because a
+        # truncated plate that happens to sit within bed extent would
+        # otherwise be hashed and uploaded as a successful slice.
+        if proc.returncode != _ORCA_OVERFLOW_RC or not plates_found:
             tail = (proc.stdout or "")[-4000:]
             raise RuntimeError(f"Orca arrange-slice failed rc={proc.returncode}: {tail}")
     if not plates_found:
@@ -387,7 +398,7 @@ def _run_orca_one_plate(
         # split (audit 2026-06-30 caught the opposite case), so when we see
         # this we keep the first one and raise — the manual partitioner will
         # re-run with a smaller part list.
-        raise RuntimeError(
+        raise MultipleInternalPlatesError(
             f"Orca produced {len(plates_found)} plates internally; "
             "this code expects exactly one plate per invocation. Caller "
             "should partition the part list."
@@ -464,6 +475,14 @@ def arrange_slice(
         if src_gcode.stat().st_size == 0:
             raise RuntimeError(f"empty plate gcode: {src_gcode.name}")
         extent = _gcode_extrusion_xy_extent(src_gcode)
+        if extent is None:
+            # Not an overflow — a plate with zero extrusion moves is a bad
+            # slice (truncated/empty output), and calling it "overflow"
+            # sends the operator chasing part sizes.
+            raise RuntimeError(
+                f"plate {plate_idx} gcode has no extrusion moves — bad or "
+                f"truncated slice output (gcode at {src_gcode})"
+            )
         ok, reason = _extent_within_bed(extent, bed_mm, bed_margin_mm)
         if not ok:
             raise BedOverflowError(
@@ -489,14 +508,11 @@ def arrange_slice(
             orca_bin=orca_bin, auto_orient=auto_orient,
             allow_rotations=allow_rotations, runner=runner,
         )
-    except RuntimeError as exc:
+    except MultipleInternalPlatesError:
         # Orca produced multiple plates internally — we don't trust that
         # behavior post-audit; fall to manual split.
-        if "produced" in str(exc).lower() and "plates internally" in str(exc):
-            single_path = None
-            single_cmd = []
-        else:
-            raise
+        single_path = None
+        single_cmd = []
 
     if single_path is not None:
         extent = _gcode_extrusion_xy_extent(single_path)
