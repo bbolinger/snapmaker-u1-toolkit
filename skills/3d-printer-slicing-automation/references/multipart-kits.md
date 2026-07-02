@@ -21,11 +21,12 @@ action).
   `next_command` (it carries `--form-answers-from=<form_id>`) VERBATIM.
   Never read, restate, or reconstruct the answers — you never had them.
 - **Form timeout/failure fallback:** if the form tool returns `_timeout`,
-  `cancelled`, or an error, fall back to the STAGED text flow — re-show the
-  numbered `form` text and collect ONE `--form-answers` line, exactly as in
-  text mode. NEVER dump every field as separate free-text questions in one
-  message; the staged/form structure exists so the operator is not asked
-  for word-vomit.
+  `cancelled`, or an error, re-run the SAME `u1_kit_workflow.py` command
+  with `--interaction-mode text` appended — the workflow then drives the
+  staged one-question-per-turn flow (parts → orient → tool → material →
+  profile → confirm). NEVER paste the event's `form`/`text_fallback` block
+  into the chat as a single message, and never ask every field at once —
+  the operator gets ONE question per turn, always.
 - The operator answers all fields at once in any order, e.g.:
   `parts 1,3 | auto | T0 | PLA | profile 2 | no-supports | start`
   - `parts`: `all`, or `1,3,5`, or a range `1-4`
