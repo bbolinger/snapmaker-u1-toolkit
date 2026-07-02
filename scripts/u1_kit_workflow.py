@@ -2017,8 +2017,11 @@ def run_kit_workflow(args) -> dict[str, Any]:
                 "Pass form_schema to the form tool (button UX). When the "
                 "gateway confirms the answers file is written, tool-call "
                 "next_command VERBATIM — do not add, remove, or restate "
-                "any answer. Text fallback: show `form`, then relay the "
-                "operator's one line via --form-answers instead."),
+                "any answer. If the form tool errors, is unavailable, or "
+                "times out: re-run THIS SAME kit command with "
+                "--interaction-mode text appended — that starts the staged "
+                "one-question-per-turn flow. NEVER paste this event's "
+                "text_fallback block into the chat as one message."),
         }, json_events)
         _emit(events_file, {"stage": "awaiting_input", "need": "kit_form",
                             "request_id": request_id}, json_events)

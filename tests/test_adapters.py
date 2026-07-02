@@ -558,6 +558,11 @@ def test_cb_handler_registered_on_live_app_not_class(monkeypatch, tmp_path):
     added = []
 
     class _FakeApp:
+        # PTB's Application is __slots__-ed: arbitrary attributes raise.
+        # The 2026-07-02 live failure ("no __dict__ for setting new
+        # attributes") slipped through because the old fake was permissive.
+        __slots__ = ()
+
         def add_handler(self, handler, group=0):
             added.append((handler, group))
 

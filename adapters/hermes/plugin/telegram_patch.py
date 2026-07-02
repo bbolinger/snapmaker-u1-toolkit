@@ -149,7 +149,14 @@ def ensure_patched(adapter_cls) -> bool:
             logger.warning("u1-form: adapter has no _app — taps cannot be "
                            "routed; form will time out. (hook point moved?)")
             return
-        if getattr(app, "_u1_form_cb_handler", None) is not None:
+        # Idempotence flag lives on the ADAPTER (plain __dict__), keyed by
+        # app identity — PTB's Application is __slots__-ed, so setting an
+        # attribute on it raises (live 2026-07-02: form send exception
+        # "'Application' object has no attribute ... no __dict__"). The
+        # adapter already carries our per-instance form state, and a
+        # reconnect swaps self._app to a fresh object, failing the identity
+        # check and re-registering on the new app.
+        if getattr(self, "_u1_form_cb_app", None) is app:
             return
         from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler  # type: ignore
 
@@ -159,7 +166,7 @@ def ensure_patched(adapter_cls) -> bool:
 
         handler = CallbackQueryHandler(_entry, pattern=FORM_CB_PATTERN)
         app.add_handler(handler, group=-11)
-        app._u1_form_cb_handler = handler
+        self._u1_form_cb_app = app
         logger.info("u1-form: callback handler registered on live PTB app "
                     "(group -11, pattern-scoped).")
 
