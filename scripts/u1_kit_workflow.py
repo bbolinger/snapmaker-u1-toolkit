@@ -4147,8 +4147,8 @@ def main(argv=None) -> int:
                           "6-turn Q&A (parts → orient → tool → preset → "
                           "supports → confirm), cheap intermediates, safe for "
                           "small local models. `form` = single kit_form event "
-                          "with form_schema (buttons UX, requires form_tool "
-                          "installed). Falls through to env U1_INTERACTION_MODE "
+                          "with form_schema (buttons UX, requires the u1-form "
+                          "Hermes plugin). Falls through to env U1_INTERACTION_MODE "
                           "then defaults to 'text'. Detection at Hermes "
                           "session start by the snapmaker_u1 plugin based on "
                           "model provider (web APIs = form, local = text)."))

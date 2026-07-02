@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -358,7 +359,297 @@ def test_tg_required_warning_escapes_field_labels():
 
 
 # --------------------------------------------------------------------------- #
-# Hermes install.py — real copy + patch + verify path against a fake tree
+# Hermes plugin — loading, tool registration, handler bridge, adapter patch
+# --------------------------------------------------------------------------- #
+# The u1-form plugin is what makes the tool VISIBLE: plugin-provided
+# toolsets are auto-enabled per platform by Hermes' _get_platform_tools
+# (the first-party path). A tool dropped into tools/ registers but is never
+# offered — built-in toolsets resolve by subset-inference against the
+# platform composite, which a runtime toolset can't satisfy, and joining an
+# existing toolset (clarify) evicts it. See test_hermes_real_package.py for
+# the against-the-real-package proof of that invariant.
+
+_PLUGIN_DIR = _ADAPTERS / "hermes" / "plugin"
+
+
+def _load_plugin_pkg(monkeypatch, tmp_path):
+    """Load the plugin exactly the way Hermes' loader does: as a package
+    (``hermes_plugins.u1_form``) with the plugin dir on its search path —
+    with the renderer copied in, as install.py deploys it."""
+    import shutil as _sh
+    pdir = tmp_path / "u1-form"
+    pdir.mkdir()
+    for name in ("plugin.yaml", "__init__.py", "telegram_patch.py"):
+        _sh.copy(_PLUGIN_DIR / name, pdir / name)
+    _sh.copy(_ADAPTERS / "telegram" / "u1_form_telegram.py",
+             pdir / "u1_form_telegram.py")
+
+    mod_name = "hermes_plugins.u1_form"
+    parent = types.ModuleType("hermes_plugins")
+    parent.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_plugins", parent)
+    spec = importlib.util.spec_from_file_location(
+        mod_name, pdir / "__init__.py",
+        submodule_search_locations=[str(pdir)])
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = mod_name
+    mod.__path__ = [str(pdir)]
+    monkeypatch.setitem(sys.modules, mod_name, mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeCtx:
+    def __init__(self):
+        self.tools = []
+        self.hooks = []
+
+    def register_tool(self, **kwargs):
+        self.tools.append(kwargs)
+
+    def register_hook(self, hook_name, callback):
+        self.hooks.append((hook_name, callback))
+
+
+def test_plugin_registers_form_tool_and_dispatch_hook(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    ctx = _FakeCtx()
+    mod.register(ctx)
+    (tool,) = ctx.tools
+    assert tool["name"] == "form"
+    assert tool["toolset"] == "form"  # own toolset — the plugin path is what
+    # surfaces it; joining clarify would evict clarify via subset-inference
+    assert callable(tool["handler"])
+    assert tool["schema"]["parameters"]["required"] == ["form_schema"]
+    assert [h for h, _ in ctx.hooks] == ["pre_gateway_dispatch"]
+
+
+def _fake_form_gateway(monkeypatch):
+    """Stand-in for tools.form_gateway with the callback registry surface."""
+    fg = types.ModuleType("tools.form_gateway")
+    fg._cbs = {}
+
+    def set_form_callback(session_id, cb):
+        fg._cbs[session_id or "__default__"] = cb
+        fg._cbs["__default__"] = cb
+
+    def get_form_callback(session_id=""):
+        return fg._cbs.get(session_id) or fg._cbs.get("__default__")
+
+    fg.set_form_callback = set_form_callback
+    fg.get_form_callback = get_form_callback
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.form_gateway = fg
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.form_gateway", fg)
+    return fg
+
+
+def _schema_min():
+    return {"version": 1, "fields": [{"id": "tool", "label": "Tool",
+                                      "type": "single_select",
+                                      "options": [{"id": "T0"}]}]}
+
+
+def test_handler_routes_to_session_callback(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)
+    seen = {}
+
+    def cb(schema):
+        seen["schema"] = schema
+        return {"tool": "T0"}
+
+    fg.set_form_callback("sess-1", cb)
+    out = json.loads(mod._form_handler({"form_schema": _schema_min()},
+                                       session_id="sess-1"))
+    assert out["user_answer"] == {"tool": "T0"}
+    assert seen["schema"]["fields"][0]["id"] == "tool"
+
+
+def test_handler_falls_back_to_default_callback(monkeypatch, tmp_path):
+    """session_id mismatch degrades to the latest gateway turn — a live
+    single-operator gateway keeps working even if ids drift."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)
+    fg.set_form_callback("sess-A", lambda s: {"tool": "T1"})
+    out = json.loads(mod._form_handler({"form_schema": _schema_min()},
+                                       session_id="sess-UNSEEN"))
+    assert out["user_answer"] == {"tool": "T1"}
+
+
+def test_handler_without_gateway_wiring_returns_error_not_crash(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)  # registry present but EMPTY
+    out = json.loads(mod._form_handler({"form_schema": _schema_min()},
+                                       session_id="s"))
+    assert "error" in out and "callback" in out["error"]
+
+
+def test_handler_cancelled_answer_shape(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)
+    fg.set_form_callback("s", lambda schema: {"_cancelled": True})
+    out = json.loads(mod._form_handler({"form_schema": _schema_min()},
+                                       session_id="s"))
+    assert out == {"cancelled": True, "user_answer": None}
+
+
+def test_handler_rejects_bad_schema_before_callback(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _fake_form_gateway(monkeypatch)
+    for bad in ({}, {"fields": []}, {"fields": "nope"}):
+        out = json.loads(mod._form_handler({"form_schema": bad}, session_id="s"))
+        assert "error" in out
+
+
+# --------------------------------------------------------------------------- #
+# pre_gateway_dispatch hook — patches the LIVE adapter class
+# --------------------------------------------------------------------------- #
+# The adapter source file can be imported under two module names (plugin
+# loader vs namespace-package import) — two distinct class objects. The hook
+# therefore patches type() of the instances in gateway.adapters: by
+# construction the class the gateway dispatches through.
+
+def _fake_adapter_cls():
+    class TelegramAdapter:
+        async def _handle_callback_query(self, update, ctx):
+            return "original"
+    return TelegramAdapter
+
+
+def test_hook_patches_live_telegram_adapter_class(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    cls = _fake_adapter_cls()
+    adapter = cls()
+
+    class _P:  # stands in for the Platform enum member
+        value = "telegram"
+
+    gateway = types.SimpleNamespace(adapters={_P(): adapter})
+    mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
+    assert getattr(cls, "_u1_form_patched", False)
+    assert hasattr(cls, "send_form")
+    # idempotent across messages: second fire keeps the same wrapper
+    wrapped = cls._handle_callback_query
+    mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
+    assert cls._handle_callback_query is wrapped
+
+
+def test_hook_ignores_non_telegram_adapters(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+
+    class DiscordAdapter:
+        async def _handle_callback_query(self, update, ctx):
+            return "original"
+
+    class _P:
+        value = "discord"
+
+    gateway = types.SimpleNamespace(adapters={_P(): DiscordAdapter()})
+    mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
+    assert not getattr(DiscordAdapter, "_u1_form_patched", False)
+    assert not hasattr(DiscordAdapter, "send_form")
+
+
+def test_hook_never_raises_and_never_blocks_dispatch(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    # gateway=None, missing adapters attr, adapter without hook point — all
+    # must return None (dispatch unaffected) without raising
+    assert mod._pre_gateway_dispatch(event=None, gateway=None) is None
+    assert mod._pre_gateway_dispatch() is None
+
+    class Hookless:
+        pass
+
+    class _P:
+        value = "telegram"
+
+    gateway = types.SimpleNamespace(adapters={_P(): Hookless()})
+    assert mod._pre_gateway_dispatch(gateway=gateway) is None
+    assert not getattr(Hookless, "_u1_form_patched", False)
+
+
+def test_ensure_patched_missing_hook_point_is_loud_no_op(monkeypatch, tmp_path, caplog):
+    import logging
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    tp = sys.modules["hermes_plugins.u1_form.telegram_patch"]
+
+    class Hookless:
+        pass
+
+    with caplog.at_level(logging.WARNING):
+        assert tp.ensure_patched(Hookless) is False
+    assert "_handle_callback_query" in " ".join(r.getMessage() for r in caplog.records)
+    assert tp.ensure_patched(None) is False
+
+
+# --------------------------------------------------------------------------- #
+# answers-file writer (gateway-side half of the v2.2 handoff)
+# --------------------------------------------------------------------------- #
+
+def _load_telegram_patch(monkeypatch, tmp_path):
+    _load_plugin_pkg(monkeypatch, tmp_path)
+    return sys.modules["hermes_plugins.u1_form.telegram_patch"]
+
+
+def test_write_answers_file_env_dir_and_atomic(monkeypatch, tmp_path):
+    tp = _load_telegram_patch(monkeypatch, tmp_path)
+    dest = tmp_path / "handoff"
+    monkeypatch.setenv("U1_FORM_ANSWERS_DIR", str(dest))
+    path = tp.write_answers_file("abc123", {"tool": "T0"})
+    assert Path(path).parent == dest
+    assert json.loads(Path(path).read_text()) == {"tool": "T0"}
+    assert not list(dest.glob("*.tmp.*"))  # tmp file replaced away
+
+
+def test_write_answers_file_rejects_bad_form_ids(monkeypatch, tmp_path):
+    tp = _load_telegram_patch(monkeypatch, tmp_path)
+    monkeypatch.setenv("U1_FORM_ANSWERS_DIR", str(tmp_path / "h"))
+    for bad in ("../escape", "a/b", "x", "", None, "id with spaces"):
+        with pytest.raises(ValueError):
+            tp.write_answers_file(bad, {})
+
+
+# --------------------------------------------------------------------------- #
+# form_gateway callback registry (the dispatch → gateway bridge)
+# --------------------------------------------------------------------------- #
+
+def _load_form_gateway():
+    path = _ADAPTERS / "hermes" / "tools" / "form_gateway.py"
+    spec = importlib.util.spec_from_file_location("u1_form_gateway_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["u1_form_gateway_test"] = mod  # @dataclass resolves cls.__module__
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop("u1_form_gateway_test", None)
+    return mod
+
+
+def test_callback_registry_session_lookup_and_default():
+    fg = _load_form_gateway()
+    a, b = object(), object()
+    fg.set_form_callback("sess-a", a)
+    assert fg.get_form_callback("sess-a") is a
+    assert fg.get_form_callback("never-seen") is a   # default = latest
+    fg.set_form_callback("sess-b", b)
+    assert fg.get_form_callback("sess-a") is a       # keyed slot survives
+    assert fg.get_form_callback("") is b             # default follows latest
+
+
+def test_callback_registry_bounds_session_slots():
+    fg = _load_form_gateway()
+    for i in range(fg._CB_MAX_ENTRIES + 10):
+        fg.set_form_callback(f"s{i}", object())
+    with fg._cb_lock:
+        keyed = [k for k in fg._form_callbacks if k != "__default__"]
+    assert len(keyed) <= fg._CB_MAX_ENTRIES
+    assert fg.get_form_callback("anything") is not None  # default never evicted
+
+
+# --------------------------------------------------------------------------- #
+# Hermes install.py — copy + plugin deploy + patch + verify against a fake tree
 # --------------------------------------------------------------------------- #
 
 _STOCK_RUN_PY = (
@@ -369,9 +660,11 @@ _STOCK_RUN_PY = (
 )
 
 
-def _fake_hermes(tmp_path, run_py_text=_STOCK_RUN_PY):
+def _fake_hermes(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
     """Minimal Hermes venv layout install.py's discovery expects:
-    <venv>/lib/pythonX.Y/site-packages/{tools/, gateway/run.py} + <venv>/bin/python*.
+    <venv>/lib/pythonX.Y/site-packages/{tools/, gateway/run.py} +
+    <venv>/bin/{python*, hermes}. HERMES_HOME is redirected under tmp so
+    plugin deploys never touch the real home.
     """
     venv = tmp_path / "hermes-venv"
     sp = venv / "lib" / "python3.11" / "site-packages"
@@ -382,6 +675,8 @@ def _fake_hermes(tmp_path, run_py_text=_STOCK_RUN_PY):
     bin_dir = venv / "bin"
     bin_dir.mkdir()
     (bin_dir / "python3").symlink_to(sys.executable)
+    (bin_dir / "hermes").write_text("#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     return venv, sp, run_py
 
 
@@ -392,80 +687,143 @@ def _stub_subprocess_run(calls):
     return fake_run
 
 
-def test_install_copies_patches_and_verifies(tmp_path, monkeypatch):
-    """Non-dry-run install: exercises the real copy + patch + _verify source
-    build (where the %%-format TypeError crashed every install at [3/3])."""
-    venv, sp, run_py = _fake_hermes(tmp_path)
+def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatch):
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
     calls = []
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
 
     rc = hermes_install.main(["--venv", str(venv)])
     assert rc == 0
 
-    # All three tool files landed; the renderer is single-sourced from
-    # adapters/telegram/ (the hermes tree keeps no copy).
+    # form_gateway landed in tools/; the pre-plugin files are NOT copied.
     tools = sp / "tools"
     assert (tools / "form_gateway.py").read_bytes() == \
         (_ADAPTERS / "hermes" / "tools" / "form_gateway.py").read_bytes()
-    assert (tools / "form_tool.py").read_bytes() == \
-        (_ADAPTERS / "hermes" / "tools" / "form_tool.py").read_bytes()
-    assert (tools / "u1_form_telegram.py").read_bytes() == \
-        (_ADAPTERS / "telegram" / "u1_form_telegram.py").read_bytes()
-    assert not (_ADAPTERS / "hermes" / "tools" / "u1_form_telegram.py").exists()
+    assert not (tools / "form_tool.py").exists()
+    assert not (tools / "u1_form_telegram.py").exists()
 
-    # run.py patched: marker present, anchor preserved, backup captured.
+    # plugin deployed to HERMES_HOME with the renderer single-sourced from
+    # adapters/telegram/ (the hermes tree keeps no copy).
+    pdir = tmp_path / "hermes-home" / "plugins" / "u1-form"
+    for name in ("plugin.yaml", "__init__.py", "telegram_patch.py"):
+        assert (pdir / name).read_bytes() == (_PLUGIN_DIR / name).read_bytes()
+    assert (pdir / "u1_form_telegram.py").read_bytes() == \
+        (_ADAPTERS / "telegram" / "u1_form_telegram.py").read_bytes()
+    assert not (_PLUGIN_DIR / "u1_form_telegram.py").exists()
+
+    # run.py patched: marker present, anchor preserved, backup pristine.
     txt = run_py.read_text()
     assert hermes_install.RUN_PY_MARKER in txt
+    assert hermes_install.RUN_PY_END_MARKER in txt
     assert hermes_install.RUN_PY_ANCHOR in txt
     bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
     assert bak.read_text() == _STOCK_RUN_PY
 
-    # verify step ran through the fake venv python with syntactically valid
-    # source (the old %-format bug raised TypeError before ever getting here).
-    assert len(calls) == 1
-    assert calls[0][0] == str(venv / "bin" / "python3")
-    assert calls[0][1] == "-c"
-    compile(calls[0][2], "<verify-src>", "exec")
-    assert repr(str(tools)) in calls[0][2]
+    # enable + verify both ran: `hermes plugins enable u1-form`, then the
+    # bare-composite invariant check with syntactically valid source.
+    assert len(calls) == 2
+    assert calls[0][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
+    assert calls[1][0] == str(venv / "bin" / "python3")
+    assert calls[1][1] == "-c"
+    compile(calls[1][2], "<verify-src>", "exec")
+    assert "'clarify' in ts" in calls[1][2]  # the eviction regression check
+    assert "'form' in ts" in calls[1][2]
+
+
+def test_install_patched_run_py_body_is_valid_python(tmp_path, monkeypatch):
+    """The inserted block must compile in situ — an indent drift or template
+    typo here would take down the whole gateway at import."""
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    compile(run_py.read_text(), str(run_py), "exec")
+    # callback published under agent.session_id — the dispatch bridge
+    assert "set_form_callback" in run_py.read_text()
 
 
 def test_install_rerun_is_idempotent(tmp_path, monkeypatch):
-    venv, sp, run_py = _fake_hermes(tmp_path)
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
     assert hermes_install.main(["--venv", str(venv)]) == 0
     once = run_py.read_text()
     assert hermes_install.main(["--venv", str(venv)]) == 0
-    assert run_py.read_text() == once  # marker guard: no double insert
+    assert run_py.read_text() == once  # byte-identical: strip+reinsert round-trips
+
+
+def test_install_upgrades_marked_block_in_place(tmp_path, monkeypatch):
+    """A changed insert body (new toolkit version) replaces the old block —
+    no duplicate markers, no stale body left behind."""
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    old_insert = hermes_install.RUN_PY_INSERT
+    monkeypatch.setattr(hermes_install, "RUN_PY_INSERT",
+                        old_insert.replace("form prompt send failed",
+                                           "form prompt send FAILED"))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    txt = run_py.read_text()
+    assert txt.count(hermes_install.RUN_PY_MARKER) == 1
+    assert "form prompt send FAILED" in txt
+    assert "form prompt send failed" not in txt
+    compile(txt, str(run_py), "exec")
+
+
+def test_install_removes_pre_plugin_layout_files(tmp_path, monkeypatch):
+    """Upgrade path from earlier v2.2-dev deploys: the tools/ copies of
+    form_tool.py / u1_form_telegram.py must be removed or the form tool
+    double-registers via Hermes' tools/* auto-import."""
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
+    (sp / "tools" / "form_tool.py").write_text("# stale pre-plugin copy\n")
+    (sp / "tools" / "u1_form_telegram.py").write_text("# stale renderer copy\n")
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert not (sp / "tools" / "form_tool.py").exists()
+    assert not (sp / "tools" / "u1_form_telegram.py").exists()
 
 
 def test_install_aborts_before_copying_when_anchor_missing(tmp_path, monkeypatch):
     """Unrecognized Hermes: the (read-only) anchor check must run BEFORE any
-    file copy — otherwise Hermes auto-imports the orphaned form tool."""
+    file copy — otherwise Hermes auto-imports an orphaned half-install."""
     venv, sp, run_py = _fake_hermes(
-        tmp_path, run_py_text="def start():\n    pass  # layout changed upstream\n")
+        tmp_path, monkeypatch,
+        run_py_text="def start():\n    pass  # layout changed upstream\n")
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
     rc = hermes_install.main(["--venv", str(venv)])
     assert rc == 2
     assert list((sp / "tools").iterdir()) == []          # nothing copied
+    assert not (tmp_path / "hermes-home").exists()       # no plugin deployed
     assert run_py.read_text().startswith("def start()")  # untouched
     assert not run_py.with_suffix(run_py.suffix + ".u1-bak").exists()
 
 
-def test_uninstall_restores_backup_and_removes_it(tmp_path, monkeypatch):
-    venv, sp, run_py = _fake_hermes(tmp_path)
+def test_install_refuses_malformed_marker_block(tmp_path, monkeypatch):
+    """Begin marker without end marker: never edit blind."""
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
+    run_py.write_text(_STOCK_RUN_PY + "\n" + hermes_install.RUN_PY_MARKER + "\n")
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    rc = hermes_install.main(["--venv", str(venv)])
+    assert rc == 2
+
+
+def test_uninstall_restores_backup_removes_plugin_and_disables(tmp_path, monkeypatch):
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
     assert hermes_install.main(["--venv", str(venv)]) == 0
     assert hermes_install.main(["--venv", str(venv), "--uninstall"]) == 0
     assert run_py.read_text() == _STOCK_RUN_PY
     assert not run_py.with_suffix(run_py.suffix + ".u1-bak").exists()
     assert list((sp / "tools").iterdir()) == []
+    assert not (tmp_path / "hermes-home" / "plugins" / "u1-form").exists()
+    assert any(c[:3] == [str(venv / "bin" / "hermes"), "plugins", "disable"]
+               for c in calls if isinstance(c, list))
 
 
 def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkeypatch):
     """Upgrade scenario: pip replaced run.py (marker gone) but the old backup
     still exists. --uninstall must NOT restore it — that would downgrade
     run.py to the pre-upgrade Hermes version."""
-    venv, sp, run_py = _fake_hermes(tmp_path)
+    venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
     assert hermes_install.main(["--venv", str(venv)]) == 0
     upgraded = (
@@ -477,217 +835,3 @@ def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkey
     rc = hermes_install.main(["--venv", str(venv), "--uninstall"])
     assert rc == 0
     assert run_py.read_text() == upgraded  # NOT clobbered by the stale backup
-
-
-# --------------------------------------------------------------------------- #
-# form_tool: version-adaptive Telegram platform class resolution
-# --------------------------------------------------------------------------- #
-# hermes-agent 0.18 moved the adapter to plugins.platforms.telegram.adapter
-# .TelegramAdapter; 0.17 had gateway.platforms.telegram.TelegramPlatform.
-# The patch must find whichever is installed, prefer the newer path, and
-# come back None (text fallback, no crash) when neither imports.
-
-def _load_form_tool(monkeypatch, extra_modules):
-    """Import form_tool.py with a faked Hermes environment.
-
-    `tools.registry` is always faked (module-level import); extra_modules
-    maps dotted names to module objects standing in for the platform class
-    locations of a given hermes-agent version.
-    """
-    registry_mod = types.ModuleType("tools.registry")
-
-    class _Reg:
-        def __init__(self):
-            self.calls = []
-
-        def register(self, **kwargs):
-            self.calls.append(kwargs)
-
-    registry_mod.registry = _Reg()
-    tools_pkg = types.ModuleType("tools")
-    tools_pkg.registry = registry_mod
-    fakes = {"tools": tools_pkg, "tools.registry": registry_mod}
-    fakes.update(extra_modules)
-    for name, mod in fakes.items():
-        monkeypatch.setitem(sys.modules, name, mod)
-    # parent packages so importlib can traverse dotted paths
-    for name in list(extra_modules):
-        parts = name.split(".")
-        for i in range(1, len(parts)):
-            pkg = ".".join(parts[:i])
-            if pkg not in sys.modules:
-                monkeypatch.setitem(sys.modules, pkg, types.ModuleType(pkg))
-
-    path = _ADAPTERS / "hermes" / "tools" / "form_tool.py"
-    spec = importlib.util.spec_from_file_location("u1_form_tool_under_test", path)
-    mod = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "u1_form_tool_under_test", mod)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _platform_module(dotted, cls_name):
-    mod = types.ModuleType(dotted)
-
-    class _Cls:
-        async def _handle_callback_query(self, update, ctx):
-            return "original"
-
-    _Cls.__name__ = cls_name
-    setattr(mod, cls_name, _Cls)
-    return mod, _Cls
-
-
-def test_resolver_finds_018_plugin_adapter(monkeypatch):
-    mod018, cls018 = _platform_module(
-        "plugins.platforms.telegram.adapter", "TelegramAdapter")
-    ft = _load_form_tool(monkeypatch, {
-        "plugins.platforms.telegram.adapter": mod018})
-    assert ft._resolve_telegram_platform_class() is cls018
-    # import-time patch actually landed on the 0.18 class
-    assert getattr(cls018, "_u1_form_patched", False)
-    assert hasattr(cls018, "send_form")
-
-
-def test_resolver_falls_back_to_017_platform(monkeypatch):
-    mod017, cls017 = _platform_module(
-        "gateway.platforms.telegram", "TelegramPlatform")
-    ft = _load_form_tool(monkeypatch, {
-        "gateway.platforms.telegram": mod017})
-    assert ft._resolve_telegram_platform_class() is cls017
-    assert getattr(cls017, "_u1_form_patched", False)
-
-
-def test_resolver_prefers_018_when_both_importable(monkeypatch):
-    mod018, cls018 = _platform_module(
-        "plugins.platforms.telegram.adapter", "TelegramAdapter")
-    mod017, cls017 = _platform_module(
-        "gateway.platforms.telegram", "TelegramPlatform")
-    ft = _load_form_tool(monkeypatch, {
-        "plugins.platforms.telegram.adapter": mod018,
-        "gateway.platforms.telegram": mod017})
-    assert ft._resolve_telegram_platform_class() is cls018
-    assert not getattr(cls017, "_u1_form_patched", False)
-
-
-def test_resolver_none_means_text_fallback_not_crash(monkeypatch, caplog):
-    import logging
-    with caplog.at_level(logging.WARNING):
-        ft = _load_form_tool(monkeypatch, {})
-    assert ft._resolve_telegram_platform_class() is None
-    warned = " ".join(r.getMessage() for r in caplog.records)
-    # the warning must name every path it tried, so a runtime operator can
-    # see at a glance which hermes-agent layout the box actually has
-    assert "plugins.platforms.telegram.adapter" in warned
-    assert "gateway.platforms.telegram" in warned
-
-
-def test_missing_callback_hook_skips_patch_loudly(monkeypatch, caplog):
-    import logging
-    dotted = "plugins.platforms.telegram.adapter"
-    mod = types.ModuleType(dotted)
-
-    class TelegramAdapter:  # no _handle_callback_query — hook point moved
-        pass
-
-    mod.TelegramAdapter = TelegramAdapter
-    with caplog.at_level(logging.WARNING):
-        _load_form_tool(monkeypatch, {dotted: mod})
-    assert not getattr(TelegramAdapter, "_u1_form_patched", False)
-    assert not hasattr(TelegramAdapter, "send_form")
-    assert "_handle_callback_query" in " ".join(
-        r.getMessage() for r in caplog.records)
-
-
-def test_make_send_result_degrades_without_hermes_base(monkeypatch):
-    ft = _load_form_tool(monkeypatch, {})
-    res = ft._make_send_result(success=True, message_id="42")
-    assert res.success is True and res.message_id == "42"
-    err = ft._make_send_result(success=False, error="boom")
-    assert err.success is False and err.error == "boom"
-
-
-# --------------------------------------------------------------------------- #
-# form_tool: platform tool injection — the tool must actually be OFFERED
-# --------------------------------------------------------------------------- #
-# Platform agents get a per-toolset allowlist, and on bare-composite configs
-# (platform_toolsets.telegram: [hermes-telegram]) Hermes enables a toolset
-# only when it is a SUBSET of the composite. A runtime-registered toolset is
-# never a subset — and joining an existing toolset poisons it (form in
-# clarify makes {clarify, form} ⊄ hermes-telegram, evicting clarify
-# itself; verified live). So form keeps its own toolset and is injected
-# directly into _get_platform_tools' result, the way Hermes handles
-# x_search.
-
-def test_form_registers_under_its_own_toolset(monkeypatch):
-    """Pin toolset="form" — moving form into a subset-inferred toolset
-    (e.g. clarify) evicts that toolset on bare-composite platform configs."""
-    ft = _load_form_tool(monkeypatch, {})
-    call = next(c for c in ft.registry.calls if c.get("name") == "form")
-    assert call["toolset"] == "form"
-
-
-def _model_tools_module(result_factory):
-    mod = types.ModuleType("model_tools")
-
-    def _get_platform_tools(platform, config=None):
-        return result_factory()
-
-    mod._get_platform_tools = _get_platform_tools
-    return mod
-
-
-def test_injection_adds_form_to_set_result(monkeypatch):
-    mod = _model_tools_module(lambda: {"clarify", "terminal", "send_photo"})
-    _load_form_tool(monkeypatch, {"model_tools": mod})
-    out = mod._get_platform_tools("telegram")
-    assert out == {"clarify", "terminal", "send_photo", "form"}
-
-
-def test_injection_appends_form_to_list_result_without_dupes(monkeypatch):
-    mod = _model_tools_module(lambda: ["clarify", "form"])
-    _load_form_tool(monkeypatch, {"model_tools": mod})
-    assert mod._get_platform_tools("telegram") == ["clarify", "form"]
-    mod2 = _model_tools_module(lambda: ["clarify", "terminal"])
-    _load_form_tool(monkeypatch, {"model_tools": mod2})
-    assert mod2._get_platform_tools("telegram") == ["clarify", "terminal", "form"]
-
-
-def test_injection_never_removes_existing_tools(monkeypatch):
-    """The regression that motivated this design: adding form must not cost
-    clarify (or anything else) its slot."""
-    baseline = {"clarify", "terminal", "send_photo", "x_search"}
-    mod = _model_tools_module(lambda: set(baseline))
-    _load_form_tool(monkeypatch, {"model_tools": mod})
-    out = mod._get_platform_tools("telegram")
-    assert baseline <= out and "form" in out
-
-
-def test_injection_is_idempotent_across_reimports(monkeypatch):
-    mod = _model_tools_module(lambda: {"clarify"})
-    _load_form_tool(monkeypatch, {"model_tools": mod})
-    once = mod._get_platform_tools
-    _load_form_tool(monkeypatch, {"model_tools": mod})
-    assert mod._get_platform_tools is once, "re-import must not double-wrap"
-    assert mod._get_platform_tools("telegram") == {"clarify", "form"}
-
-
-def test_injection_missing_module_warns_and_degrades(monkeypatch, caplog):
-    import logging
-    with caplog.at_level(logging.WARNING):
-        _load_form_tool(monkeypatch, {})
-    warned = " ".join(r.getMessage() for r in caplog.records)
-    assert "u1 form injection" in warned
-    assert "model_tools" in warned  # names the paths it tried
-
-
-def test_injection_leaves_unexpected_result_shapes_alone(monkeypatch, caplog):
-    import logging
-    defs = [{"name": "clarify"}, {"name": "terminal"}]
-    mod = _model_tools_module(lambda: [dict(d) for d in defs])
-    with caplog.at_level(logging.WARNING):
-        _load_form_tool(monkeypatch, {"model_tools": mod})
-        out = mod._get_platform_tools("telegram")
-    assert out == defs  # untouched — no stray "form" string among dicts
-    assert "leaving it untouched" in " ".join(
-        r.getMessage() for r in caplog.records)

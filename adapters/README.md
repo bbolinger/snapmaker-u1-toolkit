@@ -2,14 +2,15 @@
 
 > **Status (v2.2):** the `form_schema` event IS now emitted —
 > `--interaction-mode form` (or `U1_INTERACTION_MODE=form`) replaces the
-> staged turns with one consolidated form. The Hermes/Telegram adapter is
-> wired for the **file handoff**: on Submit the gateway writes
-> `<U1_FORM_ANSWERS_DIR>/<form_id>.json` and the agent relays the emitted
-> `--form-answers-from` command verbatim — answer content never passes
-> through the model in either direction. The staged text flow remains the
-> default. Discord remains a reference renderer (submits via
-> `--form-answers-json`); live end-to-end validation on real hardware is
-> the remaining step before this loses its experimental label.
+> staged turns with one consolidated form. The Hermes integration is a
+> **first-party plugin** (`adapters/hermes/plugin/`, deployed by
+> `adapters/hermes/install.py`) wired for the **file handoff**: on Submit
+> the gateway writes `<U1_FORM_ANSWERS_DIR>/<form_id>.json` and the agent
+> relays the emitted `--form-answers-from` command verbatim — answer
+> content never passes through the model in either direction. The staged
+> text flow remains the default. Discord remains a reference renderer
+> (submits via `--form-answers-json`); live end-to-end validation on real
+> hardware is the remaining step before this loses its experimental label.
 
 Optional, consumer-side reference code that renders the toolkit's `form_schema`
 (emitted on the `kit_form` event) as native UI on a chat surface, collects the
