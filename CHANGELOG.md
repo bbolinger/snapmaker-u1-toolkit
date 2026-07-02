@@ -60,15 +60,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   construction got the same treatment, and a missing
   `_handle_callback_query` hook point now skips the patch loudly instead
   of raising.
-- **`form` tool now rides the `clarify` toolset.** Hermes'
-  `get_tool_definitions()` is a per-toolset allowlist, and the static
-  `hermes-<platform>` composites don't resolve runtime-registered toolset
-  names — registering under a novel `"form"` toolset succeeded but the
-  tool was never offered to any platform agent (adapter could render
-  forms nobody could trigger). `clarify` is in every platform composite
-  and form is its multi-field sibling, so membership there makes the tool
-  reachable everywhere clarify is. `U1_FORM_TOOLSET` env override
-  available if a Hermes build ever ships a first-party form toolset.
+- **`form` tool injected into platform tool resolution** (the x_search
+  pattern). Registration alone never surfaced the tool: platform agents
+  get a per-toolset allowlist, and on bare-composite configs
+  (`platform_toolsets.telegram: [hermes-telegram]`) Hermes enables a
+  toolset only when it's a subset of the composite — a runtime-registered
+  `"form"` toolset never qualifies, so the adapter could render forms
+  nobody could trigger. Joining an existing toolset is worse: adding form
+  to `clarify` makes `{clarify, form} ⊄ hermes-telegram` and evicts
+  clarify itself (caught in live-config verification before it reached a
+  running gateway). The shipped fix keeps `form` in its own toolset and
+  wraps `_get_platform_tools` at import to add `form` to its result
+  directly — Hermes' own escape hatch for `x_search`. Loud-but-safe:
+  unknown module layouts or unexpected result shapes log a warning and
+  leave Hermes' resolution untouched, and the wrapper only ever ADDS to
+  the tool list, pinned by test.
 
 ---
 
