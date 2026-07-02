@@ -526,14 +526,57 @@ def test_hook_patches_live_telegram_adapter_class(monkeypatch, tmp_path):
     class _P:  # stands in for the Platform enum member
         value = "telegram"
 
+    orig_dispatcher = cls._handle_callback_query
     gateway = types.SimpleNamespace(adapters={_P(): adapter})
     mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
     assert getattr(cls, "_u1_form_patched", False)
     assert hasattr(cls, "send_form")
-    # idempotent across messages: second fire keeps the same wrapper
-    wrapped = cls._handle_callback_query
+    assert hasattr(cls, "_u1_ensure_cb_handler")
+    # THE bound-method lesson (live 2026-07-02): PTB captured
+    # self._handle_callback_query at connect(); replacing it on the class is
+    # a silent no-op for already-registered handlers. The patch must NOT
+    # swap the native dispatcher — routing goes through app.add_handler.
+    assert cls._handle_callback_query is orig_dispatcher
     mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
-    assert cls._handle_callback_query is wrapped
+    assert cls._handle_callback_query is orig_dispatcher
+
+
+def test_cb_handler_registered_on_live_app_not_class(monkeypatch, tmp_path):
+    """_ensure_cb_handler registers pattern-scoped on the PTB app, group -11,
+    idempotent per app object (a reconnect's fresh app re-registers)."""
+    import re
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    tp = sys.modules["hermes_plugins.u1_form.telegram_patch"]
+    cls = _fake_adapter_cls()
+
+    class _P:
+        value = "telegram"
+
+    gateway = types.SimpleNamespace(adapters={_P(): cls()})
+    mod._pre_gateway_dispatch(event=None, gateway=gateway, session_store=None)
+
+    added = []
+
+    class _FakeApp:
+        def add_handler(self, handler, group=0):
+            added.append((handler, group))
+
+    inst = cls()
+    inst._app = _FakeApp()
+    inst._u1_ensure_cb_handler()
+    assert len(added) == 1 and added[0][1] == -11
+    inst._u1_ensure_cb_handler()  # same app: no duplicate
+    assert len(added) == 1
+    inst._app = _FakeApp()        # reconnect: fresh app object
+    inst._u1_ensure_cb_handler()
+    assert len(added) == 2
+
+    # pattern owns the ENTIRE renderer vocabulary and nothing native
+    pat = re.compile(tp.FORM_CB_PATTERN)
+    for ours in ("t:0:2", "s:1:3", "p:0:1", "a:0", "z:2", "n:0", "e:4", "S", "X"):
+        assert pat.match(ours), ours
+    for native in ("cl:1", "ea:x", "mp:2", "gt:9", "t:", "tt:1:2", "S:1", "Xx"):
+        assert not pat.match(native), native
 
 
 def test_hook_ignores_non_telegram_adapters(monkeypatch, tmp_path):
@@ -567,20 +610,24 @@ def test_hook_never_raises_and_never_blocks_dispatch(monkeypatch, tmp_path):
 
     gateway = types.SimpleNamespace(adapters={_P(): Hookless()})
     assert mod._pre_gateway_dispatch(gateway=gateway) is None
-    assert not getattr(Hookless, "_u1_form_patched", False)
+    # hookless classes now patch fine (routing no longer needs the native
+    # dispatcher); the invariant here is only: dispatch never raised.
+    assert getattr(Hookless, "_u1_form_patched", False)
 
 
-def test_ensure_patched_missing_hook_point_is_loud_no_op(monkeypatch, tmp_path, caplog):
-    import logging
+def test_ensure_patched_no_longer_needs_native_dispatcher(monkeypatch, tmp_path):
+    """The patch no longer touches _handle_callback_query, so a class
+    without it still patches fine (send_form + registered-handler routing
+    are independent of the native dispatcher)."""
     mod = _load_plugin_pkg(monkeypatch, tmp_path)
     tp = sys.modules["hermes_plugins.u1_form.telegram_patch"]
 
     class Hookless:
         pass
 
-    with caplog.at_level(logging.WARNING):
-        assert tp.ensure_patched(Hookless) is False
-    assert "_handle_callback_query" in " ".join(r.getMessage() for r in caplog.records)
+    assert tp.ensure_patched(Hookless) is True
+    assert hasattr(Hookless, "send_form")
+    assert not hasattr(Hookless, "_handle_callback_query")
     assert tp.ensure_patched(None) is False
 
 

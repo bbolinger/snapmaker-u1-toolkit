@@ -121,7 +121,7 @@ def test_form_mode_emits_schema_with_bound_form_id(tmp_path, hermetic_commit, ca
     schema = form_ev["form_schema"]
     assert schema["version"] == 1 and schema["fields"]
     assert schema["submit"] == {"mode": "file", "form_id": fid}
-    assert f"--form-answers-from {fid}" in form_ev["next_command"]
+    assert f"--form-answers-from={fid}" in form_ev["next_command"]
     # answer content can't be in the command — only the opaque id
     st = u1_request.read_request(res["request_id"])
     assert st["phase"] == "awaiting_form" and st["form_id"] == fid
