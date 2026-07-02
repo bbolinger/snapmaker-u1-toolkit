@@ -166,7 +166,7 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
 
 
 def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys):
-    """The need_input event must carry key=bed_clear_start (Hermy's spec)."""
+    """The need_input event must carry key=bed_clear_start."""
     import io
     rid = "u1_test_key_naming"
     _seed_request(sandbox_requests, rid)
@@ -346,7 +346,7 @@ def test_stage2_gate_allows_real_operator_prefixes(sandbox_requests, monkeypatch
       * generic identities: `human:brent`, bare `brent`, `unknown:x`
       * developer / CI identities: `dev:my-fork`, `ci:release-pipeline` —
         deliberately left off the fence list to avoid burning fork
-        developers or CI-orchestrated real prints (2026-07-01 ship-review)."""
+        developers or CI-orchestrated real prints."""
     import u1_print_start_gate as gate
     called = {"query_state": False}
     monkeypatch.setattr(gate, "query_state",
@@ -393,11 +393,11 @@ def test_stage2_gate_refuses_hash_binding_mismatch(sandbox_requests, monkeypatch
     assert "hash" in res["reason"].lower()
 
 
-# ─── Fresh audit 2026-07-01: kit request must require staged nonce ──────────
+# ─── Kit request must require staged nonce ─────────────────────────────────
 
 def test_stage2_gate_refuses_kit_request_without_persisted_nonce(
         sandbox_requests, monkeypatch):
-    """Kit-path close (fresh audit finding HIGH-1): a kit request that
+    """Kit-path close: a kit request that
     reached Stage 2 via the legacy --form-answers one-liner never mints a
     Stage 2 nonce. Absent nonce state on a kit request means the two-turn
     boundary was bypassed. Gate refuses regardless of approval-token
@@ -459,7 +459,7 @@ def test_stage2_gate_allows_single_stl_request_without_persisted_nonce(
         "kit-request check — legacy backward compat must hold")
 
 
-# ─── Fresh audit 2026-07-01: fence refusal must return dict, not print ──────
+# ─── Fence refusal must return dict, not print ─────────────────────────────
 
 def test_fence_refusal_returns_dict_no_bare_none(sandbox_requests, monkeypatch):
     """Fence 1 refusal must RETURN the JSON payload, not print + return None.
@@ -480,11 +480,11 @@ def test_fence_refusal_returns_dict_no_bare_none(sandbox_requests, monkeypatch):
     assert res["stage"] == "gate_refused_test_operator"
 
 
-# ─── Fresh audit 2026-07-01: manual bed-check wires through the gate ────────
+# ─── Manual bed-check wires through the gate ───────────────────────────────
 
 def test_stage2_gate_skips_sanity_capture_when_manual_verification_fresh(
         sandbox_requests, monkeypatch):
-    """Manual-bed-check wire-through (fresh audit finding MED-1): when
+    """Manual-bed-check wire-through: when
     safety.manual_verification is True AND a Stage 2 nonce was minted
     (proving the operator's fresh yes actually happened) AND
     verification_method + operator_text are recorded, the Stage 2
@@ -588,7 +588,7 @@ def test_stage2_gate_still_captures_sanity_when_no_manual_verification(
         "manual-verification wire-through must not over-reach")
 
 
-# ─── Fresh audit 2026-07-01: refresh-bed-photo cannot create a start path ───
+# ─── Refresh-bed-photo cannot create a start path ─────────────────────────
 
 def test_refresh_bed_photo_does_not_directly_emit_stage2(sandbox_requests, monkeypatch):
     """The refresh-bed-photo action must go through the SAME two-turn
@@ -645,7 +645,7 @@ def test_refresh_bed_photo_does_not_directly_emit_stage2(sandbox_requests, monke
         "refresh alone must not persist a Stage 2 nonce")
 
 
-# ─── Final audit 2026-07-01: remaining coverage gaps ────────────────────────
+# ─── Remaining coverage gaps ────────────────────────────────────────────────
 
 def test_stage2_gate_refuses_kit_request_wrong_revision(sandbox_requests, monkeypatch):
     """Nonce matches but request_revision drifted (plan changed since the
@@ -684,7 +684,7 @@ def test_stage2_gate_refuses_kit_replay_of_consumed_nonce(sandbox_requests, monk
     """Consumed-nonce replay guard on kit path: after a successful Stage
     2 the workflow pops the nonce from safety. A subsequent invocation
     with the SAME nonce value now finds `expected_nonce is None` on a
-    kit request, which the HIGH-1 fix refuses. Belt for defense in
+    kit request, which is refused. Belt for defense in
     depth — the attacker had a valid consumed nonce; the gate still
     refuses."""
     import u1_print_start_gate as gate
@@ -851,7 +851,7 @@ def test_readiness_card_gates_only_plate_1_not_plates_2_N():
     # contains plate1 in gated_plate + start_gate_stage1_command.
 
 
-# ─── Grace period (2026-07-01 postmortem): pre-start cancel window ──────────
+# ─── Pre-start cancel window ─────────────────────────────────────────────
 
 def test_grace_period_default_120s_from_env(monkeypatch):
     """No CLI override + no env → default 120s."""
@@ -898,7 +898,7 @@ def test_grace_period_negative_clamped_to_zero():
 def test_grace_period_cancel_marker_prevents_start_func(sandbox_requests, monkeypatch):
     """The load-bearing test: if the cancel marker appears within the
     grace window, start_func is NEVER called. HTTP never reaches the
-    printer. This is the safety net for the 2026-07-01 postmortem."""
+    printer. This is the safety net."""
     import u1_print_start_gate as gate
     rid = "u1_test_grace_cancel"
     _seed_request(sandbox_requests, rid,
@@ -939,7 +939,7 @@ def test_grace_period_cancel_marker_prevents_start_func(sandbox_requests, monkey
         grace_seconds=10, grace_sleep_fn=fake_sleep,
         out_dir=out_dir)
     assert not start_called["hit"], (
-        "cancel marker MUST prevent start_func — this is the 2026-07-01 "
+        "cancel marker MUST prevent start_func — this is the safety "
         "safety net the whole thing was built for")
     assert res["ok"] is False
     assert res["started"] is False
@@ -1064,7 +1064,7 @@ def test_grace_period_stale_marker_from_prior_run_is_cleared(sandbox_requests, m
         "net would falsely cancel every subsequent print")
 
 
-# ─── Grace-period notify command (2026-07-01 postmortem, part 2) ────────────
+# ─── Grace-period notify command ──────────────────────────────────────────
 
 def test_grace_notify_cmd_resolution_from_env(sandbox_requests, monkeypatch):
     """CLI arg wins over env var."""

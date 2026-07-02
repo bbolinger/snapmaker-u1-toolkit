@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed U1 start gate.
 
-Two-stage design with approval-token handoff (audit response 2026-06-25):
+Two-stage design with approval-token handoff:
 
   Stage 1 — default (--bed-clear=cancel): captures REAL fresh photo via
   u1_camera.capture_photo (LED on + 5s settle), checks brightness so a
@@ -36,12 +36,12 @@ from u1_config import get_u1_host, get_u1_port, get_data_dir
 # can't drift meaningfully (no human will walk in, mess with the bed,
 # and walk out again in this window for a normal home/office deployment);
 # long enough for an operator to set the phone down, deal with something,
-# and come back to confirm. Tuned 2026-06-28 to 30 min after live
-# operator hit refusals on the original 5-min ceiling.
+# and come back to confirm. 30 min is long enough to set the phone
+# down and deal with something, short enough that bed drift matters.
 APPROVAL_TTL_SEC = 1800  # 30 minutes
 
 # Brightness floor below which a photo is considered "too dark for operator
-# review" (cold review 2026-06-25 round 10). Tuned to catch the all-black
+# review". Tuned to catch the all-black
 # frame that bypassing photo_wrap produces, while not rejecting low-light
 # bed photos with a part on it.
 DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
@@ -121,7 +121,7 @@ def _gcode_has_tool_activation(gcode_path: Path | None, expected_t: str,
     Scans starting from ``; EXECUTABLE_BLOCK_START`` when present — OrcaSlicer
     puts a 900+ line config-comment header before any real gcode, so a naive
     top-of-file scan (500 lines) misses the T-activation and false-flags
-    slicer-config-mismatch (verified live 2026-07-01 on request u1_2026_0701_986ba6:
+    slicer-config-mismatch:
     T1 activation was at line 952 but the gate stopped scanning at 500).
     Falls back to first ``scan_lines`` if the marker is absent.
     """
@@ -170,7 +170,7 @@ def preflight(status: dict[str, Any],
         blockers.append('printer is paused')
     if vsd.get('is_active'):
         blockers.append('virtual_sdcard is active')
-    # Audit 2026-06-26: 'cancelled' is a benign terminal state from a prior
+    # 'cancelled' is a benign terminal state from a prior
     # run when the printer is otherwise idle + webhooks ready + vsd inactive
     # + not paused. Klipper accepts /printer/print/start from this state.
     # Same shape as the u1_upload_gcode.py post-upload check.
@@ -183,7 +183,7 @@ def preflight(status: dict[str, Any],
     )
     if ps_state not in (None, 'standby', 'complete', 'ready') and not ps_cancelled_but_clean:
         blockers.append(f"print_stats state is {ps_state}")
-    # Tool-activation check (replaces v2.0's idle-state check 2026-06-30):
+    # Tool-activation check (replaces v2.0's idle-state check):
     # The original check refused if Klipper's `toolhead.extruder` (idle-state
     # last-activated extruder) didn't already match intended_tool. That logic
     # is correct for a single-extruder printer where the operator must
@@ -218,7 +218,7 @@ def preflight(status: dict[str, Any],
     if requested_material and intended_tool and host and port is not None:
         ok, out = run_tool_gate(host, int(port), requested_material, intended_tool)
         if not ok:
-            # Brent design 2026-06-30 / Layer 3 override: the material
+            # Layer 3 override: the material
             # check is loud-by-default, but the operator can take explicit
             # responsibility via --accept-material-mismatch (audited in
             # main() after the override fires). When the override is set,
@@ -266,7 +266,7 @@ def capture_real_bed_photo(out_dir: Path, host: str, port: int, wait: float = 5.
     Either failure mode emits is_mock or brightness_ok=False so the
     caller knows the photo isn't valid for operator review.
 
-    Cold-review fix 2026-06-25 round 10: prior version bypassed
+    Prior version bypassed
     u1_led.photo_wrap and used start_monitor + sleep + fetch_monitor
     directly. Result: black photo, "fresh JPEG" passed, operator approved
     a bed they couldn't see, print started, bed wasn't actually clear.
@@ -281,7 +281,7 @@ def capture_real_bed_photo(out_dir: Path, host: str, port: int, wait: float = 5.
         sha = hashlib.sha256(out_path.read_bytes()).hexdigest() if out_path.exists() else None
         timestamp = datetime.now(timezone.utc).isoformat()
         if brightness is None:
-            # Audit 2026-06-26: when PIL/Pillow isn't available or the JPEG
+            # When PIL/Pillow isn't available or the JPEG
             # is malformed enough that we can't measure brightness, we have
             # a real-camera capture (not a mock) but no automated sanity
             # check. Defer to the operator — they're the bed-clear
@@ -356,7 +356,7 @@ def _normalize_filename(filename: str) -> str:
     """Map a host-filesystem gcode path to the printer-storage filename
     Moonraker expects on /printer/print/start.
 
-    Audit 2026-06-25 (round 11): operator followed the skill verbatim,
+    Prior class of failure: operator followed the skill verbatim,
     passed the host path returned in readiness_card / uploaded events,
     got HTTP 400 'Unable to open file' from Moonraker because Moonraker's
     file-lookup is by basename in its gcode dir (~/printer_data/gcodes/).
@@ -431,7 +431,7 @@ def _resolve_operator_for_gate(cli_operator: str | None) -> str:
     flag > U1_OPERATOR env > 'unknown:gate' fallback. Kept distinct so
     audit rows clearly attribute "where did this row come from."
 
-    Live harness regression 2026-06-28: force dotenv load here too — the
+    Force dotenv load here too — the
     gate may run from any cwd, and u1_config's lazy loader hasn't fired
     yet at this point in the call chain.
     """
@@ -651,10 +651,10 @@ def run_gate(filename: str,
              grace_notify_fn=None):
     host = host or get_u1_host()
     port = port or get_u1_port()
-    # Per-request token + photo storage (live bug 2026-06-28): if we have a
+    # Per-request token + photo storage: if we have a
     # request_id, prefer its request_dir so the bed_snapshot.jpg + approval
     # token live inside the per-request folder. Prevents cross-request
-    # token leakage — the bug Brent hit when Gemma dispatched Stage 2 for
+    # token leakage: a class of bug where an agent dispatches Stage 2 for
     # a new request and the gate picked up a stale GLOBAL token from a
     # prior unrelated session (88 min old, refused). With per-request
     # storage, a new request without a Stage 1 capture has no token to
@@ -672,7 +672,7 @@ def run_gate(filename: str,
     # Fence 1 — test-operator refusal. If the resolved operator carries an
     # unambiguously test-flavored prefix, refuse Stage 2 BEFORE any
     # Moonraker call. Closes the "smoke test accidentally runs a real
-    # print" failure that bit us on 2026-07-01: tester runs the workflow
+    # print" failure class: tester runs the workflow
     # with --operator smoke:xxx, extracts the emitted Stage 2 command,
     # runs it, and the gate happily sends /printer/print/start to the
     # real printer.
@@ -724,7 +724,7 @@ def run_gate(filename: str,
                          host=host, port=port,
                          gcode_path=_gcode_path,
                          accept_material_mismatch=accept_material_mismatch)
-    # Brent design 2026-06-30 / Layer 3 override: when --accept-material-mismatch
+    # Layer 3 override: when --accept-material-mismatch
     # is set, preflight tags the material-mismatch line with [OVERRIDE:...].
     # Filter those out of the active blocker list + audit the override so it's
     # visible forensically. The hardware safety isn't bypassed — just the
@@ -843,7 +843,7 @@ def run_gate(filename: str,
             req_for_nonce = {}
             safety_for_nonce = {}
         # Kit-path nonce requirement (closes the legacy-token bypass a
-        # fresh audit flagged 2026-07-01). Kit requests ALWAYS mint a
+        # closes the kit legacy-token bypass). Kit requests ALWAYS mint a
         # nonce via _action_start() after the operator's fresh yes at
         # bed_clear_start. An absent nonce on a kit request means the
         # legacy --form-answers one-liner bypassed the two-turn
@@ -996,7 +996,7 @@ def run_gate(filename: str,
     _audit_gate(request_id, 'start_safety_check_passed', resolved_operator,
                 request_revision=(req or {}).get('request_revision'),
                 gcode_hash=(req or {}).get('gcode_hash'))
-    # Manual-verification path (Layer 3 override, wired 2026-07-01): if
+    # Manual-verification path (Layer 3 override): if
     # the operator's fresh yes at bed_clear_start was backed by a manual
     # verification method (physical look at the bed / Snapmaker app /
     # other camera), the mandatory Stage 2 sanity capture is REDUNDANT.
@@ -1044,7 +1044,7 @@ def run_gate(filename: str,
         # photo — the operator already approved Stage 1's. We just
         # refuse if this one is mock/dark too.
         sanity_snapshot = capture_real_bed_photo(out_dir, host, port)
-        # Audit 2026-06-26: distinguish mock (camera never reached) and
+        # Distinguish mock (camera never reached) and
         # measured-dark from deferred-brightness-check (PIL unavailable
         # but photo IS real). Only the first two should block — deferred
         # allows the start because the operator already approved Stage
@@ -1055,7 +1055,7 @@ def run_gate(filename: str,
                 and not sanity_snapshot.get('ok'))
         )
     if sanity_blocks_start:
-        # M5 fix (cold review 2026-06-27): audit the sanity-capture refusal
+        # Audit the sanity-capture refusal
         # so the forensic timeline reflects WHY the start was blocked
         # between start_safety_check_passed and 'nothing happened'.
         _audit_gate(request_id, 'stage2_sanity_capture_failed', resolved_operator,
@@ -1080,7 +1080,7 @@ def run_gate(filename: str,
     # notification with a cancel UI that touches cancel_marker_file
     # within the grace window. Default 120s (opt-out via
     # U1_GRACE_PERIOD_SECONDS=0 or --grace-seconds 0). Motivated by
-    # 2026-07-01 postmortem: without this the operator learns about an
+    # Without this the operator learns about an
     # unauthorized start only when the first-layer camera cron fires.
     _resolved_grace = _resolve_grace_seconds(grace_seconds)
     _resolved_notify = _resolve_grace_notify_cmd(grace_notify_cmd)
@@ -1160,7 +1160,7 @@ def main(argv=None):
                     help='v2.0 Phase 3a: operator identity for audit + approval rows '
                          '(e.g. "telegram:brent"). Falls back to env U1_OPERATOR, '
                          'then "unknown:gate".')
-    # Brent design 2026-06-30 / Layer 3 override flags. The material-mismatch
+    # Layer 3 override flags. The material-mismatch
     # blocker is loud-by-default; the operator can take explicit responsibility
     # by passing --accept-material-mismatch. The forensic-control guarantee
     # comes from the audit row capturing --operator-text verbatim. The agent

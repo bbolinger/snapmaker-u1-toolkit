@@ -2,14 +2,14 @@
 the Hermes gateway cancel-hook handler. Unit-level, no Hermes runtime
 needed — subprocess for bash, direct import for Python.
 
-Guards the postmortem-driven contract:
+Guards the contract:
   * shell notify writes /tmp/u1_pending_cancel/<request_id>.json with
     the exact schema the handler expects
   * shell notify does NOT write the pending file when `hermes send`
     fails (send-first ordering)
   * handler touches marker on bare `cancel` / `stop` / `abort`
   * handler ignores substrings like "cancel that idea" (exact match only)
-  * handler ignores expired pending entries (belt for SIGKILL'd gate)
+  * handler ignores expired pending entries (belt for a killed gate)
   * multi-request pending dir: cancel touches ALL active markers
 """
 from __future__ import annotations
@@ -136,7 +136,7 @@ def test_handler_ignores_substring_in_sentence(sandbox_pending_dir):
 
 
 def test_handler_touches_all_markers_when_multiple_pending(sandbox_pending_dir):
-    """HIGH-2 fix: multiple concurrent grace windows each have their
+    """Multiple concurrent grace windows each have their
     own pending file. A bare cancel is intended as 'stop what's about
     to happen' — touch every active marker."""
     handler, pending, tmp = sandbox_pending_dir
@@ -150,7 +150,7 @@ def test_handler_touches_all_markers_when_multiple_pending(sandbox_pending_dir):
 
 
 def test_handler_ignores_expired_pending_entry(sandbox_pending_dir):
-    """MED-4 belt: SIGKILL'd gate leaves a stale pending file.
+    """Belt for a killed gate that leaves a stale pending file.
     Handler must not touch an expired marker."""
     handler, pending, tmp = sandbox_pending_dir
     marker = tmp / "marker_expired.txt"
@@ -261,7 +261,7 @@ def test_notify_calls_hermes_send_with_message(notify_env):
 
 
 def test_notify_does_not_persist_pending_state_if_hermes_send_fails(notify_env):
-    """MED-3 fix: send-first ordering. If Telegram delivery fails, we
+    """Send-first ordering. If Telegram delivery fails, we
     must not leave a phantom pending window that a future unrelated
     cancel could hit."""
     env, tmp = notify_env
@@ -274,7 +274,7 @@ def test_notify_does_not_persist_pending_state_if_hermes_send_fails(notify_env):
 
 
 def test_notify_writes_per_request_files_not_shared(notify_env, tmp_path):
-    """HIGH-2 fix: two concurrent notifies must NOT clobber each
+    """Two concurrent notifies must NOT clobber each
     other. Each writes to <request_id>.json."""
     env_a, tmp_a = notify_env
     env_a["U1_REQUEST_ID"] = "u1_2026_0701_notfyA"
