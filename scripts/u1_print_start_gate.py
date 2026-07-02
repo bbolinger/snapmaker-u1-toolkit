@@ -496,18 +496,87 @@ def _resolve_grace_seconds(cli_override: int | None) -> int:
     return 120  # default ON — see feedback_dev_branch_until_tested
 
 
+def _resolve_grace_notify_cmd(cli_override: str | None) -> str | None:
+    """Notify-command source: CLI arg → env → None (no notification).
+
+    When set, the gate runs this shell command as the grace window
+    opens, with the following env vars exported so the command can
+    templatize them:
+      * U1_REQUEST_ID
+      * U1_FILENAME
+      * U1_GRACE_SECONDS
+      * U1_CANCEL_MARKER
+      * U1_OPERATOR
+    Example — send to Telegram via Hermes (no LLM, no agent loop):
+      U1_GRACE_NOTIFY_CMD='hermes send --to telegram "⚠️ Print starting in $U1_GRACE_SECONDS s: $U1_FILENAME. SSH: touch $U1_CANCEL_MARKER to abort. Request: $U1_REQUEST_ID"'
+    """
+    import os as _os
+    if cli_override:
+        return cli_override
+    env_val = _os.environ.get('U1_GRACE_NOTIFY_CMD', '').strip()
+    return env_val or None
+
+
+def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
+                      filename: str, grace_seconds: int,
+                      cancel_marker: Path, operator: str) -> dict[str, Any]:
+    """Fire the operator notification synchronously with a short timeout.
+
+    Runs the caller-provided shell command with U1_* env vars exported.
+    Returns a dict {ok, exit_code, stderr_tail}. Notification failure
+    is audited but does NOT block the wait — the grace window still
+    runs and the operator can still SSH-touch the marker to cancel.
+    The philosophy: we'd rather notify-fail-open-and-wait than block
+    every print on notification infrastructure. Operator sets a
+    monitor separately if they want strict fail-closed."""
+    import os as _os
+    import subprocess as _sp
+    env = _os.environ.copy()
+    env['U1_REQUEST_ID'] = request_id or ''
+    env['U1_FILENAME'] = filename
+    env['U1_GRACE_SECONDS'] = str(grace_seconds)
+    env['U1_CANCEL_MARKER'] = str(cancel_marker)
+    env['U1_OPERATOR'] = operator
+    try:
+        proc = _sp.run(notify_cmd, shell=True, env=env,
+                       capture_output=True, text=True, timeout=20)
+        result = {
+            'ok': proc.returncode == 0,
+            'exit_code': proc.returncode,
+            'stderr_tail': (proc.stderr or '')[-500:],
+        }
+    except _sp.TimeoutExpired:
+        result = {'ok': False, 'exit_code': -1,
+                  'stderr_tail': 'notify command timed out (>20s)'}
+    except Exception as exc:
+        result = {'ok': False, 'exit_code': -1,
+                  'stderr_tail': f'{type(exc).__name__}: {exc}'}
+    _audit_gate(request_id,
+                'pre_start_grace_notify_sent' if result['ok']
+                else 'pre_start_grace_notify_failed',
+                operator,
+                exit_code=result['exit_code'],
+                stderr_tail=result['stderr_tail'][:200])
+    return result
+
+
 def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                                  request_id: str | None,
                                  resolved_operator: str,
-                                 sleep_fn=None) -> bool:
+                                 filename: str = '',
+                                 notify_cmd: str | None = None,
+                                 sleep_fn=None,
+                                 notify_fn=None) -> bool:
     """Wait up to grace_seconds for cancel_marker to appear on disk.
 
     Returns True if the caller should proceed to start_func, False if
     the operator cancelled during the grace window (no HTTP call
     should follow). Audit rows on both start and end. ``sleep_fn`` is
-    injected for tests so they don't actually sleep."""
+    injected for tests so they don't actually sleep. ``notify_fn`` is
+    injected for tests so we don't shell out."""
     import time as _time
     _sleep = sleep_fn or _time.sleep
+    _notify = notify_fn or _run_grace_notify
     # Fresh window: any leftover marker from a prior request must be
     # cleared before we start listening.
     if cancel_marker.exists():
@@ -519,6 +588,17 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                 resolved_operator,
                 grace_seconds=grace_seconds,
                 cancel_marker=str(cancel_marker))
+    # Fire the operator notification BEFORE we start waiting so they
+    # have the full grace window to react. Notification failure is
+    # audited but does not block the wait (fail-open at notify layer;
+    # the wait itself is the safety net).
+    if notify_cmd:
+        _notify(notify_cmd,
+                request_id=request_id,
+                filename=filename,
+                grace_seconds=grace_seconds,
+                cancel_marker=cancel_marker,
+                operator=resolved_operator)
     for _ in range(int(grace_seconds)):
         if cancel_marker.exists():
             _audit_gate(request_id, 'pre_start_grace_cancelled',
@@ -549,7 +629,9 @@ def run_gate(filename: str,
              operator_text: str | None = None,
              verification_method: str | None = None,
              grace_seconds: int | None = None,
-             grace_sleep_fn=None):
+             grace_sleep_fn=None,
+             grace_notify_cmd: str | None = None,
+             grace_notify_fn=None):
     host = host or get_u1_host()
     port = port or get_u1_port()
     # Per-request token + photo storage (live bug 2026-06-28): if we have a
@@ -984,11 +1066,16 @@ def run_gate(filename: str,
     # 2026-07-01 postmortem: without this the operator learns about an
     # unauthorized start only when the first-layer camera cron fires.
     _resolved_grace = _resolve_grace_seconds(grace_seconds)
+    _resolved_notify = _resolve_grace_notify_cmd(grace_notify_cmd)
     if _resolved_grace > 0:
         cancel_marker = out_dir / 'pre_start_cancel.marker'
         if not _wait_pre_start_grace_period(
                 cancel_marker, _resolved_grace, request_id,
-                resolved_operator, sleep_fn=grace_sleep_fn):
+                resolved_operator,
+                filename=printer_filename,
+                notify_cmd=_resolved_notify,
+                sleep_fn=grace_sleep_fn,
+                notify_fn=grace_notify_fn):
             return {
                 'stage': 'start_attempt',
                 'filename': printer_filename,
@@ -1084,6 +1171,17 @@ def main(argv=None):
                           'cancel. Use 0 to disable (opt-out for power '
                           'users standing at the printer). Overrides env '
                           'U1_GRACE_PERIOD_SECONDS.'))
+    ap.add_argument('--grace-notify-cmd', default=None,
+                    help=('Shell command to fire when the grace window '
+                          'opens, notifying the operator. Env vars '
+                          'exported: U1_REQUEST_ID, U1_FILENAME, '
+                          'U1_GRACE_SECONDS, U1_CANCEL_MARKER, '
+                          'U1_OPERATOR. Notify failure is audited but '
+                          'does not block the wait. Example (Hermes): '
+                          "'hermes send --to telegram \"Print $U1_FILENAME "
+                          "starting in ${U1_GRACE_SECONDS}s. touch "
+                          "$U1_CANCEL_MARKER to abort.\"'. Overrides env "
+                          'U1_GRACE_NOTIFY_CMD.'))
     a = ap.parse_args(argv)
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
@@ -1096,7 +1194,8 @@ def main(argv=None):
                    accept_material_mismatch=a.accept_material_mismatch,
                    operator_text=a.operator_text,
                    verification_method=a.verification_method,
-                   grace_seconds=a.grace_seconds)
+                   grace_seconds=a.grace_seconds,
+                   grace_notify_cmd=a.grace_notify_cmd)
     print(json.dumps(res, indent=2))
     return 0
 

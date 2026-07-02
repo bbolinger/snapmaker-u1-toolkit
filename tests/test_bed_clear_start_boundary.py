@@ -1062,3 +1062,159 @@ def test_grace_period_stale_marker_from_prior_run_is_cleared(sandbox_requests, m
     assert start_called["hit"], (
         "stale cancel marker from prior run was not cleared — safety "
         "net would falsely cancel every subsequent print")
+
+
+# ─── Grace-period notify command (2026-07-01 postmortem, part 2) ────────────
+
+def test_grace_notify_cmd_resolution_from_env(sandbox_requests, monkeypatch):
+    """CLI arg wins over env var."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_NOTIFY_CMD", "env-cmd")
+    assert gate._resolve_grace_notify_cmd("cli-cmd") == "cli-cmd"
+    assert gate._resolve_grace_notify_cmd(None) == "env-cmd"
+
+
+def test_grace_notify_cmd_none_when_unset(monkeypatch):
+    """No CLI + no env → None (no notification)."""
+    import u1_print_start_gate as gate
+    monkeypatch.delenv("U1_GRACE_NOTIFY_CMD", raising=False)
+    assert gate._resolve_grace_notify_cmd(None) is None
+
+
+def test_grace_notify_cmd_fired_when_window_opens(sandbox_requests, monkeypatch):
+    """Notify command MUST run when the grace window opens, with U1_* env
+    vars exported. Notification fires BEFORE the wait loop starts so the
+    operator has the full window to react."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_notify_fires"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    notify_calls = []
+    def fake_notify(cmd, *, request_id, filename, grace_seconds,
+                    cancel_marker, operator):
+        notify_calls.append({
+            "cmd": cmd, "request_id": request_id, "filename": filename,
+            "grace_seconds": grace_seconds, "cancel_marker": str(cancel_marker),
+            "operator": operator,
+        })
+        return {"ok": True, "exit_code": 0, "stderr_tail": ""}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: {"result": "ok"},
+        grace_seconds=3, grace_sleep_fn=lambda s: None,
+        grace_notify_cmd="my-notify-cmd",
+        grace_notify_fn=fake_notify,
+        out_dir=u1_request.request_dir(rid))
+    assert len(notify_calls) == 1, "notify must fire exactly once per window"
+    call = notify_calls[0]
+    assert call["cmd"] == "my-notify-cmd"
+    assert call["request_id"] == rid
+    assert call["filename"] == "test_plate1.gcode"
+    assert call["grace_seconds"] == 3
+    assert call["operator"] == "telegram:brent"
+    assert "pre_start_cancel.marker" in call["cancel_marker"]
+
+
+def test_grace_notify_failure_does_not_block_start(sandbox_requests, monkeypatch):
+    """Notify command failure must NOT prevent the wait / start. The wait
+    is the safety net; notification is nice-to-have. Fail-open at notify
+    layer so the print doesn't blow up on Telegram outage."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_notify_fail"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    def fake_notify_fail(cmd, **kw):
+        return {"ok": False, "exit_code": 1, "stderr_tail": "network down"}
+    start_hit = {"n": 0}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_hit.__setitem__("n", start_hit["n"]+1)
+                                     or {"ok": True}),
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        grace_notify_cmd="broken-cmd",
+        grace_notify_fn=fake_notify_fail,
+        out_dir=u1_request.request_dir(rid))
+    assert start_hit["n"] == 1, (
+        "notify failure must not block start_func — wait is the safety net, "
+        "notify is best-effort")
+
+
+def test_grace_no_notify_cmd_still_works(sandbox_requests, monkeypatch):
+    """No notify command configured → grace period still runs cleanly.
+    Nobody gets notified, but the SSH-touch cancel path still works."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_no_notify"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    monkeypatch.delenv("U1_GRACE_NOTIFY_CMD", raising=False)
+    notify_hit = {"n": 0}
+    def bad_notify(*a, **kw):
+        notify_hit["n"] += 1
+        return {"ok": True, "exit_code": 0, "stderr_tail": ""}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: {"ok": True},
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        grace_notify_fn=bad_notify,
+        out_dir=u1_request.request_dir(rid))
+    assert notify_hit["n"] == 0, "no notify_cmd → notify_fn must not fire"
