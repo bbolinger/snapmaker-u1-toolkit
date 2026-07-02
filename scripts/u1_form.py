@@ -402,6 +402,71 @@ def build_form(spec: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ── Form-answers file handoff (v2.2) ────────────────────────────────────────
+#
+# The button UX collects answers at the GATEWAY (no LLM sees them) and
+# writes them to a file keyed by form_id; the workflow redeems the file via
+# --form-answers-from <form_id>. The model's only job is relaying the
+# emitted command verbatim — the same trust level as --pending-nonce.
+
+FORM_ANSWERS_DIR_ENV = "U1_FORM_ANSWERS_DIR"
+_FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+
+def new_form_id() -> str:
+    """Opaque single-form token (filename-safe, unguessable)."""
+    import secrets
+    return secrets.token_urlsafe(9)
+
+
+def answers_dir() -> "Path":
+    """Where answer files live. Env override first (the Hermes gateway sets
+    it to a path both containers can see); else <data_dir>/form_answers."""
+    from pathlib import Path
+    import os
+    env = os.environ.get(FORM_ANSWERS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "form_answers"
+
+
+def _answers_path(form_id: str) -> "Path":
+    if not _FORM_ID_RE.match(str(form_id or "")):
+        raise ValueError(f"invalid form_id: {form_id!r}")
+    return answers_dir() / f"{form_id}.json"
+
+
+def write_answers_file(form_id: str, obj: dict) -> "Path":
+    """Atomically persist a structured answer set for later redemption."""
+    import json as _json
+    import os
+    p = _answers_path(form_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(_json.dumps(obj, indent=2))
+    os.replace(tmp, p)
+    return p
+
+
+def read_and_consume_answers(form_id: str) -> dict:
+    """Read an answer file and consume it (single-use — renamed on read so
+    a replayed --form-answers-from redeems nothing). Raises FileNotFoundError
+    when absent/already consumed and ValueError on a bad id or bad JSON."""
+    import json as _json
+    import os
+    p = _answers_path(form_id)
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"no pending answers for form {form_id!r} (missing or already used)")
+    text = p.read_text()
+    os.replace(p, p.with_suffix(".json.consumed"))
+    obj = _json.loads(text)
+    if not isinstance(obj, dict):
+        raise ValueError("answers file must contain a JSON object")
+    return obj
+
+
 FORM_SCHEMA_VERSION = 1
 
 

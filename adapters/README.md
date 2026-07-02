@@ -1,14 +1,21 @@
 # Reference adapters — form-protocol renderers
 
-> **EXPERIMENTAL.** The `form_schema` event is not yet emitted by
-> `u1_kit_workflow` (`--interaction-mode form` is parsed but unwired); the
-> staged text flow is the production path today. These adapters are reference
-> implementations ahead of that wiring.
+> **Status (v2.2):** the `form_schema` event IS now emitted —
+> `--interaction-mode form` (or `U1_INTERACTION_MODE=form`) replaces the
+> staged turns with one consolidated form. The Hermes/Telegram adapter is
+> wired for the **file handoff**: on Submit the gateway writes
+> `<U1_FORM_ANSWERS_DIR>/<form_id>.json` and the agent relays the emitted
+> `--form-answers-from` command verbatim — answer content never passes
+> through the model in either direction. The staged text flow remains the
+> default. Discord remains a reference renderer (submits via
+> `--form-answers-json`); live end-to-end validation on real hardware is
+> the remaining step before this loses its experimental label.
 
 Optional, consumer-side reference code that renders the toolkit's `form_schema`
 (emitted on the `kit_form` event) as native UI on a chat surface, collects the
-operator's choices, and submits them back via
-`u1_kit_workflow.py … --form-answers-json '<json>'`.
+operator's choices, and hands them to the workflow — preferred path: the
+gateway-written answers file redeemed via
+`u1_kit_workflow.py … --form-answers-from <form_id>`.
 
 **The core toolkit never imports these and has zero platform-SDK dependencies.**
 Each adapter is self-contained, installed/run separately, and is NOT part of the

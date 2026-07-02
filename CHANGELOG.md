@@ -38,6 +38,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The doc also now states that the chosen material is re-verified against
   what is physically loaded at start time (the gate check that already
   existed, made visible).
+- **Form mode + answers-file handoff.** `--interaction-mode form` (or
+  `U1_INTERACTION_MODE=form`) emits one consolidated `kit_form` event with
+  `form_schema` + a single-form `form_id`; the Hermes/Telegram button
+  adapter writes the collected answers to
+  `<U1_FORM_ANSWERS_DIR>/<form_id>.json` at the GATEWAY, and the workflow
+  redeems the file via `--form-answers-from <form_id>` — single-use
+  (consumed on read), bound to the persisted form id (mismatch refused,
+  file preserved for the rightful redeemer). Answer content never passes
+  through the model in either direction; the model relays one opaque id,
+  the same trust level as `--pending-nonce`. Staged text flow unchanged
+  and still the default — buttons are for reliability, not a requirement.
 
 ---
 

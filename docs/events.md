@@ -410,15 +410,29 @@ emits `kit_detected` and the rest come from `u1_kit_workflow.py`.
 `kit_slice_failed`, `kit_upload_failed`, `post_confirm_flags_backfilled`,
 `stage1_token_adopted_from_sidecar` (`event:` vocabulary, in `audit.jsonl`).
 
-### Form-protocol events (EXPERIMENTAL — not yet emitted)
+### Form mode (v2.2 — button UX with file handoff)
 
-`u1_form.build_form_schema()` and the `adapters/` renderers (Telegram
-buttons, Discord, Hermes form_tool) implement a declarative `form_schema`
-consumed via `--form-answers-json`. The workflow does **not yet emit** a
-`form_schema`-bearing event — `--interaction-mode form` is parsed but
-unwired. The staged text flow above is the production path. Treat any
-`form_schema` field you see as experimental until this section says
-otherwise.
+With `--interaction-mode form` (or `U1_INTERACTION_MODE=form`), the kit
+workflow emits ONE consolidated `need_input` with `key: "kit_form"` instead
+of the staged turns:
+
+- `form_id` — opaque single-form token.
+- `form_schema` — declarative form (`u1_form.build_form_schema`), carrying
+  `submit: {mode: "file", form_id}` so adapters know to write the answers
+  to disk.
+- `form` — `text_fallback` for text-only surfaces.
+- `next_command` — carries `--form-answers-from <form_id>`; the agent
+  tool-calls it VERBATIM once the gateway confirms the answers file exists.
+
+**The handoff is the point:** the adapter's buttons collect answers at the
+GATEWAY, which writes `<answers_dir>/<form_id>.json`
+(`U1_FORM_ANSWERS_DIR`, default `<data_dir>/form_answers`). The workflow
+redeems the file — single-use (consumed on read), bound to the persisted
+`form_id` (mismatch → `form_rejected`). Answer content never passes
+through the model in either direction; the model relays one opaque id.
+Audit rows: `kit_form_emitted`, `form_answers_file_redeemed`,
+`form_answers_rejected`. The staged text flow remains the default and is
+unchanged.
 
 ---
 

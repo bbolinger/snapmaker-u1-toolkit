@@ -1951,10 +1951,11 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # ── LEGACY: one-liner power-user path (CLI tests + scripted runs) ──
     answers = getattr(args, "form_answers", None)
     answers_json = getattr(args, "form_answers_json", None)
-    if answers or answers_json:
+    answers_from = getattr(args, "form_answers_from", None)
+    if answers or answers_json or answers_from:
         return _run_legacy_form_answers(
             args, operator, archive, kit, request_id, out_dir, events_file,
-            json_events, answers, answers_json)
+            json_events, answers, answers_json, answers_from)
 
     # ── STAGED FLOW (Brent design 2026-06-30 late — text mode 6-turn) ──
     #
@@ -1970,6 +1971,61 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # trust_factor_pdf]] and postmortem §5e.5 for the roadmap).
 
     interaction_mode = _resolve_interaction_mode(args)
+
+    # ── FORM MODE (v2.2): one consolidated form instead of staged turns ──
+    # The form_schema is rendered by an adapter (buttons); the GATEWAY
+    # writes the collected answers to a file keyed by form_id and the
+    # agent redeems it by relaying next_command verbatim. No answer
+    # content ever passes through the model — same trust level as the
+    # --pending-nonce contract. Text fallback stays available.
+    if interaction_mode == "form" and not getattr(args, "action", None):
+        _existing = u1_request.read_request(request_id) or {}
+        spec = _build_form_spec(kit, nozzle,
+                                persisted_profiles=_existing.get("form_profiles"))
+        if not spec["profiles"]:
+            _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
+                                "message": ("No profiles found. Run "
+                                            "tools/fetch_snapmaker_profiles.py.")},
+                  json_events)
+            return {"phase": "setup_required", "request_id": request_id,
+                    "out_dir": str(out_dir)}
+        # Re-invocation while a form is pending re-emits the SAME form_id —
+        # idempotent re-prompt, no orphaned answer files. (A successful
+        # commit clears form_id, so a stale one can't leak into a new run;
+        # the phase itself is unreliable here because the bare-reinvoke
+        # guard upstream resets it to kit_analysis by design.)
+        form_id = _existing.get("form_id") or u1_form.new_form_id()
+        u1_request.write_request(request_id, phase="awaiting_form",
+                                 form_id=form_id,
+                                 form_profiles=spec["_profiles_full"])
+        schema = u1_form.build_form_schema(
+            spec, submit={"mode": "file", "form_id": form_id})
+        redeem_cmd = _build_next_command(
+            archive, request_id, nozzle=nozzle,
+            no_live_upload=no_live_upload,
+            no_live_material=no_live_material) + f" --form-answers-from {form_id}"
+        if not no_live_upload:
+            redeem_cmd += " --live-upload"
+        _emit(events_file, {
+            "stage": "need_input", "key": "kit_form",
+            "request_id": request_id,
+            "form_id": form_id,
+            "form_schema": schema,
+            "form": schema["text_fallback"],
+            "next_command": redeem_cmd,
+            "instruction": (
+                "Pass form_schema to the form tool (button UX). When the "
+                "gateway confirms the answers file is written, tool-call "
+                "next_command VERBATIM — do not add, remove, or restate "
+                "any answer. Text fallback: show `form`, then relay the "
+                "operator's one line via --form-answers instead."),
+        }, json_events)
+        _emit(events_file, {"stage": "awaiting_input", "need": "kit_form",
+                            "request_id": request_id}, json_events)
+        _audit(request_id, "kit_form_emitted", operator, form_id=form_id,
+               mode="form")
+        return {"phase": "awaiting_form", "request_id": request_id,
+                "form_id": form_id}
 
     # Turn 1: parts (heavy: extract + build kit dict + render STL thumbnail grid)
     parts_answer = getattr(args, "parts", None)
@@ -3694,9 +3750,12 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
                              out_dir: Path, events_file: Path | None,
                              json_events: bool,
                              answers: str | None,
-                             answers_json: str | None) -> dict[str, Any]:
-    """Power-user one-liner path: parse a single --form-answers line and
-    commit in a single CLI call. Bypasses the staged Q&A entirely."""
+                             answers_json: str | None,
+                             answers_from: str | None = None) -> dict[str, Any]:
+    """Single-call commit path. Three intakes, one validation core:
+    --form-answers (operator's one line), --form-answers-json (structured),
+    --form-answers-from <form_id> (v2.2 file handoff — the gateway wrote
+    the answers; the model never carried them)."""
     existing = u1_request.read_request(request_id) or {}
     spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"),
                             persisted_profiles=existing.get("form_profiles"))
@@ -3710,7 +3769,36 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     # Persist the form_profiles snapshot so `profile N` stays stable across calls.
     u1_request.write_request(request_id, form_profiles=spec["_profiles_full"])
 
-    if answers_json:
+    if answers_from:
+        # File redemption is nonce-like: the id must match the form this
+        # request emitted (when one was emitted), and the file is consumed
+        # on read — a replayed command redeems nothing.
+        persisted_form_id = existing.get("form_id")
+        if persisted_form_id and answers_from != persisted_form_id:
+            msg = ("form id mismatch — this request is awaiting a different "
+                   "form. Re-run the workflow to get a fresh form.")
+            _emit(events_file, {"stage": "form_rejected", "key": "kit_form",
+                                "request_id": request_id, "errors": [msg]},
+                  json_events)
+            _audit(request_id, "form_answers_rejected", operator,
+                   reason="form_id_mismatch", given=str(answers_from)[:32])
+            return {"phase": "form_rejected", "request_id": request_id,
+                    "errors": [msg]}
+        try:
+            obj = u1_form.read_and_consume_answers(answers_from)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            msg = f"could not redeem answers file: {exc}"
+            _emit(events_file, {"stage": "form_rejected", "key": "kit_form",
+                                "request_id": request_id, "errors": [msg]},
+                  json_events)
+            _audit(request_id, "form_answers_rejected", operator,
+                   reason="file_redeem_failed", error=str(exc)[:200])
+            return {"phase": "form_rejected", "request_id": request_id,
+                    "errors": [msg]}
+        _audit(request_id, "form_answers_file_redeemed", operator,
+               form_id=answers_from)
+        parsed = u1_form.parse_answers_json(obj, spec)
+    elif answers_json:
         try:
             obj = json.loads(answers_json) if isinstance(answers_json, str) else answers_json
         except (ValueError, TypeError) as exc:
@@ -3735,6 +3823,10 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     values = parsed["values"]
     _emit(events_file, {"stage": "form_accepted", "request_id": request_id,
                         "parsed": u1_form.echo_parse(values, spec)}, json_events)
+    if answers_from:
+        # The pending form is satisfied — clear the binding so a future
+        # form-mode run mints a fresh id instead of reusing a spent one.
+        u1_request.write_request(request_id, form_id=None)
     return _commit_kit_legacy(args, request_id, operator, out_dir,
                               events_file, archive, kit, spec, values)
 
@@ -4024,6 +4116,11 @@ def main(argv=None) -> int:
                     help=("Set ONLY after the operator answers 'yes' to the "
                           "fresh bed-clear-and-start prompt. Never set on the "
                           "initial confirm-turn 'start' pick."))
+    ap.add_argument("--form-answers-from", default=None, dest="form_answers_from",
+                    help=("v2.2 file handoff: redeem a gateway-written answers "
+                          "file by form_id (single-use, bound to the form this "
+                          "request emitted). The model relays this command "
+                          "verbatim; answer content never passes through it."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "
