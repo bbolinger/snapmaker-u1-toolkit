@@ -123,9 +123,22 @@ FORM_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry  # type: ignore
 
+# Toolset membership decides whether the model is ever OFFERED this tool:
+# model_tools.get_tool_definitions() is a per-toolset allowlist, and the
+# static hermes-<platform> composites in Hermes' toolsets module predate
+# runtime-registered toolsets — a novel toolset name ("form") registers
+# fine but resolves to False for every platform agent, so the tool never
+# reaches the model. `clarify` IS in every platform composite, and form is
+# clarify's multi-field sibling (same gateway-blocking pattern, same UI
+# layer), so ride that bundle by default. Override with U1_FORM_TOOLSET if
+# a Hermes build ever grows a first-party form toolset.
+import os as _os
+
+_FORM_TOOLSET = _os.environ.get("U1_FORM_TOOLSET", "").strip() or "clarify"
+
 registry.register(
     name="form",
-    toolset="form",
+    toolset=_FORM_TOOLSET,
     schema=FORM_SCHEMA,
     handler=lambda args, **kw: form_tool(
         form_schema=args.get("form_schema") or {},
