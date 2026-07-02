@@ -1584,3 +1584,60 @@ def _build_phase2_args_with_operator(model_path, out_dir, request_id, *, operato
     args = _build_phase2_args(model_path, out_dir, request_id)
     args.operator = operator
     return args
+
+
+# --------------------------------------------------------------------------- #
+# v2.1 kit auto-routing (redirect happens before any slicing)
+# --------------------------------------------------------------------------- #
+
+def _kit_zip_for_redirect(tmp_path):
+    import zipfile as _zf
+    zp = tmp_path / 'kit.zip'
+    a, b = _stl(tmp_path), tmp_path / 'm2.stl'
+    import shutil as _sh
+    _sh.copy(a, b)
+    with _zf.ZipFile(zp, 'w') as z:
+        z.write(a, 'a.stl')
+        z.write(b, 'b.stl')
+    return zp
+
+
+def test_kit_redirect_carries_explicit_operator(tmp_path, capsys):
+    zp = _kit_zip_for_redirect(tmp_path)
+    main([str(zp), '--json-events', '--operator', 'smoke:sticky'])
+    events = [json.loads(l) for l in capsys.readouterr().out.splitlines()
+              if l.strip().startswith('{')]
+    kit = [e for e in events if e.get('stage') == 'kit_detected']
+    assert kit, events
+    assert '--operator smoke:sticky' in kit[0]['command']
+
+
+def test_kit_redirect_without_cli_operator_bakes_nothing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv('U1_OPERATOR', 'telegram:someone')
+    zp = _kit_zip_for_redirect(tmp_path)
+    main([str(zp), '--json-events'])
+    events = [json.loads(l) for l in capsys.readouterr().out.splitlines()
+              if l.strip().startswith('{')]
+    kit = [e for e in events if e.get('stage') == 'kit_detected']
+    assert kit, events
+    assert '--operator' not in kit[0]['command']
+
+
+def test_undetectable_zip_does_not_fall_into_single_flow(tmp_path, capsys, monkeypatch):
+    # If kit detection blows up on a zip, the single-STL flow (which slices
+    # only the FIRST model) must not silently proceed.
+    import u1_slice_workflow as wf
+    zp = _kit_zip_for_redirect(tmp_path)
+
+    class _Boom:
+        @staticmethod
+        def is_multi_part_archive(_):
+            raise RuntimeError("corrupt central directory")
+
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, 'u1_kit', _Boom)
+    main([str(zp), '--json-events'])
+    events = [json.loads(l) for l in capsys.readouterr().out.splitlines()
+              if l.strip().startswith('{')]
+    stages = [e.get('stage') for e in events]
+    assert 'kit_detection_failed' in stages, stages

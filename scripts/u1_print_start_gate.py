@@ -705,6 +705,16 @@ def run_gate(filename: str,
             ),
         }
 
+    if _op_lc == "unknown:gate":
+        # Deliberate decision: an UNSET operator identity passes the fence --
+        # refusing every bare CLI run would tax legitimate local use. But it
+        # also means a smoke test that simply forgot to set an operator is
+        # not fenced, so leave a loud audit trail for that exact case.
+        _audit_gate(request_id, 'gate_operator_unknown', resolved_operator,
+                    note=('operator identity was not set (no --operator, no '
+                          'U1_OPERATOR env) -- proceeding, but set an operator '
+                          'so audit rows carry a real identity'))
+
     status = query_state(host, port)
     # Construct the local gcode path for the new preamble-activation check.
     # The slice workflow writes plates to <out_dir>/slice/<printer_filename>.
