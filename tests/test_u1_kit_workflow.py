@@ -7,6 +7,7 @@ against the real binary is done separately in hermes-agent-stack.
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -317,3 +318,63 @@ def test_form_answers_json_invalid_rejected(tmp_path, fake_profiles, fake_slice_
     assert res["phase"] == "form_rejected"
     assert any("invalid --form-answers-json" in e for e in res["errors"])
 
+
+
+# --------------------------------------------------------------------------- #
+# Fence stickiness: explicit CLI operator must ride every emitted command
+# --------------------------------------------------------------------------- #
+
+def _stdout_events(capsys):
+    evs = []
+    for line in capsys.readouterr().out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                evs.append(json.loads(line))
+            except Exception:
+                pass
+    return evs
+
+
+def _emitted_commands(evs):
+    cmds = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("next_command", "command", "yes_command") and isinstance(v, str):
+                    cmds.append(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for item in o:
+                walk(item)
+
+    walk(evs)
+    return cmds
+
+
+def test_explicit_cli_operator_sticky_in_every_emitted_command(tmp_path, fake_profiles, capsys):
+    # 2026-07-01 incident class: a smoke:* operator dropped out of one
+    # next_command, the agent copied it verbatim, and the chain resolved to
+    # the production env operator — Fence 1 passed and a real print fired.
+    # Every kit-workflow command emitted under an explicit operator must
+    # carry it.
+    kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3), operator="smoke:sticky"))
+    cmds = [c for c in _emitted_commands(_stdout_events(capsys))
+            if "u1_kit_workflow.py" in c]
+    assert cmds, "expected at least one emitted kit-workflow command"
+    for c in cmds:
+        assert "--operator smoke:sticky" in c, c
+
+
+def test_env_resolved_operator_is_not_baked_into_commands(tmp_path, fake_profiles, capsys, monkeypatch):
+    # Replay-safety (v2.0.0 decision): identity that came from U1_OPERATOR
+    # env resolves at execution time; it is NOT frozen into commands.
+    monkeypatch.setenv("U1_OPERATOR", "telegram:someone")
+    kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3), operator=None))
+    cmds = [c for c in _emitted_commands(_stdout_events(capsys))
+            if "u1_kit_workflow.py" in c]
+    assert cmds
+    for c in cmds:
+        assert "--operator" not in c, c
