@@ -74,7 +74,12 @@ def _runner_writing(n_plates: int, rc: int = 0):
         out_dir = Path(cmd[cmd.index("--outputdir") + 1])
         out_dir.mkdir(parents=True, exist_ok=True)
         for i in range(1, n_plates + 1):
-            (out_dir / f"plate_{i}.gcode").write_text(f"; fake plate {i}\nT0\nG1 X0\n")
+            # In-bed extrusion moves so the extent guard sees deposited
+            # material — a bare travel move is rejected as "no extrusion
+            # moves found in gcode".
+            (out_dir / f"plate_{i}.gcode").write_text(
+                f"; fake plate {i}\nT0\nG1 X10 Y10 F3000\nG1 X50 Y50 E1.5\nG1 X60 Y40 E2.0\n"
+            )
         return subprocess.CompletedProcess(cmd, rc, stdout="ok", stderr="")
     return _run
 
@@ -92,15 +97,39 @@ def test_arrange_slice_single_plate(tmp_path, hermetic):
     assert hermetic["calls"] == [("plate_1.gcode", 0)]  # T0 -> index 0
 
 
-def test_arrange_slice_multi_plate_sorted(tmp_path, hermetic):
-    res = u1_arrange.arrange_slice(
-        [tmp_path / f"p{i}.stl" for i in range(9)], tmp_path / "out",
-        tool="T1", material="PLA", profile="0.20 Standard",
-        runner=_runner_writing(3),
+def test_arrange_slice_overflow_partitions_into_plates(tmp_path, hermetic, monkeypatch):
+    # Phase 1 (all 9 parts) slices to a plate whose extrusion extent exceeds
+    # the bed; arrange_slice must fall to phase 2, partition the parts, and
+    # slice one in-bed plate per partition.
+    stls = [tmp_path / f"p{i}.stl" for i in range(9)]
+    monkeypatch.setattr(
+        u1_arrange, "_partition_parts",
+        lambda paths, bed, margin: [paths[0:3], paths[3:6], paths[6:9]],
     )
+
+    def _run(cmd, orca_bin):
+        out_dir = Path(cmd[cmd.index("--outputdir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n_stls = sum(1 for a in cmd if a.endswith(".stl"))
+        if n_stls > 3:  # phase 1: all parts → overflowing extent
+            gcode = "T0\nG1 X10 Y10 F3000\nG1 X300 Y50 E1.5\n"
+        else:  # phase 2: one partition → fits
+            gcode = "T0\nG1 X10 Y10 F3000\nG1 X50 Y50 E1.5\n"
+        (out_dir / "plate_1.gcode").write_text(gcode)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    res = u1_arrange.arrange_slice(
+        stls, tmp_path / "out",
+        tool="T1", material="PLA", profile="0.20 Standard",
+        runner=_run,
+    )
+    assert res["was_split"] is True
     assert res["plate_count"] == 3
     assert [p["plate_idx"] for p in res["plates"]] == [1, 2, 3]
-    # T1 -> index 1, rewritten on every plate
+    assert res["partition"] == [["p0.stl", "p1.stl", "p2.stl"],
+                                ["p3.stl", "p4.stl", "p5.stl"],
+                                ["p6.stl", "p7.stl", "p8.stl"]]
+    # T1 -> index 1, rewritten on every finalized plate
     assert hermetic["calls"] == [("plate_1.gcode", 1), ("plate_2.gcode", 1), ("plate_3.gcode", 1)]
 
 
