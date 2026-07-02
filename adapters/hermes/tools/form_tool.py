@@ -156,14 +156,69 @@ import logging as _logging
 
 _logger = _logging.getLogger(__name__)
 
+# The Telegram platform class moved between hermes-agent releases:
+#   <= 0.17  gateway.platforms.telegram          .TelegramPlatform
+#   >= 0.18  plugins.platforms.telegram.adapter  .TelegramAdapter
+#            (platform adapters became plugins in "The Judgment Release")
+# Try newest first; each entry is (module, class). Some installs resolve
+# the package under a hermes_agent. prefix, so both spellings are listed.
+_TELEGRAM_CLASS_CANDIDATES = (
+    ("plugins.platforms.telegram.adapter", "TelegramAdapter"),
+    ("hermes_agent.plugins.platforms.telegram.adapter", "TelegramAdapter"),
+    ("gateway.platforms.telegram", "TelegramPlatform"),
+    ("hermes_agent.gateway.platforms.telegram", "TelegramPlatform"),
+)
+
+
+def _resolve_telegram_platform_class():
+    """Return the installed Hermes Telegram platform class, or None.
+
+    None means no candidate imported — the caller logs the tried paths and
+    leaves the form tool in text-fallback mode instead of crashing tool
+    auto-discovery.
+    """
+    import importlib
+    tried = []
+    for mod_name, cls_name in _TELEGRAM_CLASS_CANDIDATES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError as exc:
+            tried.append(f"{mod_name}.{cls_name} ({exc})")
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is not None:
+            return cls
+        tried.append(f"{mod_name}.{cls_name} (module imported but class missing)")
+    _logger.warning("u1 form patch: no Telegram platform class found; tried: %s. "
+                    "Form tool will only work via text fallback.",
+                    " | ".join(tried))
+    return None
+
+
+def _make_send_result(**kwargs):
+    """Build Hermes' SendResult if importable, else a duck-typed stand-in.
+
+    gateway/platforms/base.py survived the 0.18 plugin refactor, but if it
+    ever moves the send path degrades to an attribute-compatible namespace
+    instead of raising inside the gateway's event loop.
+    """
+    try:
+        from gateway.platforms.base import SendResult  # type: ignore
+    except ImportError:
+        try:
+            from hermes_agent.gateway.platforms.base import SendResult  # type: ignore
+        except ImportError:
+            from types import SimpleNamespace
+            return SimpleNamespace(success=kwargs.get("success", False),
+                                   message_id=kwargs.get("message_id"),
+                                   error=kwargs.get("error"))
+    return SendResult(**kwargs)
+
 
 def _install_telegram_form_patch() -> None:
-    try:
-        from gateway.platforms.telegram import TelegramPlatform  # type: ignore
-    except ImportError as exc:
-        _logger.warning("u1 form patch: TelegramPlatform import failed (%s); "
-                        "form tool will only work via text fallback.", exc)
-        return
+    TelegramPlatform = _resolve_telegram_platform_class()
+    if TelegramPlatform is None:
+        return  # _resolve_telegram_platform_class already logged the paths tried
     if getattr(TelegramPlatform, "_u1_form_patched", False):
         return  # idempotent — already patched (re-import safe)
     try:
@@ -242,15 +297,13 @@ def _install_telegram_form_patch() -> None:
                 else await self._bot.send_message(**kwargs)
         except Exception as exc:
             _logger.warning("u1 form: send failed: %s", exc)
-            from gateway.platforms.base import SendResult  # type: ignore
-            return SendResult(success=False, error=str(exc))
+            return _make_send_result(success=False, error=str(exc))
         _form_state(self)[form_id] = {
             "form": form, "schema": form_schema,
             "session_key": session_key, "msg_id": msg.message_id,
             "chat_id": int(chat_id),
         }
-        from gateway.platforms.base import SendResult  # type: ignore
-        return SendResult(success=True, message_id=str(msg.message_id))
+        return _make_send_result(success=True, message_id=str(msg.message_id))
 
     async def _u1_handle_form_callback(self, update, ctx) -> None:
         q = update.callback_query
@@ -341,7 +394,13 @@ def _install_telegram_form_patch() -> None:
         head = data.split(":", 1)[0]
         return head in _FORM_PREFIXES and (":" in data or data in ("S", "X"))
 
-    _orig_cb = TelegramPlatform._handle_callback_query
+    _orig_cb = getattr(TelegramPlatform, "_handle_callback_query", None)
+    if _orig_cb is None:
+        _logger.warning("u1 form patch: %s has no _handle_callback_query — the "
+                        "callback hook point moved in this hermes-agent build; "
+                        "form tool will only work via text fallback.",
+                        TelegramPlatform.__name__)
+        return
 
     async def _wrapped_cb(self, update, ctx):
         data = (update.callback_query.data if update and update.callback_query else "") or ""
@@ -365,7 +424,8 @@ def _install_telegram_form_patch() -> None:
     TelegramPlatform._u1_handle_form_callback = _u1_handle_form_callback
     TelegramPlatform._handle_callback_query = _wrapped_cb
     TelegramPlatform._u1_form_patched = True
-    _logger.info("u1 form patch: TelegramPlatform.send_form installed (no source edits).")
+    _logger.info("u1 form patch: %s.send_form installed (no source edits).",
+                 TelegramPlatform.__name__)
 
 
 _install_telegram_form_patch()

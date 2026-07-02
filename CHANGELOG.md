@@ -49,6 +49,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   through the model in either direction; the model relays one opaque id,
   the same trust level as `--pending-nonce`. Staged text flow unchanged
   and still the default — buttons are for reliability, not a requirement.
+- **hermes-agent 0.18 compatibility** ([`adapters/hermes/tools/form_tool.py`](adapters/hermes/tools/form_tool.py)).
+  0.18 ("The Judgment Release") moved platform adapters into a plugin
+  system — the Telegram class is now
+  `plugins.platforms.telegram.adapter.TelegramAdapter`, not 0.17's
+  `gateway.platforms.telegram.TelegramPlatform`. The form patch now
+  resolves the class version-adaptively (0.18 path first, 0.17 fallback);
+  when nothing imports it logs every path tried and degrades to text
+  fallback instead of dying inside tool auto-discovery. `SendResult`
+  construction got the same treatment, and a missing
+  `_handle_callback_query` hook point now skips the patch loudly instead
+  of raising.
 
 ---
 
