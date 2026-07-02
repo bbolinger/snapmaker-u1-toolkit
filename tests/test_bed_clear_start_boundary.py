@@ -977,6 +977,105 @@ def test_grace_period_cancel_marker_prevents_start_func(sandbox_requests, monkey
     assert "cancelled during the pre-start grace" in res["reason"]
 
 
+def test_grace_cancel_during_final_tick_still_prevents_start(sandbox_requests, monkeypatch):
+    """TOCTOU race pin: the DM counts the window down, so an operator
+    racing the deadline lands their CANCEL during the LAST sleep tick.
+    The final re-check after the loop must still catch it — no HTTP."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_lasttick"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    start_called = {"hit": False}
+    ticks = {"n": 0}
+    out_dir = u1_request.request_dir(rid)
+    cancel_marker = out_dir / "pre_start_cancel.marker"
+
+    def fake_sleep(sec):
+        ticks["n"] += 1
+        if ticks["n"] == 3:  # grace_seconds=3 → this is the LAST tick
+            cancel_marker.parent.mkdir(parents=True, exist_ok=True)
+            cancel_marker.write_text("cancel")
+
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: (start_called.__setitem__("hit", True) or {"ok": True}),
+        grace_seconds=3, grace_sleep_fn=fake_sleep,
+        out_dir=out_dir)
+    assert not start_called["hit"], (
+        "a CANCEL during the final sleep tick was silently lost — the "
+        "operator was promised the full window")
+    assert res["ok"] is False and res["started"] is False
+
+
+def test_grace_cancel_refusal_offers_stage1_recovery(sandbox_requests, monkeypatch):
+    """Usability moat-crossing: a grace-cancel must not dead-end. The slice
+    and upload are still valid — the refusal payload hands the operator the
+    fresh-photo Stage 1 command so restarting costs one photo + one yes,
+    not a whole re-run."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_grace_recovery"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={
+                      "approval_token": "test_token",
+                      "stage2_approval_nonce": "n",
+                      "stage2_approval_binds": {
+                          "request_revision": 1,
+                          "gcode_hash": "sha256:abc123",
+                          "prompt_key": "bed_clear_start",
+                      },
+                  })
+    monkeypatch.setattr(gate, "_approval_token_valid",
+                        lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    out_dir = u1_request.request_dir(rid)
+    cancel_marker = out_dir / "pre_start_cancel.marker"
+
+    def fake_sleep(sec):
+        cancel_marker.parent.mkdir(parents=True, exist_ok=True)
+        cancel_marker.write_text("cancel")
+
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        intended_tool="T1", requested_material="PLA",
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: {"ok": True},
+        grace_seconds=5, grace_sleep_fn=fake_sleep,
+        out_dir=out_dir)
+    assert res["ok"] is False
+    rec = res.get("recovery")
+    assert rec, "cancel refusal must carry a recovery block"
+    assert "stage1_command" in rec and rid in rec["stage1_command"]
+    assert "--intended-tool T1" in rec["stage1_command"]
+
+
 def test_grace_period_expires_and_start_proceeds(sandbox_requests, monkeypatch):
     """No cancel within window → after grace_seconds, start_func fires."""
     import u1_print_start_gate as gate

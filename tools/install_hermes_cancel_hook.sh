@@ -61,18 +61,34 @@ echo "install: restarting gateway..."
     exit 3
 }
 
-# Give it a beat to come up and log the hook count.
+# Give it a beat to come up, then verify THIS hook specifically loaded —
+# a generic 'hook(s) loaded' line passes even when u1_grace_cancel failed.
 sleep 4
 GATEWAY_LOG="${HERMES_HOME:-/opt/data}/logs/gateway.log"
+VERIFIED=0
 if [[ -r "${GATEWAY_LOG}" ]]; then
-    LATEST_HOOK_LINE="$(grep 'hook(s) loaded' "${GATEWAY_LOG}" | tail -1 || true)"
-    if [[ -n "${LATEST_HOOK_LINE}" ]]; then
-        echo "install: ${LATEST_HOOK_LINE}"
+    if tail -200 "${GATEWAY_LOG}" | grep -q 'u1_grace_cancel'; then
+        echo "install: verified — u1_grace_cancel appears in gateway.log"
+        VERIFIED=1
     else
-        echo "install: WARNING — no 'hook(s) loaded' line found in ${GATEWAY_LOG}" >&2
+        echo "install: WARNING — u1_grace_cancel not found in the last 200 lines of ${GATEWAY_LOG}." >&2
+        echo "install: the hook may not have loaded; reply-CANCEL will silently do nothing until it does." >&2
     fi
 else
-    echo "install: gateway.log not readable at ${GATEWAY_LOG}, skipping verification"
+    echo "install: gateway.log not readable at ${GATEWAY_LOG}, skipping verification" >&2
 fi
 
-echo "install: done. Cancel any grace-window print by replying 'cancel <code>' in your Hermes DM."
+# Receipt: the notify script checks this file to decide whether the DM may
+# honestly promise reply-to-cancel. Only written on verified load.
+RECEIPT="${U1_CANCEL_HOOK_RECEIPT:-${HERMES_HOME:-/opt/data}/.u1_cancel_hook_receipt}"
+if [[ "${VERIFIED}" == "1" ]]; then
+    printf '{"hook": "u1_grace_cancel", "dest": "%s", "installed_at": "%s"}\n' \
+        "${DEST}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RECEIPT}"
+    echo "install: receipt written to ${RECEIPT}"
+else
+    rm -f "${RECEIPT}" 2>/dev/null || true
+    echo "install: NO receipt written — grace-period DMs will advertise the SSH fallback instead of reply-CANCEL." >&2
+fi
+
+echo "install: done. Cancel any grace-window print by replying CANCEL (all windows)"
+echo "install: or 'cancel <code>' (just that request; code = last 6 chars of the request id)."

@@ -614,15 +614,24 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
         except OSError:
             pass
 
+    def _cancelled() -> bool:
+        _audit_gate(request_id, 'pre_start_grace_cancelled',
+                    resolved_operator,
+                    cancel_marker=str(cancel_marker),
+                    cancelled_after_wait_s=None)
+        _clear_pending_state()
+        return False
+
     for _ in range(int(grace_seconds)):
         if cancel_marker.exists():
-            _audit_gate(request_id, 'pre_start_grace_cancelled',
-                        resolved_operator,
-                        cancel_marker=str(cancel_marker),
-                        cancelled_after_wait_s=None)
-            _clear_pending_state()
-            return False
+            return _cancelled()
         _sleep(1)
+    # Final re-check AFTER the last sleep tick: the notification counts the
+    # window down, so an operator racing the deadline lands their CANCEL
+    # exactly here. A marker written during the final second must still
+    # win — they were promised the full window.
+    if cancel_marker.exists():
+        return _cancelled()
     _audit_gate(request_id, 'pre_start_grace_period_expired',
                 resolved_operator, grace_seconds=grace_seconds,
                 proceeded_to_start=True)
@@ -1094,8 +1103,41 @@ def run_gate(filename: str,
     # unauthorized start only when the first-layer camera cron fires.
     _resolved_grace = _resolve_grace_seconds(grace_seconds)
     _resolved_notify = _resolve_grace_notify_cmd(grace_notify_cmd)
+    cancel_marker = out_dir / 'pre_start_cancel.marker'
+
+    def _grace_cancel_refusal() -> dict[str, Any]:
+        # A grace-cancel consumed the Stage 2 nonce, but the slice, the
+        # upload, and the plate on the printer are all still valid. The
+        # cheap, legitimate path back is a fresh Stage 1 (new photo, new
+        # yes) — NOT re-running the whole workflow. Hand that path to the
+        # operator instead of a dead-end refusal.
+        recovery: dict[str, Any] = {
+            'instruction': (
+                'Cancelled before any printer traffic. The uploaded plate '
+                'is still valid — to print it after all, re-run Stage 1 '
+                '(fresh bed photo + fresh yes); no re-slice or re-upload '
+                'is needed.'),
+        }
+        if intended_tool and requested_material and request_id:
+            recovery['stage1_command'] = build_stage1_command(
+                printer_filename=printer_filename,
+                intended_tool=str(intended_tool),
+                material=str(requested_material),
+                request_id=request_id)
+        return {
+            'stage': 'start_attempt',
+            'filename': printer_filename,
+            'blockers': blockers,
+            'snapshot': sanity_snapshot,
+            'ok': False, 'started': False,
+            'reason': (
+                'Operator cancelled during the pre-start grace '
+                'period. No HTTP call was sent to the printer.'),
+            'cancel_marker': str(cancel_marker),
+            'recovery': recovery,
+        }
+
     if _resolved_grace > 0:
-        cancel_marker = out_dir / 'pre_start_cancel.marker'
         if not _wait_pre_start_grace_period(
                 cancel_marker, _resolved_grace, request_id,
                 resolved_operator,
@@ -1103,17 +1145,16 @@ def run_gate(filename: str,
                 notify_cmd=_resolved_notify,
                 sleep_fn=grace_sleep_fn,
                 notify_fn=grace_notify_fn):
-            return {
-                'stage': 'start_attempt',
-                'filename': printer_filename,
-                'blockers': blockers,
-                'snapshot': sanity_snapshot,
-                'ok': False, 'started': False,
-                'reason': (
-                    'Operator cancelled during the pre-start grace '
-                    'period. No HTTP call was sent to the printer.'),
-                'cancel_marker': str(cancel_marker),
-            }
+            return _grace_cancel_refusal()
+        # Belt: one more marker check between the window closing and the
+        # HTTP call — audit/log latency in the wait's exit path is real
+        # time an operator's last-instant CANCEL could land in.
+        if cancel_marker.exists():
+            _audit_gate(request_id, 'pre_start_grace_cancelled',
+                        resolved_operator,
+                        cancel_marker=str(cancel_marker),
+                        cancelled_after_wait_s='post-window')
+            return _grace_cancel_refusal()
     resp = start_func(host, port, printer_filename)
     # Phase 3b: record the start approval as granted now that we've actually
     # commanded the printer. record_approval binds the approval to the

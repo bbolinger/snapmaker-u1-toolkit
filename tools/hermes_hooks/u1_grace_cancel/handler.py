@@ -2,9 +2,13 @@
 grace-period Telegram DM and the pending print aborts before any HTTP
 call reaches the printer.
 
-Match: message text is EXACTLY one of {cancel, stop, abort, /cancel,
-/stop, /abort}, whitespace-trimmed, case-insensitive. Substrings do
-NOT match — "cancel that idea" is safe.
+Match: message text is EXACTLY a cancel keyword ({cancel, stop, abort,
+/cancel, /stop, /abort}, whitespace-trimmed, case-insensitive) — which
+cancels EVERY active grace window — or a keyword followed by a request
+code (`cancel abc123`, the last 6 chars of the request_id) — which
+cancels ONLY the matching window. Anything else does NOT match —
+"cancel that idea" is safe. A code that matches no active window
+cancels nothing (logged), rather than guessing.
 
 Contract with u1_print_start_gate.py + u1_grace_notify_hermes.sh:
   * When the gate opens a grace window, the notify script writes a
@@ -38,6 +42,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import re
 
 PENDING_DIR = Path("/tmp/u1_pending_cancel")
 LOG_FILE = Path(__file__).parent / "hook.log"
@@ -46,6 +51,13 @@ CANCEL_KEYWORDS = {
     "cancel", "stop", "abort",
     "/cancel", "/stop", "/abort",
 }
+
+# `cancel` / `cancel abc123`. The code is the request_id tail the notify
+# DM shows; [a-z0-9_-]{4,12} keeps prose like "cancel that idea" unmatched.
+_CANCEL_RE = re.compile(
+    r"^(?:/)?(?:cancel|stop|abort)(?:\s+([a-z0-9_-]{4,12}))?$",
+    re.IGNORECASE,
+)
 
 
 def _log(entry: dict) -> None:
@@ -73,11 +85,23 @@ def _extract_text(context: dict) -> str:
     return ""
 
 
+def _parse_cancel_message(text: str) -> tuple[bool, str | None]:
+    """Returns (is_cancel, code). Bare keyword → (True, None): cancel all
+    active windows. Keyword + code → (True, code): cancel only the window
+    whose request_id ends with the code. Prose ("cancel that plan") does
+    not match — intentionally safe."""
+    stripped = text.strip().lower()
+    if stripped in CANCEL_KEYWORDS:
+        return True, None
+    m = _CANCEL_RE.match(stripped)
+    if m:
+        return True, m.group(1)
+    return False, None
+
+
 def _is_cancel_message(text: str) -> bool:
-    """Exact-match on cancel keywords, whitespace-trimmed, case-
-    insensitive. Substrings do NOT match — "cancel that plan" is
-    intentionally safe."""
-    return text.strip().lower() in CANCEL_KEYWORDS
+    """Back-compat shim over _parse_cancel_message."""
+    return _parse_cancel_message(text)[0]
 
 
 def _load_pending_windows() -> list[dict]:
@@ -115,7 +139,8 @@ async def handle(event_type: str, context: dict) -> None:
     text = _extract_text(context)
     if not text:
         return
-    if not _is_cancel_message(text):
+    is_cancel, code = _parse_cancel_message(text)
+    if not is_cancel:
         return
     pending = _load_pending_windows()
     if not pending:
@@ -124,8 +149,22 @@ async def handle(event_type: str, context: dict) -> None:
               "platform": context.get("platform"),
               "user_id": context.get("user_id")})
         return
-    # Touch every active pending marker. In a single-U1 setup
-    # there's normally only one; if multiple somehow exist, cancel-
+    if code is not None:
+        # Code-scoped cancel: only the window whose request_id ends with
+        # the code. A code that matches nothing cancels NOTHING — we log
+        # instead of guessing, so a typo can't kill an unrelated print.
+        scoped = [s for s in pending
+                  if str(s.get("request_id", "")).lower().endswith(code)]
+        if not scoped:
+            _log({"event": "cancel_code_no_match", "code": code,
+                  "active_request_ids": [s.get("request_id") for s in pending],
+                  "text": text[:60],
+                  "platform": context.get("platform"),
+                  "user_id": context.get("user_id")})
+            return
+        pending = scoped
+    # Bare keyword: touch every active pending marker. In a single-U1
+    # setup there's normally only one; if multiple somehow exist, cancel-
     # means-cancel-all is the least surprising behavior.
     for state in pending:
         marker_path = Path(state["cancel_marker"])
