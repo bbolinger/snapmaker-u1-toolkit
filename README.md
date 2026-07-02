@@ -521,6 +521,9 @@ carries a `recovery.stage1_command`: the slice and upload are still
 valid, so restarting costs one fresh bed photo + one fresh yes — not a
 workflow re-run.
 
+Verify the whole chain (including a zero-risk drill that needs no
+printer): [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
+
 Opt-out for power users at the printer: `U1_GRACE_PERIOD_SECONDS=0`
 disables the window. `U1_GRACE_NOTIFY_CMD` unset disables the
 notification but the wait still runs (in that case an SSH `touch
