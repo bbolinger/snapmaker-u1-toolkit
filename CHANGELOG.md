@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Test suite could DM the operator a real "print starting" notification**
+  (live 2026-07-02, "spam every time you run the suite"). `test_u1_config`
+  loads the real `/opt/data/.env` into `os.environ`, leaking
+  `U1_GRACE_NOTIFY_CMD`; later start-path tests resolved it and the notify
+  script defaults `HERMES_BIN`→`hermes` + dest→`telegram`, sending to the real
+  chat. conftest now: stubs `HERMES_BIN` + shadows `hermes` on PATH (the suite
+  is structurally unable to reach Telegram; any attempt is logged), defaults
+  the grace window to 0 so non-grace tests skip it (no notify, no 120s sleep —
+  the suite also got ~13× faster), and scrubs the notify env per test.
 - **False "print starting" notification loop** (live 2026-07-02). A confused
   agent that invoked the print-start flow with a placeholder/nonexistent
   filename (gpt-5.5 looping on `x.gcode` / `wall_mount.gcode` from the skill
@@ -29,6 +38,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - **Form UX v2.2.1 — fewer, clearer screens (operator feedback 2026-07-02).**
+  - **Setup screen: print head + orientation + supports on ONE screen.** The
+    renderer gained a `group` model — fields sharing a group render together as
+    labelled blocks under one shared `Next ➜`. Grouped single-selects behave as
+    radios (tap marks, doesn't advance); ungrouped ones (profile) still advance
+    on tap. Step counter counts screens, so a group is one step.
   - **Print head carries the filament.** When the live tool map is present, the
     head screen shows each head's loaded material + colour
     (`Head 2 (T1) — PETG ⚫ black`, read from `printer_reported`), and picking
