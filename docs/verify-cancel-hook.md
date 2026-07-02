@@ -94,6 +94,9 @@ for the other match modes:
 - `cancel wrong99` — matches nothing: marker must NOT appear
   (`cancel_code_no_match` in hook.log).
 - `cancel that plan for tomorrow` — prose: ignored entirely.
+- `CANCEL!!!` — trailing punctuation is urgency, not ambiguity: marker
+  appears (fix shipped 2026-07-02; re-run the install script if your
+  hook predates it).
 
 Clean up:
 
