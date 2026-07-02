@@ -4,15 +4,22 @@
 
 ![Hermes Agent + Snapmaker U1 — safety-staged print automation](docs/images/hero-hermes-snapmaker.png)
 
+[![tests](https://github.com/bbolinger/snapmaker-u1-toolkit/actions/workflows/tests.yml/badge.svg)](https://github.com/bbolinger/snapmaker-u1-toolkit/actions/workflows/tests.yml)
+
 > Inspired by safety-staged agent workflows, this project applies the pattern specifically to the [Snapmaker U1](https://snapmaker.com/snapmaker-u1) — local slicing, visual previews, camera-gated checks, and explicit operator approval. Useful from the command line on its own; an AI agent like Hermes is the optional remote-control layer on top.
 
 This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
+
+**New in v2.1.0:** multi-part kits (send a zip, print a project), a pre-start
+grace period with a model-free Telegram cancel button, and a safety boundary
+hardened by two external review rounds — every claim live-verified on real
+hardware. See the [CHANGELOG](CHANGELOG.md).
 
 ---
 
 ## What This Is
 
-A toolkit + workflow that turns "I have an STL, slice it for my U1" into a staged, auditable, operator-gated print job:
+A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I have a zip of twelve STLs" — into a staged, auditable, operator-gated print job:
 
 1. **Triage** the model (dimensions, triangle count, mesh validity)
 2. **Orient** it — show both as-authored and Orca's auto-orient, with the real mesh-topology verdict (`floating cantilever` / `clean` / overhang layer fraction) so the operator picks based on Orca's actual call, not a face-angle approximation
@@ -26,6 +33,30 @@ A toolkit + workflow that turns "I have an STL, slice it for my U1" into a stage
 10. **Monitor** — first-layer photo, last-layer check, completion
 
 Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
+
+### Multi-part kits (v2.1.0)
+
+Send a **zip of STLs** — the common Printables shape — and the kit workflow
+takes it from there:
+
+1. **Ingest** every part (footprints measured, oversized parts flagged, hostile
+   archives refused with a clean error instead of a crash)
+2. **One consolidated decision form** — parts, orientation, tool, material,
+   profile, supports, action — answered in a single line, in any order.
+   **A script parses and validates the answer; the model never interprets it.**
+   Conflicting or ambiguous input fails loudly with a re-prompt, never a
+   silent guess.
+3. **Arrange + slice** onto as many plates as the bed needs, with a
+   gcode-extent guard that refuses any plate whose extrusion would leave the
+   bed (built from a real incident, not a hypothetical)
+4. **Upload all plates**, then run the same Stage 1/2 camera-gated start
+   boundary on plate 1. Plates 2..N start from the Snapmaker app after it —
+   the watchdog photographs every plate either way.
+
+The operator's confirm ride on a single-use nonce baked into the emitted
+command, so even the agent relaying your answers can't hand-assemble its way
+past the boundary. A single STL is just a kit of one — same entrypoint,
+auto-detected.
 
 ## What This Is Not
 
@@ -55,6 +86,13 @@ Actions that always require explicit operator confirmation:
 - Anything that affects the physical printer
 
 The workflow fails closed. If a check is unsure, it stops and asks rather than guessing. Bed-clear verdicts come from the operator looking at a real photo, not from the toolkit deciding the bed is "probably fine." Slicer profile mismatches abort BEFORE the slice. Upload that hits a filename collision asks before overwriting.
+
+None of this is aspirational: the safety boundary went through two external
+deep-review rounds (the findings and fixes are documented in the
+[CHANGELOG](CHANGELOG.md)), 614 tests run in CI on every change, and the
+cancel chain is **live-verified on real hardware** — including a
+reproducible, no-printer-needed drill anyone can run:
+[docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
 
 ## The Three Layers
 
@@ -101,6 +139,7 @@ Every operator decision is concrete and tied to a specific artifact:
 | Supports | Overhang verdict from a fast draft slice — Orca's real call, not face-angle |
 | Upload | Three options: upload-only / upload+start gate / cancel |
 | Filename collision | Three options: timestamped rename / overwrite / cancel |
+| Kit decisions (v2.1.0) | One consolidated form (parts / orient / tool / material / profile / supports / action) — script-parsed, echoed back verbatim for confirmation before anything slices |
 | **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. The operator types yes/no. Default is no. |
 
 If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
