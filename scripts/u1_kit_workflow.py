@@ -130,8 +130,11 @@ from u1_slice_workflow import (
 DEFAULT_TOOLS = ["T0", "T1", "T2", "T3"]
 DEFAULT_MATERIALS = ["PLA", "PETG", "ABS", "TPU", "ASA", "PLA-CF", "PETG-CF"]
 # Maps the form's supports vocabulary to the slice override vocabulary.
+# "overhangs" was dropped from the offered options: enable_support is binary
+# in the profile patch, so an overhangs-only mode was accepted + echoed but
+# silently unimplemented. Re-add only alongside a real profile override.
 _SUPPORTS_TO_OVERRIDE = {"supports": "supports", "no-supports": "no_supports",
-                        "no_supports": "no_supports", "overhangs": "overhangs"}
+                        "no_supports": "no_supports"}
 
 
 # ─── Staged-flow helpers (Phase 1) ──────────────────────────────────────────
@@ -2132,7 +2135,6 @@ def _emit_supports_prompt(events_file: Path | None, request_id: str, archive: Pa
     for slug, label in [
         ("supports", "Yes — generate supports on all selected parts"),
         ("no_supports", "No — no supports on any part"),
-        ("overhangs", "Overhangs only — supports on high-overhang areas"),
     ]:
         options.append({
             "label": label,
@@ -2151,8 +2153,7 @@ def _emit_supports_prompt(events_file: Path | None, request_id: str, archive: Pa
         "prompt": f"Supports? ({summary['summary_line']})",
         "options": options,
         "note": ("Per-part overhang scan shown in prompt. If some parts are "
-                 "flagged as overhang-risk, 'yes' or 'overhangs' catches "
-                 "them without penalizing simple parts."),
+                 "flagged as overhang-risk, 'yes' catches them."),
         "overhang_summary": summary,
     }, json_events)
     _emit(events_file, {"stage": "awaiting_input", "need": "supports",
@@ -2286,7 +2287,7 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "tools": DEFAULT_TOOLS,
         "materials": DEFAULT_MATERIALS,
         "profiles": [{"idx": p["idx"], "label": p["label"]} for p in profiles_full],
-        "supports": ["supports", "no-supports", "overhangs"],
+        "supports": ["supports", "no-supports"],
         "actions": ["start", "upload-only"],
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
         "_profiles_full": profiles_full,  # persisted at form-emit for index stability
@@ -3880,7 +3881,7 @@ def _emit_adjust_field_prompt(events_file, request_id, archive, kit, nozzle,
     """Step A of adjust — operator picks which field to change."""
     fields = [
         ("orient", "Orientation — as-authored vs auto"),
-        ("supports", "Supports — turn on / off / overhangs-only globally"),
+        ("supports", "Supports — turn on / off globally"),
         ("profile", "Profile — pick a different slicer process"),
         ("parts", "Parts — change which STLs are included"),
     ]
@@ -3940,7 +3941,6 @@ def _emit_supports_drill_prompt(events_file, request_id, archive, kit, nozzle,
     for slug, label in [
         ("supports", "Supports — generate supports for all parts"),
         ("no_supports", "No supports — none for any part"),
-        ("overhangs", "Overhangs only — supports just on critical overhangs"),
     ]:
         options.append({
             "label": label,
@@ -4240,7 +4240,7 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", default=None,
                     help="profile slug (default at confirm: top-scored for nozzle)")
     ap.add_argument("--supports", default=None,
-                    choices=["supports", "no_supports", "no-supports", "overhangs"],
+                    choices=["supports", "no_supports", "no-supports"],
                     help="supports decision (default at confirm: no_supports)")
     ap.add_argument("--action", default=None,
                     choices=["start", "upload-only", "upload_only", "adjust",

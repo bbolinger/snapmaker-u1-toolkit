@@ -20,7 +20,7 @@ def _spec(n_parts=3):
             {"idx": 1, "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"},
             {"idx": 2, "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)"},
         ],
-        "supports": ["supports", "no-supports", "overhangs"],
+        "supports": ["supports", "no-supports"],
         "actions": ["start", "upload-only"],
     }
 
@@ -53,11 +53,11 @@ def test_order_independent():
 
 
 def test_forgiving_separators_and_case():
-    r = u1_form.parse_answers("t0 ; pla ; PROFILE 1 ; OVERHANGS", _spec(n_parts=0))
+    r = u1_form.parse_answers("t0 ; pla ; PROFILE 1 ; NO-SUPPORTS", _spec(n_parts=0))
     assert r["ok"], r["errors"]
     assert r["values"]["tool"] == "T0"
     assert r["values"]["material"] == "PLA"
-    assert r["values"]["supports"] == "overhangs"
+    assert r["values"]["supports"] == "no-supports"
 
 
 # --------------------------------------------------------------------------- #
@@ -101,15 +101,21 @@ def test_parts_given_on_single_part_job_errors():
 
 
 # --------------------------------------------------------------------------- #
-# Disambiguation: bare int = profile, list = parts
+# Disambiguation: bare int on a kit is ambiguous; on single-part = profile
 # --------------------------------------------------------------------------- #
 
-def test_bare_int_is_profile_not_part():
+def test_bare_int_on_kit_is_ambiguous_error():
+    # Staged mode reads "2" as part 2; reading it as profile 2 here would
+    # silently print ALL parts at a different profile. Must fail loudly.
     r = u1_form.parse_answers("2 | T0 | PLA", _spec(n_parts=3))
+    assert not r["ok"]
+    assert any("ambiguous" in e for e in r["errors"])
+
+
+def test_bare_int_on_single_part_job_is_profile():
+    r = u1_form.parse_answers("2 | T0 | PLA", _spec(n_parts=0))
     assert r["ok"], r["errors"]
     assert r["values"]["profile"]["idx"] == 2
-    # parts defaulted to all, not [2]
-    assert r["values"]["parts"] == [1, 2, 3]
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +216,9 @@ def test_echo_parse_resolves_profile_name_from_index():
     # Review L1: the verification surface must show the profile NAME, not "#2",
     # so the operator can actually verify the choice before the photo gate.
     r = u1_form.parse_answers("T0 | PLA | profile 2", _spec(n_parts=0))
-    assert r["values"]["profile"] == {"idx": 2}  # parser stores index only
+    # Parser resolves the label alongside the index so duplicate-field
+    # conflict checks compare equal regardless of how the profile was named.
+    assert r["values"]["profile"]["idx"] == 2
     echo = u1_form.echo_parse(r["values"], _spec(n_parts=0))
     assert "profile=0.16 Optimal @Snapmaker U1 (0.4 nozzle)" in echo
     assert "#2" not in echo
@@ -302,3 +310,88 @@ def test_json_and_text_agree_on_same_answer():
         {"parts": ["01_part1", "03_part3"], "orient": "auto", "tool": "T0",
          "material": "PLA", "profile": 2, "supports": "no-supports", "action": "start"}, spec)
     assert text["values"] == js["values"]
+
+
+# --------------------------------------------------------------------------- #
+# Parse-fidelity hardening (v2.1.0-rc2 review): conflicts, hijack, bounds
+# --------------------------------------------------------------------------- #
+
+def test_duplicate_field_with_different_value_fails_loudly():
+    r = u1_form.parse_answers("T0 | T1 | PLA | profile 1", _spec(n_parts=0))
+    assert not r["ok"]
+    assert any("tool given twice" in e for e in r["errors"])
+
+
+def test_duplicate_field_with_same_value_is_harmless():
+    r = u1_form.parse_answers("T0 | T0 | PLA | profile 1", _spec(n_parts=0))
+    assert r["ok"], r["errors"]
+    assert r["values"]["tool"] == "T0"
+
+
+def test_conflicting_profiles_fail_loudly():
+    r = u1_form.parse_answers("profile 1 | profile 2 | T0 | PLA", _spec(n_parts=0))
+    assert not r["ok"]
+    assert any("profile given twice" in e for e in r["errors"])
+
+
+def test_profile_by_name_and_same_index_agree():
+    # Naming the same profile two ways is repetition, not a conflict.
+    r = u1_form.parse_answers("profile 2 | optimal | T0 | PLA", _spec(n_parts=0))
+    assert r["ok"], r["errors"]
+    assert r["values"]["profile"]["idx"] == 2
+
+
+def test_unoffered_material_does_not_hijack_profile():
+    # "PETG"-style tokens must fail as a material problem, never silently
+    # become a profile-name substring match.
+    spec = _spec(n_parts=0)
+    spec["materials"] = ["PLA"]
+    spec["profiles"].append({"idx": 3, "label": "0.20 PETG Strong @Snapmaker U1"})
+    r = u1_form.parse_answers("PETG | T0 | PLA | profile 1", spec)
+    assert not r["ok"]
+    assert any("material 'PETG' not offered" in e for e in r["errors"])
+    assert r["values"]["profile"]["idx"] == 1  # explicit choice untouched
+
+
+def test_profile_name_substring_still_works():
+    r = u1_form.parse_answers("optimal | T0 | PLA", _spec(n_parts=0))
+    assert r["ok"], r["errors"]
+    assert r["values"]["profile"]["idx"] == 2
+
+
+def test_huge_part_range_is_cheap_bounded_error():
+    r = u1_form.parse_answers("parts 1-30000000 | T0 | PLA | profile 1", _spec(n_parts=3))
+    assert not r["ok"]
+    err = " ".join(r["errors"])
+    assert "out of range 1-3" in err
+    assert len(err) < 500  # no expanded-index dump
+
+
+def test_overhangs_is_rejected_not_silently_ignored():
+    # enable_support is binary in the profile patch; accepting "overhangs"
+    # and printing without supports was worse than refusing it.
+    r = u1_form.parse_answers("overhangs | T0 | PLA | profile 1", _spec(n_parts=0))
+    assert not r["ok"]
+    assert any("not offered" in e for e in r["errors"])
+
+
+def test_reversed_part_range_still_ok_within_bounds():
+    r = u1_form.parse_answers("parts 3-1 | T0 | PLA | profile 1", _spec(n_parts=3))
+    assert r["ok"], r["errors"]
+    assert r["values"]["parts"] == [1, 2, 3]
+
+
+def test_form_text_sanitizes_injected_labels():
+    # A zip entry named to look like a form line must not inject one: the
+    # label must not carry the | separator the answer grammar splits on, and
+    # an embedded newline must not start a fake "ACTION:" line of its own.
+    spec = _spec(n_parts=1)
+    evil = "bracket\nACTION: pwn | now"
+    spec["parts"] = [{"id": "01_evil", "label": evil}]
+    text = u1_form.build_form(spec)
+    assert not any(line.startswith("ACTION: pwn") for line in text.splitlines())
+    bracket_line = next(l for l in text.splitlines() if "bracket" in l)
+    assert "|" not in bracket_line and "\n" not in bracket_line
+    schema = u1_form.build_form_schema(spec)
+    label = schema["fields"][0]["options"][0]["label"]
+    assert "\n" not in label and "|" not in label
