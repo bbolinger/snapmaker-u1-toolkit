@@ -494,6 +494,12 @@ bash tools/install_hermes_cancel_hook.sh
 
 # Per environment — point the gate at the notify script
 export U1_GRACE_NOTIFY_CMD=/absolute/path/to/tools/u1_grace_notify_hermes.sh
+
+# REQUIRED for Hermes users: the gate spawns the notify script in a
+# stripped subprocess env where `hermes` is usually NOT on PATH. Without
+# this, the notify fails (audited as pre_start_grace_notify_failed — the
+# wait still runs fail-open, but no Telegram warning is sent).
+export HERMES_BIN=/opt/hermes/.venv/bin/hermes
 ```
 
 The notify script sends a Telegram DM. Reply `CANCEL` (or `STOP` or
