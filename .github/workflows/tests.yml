@@ -1,8 +1,10 @@
 name: tests
 
+# Non-overlapping triggers: pushes to main run directly; everything else is
+# covered by its pull request — avoids double-running the suite on PR branches.
 on:
   push:
-    branches: ["main", "v*"]
+    branches: ["main"]
   pull_request:
 
 jobs:
