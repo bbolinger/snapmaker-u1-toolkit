@@ -214,6 +214,15 @@ def _live_tool_options(no_live: bool = False,
                 for t in DEFAULT_TOOLS]
 
 
+# Set once per invocation (run_kit_workflow) to the EXPLICIT --operator CLI
+# value, if any. _build_next_command stamps it into every emitted command so
+# no call site can forget to thread it — the 2026-07-01 incident class was a
+# smoke:* operator silently dropping to the production env default because
+# a prompt's next_command omitted --operator. Env-resolved operators are
+# deliberately NOT baked (replay-safe across operator config changes).
+_CLI_OPERATOR: str | None = None
+
+
 def _build_next_command(archive: Path, request_id: str, *,
                         parts: str | None = None,
                         tool: str | None = None,
@@ -234,6 +243,8 @@ def _build_next_command(archive: Path, request_id: str, *,
     CLI alone (request.json is also persisted but the command is the
     single source of truth the agent copies verbatim).
     """
+    if operator is None:
+        operator = _CLI_OPERATOR
     parts_q = []
     parts_q.append("python3 /opt/data/scripts/u1_kit_workflow.py")
     parts_q.append(_shell_quote(str(archive)))
@@ -2296,6 +2307,8 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
 
 def run_kit_workflow(args) -> dict[str, Any]:
     """Orchestrate the kit path. See module docstring for the staged flow."""
+    global _CLI_OPERATOR
+    _CLI_OPERATOR = getattr(args, "operator", None) or None
     operator = _resolve_operator(args)
     # Fence 1 companion: visible stderr banner whenever the workflow is
     # invoked under a test-prefixed operator. Same prefix list as
@@ -2503,12 +2516,14 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # (awaiting_parts). Use _build_next_command which already threads
     # every prior answer, then append --bed-clear-confirmed. Applies to
     # both `start` and `start manual-bed-check` handlers.
+    # Operator is NOT passed here: _build_next_command stamps the explicit
+    # CLI operator (_CLI_OPERATOR) into every emitted command uniformly, and
+    # env-resolved identity stays env-resolved (replay-safe).
     _yes_base = _build_next_command(
         archive, request_id, parts=parts_answer, tool=tool_choice,
         material=material, orient=orient, profile=profile_slug,
         supports=supports, action=action, nozzle=nozzle,
-        no_live_upload=no_live_upload, no_live_material=no_live_material,
-        operator=operator)
+        no_live_upload=no_live_upload, no_live_material=no_live_material)
     yes_command_on_confirmed = _yes_base + " --bed-clear-confirmed"
 
     # Action handlers

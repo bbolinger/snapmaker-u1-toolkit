@@ -480,6 +480,37 @@ def test_fence_refusal_returns_dict_no_bare_none(sandbox_requests, monkeypatch):
     assert res["stage"] == "gate_refused_test_operator"
 
 
+# ─── Unset operator passes the fence — a DECISION, loudly audited ──────────
+
+def test_unset_operator_passes_fence_with_loud_audit(sandbox_requests, monkeypatch):
+    """`unknown:gate` (no --operator, no U1_OPERATOR) deliberately PASSES
+    Fence 1 — refusing every bare CLI run would tax legitimate local use.
+    The trade-off: a smoke test that forgot to set an operator is not
+    fenced. That gap is a decision, not an accident, and it must leave a
+    gate_operator_unknown audit row."""
+    import u1_print_start_gate as gate
+    monkeypatch.delenv("U1_OPERATOR", raising=False)
+    audits = []
+    monkeypatch.setattr(gate, "_audit_gate",
+                        lambda rid, event, op=None, **kw: audits.append(event))
+    reached_query = {"hit": False}
+
+    def _query(h, p):
+        reached_query["hit"] = True
+        raise RuntimeError("stop after fence — this test only pins the fence")
+
+    monkeypatch.setattr(gate, "query_state", _query)
+    try:
+        gate.run_gate("test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+                      approval_token="tok", request_id="u1_test_unknown_op",
+                      out_dir=sandbox_requests / "no_such_request")
+    except RuntimeError:
+        pass
+    assert reached_query["hit"], "unknown:gate must NOT be refused by Fence 1"
+    assert "gate_operator_unknown" in audits
+    assert "gate_refused_test_operator" not in audits
+
+
 # ─── Manual bed-check wires through the gate ───────────────────────────────
 
 def test_stage2_gate_skips_sanity_capture_when_manual_verification_fresh(
