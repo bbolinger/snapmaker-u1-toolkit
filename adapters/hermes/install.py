@@ -10,8 +10,10 @@ What this does:
        - form_gateway.py   (blocking primitive; mirrors clarify_gateway;
                             from ``adapters/hermes/tools/``)
        - form_tool.py      (LLM-facing form tool + class-level monkey-patch
-                            of TelegramPlatform — adds send_form + callback
-                            routing without editing telegram.py; from
+                            of the Telegram platform class — TelegramAdapter
+                            on hermes-agent >= 0.18, TelegramPlatform on
+                            <= 0.17 — adds send_form + callback routing
+                            without editing Hermes source; from
                             ``adapters/hermes/tools/``)
        - u1_form_telegram.py (the L1 pure renderer the patch's send_form
                             calls; single-sourced from the sibling

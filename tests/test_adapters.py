@@ -477,3 +477,128 @@ def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkey
     rc = hermes_install.main(["--venv", str(venv), "--uninstall"])
     assert rc == 0
     assert run_py.read_text() == upgraded  # NOT clobbered by the stale backup
+
+
+# --------------------------------------------------------------------------- #
+# form_tool: version-adaptive Telegram platform class resolution
+# --------------------------------------------------------------------------- #
+# hermes-agent 0.18 moved the adapter to plugins.platforms.telegram.adapter
+# .TelegramAdapter; 0.17 had gateway.platforms.telegram.TelegramPlatform.
+# The patch must find whichever is installed, prefer the newer path, and
+# come back None (text fallback, no crash) when neither imports.
+
+def _load_form_tool(monkeypatch, extra_modules):
+    """Import form_tool.py with a faked Hermes environment.
+
+    `tools.registry` is always faked (module-level import); extra_modules
+    maps dotted names to module objects standing in for the platform class
+    locations of a given hermes-agent version.
+    """
+    registry_mod = types.ModuleType("tools.registry")
+
+    class _Reg:
+        def register(self, **kwargs):
+            pass
+
+    registry_mod.registry = _Reg()
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.registry = registry_mod
+    fakes = {"tools": tools_pkg, "tools.registry": registry_mod}
+    fakes.update(extra_modules)
+    for name, mod in fakes.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    # parent packages so importlib can traverse dotted paths
+    for name in list(extra_modules):
+        parts = name.split(".")
+        for i in range(1, len(parts)):
+            pkg = ".".join(parts[:i])
+            if pkg not in sys.modules:
+                monkeypatch.setitem(sys.modules, pkg, types.ModuleType(pkg))
+
+    path = _ADAPTERS / "hermes" / "tools" / "form_tool.py"
+    spec = importlib.util.spec_from_file_location("u1_form_tool_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "u1_form_tool_under_test", mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _platform_module(dotted, cls_name):
+    mod = types.ModuleType(dotted)
+
+    class _Cls:
+        async def _handle_callback_query(self, update, ctx):
+            return "original"
+
+    _Cls.__name__ = cls_name
+    setattr(mod, cls_name, _Cls)
+    return mod, _Cls
+
+
+def test_resolver_finds_018_plugin_adapter(monkeypatch):
+    mod018, cls018 = _platform_module(
+        "plugins.platforms.telegram.adapter", "TelegramAdapter")
+    ft = _load_form_tool(monkeypatch, {
+        "plugins.platforms.telegram.adapter": mod018})
+    assert ft._resolve_telegram_platform_class() is cls018
+    # import-time patch actually landed on the 0.18 class
+    assert getattr(cls018, "_u1_form_patched", False)
+    assert hasattr(cls018, "send_form")
+
+
+def test_resolver_falls_back_to_017_platform(monkeypatch):
+    mod017, cls017 = _platform_module(
+        "gateway.platforms.telegram", "TelegramPlatform")
+    ft = _load_form_tool(monkeypatch, {
+        "gateway.platforms.telegram": mod017})
+    assert ft._resolve_telegram_platform_class() is cls017
+    assert getattr(cls017, "_u1_form_patched", False)
+
+
+def test_resolver_prefers_018_when_both_importable(monkeypatch):
+    mod018, cls018 = _platform_module(
+        "plugins.platforms.telegram.adapter", "TelegramAdapter")
+    mod017, cls017 = _platform_module(
+        "gateway.platforms.telegram", "TelegramPlatform")
+    ft = _load_form_tool(monkeypatch, {
+        "plugins.platforms.telegram.adapter": mod018,
+        "gateway.platforms.telegram": mod017})
+    assert ft._resolve_telegram_platform_class() is cls018
+    assert not getattr(cls017, "_u1_form_patched", False)
+
+
+def test_resolver_none_means_text_fallback_not_crash(monkeypatch, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        ft = _load_form_tool(monkeypatch, {})
+    assert ft._resolve_telegram_platform_class() is None
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    # the warning must name every path it tried, so a runtime operator can
+    # see at a glance which hermes-agent layout the box actually has
+    assert "plugins.platforms.telegram.adapter" in warned
+    assert "gateway.platforms.telegram" in warned
+
+
+def test_missing_callback_hook_skips_patch_loudly(monkeypatch, caplog):
+    import logging
+    dotted = "plugins.platforms.telegram.adapter"
+    mod = types.ModuleType(dotted)
+
+    class TelegramAdapter:  # no _handle_callback_query — hook point moved
+        pass
+
+    mod.TelegramAdapter = TelegramAdapter
+    with caplog.at_level(logging.WARNING):
+        _load_form_tool(monkeypatch, {dotted: mod})
+    assert not getattr(TelegramAdapter, "_u1_form_patched", False)
+    assert not hasattr(TelegramAdapter, "send_form")
+    assert "_handle_callback_query" in " ".join(
+        r.getMessage() for r in caplog.records)
+
+
+def test_make_send_result_degrades_without_hermes_base(monkeypatch):
+    ft = _load_form_tool(monkeypatch, {})
+    res = ft._make_send_result(success=True, message_id="42")
+    assert res.success is True and res.message_id == "42"
+    err = ft._make_send_result(success=False, error="boom")
+    assert err.success is False and err.error == "boom"
