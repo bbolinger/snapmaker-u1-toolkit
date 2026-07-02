@@ -507,8 +507,9 @@ The notify script sends a Telegram DM. Reply `CANCEL` (or `STOP` or
 any HTTP call — a bare keyword cancels **every** active grace window;
 `cancel <code>` (the code is the last 6 chars of the request id, shown in
 the DM) cancels **only** that request, and a code that matches nothing
-cancels nothing. Prose doesn't match — "cancel that plan" is safe from
-unintended cancels. Multi-request setups (two concurrent grace windows)
+cancels nothing. Trailing punctuation is fine — `CANCEL!!!` fires (urgency
+isn't ambiguity) — but extra words never match: "cancel that plan" is safe
+from unintended cancels. Multi-request setups (two concurrent grace windows)
 each write their own pending-state file so they don't race each other.
 
 Honesty guard: the DM only promises reply-to-cancel when the installer's

@@ -89,8 +89,13 @@ def _parse_cancel_message(text: str) -> tuple[bool, str | None]:
     """Returns (is_cancel, code). Bare keyword → (True, None): cancel all
     active windows. Keyword + code → (True, code): cancel only the window
     whose request_id ends with the code. Prose ("cancel that plan") does
-    not match — intentionally safe."""
-    stripped = text.strip().lower()
+    not match — intentionally safe.
+
+    Trailing punctuation is tolerated ("CANCEL!!!" / "cancel." / "stop!?"):
+    extra WORDS are ambiguity, but exclamation marks are urgency — the
+    panicking operator hammering the keyboard is exactly who this exists
+    for. Only word-content decides the match."""
+    stripped = text.strip().lower().rstrip("!.?,;: ")
     if stripped in CANCEL_KEYWORDS:
         return True, None
     m = _CANCEL_RE.match(stripped)
