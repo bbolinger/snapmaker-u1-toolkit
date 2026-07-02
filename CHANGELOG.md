@@ -49,32 +49,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   through the model in either direction; the model relays one opaque id,
   the same trust level as `--pending-nonce`. Staged text flow unchanged
   and still the default — buttons are for reliability, not a requirement.
-- **hermes-agent 0.18 compatibility** ([`adapters/hermes/tools/form_tool.py`](adapters/hermes/tools/form_tool.py)).
-  0.18 ("The Judgment Release") moved platform adapters into a plugin
-  system — the Telegram class is now
-  `plugins.platforms.telegram.adapter.TelegramAdapter`, not 0.17's
-  `gateway.platforms.telegram.TelegramPlatform`. The form patch now
-  resolves the class version-adaptively (0.18 path first, 0.17 fallback);
-  when nothing imports it logs every path tried and degrades to text
-  fallback instead of dying inside tool auto-discovery. `SendResult`
-  construction got the same treatment, and a missing
-  `_handle_callback_query` hook point now skips the patch loudly instead
-  of raising.
-- **`form` tool injected into platform tool resolution** (the x_search
-  pattern). Registration alone never surfaced the tool: platform agents
-  get a per-toolset allowlist, and on bare-composite configs
-  (`platform_toolsets.telegram: [hermes-telegram]`) Hermes enables a
-  toolset only when it's a subset of the composite — a runtime-registered
-  `"form"` toolset never qualifies, so the adapter could render forms
-  nobody could trigger. Joining an existing toolset is worse: adding form
-  to `clarify` makes `{clarify, form} ⊄ hermes-telegram` and evicts
-  clarify itself (caught in live-config verification before it reached a
-  running gateway). The shipped fix keeps `form` in its own toolset and
-  wraps `_get_platform_tools` at import to add `form` to its result
-  directly — Hermes' own escape hatch for `x_search`. Loud-but-safe:
-  unknown module layouts or unexpected result shapes log a warning and
-  leave Hermes' resolution untouched, and the wrapper only ever ADDS to
-  the tool list, pinned by test.
+- **hermes-agent 0.18 compatibility** ("The Judgment Release" moved
+  platform adapters into a plugin system; the Telegram class moved from
+  `gateway.platforms.telegram.TelegramPlatform` to a plugin-loaded
+  `TelegramAdapter`). Solved structurally by the plugin rebuild below:
+  the adapter patch never imports a class by module path anymore — it
+  patches the live instance's class — so adapter relocations stop being
+  breaking events. `SendResult` construction degrades to a duck-typed
+  stand-in if `gateway/platforms/base.py` ever moves, and a missing
+  `_handle_callback_query` hook point skips the patch loudly instead of
+  raising.
+- **Hermes integration rebuilt as a first-party plugin**
+  ([`adapters/hermes/plugin/`](adapters/hermes/plugin/)), replacing the
+  tools/-drop + monkey-patch approach after three visibility fixes in a
+  row proved wrong against the real package. Root causes, all verified in
+  hermes-agent 0.18 source: (1) platform agents get a per-toolset
+  allowlist and bare-composite configs enable toolsets by
+  subset-inference — a runtime-registered toolset never qualifies, and
+  joining `clarify` evicts clarify itself; plugin-provided toolsets are
+  the first-party path (auto-enabled per platform, no inference, operator
+  can toggle in `hermes tools`). (2) Generic registry dispatch passes
+  handlers no callback and no agent — the gateway's run.py patch now
+  publishes its per-turn form callback into `tools.form_gateway` keyed by
+  `agent.session_id`, exactly what dispatch hands the handler. (3) The
+  Telegram adapter class loads under two module names — import-side
+  patching can hit the copy the gateway never instantiates; the plugin's
+  `pre_gateway_dispatch` hook patches `type()` of the live adapter
+  instances in `gateway.adapters` instead. `install.py` now deploys +
+  enables the plugin, removes pre-plugin layout files, replaces the
+  run.py block in place on upgrades, and verifies the real invariant in
+  the venv (clarify held AND form offered on a bare-composite config).
+- **Real-package regression tests**
+  ([`tests/test_hermes_real_package.py`](tests/test_hermes_real_package.py)):
+  run against an actual hermes-agent tree (`U1_HERMES_AGENT_SRC`; CI
+  skips) — baseline bug reproduction, the no-eviction superset invariant
+  (`with_plugin == baseline | {"form"}`), schema delivery through
+  `get_tool_definitions`, clean plugin load, and the run.py patcher
+  against the real `gateway/run.py`. Exists because this bug class is
+  invisible to hermetic tests.
 
 ---
 

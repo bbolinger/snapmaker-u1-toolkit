@@ -1,0 +1,14 @@
+name: u1-form
+version: 2.2.0
+kind: standalone
+description: >
+  Structured multi-field forms for the Snapmaker U1 print workflow.
+  Registers a `form` tool (multi-field sibling of clarify) and renders it
+  as inline-keyboard screens on Telegram, with gateway-side answer handoff
+  so form answers never pass through the model. Companion to the
+  snapmaker-u1-toolkit's --interaction-mode form.
+author: bbolinger
+provides_tools:
+  - form
+provides_hooks:
+  - pre_gateway_dispatch
