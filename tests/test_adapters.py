@@ -608,31 +608,86 @@ def test_make_send_result_degrades_without_hermes_base(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# form_tool: toolset membership — the tool must actually be OFFERED
+# form_tool: platform tool injection — the tool must actually be OFFERED
 # --------------------------------------------------------------------------- #
-# Hermes' get_tool_definitions() is a per-toolset allowlist and the static
-# hermes-<platform> composites don't know runtime-registered toolset names:
-# registering under a novel toolset ("form") succeeds but the tool never
-# reaches any platform agent. Riding "clarify" — present in every platform
-# composite, and form's single-question sibling — is what makes the tool
-# reachable at all.
+# Platform agents get a per-toolset allowlist, and on bare-composite configs
+# (platform_toolsets.telegram: [hermes-telegram]) Hermes enables a toolset
+# only when it is a SUBSET of the composite. A runtime-registered toolset is
+# never a subset — and joining an existing toolset poisons it (form in
+# clarify makes {clarify, form} ⊄ hermes-telegram, evicting clarify
+# itself; verified live). So form keeps its own toolset and is injected
+# directly into _get_platform_tools' result, the way Hermes handles
+# x_search.
 
-def test_form_registers_under_clarify_toolset_by_default(monkeypatch):
-    monkeypatch.delenv("U1_FORM_TOOLSET", raising=False)
+def test_form_registers_under_its_own_toolset(monkeypatch):
+    """Pin toolset="form" — moving form into a subset-inferred toolset
+    (e.g. clarify) evicts that toolset on bare-composite platform configs."""
     ft = _load_form_tool(monkeypatch, {})
     call = next(c for c in ft.registry.calls if c.get("name") == "form")
-    assert call["toolset"] == "clarify"
+    assert call["toolset"] == "form"
 
 
-def test_form_toolset_env_override(monkeypatch):
-    monkeypatch.setenv("U1_FORM_TOOLSET", "forms-native")
-    ft = _load_form_tool(monkeypatch, {})
-    call = next(c for c in ft.registry.calls if c.get("name") == "form")
-    assert call["toolset"] == "forms-native"
+def _model_tools_module(result_factory):
+    mod = types.ModuleType("model_tools")
+
+    def _get_platform_tools(platform, config=None):
+        return result_factory()
+
+    mod._get_platform_tools = _get_platform_tools
+    return mod
 
 
-def test_form_toolset_blank_env_falls_back_to_clarify(monkeypatch):
-    monkeypatch.setenv("U1_FORM_TOOLSET", "   ")
-    ft = _load_form_tool(monkeypatch, {})
-    call = next(c for c in ft.registry.calls if c.get("name") == "form")
-    assert call["toolset"] == "clarify"
+def test_injection_adds_form_to_set_result(monkeypatch):
+    mod = _model_tools_module(lambda: {"clarify", "terminal", "send_photo"})
+    _load_form_tool(monkeypatch, {"model_tools": mod})
+    out = mod._get_platform_tools("telegram")
+    assert out == {"clarify", "terminal", "send_photo", "form"}
+
+
+def test_injection_appends_form_to_list_result_without_dupes(monkeypatch):
+    mod = _model_tools_module(lambda: ["clarify", "form"])
+    _load_form_tool(monkeypatch, {"model_tools": mod})
+    assert mod._get_platform_tools("telegram") == ["clarify", "form"]
+    mod2 = _model_tools_module(lambda: ["clarify", "terminal"])
+    _load_form_tool(monkeypatch, {"model_tools": mod2})
+    assert mod2._get_platform_tools("telegram") == ["clarify", "terminal", "form"]
+
+
+def test_injection_never_removes_existing_tools(monkeypatch):
+    """The regression that motivated this design: adding form must not cost
+    clarify (or anything else) its slot."""
+    baseline = {"clarify", "terminal", "send_photo", "x_search"}
+    mod = _model_tools_module(lambda: set(baseline))
+    _load_form_tool(monkeypatch, {"model_tools": mod})
+    out = mod._get_platform_tools("telegram")
+    assert baseline <= out and "form" in out
+
+
+def test_injection_is_idempotent_across_reimports(monkeypatch):
+    mod = _model_tools_module(lambda: {"clarify"})
+    _load_form_tool(monkeypatch, {"model_tools": mod})
+    once = mod._get_platform_tools
+    _load_form_tool(monkeypatch, {"model_tools": mod})
+    assert mod._get_platform_tools is once, "re-import must not double-wrap"
+    assert mod._get_platform_tools("telegram") == {"clarify", "form"}
+
+
+def test_injection_missing_module_warns_and_degrades(monkeypatch, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        _load_form_tool(monkeypatch, {})
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "u1 form injection" in warned
+    assert "model_tools" in warned  # names the paths it tried
+
+
+def test_injection_leaves_unexpected_result_shapes_alone(monkeypatch, caplog):
+    import logging
+    defs = [{"name": "clarify"}, {"name": "terminal"}]
+    mod = _model_tools_module(lambda: [dict(d) for d in defs])
+    with caplog.at_level(logging.WARNING):
+        _load_form_tool(monkeypatch, {"model_tools": mod})
+        out = mod._get_platform_tools("telegram")
+    assert out == defs  # untouched — no stray "form" string among dicts
+    assert "leaving it untouched" in " ".join(
+        r.getMessage() for r in caplog.records)

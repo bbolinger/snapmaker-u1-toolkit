@@ -123,22 +123,17 @@ FORM_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry  # type: ignore
 
-# Toolset membership decides whether the model is ever OFFERED this tool:
-# model_tools.get_tool_definitions() is a per-toolset allowlist, and the
-# static hermes-<platform> composites in Hermes' toolsets module predate
-# runtime-registered toolsets — a novel toolset name ("form") registers
-# fine but resolves to False for every platform agent, so the tool never
-# reaches the model. `clarify` IS in every platform composite, and form is
-# clarify's multi-field sibling (same gateway-blocking pattern, same UI
-# layer), so ride that bundle by default. Override with U1_FORM_TOOLSET if
-# a Hermes build ever grows a first-party form toolset.
-import os as _os
-
-_FORM_TOOLSET = _os.environ.get("U1_FORM_TOOLSET", "").strip() or "clarify"
-
+# Registration alone does NOT make the model see this tool — platform
+# agents get a per-toolset allowlist, and `form` deliberately keeps its
+# OWN toolset (joining an existing one like `clarify` is a trap: on
+# bare-composite configs Hermes enables a toolset only if it is a SUBSET
+# of the platform composite, so adding form to clarify evicts clarify
+# itself). Visibility comes from _install_form_toolset_injection() below,
+# which injects `form` into _get_platform_tools' result directly — the
+# same pattern Hermes uses for x_search.
 registry.register(
     name="form",
-    toolset=_FORM_TOOLSET,
+    toolset="form",
     schema=FORM_SCHEMA,
     handler=lambda args, **kw: form_tool(
         form_schema=args.get("form_schema") or {},
@@ -206,6 +201,94 @@ def _resolve_telegram_platform_class():
                     "Form tool will only work via text fallback.",
                     " | ".join(tried))
     return None
+
+
+# Where Hermes' per-platform tool resolution lives. The runtime we target
+# has it importable as `model_tools` alongside `tools`/`gateway`; other
+# layouts are tried too. The attribute check is the real test — a module
+# only counts if it actually owns _get_platform_tools.
+_MODEL_TOOLS_CANDIDATES = (
+    "model_tools",
+    "tools.model_tools",
+    "agent.model_tools",
+    "gateway.model_tools",
+    "hermes_agent.model_tools",
+    "hermes_agent.tools.model_tools",
+)
+
+
+def _resolve_model_tools_module():
+    import importlib
+    tried = []
+    for name in _MODEL_TOOLS_CANDIDATES:
+        try:
+            mod = importlib.import_module(name)
+        except ImportError as exc:
+            tried.append(f"{name} ({exc})")
+            continue
+        if hasattr(mod, "_get_platform_tools"):
+            return mod
+        tried.append(f"{name} (imported but no _get_platform_tools)")
+    _logger.warning("u1 form injection: model_tools not found; tried: %s. "
+                    "The form tool will register but never be OFFERED to "
+                    "platform agents (text staged flow still works).",
+                    " | ".join(tried))
+    return None
+
+
+def _install_form_toolset_injection() -> None:
+    """Inject `form` into per-platform tool resolution (x_search pattern).
+
+    On bare-composite configs (platform_toolsets.telegram: [hermes-telegram])
+    Hermes enables a configurable toolset only when resolve_toolset(key) is a
+    SUBSET of the platform composite. A runtime-registered toolset ("form")
+    is never a subset, and joining an existing toolset poisons it — adding
+    form to clarify makes {clarify, form} ⊄ hermes-telegram, evicting clarify
+    itself. Hermes' own escape hatch for x_search is direct injection into
+    _get_platform_tools' result, bypassing subset inference; form gets the
+    identical treatment. Failure modes are loud-but-safe: unknown module
+    layout or an unexpected result shape logs a warning and leaves Hermes'
+    resolution untouched.
+    """
+    mod = _resolve_model_tools_module()
+    if mod is None:
+        return
+    if getattr(mod._get_platform_tools, "_u1_form_injected", False):
+        return  # idempotent — already wrapped (re-import safe)
+    _orig = mod._get_platform_tools
+
+    def _with_form(*args, **kwargs):
+        tools = _orig(*args, **kwargs)
+        try:
+            if isinstance(tools, set):
+                if all(isinstance(t, str) for t in tools):
+                    tools.add("form")
+                else:
+                    _logger.warning("u1 form injection: _get_platform_tools "
+                                    "returned a set of non-strings; leaving "
+                                    "it untouched.")
+            elif isinstance(tools, (list, tuple)):
+                if all(isinstance(t, str) for t in tools):
+                    if "form" not in tools:
+                        tools = list(tools) + ["form"]
+                else:
+                    _logger.warning("u1 form injection: _get_platform_tools "
+                                    "returned non-string entries (%s); "
+                                    "leaving it untouched.",
+                                    type(tools[0]).__name__ if tools else "?")
+            else:
+                _logger.warning("u1 form injection: unexpected "
+                                "_get_platform_tools return type %s; leaving "
+                                "it untouched.", type(tools).__name__)
+        except Exception as exc:
+            _logger.warning("u1 form injection: could not add form: %s", exc)
+        return tools
+
+    _with_form._u1_form_injected = True
+    mod._get_platform_tools = _with_form
+    _logger.info("u1 form injection: form added to platform tool resolution "
+                 "via %s._get_platform_tools (direct injection, subset "
+                 "inference bypassed).", mod.__name__)
 
 
 def _make_send_result(**kwargs):
@@ -442,3 +525,4 @@ def _install_telegram_form_patch() -> None:
 
 
 _install_telegram_form_patch()
+_install_form_toolset_injection()
