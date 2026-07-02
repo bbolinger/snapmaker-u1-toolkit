@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.1.0] — 2026-07-02
+
+**Multi-part kit support, the pre-start grace period with model-free
+Telegram cancel, and a hardened safety boundary** — the rc1 feature set
+(see rc1/rc2 entries below) shipped after two external review rounds and
+full live verification on real hardware.
+
+### Added since rc2
+
+- **Cancel-chain verification guide** ([`docs/verify-cancel-hook.md`](docs/verify-cancel-hook.md)):
+  hook install checks, hook.log entry meanings, gate-side audit rows, and a
+  zero-risk drill (seeded pending window, no printer needed) covering every
+  match mode.
+- **`HERMES_BIN` documented** (README + `.env.example`): the gate spawns the
+  notify script in a stripped subprocess env where `hermes` is usually not
+  on PATH — without it the DM is never sent (audited
+  `pre_start_grace_notify_failed`; the wait still runs fail-open).
+
+### Fixed since rc2
+
+- **`CANCEL!!!` fires.** The exact-match rule refused trailing punctuation —
+  ignoring exactly the panicking operator the button exists for. Punctuation
+  is stripped before matching; extra WORDS still never match ("cancel that
+  plan" stays safe). Found in live drilling, fixed with tests, re-verified
+  on hardware the same hour.
+- Kit `bed_clear_start` skill guidance: don't re-run the camera when
+  `bed_snapshot_path` is null (runtime fix ported back to the workspace).
+
+### Validated — live on hardware, 2026-07-02
+
+- Full cancel drill, 5/5 on the real Hermes gateway: bare `CANCEL`
+  (case-insensitive), scoped `cancel <code>`, wrong code cancels nothing,
+  prose ignored, panic punctuation (`Cancel!?!`) fires. Proves the
+  model-free path end to end: gateway hook → marker file → gate poll, with
+  the LLM agent never in the loop.
+- Real-print checklist: bare + scoped cancel during a live grace window
+  (audit rows, no HTTP to the printer), last-seconds cancel caught,
+  `recovery.stage1_command` restart (fresh photo + fresh yes, no re-slice),
+  receipt-removed run advertises the SSH fallback, kit `--pending-nonce`
+  enforcement, and the `smoke:` operator fence refusing Stage 2 end to end.
+- 614 unit + integration tests green in CI (Python 3.11 + 3.12).
+
+### Upgrading from v2.0.x
+
+`git pull` + re-run `bash tools/install_hermes_cancel_hook.sh` (new hook +
+receipt) and set `HERMES_BIN` + `U1_GRACE_NOTIFY_CMD` in your env (see
+`.env.example`). `request.json` is additive — no migration.
+
+---
+
 ## [2.1.0-rc2] — 2026-07-02
 
 Review-driven hardening of rc1. An external deep review (4 parallel passes:
