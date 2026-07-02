@@ -126,6 +126,49 @@ def test_generate_audits_doc_hash(tmp_path, monkeypatch):
     assert kw["request_revision"] == 2
 
 
+def test_deviation_from_preset_is_marked(tmp_path):
+    # The tweaked-and-forgotten value is the classic trust-killer: when the
+    # gcode differs from the chosen preset, the table says so inline with
+    # the preset's own number.
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", _plates(tmp_path),
+        state={}, decisions={"tool": "T1"},
+        reference={"nozzle_temperature": "240",     # gcode says 220,220
+                   "layer_height": "0.2",           # matches → no marker
+                   "sparse_infill_pattern": "gyroid"})
+    text = Path(doc).read_text()
+    assert "⚠" in text and "preset: `240`" in text
+    # matching values carry no marker
+    assert "| Layer height (mm) | `0.2` |" in text
+    assert "1 setting(s) differ from the chosen preset" in text
+
+
+def test_no_deviations_says_so_explicitly(tmp_path):
+    doc = u1_review_doc.generate(
+        "u1_2026_0702_abc123", tmp_path / "out", _plates(tmp_path),
+        state={},
+        reference={"layer_height": "0.2", "sparse_infill_pattern": "gyroid",
+                   "nozzle_temperature": "220", "enable_support": "1"})
+    text = Path(doc).read_text()
+    assert "No deviations detected" in text.replace("no \ndeviations", "") or \
+           "no \ndeviations detected" in text.lower() or \
+           "deviations detected" in text.lower()
+    assert "⚠" not in text
+
+
+def test_norm_collapses_per_filament_lists():
+    assert u1_review_doc._norm(["240", "240"]) == "240"
+    assert u1_review_doc._norm("240,240") == "240"
+    assert u1_review_doc._norm(["240", "230"]) == "240,230"
+    assert u1_review_doc._norm(" 0.2 ") == "0.2"
+
+
+def test_material_double_check_note_present(tmp_path):
+    doc = u1_review_doc.generate("u1_2026_0702_abc123", tmp_path / "out",
+                                 _plates(tmp_path), state={})
+    assert "PHYSICALLY loaded" in Path(doc).read_text()
+
+
 def test_multi_plate_doc_says_only_plate1_is_gated(tmp_path):
     plates = _plates(tmp_path)
     plates.append({"plate_idx": 2, "gcode_path": plates[0]["gcode_path"],

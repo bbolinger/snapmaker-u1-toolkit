@@ -56,6 +56,64 @@ _KEY_SETTINGS: list[tuple[str, list[str]]] = [
 _CONFIG_LINE_RE = re.compile(r"^;\s*([A-Za-z0-9_ \[\]()]+?)\s*=\s*(.*)$")
 
 
+def _norm(v: Any) -> str:
+    """Normalize a profile/config value for comparison. Profiles store
+    per-filament lists (["240"] / ["240","240"]); gcode config emits the
+    joined form ("240,240"). Collapse both to a canonical string."""
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v]
+        if parts and all(x == parts[0] for x in parts):
+            return parts[0]
+        return ",".join(parts)
+    v = str(v).strip()
+    if "," in v:
+        parts = [x.strip() for x in v.split(",")]
+        if parts and all(x == parts[0] for x in parts):
+            return parts[0]
+        return ",".join(parts)
+    return v
+
+
+def build_reference(profile_slug: str | None, material: str | None,
+                    nozzle: str = "0.4",
+                    out_dir: Path | None = None) -> dict[str, str]:
+    """Resolve the CHOSEN preset's values (process + filament, inheritance
+    flattened) so the settings table can flag where the gcode deviates —
+    the settings people tweak (temps, supports) are exactly where distrust
+    concentrates, so a tweaked value gets a visible marker with the preset's
+    own number next to it.
+
+    Best-effort by contract: any resolution problem returns what it has
+    (possibly {}) rather than raising — a missing reference only removes
+    markers, never the document."""
+    ref: dict[str, str] = {}
+    try:
+        from u1_slice_workflow import (
+            profile_path, filament_path,
+            _flatten_process_profile, _materialize_flat_filament,
+        )
+    except Exception:
+        return ref
+    if profile_slug:
+        try:
+            for k, v in _flatten_process_profile(profile_path(profile_slug)).items():
+                if not str(k).startswith("_"):
+                    ref[str(k)] = _norm(v)
+        except Exception:
+            pass
+    if material and out_dir is not None:
+        try:
+            import json as _json
+            flat = _materialize_flat_filament(
+                filament_path(material, nozzle=nozzle), Path(out_dir))
+            for k, v in _json.loads(Path(flat).read_text()).items():
+                if not str(k).startswith("_"):
+                    ref.setdefault(str(k), _norm(v))
+        except Exception:
+            pass
+    return ref
+
+
 def _read_bounded(path: Path, chunk: int = 512_000) -> str:
     """Head+tail read so a 200MB gcode never becomes a memory bomb. The
     config block lives at the tail; header metadata at the head."""
@@ -119,6 +177,7 @@ def generate(
     decisions: dict[str, Any] | None = None,
     overrides: list[str] | None = None,
     operator: str | None = None,
+    reference: dict[str, str] | None = None,
 ) -> Path:
     """Write ``<out_dir>/review.md`` and audit its sha256. Returns the path.
 
@@ -191,10 +250,26 @@ def generate(
     if config:
         L.append("| Setting | Value |")
         L.append("|---|---|")
+        deviations = 0
         for label, keys in _KEY_SETTINGS:
             v = _first(config, keys)
-            if v is not None:
-                L.append(f"| {label} | `{v}` |")
+            if v is None:
+                continue
+            cell = f"`{v}`"
+            if reference:
+                # Flag values that differ from the chosen preset — the
+                # tweaked-and-forgotten temp is the classic trust-killer.
+                ref_v = next((reference[k] for k in keys if k in reference), None)
+                if ref_v is not None and _norm(v) != ref_v:
+                    cell = f"`{v}` ⚠ *preset: `{ref_v}`*"
+                    deviations += 1
+            L.append(f"| {label} | {cell} |")
+        if reference:
+            L.append("")
+            L.append(f"_{deviations} setting(s) differ from the chosen "
+                     f"preset (marked ⚠)._" if deviations else
+                     "_All key settings match the chosen preset — no "
+                     "deviations detected._")
     else:
         L.append("_Config block not found in the gcode — settings table "
                  "unavailable for this slice (older Orca build?). The "
@@ -233,7 +308,10 @@ def generate(
              "holds a **grace window** before any command reaches the "
              "printer. Reply `CANCEL` in that window to abort — no LLM in "
              "that path.")
-    L.append("3. Cancelling costs nothing: the slice and upload stay valid; "
+    L.append("3. The material you chose is re-verified against what is "
+             "PHYSICALLY loaded in the toolhead at start time — a mismatch "
+             "blocks the print unless you explicitly accept it (audited).")
+    L.append("4. Cancelling costs nothing: the slice and upload stay valid; "
              "restarting is one fresh photo + one fresh yes.")
     L.append("")
 
