@@ -388,3 +388,34 @@ def test_notify_message_advertises_reply_cancel_with_code_when_hook_installed(no
     assert "Reply **CANCEL**" in sent
     code = env["U1_REQUEST_ID"][-6:]
     assert f"cancel {code}" in sent
+
+
+# ─── Urgency punctuation: "CANCEL!!!" must fire; extra words must not ───────
+
+def test_handler_trailing_punctuation_still_cancels(sandbox_pending_dir):
+    # Trailing punctuation is urgency, not ambiguity — the panicking
+    # operator hammering "CANCEL!!!" is exactly who this hook exists for.
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_urgent.txt"
+    _seed_pending(pending, "u1_2026_0701_urgnt1", marker)
+    _run(handler, "CANCEL!!!")
+    assert marker.exists()
+
+
+def test_handler_scoped_cancel_with_trailing_punctuation(sandbox_pending_dir):
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_urgent2.txt"
+    _seed_pending(pending, "u1_2026_0701_abc123", marker)
+    _run(handler, "cancel abc123!")
+    assert marker.exists()
+
+
+def test_handler_extra_words_still_do_not_cancel(sandbox_pending_dir):
+    # The punctuation tolerance must NOT loosen the word rule.
+    handler, pending, tmp = sandbox_pending_dir
+    marker = tmp / "marker_words.txt"
+    _seed_pending(pending, "u1_2026_0701_abc123", marker)
+    _run(handler, "cancel please!")
+    _run(handler, "please cancel")
+    _run(handler, "Cancel that plan!!!")
+    assert not marker.exists()
