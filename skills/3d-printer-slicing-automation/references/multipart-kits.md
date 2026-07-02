@@ -20,7 +20,7 @@ action).
   - `parts`: `all`, or `1,3,5`, or a range `1-4`
   - `orient`: `as-authored` (default) or `auto` (auto-rotate; reorients each part)
   - `tool`: `T0`..`T3`; `material`: from the offered list; `profile N` by number
-  - `supports`: `supports` | `no-supports` | `overhangs`
+  - `supports`: `supports` | `no-supports`
   - `action`: `start` (gate plate 1) | `upload-only`
 
 If the answer doesn't validate, the workflow emits `form_rejected` with

@@ -108,9 +108,17 @@ row is NEVER written.
 If the grace window expires with no cancel marker, the gate audits
 `pre_start_grace_period_expired` and proceeds to HTTP the printer.
 
+If the operator DID cancel, the refusal payload includes a `recovery`
+block with `instruction` + `stage1_command`. Relay it: the slice and
+upload are still valid, so the way back is re-running Stage 1 (fresh bed
+photo + fresh yes) — do NOT restart the whole workflow.
+
 This is the mechanical safety net: if the skill (or any agent) chain-fires
 the yes-command → Stage 2 command, the operator still gets a real-world
 notification with time to react before the printer starts moving material.
+Be honest about what it guarantees: the two-turn yes/no is procedure the
+agent follows, but the grace window + single-use nonce are the parts the
+scripts enforce even against a misbehaving agent.
 
 ### After Stage 2 succeeds
 
