@@ -2345,8 +2345,41 @@ def run_workflow(args)->dict[str,Any]:
         # Build the readiness_card payload once, then emit + persist together
         # so the phase-aware resume short-circuit upstream has the same
         # event payload to replay verbatim (no re-derivation).
+        # Pre-print review doc (v2.2): human-readable flight plan built
+        # from the sliced gcode's own config block. Fail-soft — never
+        # blocks the flow.
+        _review_doc_path = None
+        try:
+            import u1_review_doc
+            import u1_request as _u1r
+            _rd_state = (_u1r.read_request(args.request_id) or {}) if getattr(args, 'request_id', None) else {}
+            _review_doc_path = str(u1_review_doc.generate(
+                getattr(args, 'request_id', None) or 'unknown',
+                gcode.parent, [{
+                    'plate_idx': 1,
+                    'gcode_path': str(gcode),
+                    'printer_storage_filename': _printer_filename,
+                    'gcode_hash': _rd_state.get('gcode_hash') or _u1r.compute_model_hash(gcode),
+                    'metadata': (up.get('metadata') if isinstance(up, dict) else None) or {},
+                }],
+                state=_rd_state,
+                decisions={'tool': str(tool), 'material': str(material),
+                           'profile': str(profile), 'orient': args.orient,
+                           'supports': args.supports},
+                operator=operator,
+            ))
+            emit({'stage': 'review_doc',
+                  'request_id': getattr(args, 'request_id', None),
+                  'path': _review_doc_path,
+                  'instruction': ('Attach this file to the operator with the '
+                                  'readiness card — human-readable review of '
+                                  'exactly what will print.')}, args.json_events)
+        except Exception:
+            pass
+
         _readiness_card_payload = {
             'stage': 'readiness_card',
+            'review_doc_path': _review_doc_path,
             'orient': args.orient,
             'orient_supports_tier': _chosen_orient_tier,
             'orient_overhang_area_pct': _chosen_overhang_pct,

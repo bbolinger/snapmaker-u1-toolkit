@@ -69,6 +69,7 @@ That's the entire prompt loop. Repeat until you see a `readiness_card` event —
 **Step 3 — Surface the preview + readiness card.** After the COMMIT slice finishes (you'll see a `summary` event and a `readiness_card` event), surface the post-slice review:
 
 - From the `render` event with `kind:"preview"`, emit its `image` field bare in your reply (auto-attaches).
+- From the `review_doc` event (v2.2), emit its `path` bare in your reply so the file attaches — it's the operator's human-readable review of exactly what will print. Informational: do not block on it, do not summarize it in place of attaching it.
 - If there's a `slicer_warning` event, surface every entry in its `messages` array verbatim BEFORE the user trusts the preview.
 - From the `summary` event, present `first_layer_width_mm` × `first_layer_depth_mm` for the footprint — NEVER render `first_layer_bbox` as "X by Y to X by Y" (that's the raw xmin/xmax/ymin/ymax tuple, not dimensions).
 

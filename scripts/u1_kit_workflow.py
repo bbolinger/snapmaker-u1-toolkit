@@ -116,6 +116,7 @@ import u1_kit
 import u1_form
 import u1_arrange
 import u1_request
+import u1_review_doc
 from u1_print_start_gate import build_stage1_command
 from u1_slice_workflow import (
     _resolve_operator,
@@ -2448,6 +2449,34 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         printer_busy_reason=printer_state.get("reason"),
     )
 
+    # Pre-print review doc (v2.2): the operator's flight plan, generated
+    # from the sliced gcode's own config block. Strictly fail-soft — a doc
+    # problem must never block a print.
+    review_doc_path: str | None = None
+    try:
+        review_doc_path = str(u1_review_doc.generate(
+            request_id, out_dir, plates_state,
+            state=u1_request.read_request(request_id) or {},
+            decisions={"tool": tool_choice, "material": material,
+                       "profile": profile_slug, "orient": orient,
+                       "supports": supports,
+                       "parts": ", ".join(p["part_id"] for p in selected)},
+            overrides=([f"supports forced {'ON' if supports == 'supports' else 'OFF'} "
+                        f"by your answer (preset value overridden)"]
+                       if supports in ("supports", "no_supports") else None),
+            operator=operator,
+        ))
+        _emit(events_file, {
+            "stage": "review_doc", "request_id": request_id,
+            "path": review_doc_path,
+            "instruction": ("Attach this file to the operator alongside the "
+                            "print plan card — it is the human-readable "
+                            "review of exactly what will print."),
+        }, json_events)
+    except Exception as _rd_exc:
+        _audit(request_id, "review_doc_failed", operator,
+               error=f"{type(_rd_exc).__name__}: {_rd_exc}"[:200])
+
     # Readiness card carries the plan + captured photo/status. The raw
     # Stage 2 command and approval token are NOT surfaced here's
     # 2026-07-01 audit flagged that as a shortcut path any adapter could
@@ -2456,6 +2485,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
     # workflow's _action_start() can reach it.
     readiness = {
         "stage": "kit_readiness_card",
+        "review_doc_path": review_doc_path,
         "request_id": request_id,
         "part_count": kit["part_count"],
         "selected_parts": [p["part_id"] for p in selected],
@@ -3851,8 +3881,35 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     )
 
     action = values.get("action", "start")
+
+    # Pre-print review doc (v2.2) — same artifact as the staged path,
+    # same fail-soft contract.
+    review_doc_path: str | None = None
+    try:
+        review_doc_path = str(u1_review_doc.generate(
+            request_id, out_dir, plates_state,
+            state=u1_request.read_request(request_id) or {},
+            decisions={"tool": tool, "material": material,
+                       "profile": profile_slug,
+                       "orient": values.get("orient"),
+                       "supports": supports,
+                       "parts": ", ".join(p["part_id"] for p in selected)},
+            operator=operator,
+        ))
+        _emit(events_file, {
+            "stage": "review_doc", "request_id": request_id,
+            "path": review_doc_path,
+            "instruction": ("Attach this file to the operator alongside the "
+                            "readiness card — human-readable review of "
+                            "exactly what will print."),
+        }, json_events)
+    except Exception as _rd_exc:
+        _audit(request_id, "review_doc_failed", operator,
+               error=f"{type(_rd_exc).__name__}: {_rd_exc}"[:200])
+
     readiness = {
         "stage": "kit_readiness_card",
+        "review_doc_path": review_doc_path,
         "request_id": request_id,
         "part_count": kit["part_count"],
         "selected_parts": [p["part_id"] for p in selected],

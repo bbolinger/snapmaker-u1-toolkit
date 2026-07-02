@@ -140,6 +140,7 @@ Every operator decision is concrete and tied to a specific artifact:
 | Upload | Three options: upload-only / upload+start gate / cancel |
 | Filename collision | Three options: timestamped rename / overwrite / cancel |
 | Kit decisions (v2.1.0) | One consolidated form (parts / orient / tool / material / profile / supports / action) — script-parsed, echoed back verbatim for confirmation before anything slices |
+| Pre-print review (v2.2) | A `review.md` flight plan generated from the sliced gcode's own config block: what will print, the ~12 settings that matter, your decisions and overrides — bound to the plan's revision + hash so what you read is what prints |
 | **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. The operator types yes/no. Default is no. |
 
 If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.

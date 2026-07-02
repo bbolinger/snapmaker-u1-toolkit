@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased — v2.2 line]
+
+### Added
+
+- **Pre-print review document** ([`scripts/u1_review_doc.py`](scripts/u1_review_doc.py)).
+  Every readiness card now ships with a `review.md` flight plan the operator
+  can actually read before saying yes: what will print (per-plate files,
+  estimates, parts), the ~12 settings that decide success, and the operator's
+  own decisions/overrides. Settings come from the config block inside the
+  sliced gcode — what the printer will execute, never what the workflow
+  intended — and the doc header carries request revision + gcode hash, so
+  `can_start()`'s drift check guarantees the reviewed plan is the printed
+  plan. Informational by design: generation failures audit
+  `review_doc_failed` and never block the flow. Emitted as a `review_doc`
+  event by both kit paths and the single-STL workflow; readiness cards carry
+  `review_doc_path`.
+
+---
+
 ## [2.1.0] — 2026-07-02
 
 **Multi-part kit support, the pre-start grace period with model-free
