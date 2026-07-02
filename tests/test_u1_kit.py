@@ -223,3 +223,81 @@ def test_is_multi_part_archive_false_for_single_stl_zip(tmp_path):
 def test_is_multi_part_archive_false_for_bare_stl(tmp_path):
     a = _write_cube(tmp_path / "a.stl", 20)
     assert u1_kit.is_multi_part_archive(a) is False
+
+
+# --------------------------------------------------------------------------- #
+# Ingest hardening (v2.1.0-rc2 round 2)
+# --------------------------------------------------------------------------- #
+
+def test_extract_dedup_does_not_clobber_real_suffixed_entry(tmp_path):
+    # Archive holds a/part.stl, a GENUINE part__1.stl, and b/part.stl. The
+    # old per-name counter renamed b/part.stl to part__1.stl and overwrote
+    # the real one — one part destroyed, one duplicated, no error.
+    a = _write_cube(tmp_path / "A.stl", 10)
+    real = _write_cube(tmp_path / "B.stl", 20)
+    b = _write_cube(tmp_path / "C.stl", 30)
+    zp = tmp_path / "kit.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.write(a, "a/part.stl")
+        z.write(real, "part__1.stl")
+        z.write(b, "b/part.stl")
+    out = u1_kit.extract_all_stls(zp, tmp_path / "out")
+    assert len(out) == 3
+    assert len(set(out)) == 3, "no duplicate paths"
+    contents = sorted(p.read_bytes() for p in out)
+    expected = sorted(p.read_bytes() for p in (a, real, b))
+    assert contents == expected, "every distinct part's bytes must survive"
+
+
+def test_extract_sanitizes_backslash_entry_names(tmp_path):
+    # Windows-style entry names: Path('..\\..\\evil.stl').name is the whole
+    # string on POSIX — must not escape (or weirdly name) the out dir.
+    a = _write_cube(tmp_path / "a.stl", 10)
+    zp = tmp_path / "kit.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.write(a, "..\\..\\evil.stl")
+        z.write(a, "ok.stl")
+    out_dir = tmp_path / "out"
+    out = u1_kit.extract_all_stls(zp, out_dir)
+    for p in out:
+        assert p.parent == out_dir
+        assert "\\" not in p.name and ".." not in p.name.split(".stl")[0].replace("evil", "")
+    assert any(p.name == "evil.stl" for p in out)
+
+
+def test_extract_refuses_too_many_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(u1_kit, "MAX_KIT_PARTS", 3)
+    a = _write_cube(tmp_path / "a.stl", 10)
+    zp = tmp_path / "kit.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        for i in range(4):
+            z.write(a, f"p{i}.stl")
+    import pytest
+    with pytest.raises(u1_kit.KitIngestError, match="limit is 3"):
+        u1_kit.extract_all_stls(zp, tmp_path / "out")
+
+
+def test_extract_refuses_oversized_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(u1_kit, "MAX_PART_BYTES", 100)
+    a = _write_cube(tmp_path / "a.stl", 10)  # binary STL cube > 100 bytes
+    zp = tmp_path / "kit.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.write(a, "big.stl")
+        z.write(a, "big2.stl")
+    import pytest
+    with pytest.raises(u1_kit.KitIngestError, match="per-part limit"):
+        u1_kit.extract_all_stls(zp, tmp_path / "out")
+
+
+def test_extract_refuses_oversized_total(tmp_path, monkeypatch):
+    a = _write_cube(tmp_path / "a.stl", 10)
+    size = a.stat().st_size
+    monkeypatch.setattr(u1_kit, "MAX_PART_BYTES", size + 10)
+    monkeypatch.setattr(u1_kit, "MAX_KIT_TOTAL_BYTES", size + 10)  # 2 entries exceed
+    zp = tmp_path / "kit.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.write(a, "a.stl")
+        z.write(a, "b.stl")
+    import pytest
+    with pytest.raises(u1_kit.KitIngestError, match="limit is"):
+        u1_kit.extract_all_stls(zp, tmp_path / "out")

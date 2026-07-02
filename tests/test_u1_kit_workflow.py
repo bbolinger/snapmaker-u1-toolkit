@@ -495,3 +495,27 @@ def test_action_start_adopts_stage1_sidecar_token(tmp_path, fake_profiles, monke
     assert res["phase"] == "awaiting_bed_clear_start", res
     st = u1_request.read_request(rid)
     assert st["safety"]["approval_token"] == "sidecartoken123"
+
+
+def test_garbage_stl_in_zip_emits_kit_rejected_not_traceback(tmp_path, fake_profiles, capsys):
+    # A .stl entry full of garbage used to escape as a raw ValueError
+    # traceback from build_kit. It must be a clean kit_rejected event.
+    import zipfile as _zf
+    zp = tmp_path / "bad.zip"
+    with _zf.ZipFile(zp, "w") as z:
+        z.writestr("a.stl", "this is not an stl at all")
+        z.writestr("b.stl", "neither is this")
+    res = kw.run_kit_workflow(_args(zp))
+    assert res["phase"] == "kit_rejected"
+    stages = [e.get("stage") for e in _stdout_events(capsys)]
+    assert "kit_rejected" in stages
+
+
+def test_over_limit_zip_emits_kit_rejected(tmp_path, fake_profiles, capsys, monkeypatch):
+    import u1_kit as _uk
+    monkeypatch.setattr(_uk, "MAX_KIT_PARTS", 2)
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 3)))
+    assert res["phase"] == "kit_rejected"
+    evs = _stdout_events(capsys)
+    rej = next(e for e in evs if e.get("stage") == "kit_rejected")
+    assert "limit is 2" in rej["error"]

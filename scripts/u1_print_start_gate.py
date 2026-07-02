@@ -362,9 +362,11 @@ def _normalize_filename(filename: str) -> str:
     file-lookup is by basename in its gcode dir (~/printer_data/gcodes/).
 
     Strip any directory components — Moonraker only knows files by their
-    storage name. Accepts both forms transparently."""
-    p = Path(filename)
-    return p.name if p.parent != Path('.') else filename
+    storage name. Accepts both forms transparently. (`Path.name` alone
+    handles the `./x.gcode` edge the old parent-compare missed: Path
+    collapses the leading `./`, so its parent looked like a bare name.)"""
+    name = Path(filename).name
+    return name or filename
 
 
 def _read_approval_token(out_dir: Path) -> dict[str, Any] | None:
@@ -592,6 +594,14 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
     # have the full grace window to react. Notification failure is
     # audited but does not block the wait (fail-open at notify layer;
     # the wait itself is the safety net).
+    #
+    # Timing note (reviewed, kept as-is): the notify command can block up
+    # to 20s, so the window closes up to 20s later than the started audit
+    # row suggests. That drift is in the OPERATOR'S favor — the DM lands
+    # at the end of the send, and the countdown it advertises starts
+    # then, which is exactly when the poll loop starts. Do not "fix" this
+    # by subtracting notify latency; that would shorten the window below
+    # what the DM promised.
     if notify_cmd:
         _notify(notify_cmd,
                 request_id=request_id,
