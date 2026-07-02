@@ -60,6 +60,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   construction got the same treatment, and a missing
   `_handle_callback_query` hook point now skips the patch loudly instead
   of raising.
+- **`form` tool now rides the `clarify` toolset.** Hermes'
+  `get_tool_definitions()` is a per-toolset allowlist, and the static
+  `hermes-<platform>` composites don't resolve runtime-registered toolset
+  names — registering under a novel `"form"` toolset succeeded but the
+  tool was never offered to any platform agent (adapter could render
+  forms nobody could trigger). `clarify` is in every platform composite
+  and form is its multi-field sibling, so membership there makes the tool
+  reachable everywhere clarify is. `U1_FORM_TOOLSET` env override
+  available if a Hermes build ever ships a first-party form toolset.
 
 ---
 

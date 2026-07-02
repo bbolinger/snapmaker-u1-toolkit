@@ -497,8 +497,11 @@ def _load_form_tool(monkeypatch, extra_modules):
     registry_mod = types.ModuleType("tools.registry")
 
     class _Reg:
+        def __init__(self):
+            self.calls = []
+
         def register(self, **kwargs):
-            pass
+            self.calls.append(kwargs)
 
     registry_mod.registry = _Reg()
     tools_pkg = types.ModuleType("tools")
@@ -602,3 +605,34 @@ def test_make_send_result_degrades_without_hermes_base(monkeypatch):
     assert res.success is True and res.message_id == "42"
     err = ft._make_send_result(success=False, error="boom")
     assert err.success is False and err.error == "boom"
+
+
+# --------------------------------------------------------------------------- #
+# form_tool: toolset membership — the tool must actually be OFFERED
+# --------------------------------------------------------------------------- #
+# Hermes' get_tool_definitions() is a per-toolset allowlist and the static
+# hermes-<platform> composites don't know runtime-registered toolset names:
+# registering under a novel toolset ("form") succeeds but the tool never
+# reaches any platform agent. Riding "clarify" — present in every platform
+# composite, and form's single-question sibling — is what makes the tool
+# reachable at all.
+
+def test_form_registers_under_clarify_toolset_by_default(monkeypatch):
+    monkeypatch.delenv("U1_FORM_TOOLSET", raising=False)
+    ft = _load_form_tool(monkeypatch, {})
+    call = next(c for c in ft.registry.calls if c.get("name") == "form")
+    assert call["toolset"] == "clarify"
+
+
+def test_form_toolset_env_override(monkeypatch):
+    monkeypatch.setenv("U1_FORM_TOOLSET", "forms-native")
+    ft = _load_form_tool(monkeypatch, {})
+    call = next(c for c in ft.registry.calls if c.get("name") == "form")
+    assert call["toolset"] == "forms-native"
+
+
+def test_form_toolset_blank_env_falls_back_to_clarify(monkeypatch):
+    monkeypatch.setenv("U1_FORM_TOOLSET", "   ")
+    ft = _load_form_tool(monkeypatch, {})
+    call = next(c for c in ft.registry.calls if c.get("name") == "form")
+    assert call["toolset"] == "clarify"
