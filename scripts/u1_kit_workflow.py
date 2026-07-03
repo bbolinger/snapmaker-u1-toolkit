@@ -3979,6 +3979,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                 })
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
+        _arranged = pl.get("arranged_stls") or []
         plates_state.append({
             "plate_idx": idx,
             "gcode_path": str(named),
@@ -3986,7 +3987,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             "printer_storage_filename": up.get("uploaded_filename") or named.name,
             "uploaded": up,
             "started": False,
-            "arranged_stls": pl.get("arranged_stls") or [],
+            # metadata (est time + filament) + partition_parts were missing on
+            # this (form-mode) path, so the review doc showed "—" and no parts
+            # row — unlike the staged path (operator feedback 2026-07-03).
+            "metadata": pl.get("metadata", {}),
+            "partition_parts": [re.sub(r"^obj_\d+_", "", os.path.basename(s))
+                                for s in _arranged],
+            "arranged_stls": _arranged,
             "preview_path": layout.get("path"),
             "thumbnail_injection": injection,
         })
@@ -4021,6 +4028,14 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
 
     action = values.get("action", "start")
 
+    # Human-readable profile name + part filenames for the review doc, so it
+    # reads like the sample and not raw slugs/IDs (operator feedback
+    # 2026-07-03: "0_20_strength_gyroid" and "04_angle_90" looked generated).
+    _pf = (u1_request.read_request(request_id) or {}).get("form_profiles") or []
+    _profile_label = next((p.get("label") for p in _pf
+                           if p.get("value") == profile_slug), None) or profile_slug
+    _parts_display = ", ".join(p.get("filename", p["part_id"]) for p in selected)
+
     # Pre-print review doc (v2.2) — same artifact as the staged path,
     # same fail-soft contract.
     review_doc_path: str | None = None
@@ -4029,10 +4044,10 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             request_id, out_dir, plates_state,
             state=u1_request.read_request(request_id) or {},
             decisions={"tool": tool, "material": material,
-                       "profile": profile_slug,
+                       "profile": _profile_label,
                        "orient": values.get("orient"),
                        "supports": supports,
-                       "parts": ", ".join(p["part_id"] for p in selected)},
+                       "parts": _parts_display},
             operator=operator,
             reference=u1_review_doc.build_reference(
                 profile_slug, material, nozzle=nozzle, out_dir=out_dir),
@@ -4064,10 +4079,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         "orient": values.get("orient"), "supports": supports,
         "parsed_echo": u1_form.echo_parse(values, spec),
         "gated_plate": plate1["printer_storage_filename"],
-        # NOT A START AUTHORIZATION — Stage 1 photo-capture command
-        # only. Kit Stage 2 requires the staged bed_clear_start
-        # nonce (u1_print_start_gate.py refuses kit start without one).
-        "start_gate_stage1_command": stage1_cmd,
+        # start_gate_stage1_command is deliberately NOT surfaced here — a
+        # confused agent grabbed it and drove the gate directly (Stage 1 then a
+        # Stage 2 with no nonce → correctly refused, the scary "Stage 2 refused"
+        # the operator kept hitting on the FORM path). The ONLY start path is
+        # the `start` option's --action start command; the workflow drives the
+        # bed-clear yes/no and emits the nonce-bound Stage 2 itself. Still
+        # persisted in request state (write_request below) for the fallback.
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Stage 1 gates ONLY plate 1 "
             f"({plate1['printer_storage_filename']}). After it prints, start plates "
@@ -4078,24 +4096,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     }
     _emit(events_file, readiness, json_events)
 
-    persist_phase = "awaiting_start_approval" if action == "start" else "complete"
-    next_action = None
-    if action == "start":
-        next_action = {
-            "stage": "next_action_required",
-            "reason": "Run Stage 1 to capture a real bed photo + approval token for plate 1.",
-            "command": stage1_cmd,
-        }
-        _emit(events_file, next_action, json_events)
-    else:
-        _emit(events_file, {"stage": "complete", "request_id": request_id,
-                            "reason": ("Upload-only: all plates on the printer; "
-                                       "start from the Snapmaker app."
-                                       if live else
-                                       "Upload-only DRY RUN: plates sliced "
-                                       "locally, nothing sent to the printer "
-                                       "(pass --live-upload to send).")}, json_events)
-
+    # Persist plate + plan state BEFORE any bed-clear routing so _action_start
+    # (below) reads plate_filename / gcode_hash / tool / material from state.
+    persist_phase = "awaiting_confirm" if action == "start" else "complete"
     u1_request.write_request(
         request_id,
         phase=persist_phase,
@@ -4107,18 +4110,68 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         printer_storage_filename=plate1["printer_storage_filename"],
         start_gate_stage1_command=stage1_cmd,
         readiness_card_event=readiness,
-        next_action_required_event=next_action,
     )
     _audit(request_id, "kit_readiness_card_emitted", operator,
            plate_count=len(plates_state), gated_plate=plate1["printer_storage_filename"],
-           gcode_hash=plate1["gcode_hash"], request_revision=(u1_request.read_request(request_id) or {}).get("request_revision", 1))
+           gcode_hash=plate1["gcode_hash"],
+           request_revision=(u1_request.read_request(request_id) or {}).get("request_revision", 1))
 
-    return {
-        "phase": persist_phase, "request_id": request_id, "out_dir": str(out_dir),
-        "plate_count": len(plates_state),
-        "gated_plate": plate1["printer_storage_filename"],
-        "start_gate_stage1_command": stage1_cmd,
-    }
+    if action != "start":
+        _emit(events_file, {"stage": "complete", "request_id": request_id,
+                            "reason": ("Upload-only: all plates on the printer; "
+                                       "start from the Snapmaker app."
+                                       if live else
+                                       "Upload-only DRY RUN: plates sliced "
+                                       "locally, nothing sent to the printer "
+                                       "(pass --live-upload to send).")}, json_events)
+        return {"phase": "complete", "request_id": request_id,
+                "out_dir": str(out_dir), "plate_count": len(plates_state),
+                "gated_plate": plate1["printer_storage_filename"]}
+
+    # action == "start": capture the bed photo + issue a token, then route into
+    # the SAME two-turn bed-clear gate as the staged path. _action_start emits
+    # the yes/no and mints the Stage-2 nonce on yes. The form path used to hand
+    # the agent the raw Stage-1 gate command with NO nonce path, so the kit gate
+    # refused EVERY start ("Stage 2 refused", operator 2026-07-03, every run).
+    _no_live_upload = not live
+    _no_live_material = bool(getattr(args, "no_live_material", False))
+    bed_result = _capture_bed_and_issue_token(out_dir)
+    if not bed_result["ok"]:
+        reason = str(bed_result.get("reason") or "camera unreachable")
+        _emit(events_file, {
+            "stage": "need_input", "key": "confirm", "request_id": request_id,
+            "prompt": (f"Bed photo could not be captured ({reason}). Can't offer a "
+                       "gated start. Reply `upload-only` to keep the sliced plates, "
+                       "or fix the camera and re-run the kit."),
+            "options": [{"label": "Upload only — keep plates, don't print",
+                         "value": "upload-only",
+                         "next_command": _build_next_command(
+                             archive, request_id, action="upload-only", nozzle=nozzle,
+                             no_live_upload=no_live_upload,
+                             no_live_material=no_live_material)}],
+        }, json_events)
+        return {"phase": "awaiting_confirm", "request_id": request_id,
+                "out_dir": str(out_dir), "bed_capture_failed": True}
+
+    _safety = dict((u1_request.read_request(request_id) or {}).get("safety") or {})
+    _safety.update({
+        "bed_clear_check_required": True,
+        "bed_clear_photo_captured": True,
+        "bed_clear_photo_path": bed_result["snapshot_path"],
+        "snapshot_path": bed_result["snapshot_path"],
+        "approval_token": bed_result["token"],
+    })
+    u1_request.write_request(request_id, safety=_safety)
+    _emit(events_file, {"stage": "render", "request_id": request_id,
+                        "kind": "bed_snapshot", "image": bed_result["snapshot_path"]},
+          json_events)
+    yes_command = _build_next_command(
+        archive, request_id, action="start", nozzle=nozzle,
+        no_live_upload=_no_live_upload, no_live_material=_no_live_material
+    ) + " --bed-clear-confirmed"
+    return _action_start(events_file, request_id, json_events,
+                         yes_command=yes_command, bed_clear_confirmed=False,
+                         operator=operator)
 
 
 def main(argv=None) -> int:
