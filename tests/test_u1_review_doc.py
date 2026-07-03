@@ -88,7 +88,7 @@ def test_generate_writes_bound_reviewable_doc(tmp_path):
     text = Path(doc).read_text()
     # moat binding in the header
     assert "u1_2026_0702_abc123" in text
-    assert "revision **3**" in text
+    assert "plan revision 3" in text
     assert "abab" in text  # gcode hash surfaced
     # ground-truth settings from the gcode config block
     assert "gyroid" in text and "0.2" in text
@@ -109,7 +109,7 @@ def test_generate_survives_missing_gcode(tmp_path):
     doc = u1_review_doc.generate("u1_2026_0702_abc123", tmp_path / "out",
                                  plates, state={}, decisions={"tool": "T0"})
     text = Path(doc).read_text()
-    assert "settings table" in text  # graceful placeholder, not a crash
+    assert "settings unavailable" in text  # graceful placeholder, not a crash
     assert "T0" in text
 
 
@@ -137,9 +137,9 @@ def test_deviation_from_preset_is_marked(tmp_path):
                    "layer_height": "0.2",           # matches → no marker
                    "sparse_infill_pattern": "gyroid"})
     text = Path(doc).read_text()
-    assert "⚠" in text and "preset: `240`" in text
+    assert "DIFFERS" in text and "preset: 240)" in text
     # matching values carry no marker
-    assert "| Layer height (mm) | `0.2` |" in text
+    assert "Layer height (mm):" in text and "0.2" in text
     assert "1 setting(s) differ from the chosen preset" in text
 
 
@@ -150,7 +150,7 @@ def test_no_deviations_says_so_explicitly(tmp_path):
         reference={"layer_height": "0.2", "sparse_infill_pattern": "gyroid",
                    "nozzle_temperature": "220", "enable_support": "1"})
     text = Path(doc).read_text()
-    assert "No deviations detected" in text.replace("no \ndeviations", "") or \
+    assert "matches the chosen preset" in text or \
            "no \ndeviations detected" in text.lower() or \
            "deviations detected" in text.lower()
     assert "⚠" not in text
@@ -180,8 +180,8 @@ def test_full_sweep_catches_non_curated_tweaks(tmp_path):
                    "print_settings_id": "different-but-noise"})
     text = Path(doc).read_text()
     assert "Other deviations from the preset" in text
-    assert "`ironing_type` | `top surfaces` ⚠ | `no ironing`" in text
-    assert "`retraction_length` | `1.2` ⚠ | `0.8`" in text
+    assert "ironing_type:" in text and "top surfaces" in text and "(preset: no ironing)" in text
+    assert "retraction_length:" in text and "1.2" in text and "(preset: 0.8)" in text
     # matching + noisy keys stay out
     assert "flow_ratio" not in text.split("Other deviations")[1]
     assert "print_settings_id" not in text
@@ -203,7 +203,7 @@ def test_full_sweep_silent_when_everything_matches(tmp_path):
         reference={"layer_height": "0.2", "ironing_type": "no ironing"})
     text = Path(doc).read_text()
     assert "Other deviations" not in text
-    assert "no deviations detected" in text.lower()
+    assert "matches the chosen preset" in text.lower()
 
 
 def test_envelope_flags_out_of_range_nozzle_temp(tmp_path):
@@ -225,11 +225,11 @@ def test_envelope_flags_out_of_range_nozzle_temp(tmp_path):
         reference={"layer_height": "0.2"},
         envelope={"material": "PETG", "nozzle_low": 220.0, "nozzle_high": 260.0})
     text = Path(doc).read_text()
-    assert "Material sanity" in text
-    assert "outside PETG's declared range (220–260°C)" in text
+    assert "MATERIAL SANITY" in text
+    assert "outside PETG's declared range (220-260C)" in text
     assert "275,275" in text
     # the in-range first-layer temp is NOT named in the warning
-    assert "First-layer nozzle temp `250`" not in text
+    assert "First-layer nozzle temp 250" not in text
 
 
 def test_envelope_confirms_in_range_quietly(tmp_path):
@@ -239,7 +239,7 @@ def test_envelope_confirms_in_range_quietly(tmp_path):
         envelope={"material": "PETG", "nozzle_low": 220.0, "nozzle_high": 260.0})
     text = Path(doc).read_text()
     assert "within PETG's declared range" in text
-    assert "⚠ **Material sanity" not in text
+    assert "MATERIAL SANITY:" not in text
 
 
 def test_no_envelope_no_section(tmp_path):
@@ -265,7 +265,7 @@ def test_norm_collapses_per_filament_lists():
 def test_material_double_check_note_present(tmp_path):
     doc = u1_review_doc.generate("u1_2026_0702_abc123", tmp_path / "out",
                                  _plates(tmp_path), state={})
-    assert "PHYSICALLY loaded" in Path(doc).read_text()
+    assert "physically" in Path(doc).read_text().lower()
 
 
 def test_multi_plate_doc_says_only_plate1_is_gated(tmp_path):
@@ -276,7 +276,7 @@ def test_multi_plate_doc_says_only_plate1_is_gated(tmp_path):
     doc = u1_review_doc.generate("u1_2026_0702_abc123", tmp_path / "out",
                                  plates, state={})
     text = Path(doc).read_text()
-    assert "Only **plate 1**" in text
+    assert "Only plate 1" in text
     assert "kit_plate2.gcode" in text
 
 

@@ -4018,6 +4018,18 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                         "plates": [p["printer_storage_filename"] for p in plates_state],
                         "live": live}, json_events)
 
+    # Surface the sliced-plate layout render(s) so the operator sees the
+    # arranged parts on the bed — the staged path does this; the form path was
+    # computing the preview but never emitting it (operator 2026-07-03: "I never
+    # got the photo of the sliced render").
+    for _ps in plates_state:
+        _pv = _ps.get("preview_path")
+        if _pv and os.path.isfile(_pv):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_preview",
+                                "plate_idx": _ps.get("plate_idx"),
+                                "image": _pv}, json_events)
+
     plate1 = plates_state[0]
     _tidx = _tool_to_index(tool)
     extruder = "extruder" if _tidx == 0 else f"extruder{_tidx}"
