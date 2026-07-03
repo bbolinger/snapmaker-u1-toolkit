@@ -57,12 +57,16 @@ _CONFIG_LINE_RE = re.compile(r"^;\s*([A-Za-z0-9_ \[\]()]+?)\s*=\s*(.*)$")
 
 
 def _num_canon(x: Any) -> str:
-    """Canonicalize a numeric token so equal numbers compare equal:
-    ``0.20`` → ``0.2``, ``1.0`` → ``1``, ``1`` → ``1``. Non-numeric tokens
-    pass through unchanged. Without this the deviation sweep flagged
-    ``0.2`` vs ``0.20`` and ``1`` vs ``1.0`` as differences (operator
-    feedback 2026-07-02: the review doc filled with false ⚠ noise)."""
+    """Canonicalize a token so equal values compare equal. Strips a single
+    pair of surrounding quotes (the sliced gcode emits empty string fields as
+    the 2-char token ``""`` and text fields as ``"foo"``, while the preset
+    stores them unquoted), then canonicalizes numbers (``0.20`` → ``0.2``,
+    ``1.0`` → ``1``). Non-numeric tokens pass through. Without this the sweep
+    flagged ``""`` vs empty, ``0.2`` vs ``0.20``, ``1`` vs ``1.0`` as
+    differences (operator feedback 2026-07-02: false ⚠ noise)."""
     s = str(x).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
     try:
         f = float(s)
     except (ValueError, TypeError):
