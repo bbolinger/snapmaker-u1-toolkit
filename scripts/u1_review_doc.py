@@ -267,6 +267,25 @@ def _sha256_text(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
+_ASCII_MAP = {
+    "\u2014": "-", "\u2013": "-", "\u2026": "...", "\u00b0": "",
+    "\u26a0": "!", "\u21b3": "->", "\u00b7": "|", "\u2192": "->",
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+}
+
+
+def _ascii(v: Any) -> str:
+    """Force a value to pure ASCII so the plain-text review reads cleanly in ANY
+    viewer. Telegram's file preview reads the .md as Latin-1, so any UTF-8
+    (degree signs, arrows, em-dashes) shows as mojibake (operator 2026-07-03:
+    "it looks like hieroglyphics"). Map the common typographic chars, then drop
+    anything else non-ASCII."""
+    out = str(v)
+    for k, rep in _ASCII_MAP.items():
+        out = out.replace(k, rep)
+    return out.encode("ascii", "ignore").decode("ascii")
+
+
 def generate(
     request_id: str,
     out_dir: Path,
@@ -297,173 +316,158 @@ def generate(
     revision = state.get("request_revision", 1)
     plate1 = plates[0] if plates else {}
 
-    L: list[str] = []
-    L.append(f"# Pre-print review — `{request_id}`")
-    L.append("")
-    L.append(f"Generated {datetime.now(timezone.utc).isoformat(timespec='seconds')} "
-             f"· plan revision **{revision}** · gated plate sha256 "
-             f"`{plate1.get('gcode_hash', 'n/a')}`")
-    L.append("")
-    L.append("> This document is bound to the plan above. If anything "
-             "plan-affecting changes after you review it, `can_start()` "
-             "refuses the start and you get a fresh card — the plan you "
-             "read here is the plan that prints.")
-    L.append("")
+    def _sep(title):
+        return ["", "=== " + title + " ===", ""]
 
-    # ── What will print ──
-    L.append("## What will print")
+    L: list[str] = []
+    L.append("PRE-PRINT REVIEW  -  " + _ascii(request_id))
+    L.append("Generated " + datetime.now(timezone.utc).isoformat(timespec="seconds")
+             + "  |  plan revision " + str(revision))
+    L.append("Gated plate sha256: " + _ascii(plate1.get("gcode_hash", "n/a")))
     L.append("")
-    L.append("| Plate | File on printer | Est. time | Filament | sha256 |")
-    L.append("|---|---|---|---|---|")
+    L.append("This document is bound to the plan above. If anything plan-affecting")
+    L.append("changes after you review it, the start is refused and you get a fresh")
+    L.append("card - the plan you read here is the plan that prints.")
+
+    # What will print
+    L += _sep("WHAT WILL PRINT")
     for p in plates:
         md = p.get("metadata") or {}
         est = (md.get("estimated printing time (normal mode)")
-               or md.get("estimated printing time") or "—")
+               or md.get("estimated printing time") or "-")
         fil = (md.get("total filament used [g]")
-               or md.get("filament used [g]") or "—")
-        fil = f"{fil} g" if fil != "—" else fil
-        h = str(p.get("gcode_hash", ""))
-        h_short = h.replace("sha256:", "")[:12] or "—"
-        L.append(f"| {p.get('plate_idx', '?')} | "
-                 f"`{p.get('printer_storage_filename', '?')}` | "
-                 f"{est} | {fil} | `{h_short}…` |")
+               or md.get("filament used [g]") or "-")
+        fil = (str(fil) + " g") if fil != "-" else fil
+        h = str(p.get("gcode_hash", "")).replace("sha256:", "")[:12] or "-"
+        L.append("Plate " + str(p.get("plate_idx", "?")) + ": "
+                 + _ascii(p.get("printer_storage_filename", "?")))
+        L.append("  Est. time: " + _ascii(est))
+        L.append("  Filament:  " + _ascii(fil))
         parts = p.get("partition_parts")
         if parts:
-            L.append(f"| | ↳ parts: {', '.join(parts)} | | | |")
+            L.append("  Parts:     " + _ascii(", ".join(parts)))
+        L.append("  sha256:    " + h + "...")
     if len(plates) > 1:
         L.append("")
-        L.append(f"Only **plate 1** goes through the camera-gated start. "
-                 f"Plates 2–{len(plates)} are uploaded; start them from the "
-                 f"Snapmaker app after plate 1 finishes.")
-    L.append("")
+        L.append("Only plate 1 goes through the camera-gated start. Plates 2-"
+                 + str(len(plates)) + " are uploaded;")
+        L.append("start them from the Snapmaker app after plate 1 finishes.")
 
-    # ── Key settings from the gcode itself ──
-    L.append("## Key settings")
-    L.append("")
-    L.append("Read from the config block inside the sliced gcode — what the "
-             "printer will execute, not what the workflow intended.")
+    # Key settings
+    L += _sep("KEY SETTINGS")
+    L.append("Read from the config block inside the sliced gcode - what the printer")
+    L.append("will execute, not what the workflow intended.")
     L.append("")
     gcode_path = plate1.get("gcode_path")
     config: dict[str, str] = {}
     if gcode_path and Path(gcode_path).is_file():
         config = parse_gcode_config(Path(gcode_path))
     if config:
-        L.append("| Setting | Value |")
-        L.append("|---|---|")
+        rows = []
         deviations = 0
         for label, keys in _KEY_SETTINGS:
             v = _first(config, keys)
             if v is None:
                 continue
-            cell = f"`{v}`"
+            note = ""
             if reference:
-                # Flag values that differ from the chosen preset — the
-                # tweaked-and-forgotten temp is the classic trust-killer.
                 ref_v = next((reference[k] for k in keys if k in reference), None)
                 if ref_v is not None and _norm(v) != _norm(ref_v):
-                    cell = f"`{v}` ⚠ *preset: `{ref_v}`*"
+                    note = "<-- DIFFERS (preset: " + _ascii(ref_v) + ")"
                     deviations += 1
-            L.append(f"| {label} | {cell} |")
-        others: list = []
+            rows.append((_ascii(label), _ascii(v), note))
+        width = max((len(r[0]) for r in rows), default=0)
+        for lbl, val, note in rows:
+            line = "  " + (lbl + ":").ljust(width + 2) + val
+            if note:
+                line += "   " + note
+            L.append(line)
+        others = []
         if reference:
             curated_keys = {k for _, keys in _KEY_SETTINGS for k in keys}
             others = _sweep_deviations(config, reference, curated_keys)
             total = deviations + len(others)
             L.append("")
-            L.append(f"_{total} setting(s) differ from the chosen "
-                     f"preset (marked ⚠)._" if total else
-                     "_Every setting in the sliced gcode matches the chosen "
-                     "preset — no deviations detected._")
+            L.append((str(total) + " setting(s) differ from the chosen preset "
+                      "(marked DIFFERS).") if total else
+                     "Every setting in the sliced gcode matches the chosen preset.")
         if others:
             L.append("")
-            L.append("**Other deviations from the preset** (full-config "
-                     "sweep — every remaining setting matches):")
-            L.append("")
-            L.append("| Setting | In this print | Preset |")
-            L.append("|---|---|---|")
+            L.append("Other deviations from the preset (full-config sweep):")
             shown = others[:20]
+            ow = max((len(_ascii(k)) for k, _, _ in shown), default=0)
             for key, got, ref_v in shown:
-                L.append(f"| `{key}` | `{got}` ⚠ | `{ref_v}` |")
+                L.append("  " + (_ascii(key) + ":").ljust(ow + 2) + _ascii(got)
+                         + "   (preset: " + _ascii(ref_v) + ")")
             if len(others) > len(shown):
-                L.append(f"| _…and {len(others) - len(shown)} more_ | | |")
-        # Material-envelope sanity (v2.2): a custom preset can match itself
-        # perfectly and still be wild for the material. Check the gcode's
-        # nozzle temps against the range the material's own filament
-        # profile declares. In-range prints a quiet confirmation; out-of-
-        # range gets its own distinctly-worded flag. No declared range =
-        # no section (norms are never invented here).
+                L.append("  ...and " + str(len(others) - len(shown)) + " more")
         if envelope and envelope.get("nozzle_low") is not None:
             lo, hi = envelope["nozzle_low"], envelope["nozzle_high"]
-            mat = envelope.get("material", "this material")
-            bad: list[str] = []
+            mat = _ascii(envelope.get("material", "this material"))
+            bad = []
             for cfg_key, label in (("nozzle_temperature", "Nozzle temp"),
                                    ("nozzle_temperature_initial_layer",
                                     "First-layer nozzle temp")):
                 v = config.get(cfg_key)
                 if v is None:
                     continue
-                outside = _temps_outside(v, lo, hi)
-                if outside:
-                    bad.append(f"{label} `{v}`°C")
+                if _temps_outside(v, lo, hi):
+                    bad.append(label + " " + _ascii(v) + "C")
             L.append("")
             if bad:
-                L.append(f"⚠ **Material sanity:** {'; '.join(bad)} — "
-                         f"outside {mat}'s declared range "
-                         f"({lo:.0f}–{hi:.0f}°C). This can be intentional "
-                         f"(speed profiles run hot), but it is exactly the "
-                         f"kind of thing to notice before saying yes.")
+                L.append("MATERIAL SANITY: " + "; ".join(bad))
+                L.append("  outside " + mat + "'s declared range (%.0f-%.0fC)."
+                         % (lo, hi))
+                L.append("  Can be intentional (speed profiles run hot), but exactly")
+                L.append("  the kind of thing to notice before saying yes.")
             else:
-                L.append(f"_Material sanity: nozzle temps are within "
-                         f"{mat}'s declared range ({lo:.0f}–{hi:.0f}°C)._")
+                L.append("Material sanity: nozzle temps are within " + mat
+                         + "'s declared range (%.0f-%.0fC)." % (lo, hi))
     else:
-        L.append("_Config block not found in the gcode — settings table "
-                 "unavailable for this slice (older Orca build?). The "
-                 "decisions below still describe the operator's choices._")
-    L.append("")
+        L.append("Config block not found in the gcode - settings unavailable for")
+        L.append("this slice (older Orca build?). The decisions below still describe")
+        L.append("the operator's choices.")
 
-    # ── Operator decisions & overrides ──
-    L.append("## Your decisions")
-    L.append("")
-    label_map = [
-        ("tool", "Toolhead"), ("material", "Material"),
-        ("profile", "Profile"), ("orient", "Orientation"),
-        ("supports", "Supports"), ("parts", "Parts selected"),
-    ]
-    any_dec = False
+    # Your decisions
+    L += _sep("YOUR DECISIONS")
+    label_map = [("tool", "Toolhead"), ("material", "Material"),
+                 ("profile", "Profile"), ("orient", "Orientation"),
+                 ("supports", "Supports"), ("parts", "Parts")]
+    decs = []
     for key, label in label_map:
         v = decisions.get(key) if key in decisions else state.get(key)
         if v not in (None, "", []):
-            L.append(f"- **{label}:** {v}")
-            any_dec = True
-    if not any_dec:
-        L.append("- _(none recorded)_")
+            decs.append((label, _ascii(v)))
+    if decs:
+        dw = max(len(d[0]) for d in decs)
+        for label, v in decs:
+            L.append("  " + (label + ":").ljust(dw + 2) + v)
+    else:
+        L.append("  (none recorded)")
     if overrides:
         L.append("")
-        L.append("**Overrides applied to the preset:**")
+        L.append("Overrides applied to the preset:")
         for o in overrides:
-            L.append(f"- {o}")
-    L.append("")
+            L.append("  - " + _ascii(o))
 
-    # ── What happens next ──
-    L.append("## Before you say yes")
-    L.append("")
-    L.append("1. Stage 1 captures a **fresh bed photo** — you approve the "
-             "photo, not a description of it.")
-    L.append("2. After your yes, the gate re-runs every safety check, then "
-             "holds a **grace window** before any command reaches the "
-             "printer. Reply `CANCEL` in that window to abort — no LLM in "
-             "that path.")
-    L.append("3. The material you chose is re-verified against what is "
-             "PHYSICALLY loaded in the toolhead at start time — a mismatch "
-             "blocks the print unless you explicitly accept it (audited).")
-    L.append("4. Cancelling costs nothing: the slice and upload stay valid; "
-             "restarting is one fresh photo + one fresh yes.")
+    # Before you say yes
+    L += _sep("BEFORE YOU SAY YES")
+    L.append("  1. Stage 1 captured a fresh bed photo - you approve the photo, not a")
+    L.append("     description of it.")
+    L.append("  2. After your yes, the gate re-runs every safety check, then holds a")
+    L.append("     grace window before any command reaches the printer. Reply CANCEL")
+    L.append("     in that window to abort - no LLM in that path.")
+    L.append("  3. The material you chose is re-verified against what is physically")
+    L.append("     loaded in the toolhead at start time - a mismatch blocks the print")
+    L.append("     unless you explicitly accept it (audited).")
+    L.append("  4. Cancelling costs nothing: the slice and upload stay valid;")
+    L.append("     restarting is one fresh photo + one fresh yes.")
     L.append("")
 
     text = "\n".join(L) + "\n"
     doc_path = out_dir / "review.md"
     out_dir.mkdir(parents=True, exist_ok=True)
-    doc_path.write_text(text)
+    doc_path.write_text(text, encoding="ascii", errors="replace")
 
     # Forensic binding: the audit trail records exactly which document the
     # operator had available at review time.
