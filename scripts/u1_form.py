@@ -66,6 +66,14 @@ _ACTIONS = {
     "upload-start": "start",
     "print": "start",
     "go": "start",
+    # v2.2: the button verb is "Slice & review" — the value stays "start"
+    # (the bed-clear yes/no is the real start decision). Accept the new
+    # phrasing from text-mode typers too.
+    "slice & review": "start",
+    "slice and review": "start",
+    "slice-review": "start",
+    "slice review": "start",
+    "review": "start",
     "upload-only": "upload-only",
     "uploadonly": "upload-only",
     "upload only": "upload-only",
@@ -510,6 +518,71 @@ def persist_schema(form_id: str, schema: dict) -> "Path":
     p = d / f"{form_id}.json"
     p.write_text(_json.dumps(schema, ensure_ascii=False))
     return p
+
+
+# --------------------------------------------------------------------------- #
+# Bed-clear confirm tokens
+# --------------------------------------------------------------------------- #
+# The bed-clear yes-command used to be a ~200-char command the model relayed
+# verbatim (full path + --request-id + all answer flags + --pending-nonce). A
+# 26B local model (gemma4) mangled the request_id mid-string
+# ('u1_2026_...' -> 'u1_202rad_...') and the gate refused. Same medicine as the
+# form: the model now relays ONE short opaque token; the workflow resolves the
+# request from it. Single-use (consumed on redeem); the nonce it maps to still
+# does all the real auth (single-use + revision/gcode binding).
+
+CONFIRM_TOKENS_DIR_ENV = "U1_CONFIRM_TOKENS_DIR"
+
+
+def confirm_tokens_dir() -> "Path":
+    from pathlib import Path
+    import os
+    env = os.environ.get(CONFIRM_TOKENS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "confirm_tokens"
+
+
+def new_confirm_token() -> str:
+    """Short, filename-safe, unguessable. ``c`` prefix guarantees a leading
+    letter (a leading '-' would turn ``--confirm-start <tok>`` into a flag) and
+    distinguishes it from a form id."""
+    import secrets
+    return "c" + secrets.token_hex(5)
+
+
+def persist_confirm_token(token: str, request_id: str) -> "Path":
+    """Map a confirm token to a request id on disk. Raises on a bad token."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(token or "")):
+        raise ValueError(f"invalid confirm token: {token!r}")
+    d = confirm_tokens_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{token}.json"
+    p.write_text(_json.dumps({"request_id": request_id}, ensure_ascii=False))
+    return p
+
+
+def resolve_confirm_token(token: str, consume: bool = True):
+    """Return the request_id a confirm token maps to (or None). When
+    ``consume`` (default), delete the token file so it can't be replayed —
+    single-use, like the nonce it fronts for. Strict pattern also blocks
+    traversal."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(token or "")):
+        return None
+    p = confirm_tokens_dir() / f"{token}.json"
+    try:
+        rid = _json.loads(p.read_text()).get("request_id")
+    except Exception:
+        return None
+    if consume:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    return rid
 
 
 def write_answers_file(form_id: str, obj: dict) -> "Path":

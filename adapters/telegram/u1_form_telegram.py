@@ -299,7 +299,10 @@ def _render_group(form: dict[str, Any], screen: list[dict[str, Any]]) -> dict[st
 # Submit-verb button styling per action option id.
 _SUBMIT_VERBS = {
     "upload-only": "\u2b06 Upload only",
-    "start": "\u25b6 Upload + Start",
+    # NOT "Start": submitting slices + shows the plate/review/bed photo, then a
+    # single bed-clear yes/no is the actual start decision (against a fresh bed
+    # photo). Avoids the "say yes to start, then say yes again" double-confirm.
+    "start": "\U0001f50d Slice & review",
 }
 
 
@@ -384,7 +387,7 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
             # verb; the verbs are the only sanctioned submit path here.
             form["current"] = REVIEW_FIELD
             return {"kind": "rerender",
-                    "warning": "Choose “Upload only” or “Upload + Start”."}
+                    "warning": "Choose “Slice & review” or “Upload only”."}
         # Validate required SCREEN fields are answered before submit.
         missing = []
         for f in fields:
