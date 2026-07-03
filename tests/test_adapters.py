@@ -448,7 +448,10 @@ def test_plugin_registers_form_tool_and_dispatch_hook(monkeypatch, tmp_path):
     assert tool["toolset"] == "form"  # own toolset — the plugin path is what
     # surfaces it; joining clarify would evict clarify via subset-inference
     assert callable(tool["handler"])
-    assert tool["schema"]["parameters"]["required"] == ["form_schema"]
+    # Flat contract: the agent passes ONLY form_id (gemma4 couldn't emit
+    # the nested schema); form_schema stays as a legacy optional property.
+    assert tool["schema"]["parameters"]["required"] == ["form_id"]
+    assert "form_schema" in tool["schema"]["parameters"]["properties"]
     assert [h for h, _ in ctx.hooks] == ["pre_gateway_dispatch"]
 
 
@@ -1077,3 +1080,49 @@ def test_group_step_counter_counts_screens_not_fields():
     assert "Step 1 of 3" in tg.render_screen(form)["text"]   # parts / setup / profile
     tg.apply_callback(form, "n:%d" % _fi(schema, "parts"))
     assert "Step 2 of 3" in tg.render_screen(form)["text"]   # the group is ONE step
+
+
+def test_form_handler_loads_persisted_schema_by_form_id(monkeypatch, tmp_path):
+    """Flat contract round-trip: workflow persists the schema, the agent
+    passes only form_id, the handler loads the schema from disk and hands it
+    to the gateway callback (gemma4 couldn't reproduce nested JSON in a
+    tool call — Ollama #15539/#15798/#15943)."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)
+    seen = {}
+    fg.set_form_callback("sess1", lambda schema: seen.update(schema=schema) or {"ok": 1})
+
+    sdir = tmp_path / "schemas"
+    sdir.mkdir()
+    monkeypatch.setenv("U1_FORM_SCHEMAS_DIR", str(sdir))
+    schema = {"version": 1, "fields": [{"id": "parts", "type": "multi_select",
+                                        "label": "Parts", "options": ["a", "b"]}],
+              "submit": {"mode": "file", "form_id": "fabc123def"}}
+    (sdir / "fabc123def.json").write_text(json.dumps(schema))
+
+    out = json.loads(mod._form_handler({"form_id": "fabc123def"}, session_id="sess1"))
+    assert out.get("user_answer") == {"ok": 1}
+    assert seen["schema"]["submit"]["form_id"] == "fabc123def"
+
+
+def test_form_handler_rejects_unknown_and_traversal_form_ids(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _fake_form_gateway(monkeypatch)
+    monkeypatch.setenv("U1_FORM_SCHEMAS_DIR", str(tmp_path))
+    # unknown id -> structured error, no crash
+    out = json.loads(mod._form_handler({"form_id": "fdeadbeef1"}, session_id="s"))
+    assert "no pending form" in out.get("error", "")
+    # traversal attempt -> refused by the strict pattern, never touches disk
+    out2 = json.loads(mod._form_handler({"form_id": "../../etc/passwd"}, session_id="s"))
+    assert "no pending form" in out2.get("error", "")
+
+
+def test_form_handler_legacy_full_schema_still_works(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _fake_form_gateway(monkeypatch)
+    fg.set_form_callback("sess2", lambda schema: {"parts": ["a"]})
+    schema = {"version": 1, "fields": [{"id": "parts", "type": "multi_select",
+                                        "label": "Parts", "options": ["a"]}]}
+    out = json.loads(mod._form_handler(
+        {"form_schema": schema}, session_id="sess2"))
+    assert out.get("user_answer") == {"parts": ["a"]}
