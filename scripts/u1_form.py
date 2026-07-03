@@ -479,6 +479,39 @@ def _answers_path(form_id: str) -> "Path":
     return answers_dir() / f"{form_id}.json"
 
 
+FORM_SCHEMAS_DIR_ENV = "U1_FORM_SCHEMAS_DIR"
+
+
+def schemas_dir() -> "Path":
+    """Where persisted form schemas live (sibling of form_answers).
+
+    The agent no longer relays the schema through its tool call — a 26B
+    local model (gemma4) reproduced the nested JSON as template-token soup
+    (finish=stop, special-token leaks) and the flow stranded. The workflow
+    persists the schema here keyed by form_id; the agent passes ONLY the
+    flat form_id and the form plugin loads the schema from disk."""
+    from pathlib import Path
+    import os
+    env = os.environ.get(FORM_SCHEMAS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "form_schemas"
+
+
+def persist_schema(form_id: str, schema: dict) -> "Path":
+    """Write the schema JSON for ``form_id``; returns the path. Raises on
+    an invalid form_id (same filename-safety rule as answer files)."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(form_id or "")):
+        raise ValueError(f"invalid form_id: {form_id!r}")
+    d = schemas_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{form_id}.json"
+    p.write_text(_json.dumps(schema, ensure_ascii=False))
+    return p
+
+
 def write_answers_file(form_id: str, obj: dict) -> "Path":
     """Atomically persist a structured answer set for later redemption."""
     import json as _json

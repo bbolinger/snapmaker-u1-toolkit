@@ -88,6 +88,33 @@ def form_tool(
     }, ensure_ascii=False)
 
 
+import os
+import re
+
+_FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+
+def _load_persisted_schema(form_id: str) -> Optional[Dict[str, Any]]:
+    """Load the schema the workflow persisted for ``form_id``.
+
+    The agent passes ONLY the flat form_id — a 26B local model (gemma4)
+    could not reproduce the nested schema in a tool call (template-token
+    soup, finish=stop; Ollama issues #15539/#15798/#15943), so the schema
+    never rides through the model. Filename-safety: form_id must match the
+    same strict pattern the workflow uses, which also blocks traversal."""
+    if not _FORM_ID_RE.match(str(form_id or "")):
+        return None
+    base = os.environ.get("U1_FORM_SCHEMAS_DIR", "").strip() \
+        or "/opt/data/snapmaker_u1/form_schemas"
+    path = os.path.join(base, f"{form_id}.json")
+    try:
+        with open(path, "r") as f:
+            schema = json.load(f)
+        return schema if isinstance(schema, dict) else None
+    except Exception:
+        return None
+
+
 def _form_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Registry-dispatched handler: resolve the gateway callback by session.
 
@@ -102,7 +129,17 @@ def _form_handler(args: Dict[str, Any], **kwargs: Any) -> str:
     except ImportError:
         logger.warning("u1-form: tools.form_gateway not installed — was "
                        "install.py run against this Hermes?")
-    return form_tool(form_schema=args.get("form_schema") or {}, callback=callback)
+    schema = args.get("form_schema")
+    if not (isinstance(schema, dict) and schema.get("fields")):
+        form_id = str(args.get("form_id") or "").strip()
+        schema = _load_persisted_schema(form_id)
+        if schema is None:
+            return json.dumps(
+                {"error": f"no pending form found for form_id {form_id!r}. "
+                          "Use the form_id from the most recent kit_form "
+                          "event; if it expired, re-run the kit workflow "
+                          "command to get a fresh form."}, ensure_ascii=False)
+    return form_tool(form_schema=schema, callback=callback)
 
 
 # =============================================================================
@@ -112,41 +149,35 @@ def _form_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 FORM_SCHEMA = {
     "name": "form",
     "description": (
-        "Present a STRUCTURED MULTI-FIELD FORM to the user and block until "
-        "they submit. Use when you need several decisions at once that "
-        "don't fit `clarify` (which is single-question, max-4-choice).\n\n"
-        "Pass a `form_schema` object (the platform-neutral spec the toolkit "
-        "emits in its `kit_form` event): a list of typed fields "
-        "(`single_select`, `multi_select`), each with an `id`, `label`, "
-        "`options` (stable ids), optional `default`, optional `required`. "
-        "Include `text_fallback` so platforms without rich UI degrade "
-        "gracefully.\n\n"
-        "The user sees native UI on platforms that support it (Telegram "
-        "inline keyboards, Discord select menus) or a typed-line form on "
-        "ones that don't. You get back the canonical answer dict — keyed by "
-        "field id, values are stable option ids (or `'all'` for fully-"
-        "selected multi).\n\n"
-        "Use this tool when:\n"
-        "- The flow has several related decisions the user should review "
-        "together (kit slicing options, multi-step config).\n"
-        "- A `kit_form` event has been emitted with a `form_schema` field — "
-        "pass that schema directly.\n\n"
+        "Present a STRUCTURED MULTI-FIELD FORM to the user (native button "
+        "UI) and block until they submit.\n\n"
+        "When a `kit_form` event is emitted, call this tool with ONLY the "
+        "event's `form_id` string — the form definition is already stored; "
+        "do not reconstruct or restate it. Example: form(form_id=\"f1a2b3c4d5\").\n\n"
+        "You get back the user's answers (or a write-receipt when answers "
+        "are file-redeemed).\n\n"
         "Do NOT use for single yes/no (use the terminal tool's approval) or "
         "single-pick clarification (use `clarify`)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "form_id": {
+                "type": "string",
+                "description": (
+                    "The `form_id` from the kit_form event. Pass it "
+                    "EXACTLY as given. This is the only field you need."
+                ),
+            },
             "form_schema": {
                 "type": "object",
                 "description": (
-                    "The platform-neutral form schema. Pass the schema "
-                    "VERBATIM from a `kit_form` event's `form_schema` field. "
-                    "Do not invent or rewrite it."
+                    "LEGACY / advanced: a full platform-neutral schema "
+                    "object. Only pass this when there is no form_id."
                 ),
             },
         },
-        "required": ["form_schema"],
+        "required": ["form_id"],
     },
 }
 

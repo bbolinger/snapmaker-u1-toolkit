@@ -118,7 +118,12 @@ def test_form_mode_emits_schema_with_bound_form_id(tmp_path, hermetic_commit, ca
     events = _events(capsys)
     form_ev = next(e for e in events if e.get("key") == "kit_form")
     assert form_ev["form_id"] == fid
-    schema = form_ev["form_schema"]
+    # The schema no longer rides the event (weak models echoed the nested
+    # JSON as text instead of tool-calling) — it is PERSISTED, keyed by
+    # form_id, and the plugin loads it from disk.
+    assert "form_schema" not in form_ev
+    assert f'form(form_id="{fid}")' in form_ev["instruction"]
+    schema = json.loads((u1_form.schemas_dir() / f"{fid}.json").read_text())
     assert schema["version"] == 1 and schema["fields"]
     assert schema["submit"] == {"mode": "file", "form_id": fid}
     assert f"--form-answers-from={fid}" in form_ev["next_command"]

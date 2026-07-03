@@ -2029,6 +2029,15 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # (operator feedback 2026-07-02: picked parts with no photo).
         if _thumb.get("ok"):
             schema["header_image"] = _thumb["path"]
+        # Persist the schema to disk; the agent relays ONLY the flat form_id.
+        # A 26B local model (gemma4) could not reproduce the nested schema in
+        # a tool call — it emitted template-token soup as plain text
+        # (finish=stop, no tool_calls; Ollama #15539/#15798/#15943) and the
+        # flow stranded. Verified 2026-07-03: flat form_id call succeeds where
+        # the nested-schema call failed (19s vs 819s, temp-0.2 variant). The
+        # event is also kept SLIM (no schema/text_fallback) so the model
+        # never sees nested JSON it might try to echo.
+        u1_form.persist_schema(form_id, schema)
         redeem_cmd = _build_next_command(
             archive, request_id, nozzle=nozzle,
             no_live_upload=no_live_upload,
@@ -2039,23 +2048,18 @@ def run_kit_workflow(args) -> dict[str, Any]:
             "stage": "need_input", "key": "kit_form",
             "request_id": request_id,
             "form_id": form_id,
-            "form_schema": schema,
-            "form": schema["text_fallback"],
             "next_command": redeem_cmd,
             "instruction": (
-                "Your VERY NEXT action is a single tool call: pass form_schema "
-                "to the form tool (button UX). Do NOT write any text or surface "
-                "any image path first — the form renderer sends the parts "
-                "thumbnail with the first screen automatically. (A weaker model "
-                "that surfaced the thumbnail 'first' then stopped, never calling "
-                "the form tool, leaving the operator with no buttons — so go "
-                "straight to the form tool.) When the gateway confirms the "
-                "answers file is written, tool-call next_command VERBATIM — do "
-                "not add, remove, or restate any answer. If the form tool "
-                "errors, is unavailable, or times out: re-run THIS SAME kit "
-                "command with --interaction-mode text appended — that starts "
-                "the staged one-question-per-turn flow. NEVER paste this "
-                "event's text_fallback block into the chat as one message."),
+                f"Your VERY NEXT action is a single tool call: "
+                f"form(form_id=\"{form_id}\"). Nothing else — no text first, "
+                "no image paths, no restated options (the form renderer "
+                "shows the parts thumbnail and every choice as buttons). "
+                "When the gateway confirms the answers file is written, "
+                "tool-call next_command VERBATIM — do not add, remove, or "
+                "restate any answer. If the form tool errors, is "
+                "unavailable, or times out: re-run THIS SAME kit command "
+                "with --interaction-mode text appended — that starts the "
+                "staged one-question-per-turn flow."),
         }, json_events)
         _emit(events_file, {"stage": "awaiting_input", "need": "kit_form",
                             "request_id": request_id}, json_events)
