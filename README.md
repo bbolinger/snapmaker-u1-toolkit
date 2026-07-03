@@ -239,6 +239,51 @@ Operator-facing change: every approval question now includes the `request_id` ve
 - [OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary (extracted AppImage path is fine; full install steps in [Headless slicing setup](#headless-slicing-setup-no-gui--scripted))
 - Network reachability from your host to your U1's Moonraker port (default `7125`)
 
+### Local model & serving requirements (form mode / button UX)
+
+The button-based **form mode** (the rich Telegram UX in the demo) asks the local
+model to emit one tool call. Small local models are inconsistent at tool-calling,
+so form mode has hard serving requirements — verified end-to-end on
+`gemma4-26b-64k` via [Ollama](https://ollama.com/) on an NVIDIA Quadro P6000:
+
+- **Ollama 0.31.1 or newer.** Ollama 0.30.x has a gemma4 tool-call parser bug
+  ([#15539](https://github.com/ollama/ollama/issues/15539),
+  [#15798](https://github.com/ollama/ollama/issues/15798),
+  [#15943](https://github.com/ollama/ollama/issues/15943)): the model's tool
+  call leaks into the message *content* as raw template tokens (`<|channel|>`,
+  `<|"|>`), the parser misses it, `finish_reason` is `stop`, and the agent
+  stalls with no buttons.
+
+- **Run the model at low temperature (~0.2) for tool turns.** Gemma's default
+  Modelfile ships `temperature 1`, which is unreliable for tool calls (~2 of 3
+  succeed in testing — one run in three strands the operator). A temp-0.2 variant
+  is 3 of 3. Create one (it shares the same weights blob — no extra disk):
+
+  ```bash
+  printf 'FROM gemma4-26b-64k:latest\nPARAMETER temperature 0.2\nPARAMETER num_ctx 65536\n' \
+    | ollama create gemma4-26b-64k-tool -f -
+  ```
+
+  then point your agent's model at `gemma4-26b-64k-tool`.
+
+- **The toolkit already does its part.** The `kit_form` event carries only a short
+  `form_id`; the full form definition is persisted to disk and loaded by the form
+  plugin, so the model never has to reproduce a large nested schema in its tool
+  call (what small models fail at). Nothing to configure — just don't downgrade
+  the bundled `u1-form` plugin.
+
+All three are needed together: on 0.30.8 the model failed even with the flat
+`form_id` call; on 0.31.1 the flat call works, but only at low temperature is it
+reliable. If tool calls still fail, fall back to **text mode**
+(`--interaction-mode text`) — the staged one-question-per-turn flow uses only
+simple `terminal` calls that even small models handle reliably.
+
+> **Hardware note (Pascal / older GPUs).** Ollama 0.31's `cuda_v13` runtime
+> dropped Pascal (compute capability 6.1); it falls back to the bundled
+> `cuda_v12`, so a P6000 / GTX-10-series still works today — but a future Ollama
+> that drops `cuda_v12` would break it. Benign `driverInitFileInfo ... result=11`
+> lines at startup are that fallback, not a failure.
+
 ### Install
 
 ```bash
