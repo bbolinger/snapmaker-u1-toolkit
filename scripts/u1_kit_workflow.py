@@ -2011,6 +2011,16 @@ def run_kit_workflow(args) -> dict[str, Any]:
         u1_request.write_request(request_id, phase="awaiting_form",
                                  form_id=form_id,
                                  form_profiles=spec["_profiles_full"])
+        # Render the per-part STL thumbnail grid BEFORE the form so the
+        # operator can see each piece while picking parts — the staged flow
+        # does this at Turn 1; form mode was skipping it (operator feedback
+        # 2026-07-02: "I didn't get a photo of the models before selecting").
+        _thumb = _render_parts_thumbnail_grid(
+            kit, u1_request.ensure_request_dir(request_id) / "parts_thumbnails.png")
+        if _thumb.get("ok"):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "parts_thumbnail_grid",
+                                "image": _thumb["path"]}, json_events)
         schema = u1_form.build_form_schema(
             spec, submit={"mode": "file", "form_id": form_id})
         redeem_cmd = _build_next_command(
@@ -2027,11 +2037,13 @@ def run_kit_workflow(args) -> dict[str, Any]:
             "form": schema["text_fallback"],
             "next_command": redeem_cmd,
             "instruction": (
-                "Pass form_schema to the form tool (button UX). When the "
-                "gateway confirms the answers file is written, tool-call "
-                "next_command VERBATIM — do not add, remove, or restate "
-                "any answer. If the form tool errors, is unavailable, or "
-                "times out: re-run THIS SAME kit command with "
+                "FIRST surface the parts_thumbnail_grid image path from the "
+                "render event above BARE (no backticks) so the operator sees "
+                "the pieces, THEN pass form_schema to the form tool (button "
+                "UX). When the gateway confirms the answers file is written, "
+                "tool-call next_command VERBATIM — do not add, remove, or "
+                "restate any answer. If the form tool errors, is unavailable, "
+                "or times out: re-run THIS SAME kit command with "
                 "--interaction-mode text appended — that starts the staged "
                 "one-question-per-turn flow. NEVER paste this event's "
                 "text_fallback block into the chat as one message."),
@@ -2545,9 +2557,12 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         _emit(events_file, {
             "stage": "review_doc", "request_id": request_id,
             "path": review_doc_path,
-            "instruction": ("Attach this file to the operator alongside the "
-                            "print plan card — it is the human-readable "
-                            "review of exactly what will print."),
+            "instruction": ("ATTACH this file (surface the bare path so Hermes "
+                            "sends it as a document) alongside the plan card — do "
+                            "NOT paste its contents inline; it is markdown with "
+                            "tables that render as a wall of pipes in a chat "
+                            "message. It is the human-readable review of exactly "
+                            "what will print."),
         }, json_events)
     except Exception as _rd_exc:
         _audit(request_id, "review_doc_failed", operator,
@@ -2709,7 +2724,13 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         "instruction": ("Surface BOTH render images bare in your reply (composite "
                         "plate preview + bed snapshot path) BEFORE the prompt text, "
                         "then surface the prompt verbatim, then wait for the "
-                        "operator's reply (`start` / `upload-only` / `adjust`)."),
+                        "operator's reply (`start` / `upload-only` / `adjust`). "
+                        "When the operator answers, tool-call the CHOSEN option's "
+                        "next_command VERBATIM. NEVER run u1_print_start_gate.py "
+                        "or start_gate_stage1_command yourself — the workflow drives "
+                        "the bed-clear yes/no turn and emits the Stage 2 command for "
+                        "you; running the gate directly skips the nonce and the gate "
+                        "will refuse."),
     }, json_events)
     _emit(events_file, {"stage": "awaiting_input", "need": "confirm",
                         "request_id": request_id}, json_events)
