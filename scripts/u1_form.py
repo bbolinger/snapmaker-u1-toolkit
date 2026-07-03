@@ -558,11 +558,18 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                            "group": _GROUP,
                            "options": [{"id": m, "label": m} for m in mats], "required": True})
     fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
-                   "group": _GROUP,
-                   "options": ["as-authored", "auto"], "default": "as-authored"})
+                   "group": _GROUP, "compact": True,
+                   "options": [{"id": "as-authored", "label": "As-authored"},
+                               {"id": "auto", "label": "Auto-rotate"}],
+                   "default": "as-authored"})
+    # Humanize + put the default (no-supports) first so the toggle reads
+    # left-to-right with the safe choice on the left.
+    _sup = list(spec.get("supports", ["supports", "no-supports"]))
+    _sup_lbl = {"no-supports": "No supports", "supports": "Add supports"}
+    _sup_ordered = sorted(_sup, key=lambda s: 0 if s == "no-supports" else 1)
     fields.append({"id": "supports", "type": "single_select", "label": "Supports",
-                   "group": _GROUP,
-                   "options": list(spec.get("supports", ["supports", "no-supports"])),
+                   "group": _GROUP, "compact": True,
+                   "options": [{"id": s, "label": _sup_lbl.get(s, s)} for s in _sup_ordered],
                    "default": "no-supports"})
     profiles = spec.get("profiles", [])
     if profiles:
