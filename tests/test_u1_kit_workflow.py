@@ -548,8 +548,13 @@ def test_form_start_reaches_bed_clear_gate_and_mints_nonce(tmp_path, fake_profil
     call persists a pending_bed_clear_start nonce, and the yes-turn mints the
     Stage-2 approval nonce (the value the gate consumes)."""
     ur = __import__("u1_request")
+    # Reuse the SAME zip for both calls, exactly like production: the real
+    # yes-command carries the same archive path, so model_hash is unchanged and
+    # request_revision does not bump (a fresh zip per call bumps model_hash ->
+    # revision -> the pending binding mismatches; that was a test artifact).
+    zip_path = _kit_zip(tmp_path, 3)
     res = kw.run_kit_workflow(_args(
-        _kit_zip(tmp_path, 3),
+        zip_path,
         form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start"))
     rid = res["request_id"]
     assert res["phase"] == "awaiting_bed_clear_start"
@@ -559,7 +564,7 @@ def test_form_start_reaches_bed_clear_gate_and_mints_nonce(tmp_path, fake_profil
 
     # operator says yes -> the Stage-2 nonce gets minted (the missing path)
     kw.run_kit_workflow(_args(
-        _kit_zip(tmp_path, 3), request_id=rid,
+        zip_path, request_id=rid,
         action="start", bed_clear_confirmed=True, pending_nonce=pending["nonce"]))
     safety2 = ur.read_request(rid).get("safety") or {}
     assert safety2.get("stage2_approval_nonce"), "Stage-2 nonce was never minted"
