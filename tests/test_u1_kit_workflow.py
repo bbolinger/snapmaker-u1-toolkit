@@ -152,8 +152,9 @@ def test_commit_happy_path_gates_plate_1(tmp_path, fake_profiles, fake_slice_upl
         _kit_zip(tmp_path, 3),
         form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start",
     ))
-    assert res["phase"] == "awaiting_start_approval"
-    assert res["plate_count"] == 2
+    # form action=start now routes into the two-turn bed-clear gate (like the
+    # staged path) instead of handing out a raw Stage-1 command.
+    assert res["phase"] == "awaiting_bed_clear_start"
     rid = res["request_id"]
     u1_request = __import__("u1_request")
     req = u1_request.read_request(rid)
@@ -166,9 +167,9 @@ def test_commit_happy_path_gates_plate_1(tmp_path, fake_profiles, fake_slice_upl
     assert req["printer_storage_filename"].endswith("_plate1.gcode")
     # selection persisted
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
-    # stage-1 command targets plate 1 + the request
-    assert "_plate1.gcode" in res["start_gate_stage1_command"]
-    assert rid in res["start_gate_stage1_command"]
+    # stage-1 command (persisted for the fallback) targets plate 1 + the request
+    assert "_plate1.gcode" in req["start_gate_stage1_command"]
+    assert rid in req["start_gate_stage1_command"]
 
 
 def test_commit_uploads_all_plates_with_distinct_names(tmp_path, fake_profiles, fake_slice_upload):
@@ -185,15 +186,16 @@ def test_commit_uploads_all_plates_with_distinct_names(tmp_path, fake_profiles, 
 def test_extruder_mapping_matches_single_workflow(tmp_path, fake_profiles, fake_slice_upload):
     # SAFETY: T0 -> 'extruder' (NOT extruder1); T1 -> 'extruder1'. Must match
     # u1_slice_workflow's mapping or the gate's tool-match check heats wrong head.
+    _ur = __import__("u1_request")
     r0 = kw.run_kit_workflow(_args(
         _kit_zip(tmp_path, 1), fresh=True,
         form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
-    assert "--intended-tool extruder " in r0["start_gate_stage1_command"]
+    assert "--intended-tool extruder " in _ur.read_request(r0["request_id"])["start_gate_stage1_command"]
 
     r1 = kw.run_kit_workflow(_args(
         _kit_zip(tmp_path, 1), fresh=True,
         form_answers="all | T1 | PLA | profile 1 | no-supports | start"))
-    assert "--intended-tool extruder1 " in r1["start_gate_stage1_command"]
+    assert "--intended-tool extruder1 " in _ur.read_request(r1["request_id"])["start_gate_stage1_command"]
 
 
 def test_upload_only_action_completes_without_gate(tmp_path, fake_profiles, fake_slice_upload):
@@ -272,7 +274,7 @@ def test_resume_by_request_id_after_form(tmp_path, fake_profiles, fake_slice_upl
         form_answers="all | T0 | PLA | profile 1 | no-supports | start",
     ))
     assert r2["request_id"] == rid
-    assert r2["phase"] == "awaiting_start_approval"
+    assert r2["phase"] == "awaiting_bed_clear_start"
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +307,7 @@ def test_commit_via_form_answers_json(tmp_path, fake_profiles, fake_slice_upload
         form_answers_json='{"parts": ["01_part0", "03_part2"], "tool": "T0", '
                           '"material": "PLA", "profile": 1, "supports": "no-supports", "action": "start"}',
     ))
-    assert res["phase"] == "awaiting_start_approval"
+    assert res["phase"] == "awaiting_bed_clear_start"
     rid = res["request_id"]
     req = __import__("u1_request").read_request(rid)
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
@@ -519,3 +521,45 @@ def test_over_limit_zip_emits_kit_rejected(tmp_path, fake_profiles, capsys, monk
     evs = _stdout_events(capsys)
     rej = next(e for e in evs if e.get("stage") == "kit_rejected")
     assert "limit is 2" in rej["error"]
+
+
+@pytest.fixture(autouse=True)
+def _fake_bed_capture(monkeypatch):
+    """Form-mode `action=start` now captures a bed photo + token and routes into
+    the two-turn bed-clear gate (like the staged path), instead of handing out a
+    raw Stage-1 command. Mock the capture so tests are fast + deterministic and
+    don't touch a real camera. Tests wanting capture-failure override this."""
+    def _fake(out_dir):
+        snap = Path(out_dir) / "bed_snapshot.jpg"
+        try:
+            snap.write_bytes(b"\xff\xd8\xff\xe0fakejpeg")
+        except Exception:
+            pass
+        return {"ok": True, "snapshot_path": str(snap), "token": "faketoken123",
+                "approval_ttl_seconds": 2700, "approval_expires_at": None,
+                "captured_at_utc": None, "reason": None}
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake)
+
+
+def test_form_start_reaches_bed_clear_gate_and_mints_nonce(tmp_path, fake_profiles, fake_slice_upload):
+    """Regression (operator 2026-07-03, every run): form action=start used to
+    hand out a raw Stage-1 command with NO nonce path, so the kit gate refused
+    every start. It must now route into the two-turn bed-clear gate — the first
+    call persists a pending_bed_clear_start nonce, and the yes-turn mints the
+    Stage-2 approval nonce (the value the gate consumes)."""
+    ur = __import__("u1_request")
+    res = kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 3),
+        form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start"))
+    rid = res["request_id"]
+    assert res["phase"] == "awaiting_bed_clear_start"
+    pending = (ur.read_request(rid).get("safety") or {}).get("pending_bed_clear_start")
+    assert pending and pending.get("nonce")
+    assert pending.get("prompt_key") == "bed_clear_start"
+
+    # operator says yes -> the Stage-2 nonce gets minted (the missing path)
+    kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 3), request_id=rid,
+        action="start", bed_clear_confirmed=True, pending_nonce=pending["nonce"]))
+    safety2 = ur.read_request(rid).get("safety") or {}
+    assert safety2.get("stage2_approval_nonce"), "Stage-2 nonce was never minted"
