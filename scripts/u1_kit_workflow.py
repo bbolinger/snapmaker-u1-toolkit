@@ -1790,6 +1790,32 @@ def run_kit_workflow(args) -> dict[str, Any]:
     global _CLI_OPERATOR
     _CLI_OPERATOR = getattr(args, "operator", None) or None
     operator = _resolve_operator(args)
+
+    # --confirm-start <token>: the operator said "yes" at the bed-clear prompt.
+    # The model relays ONLY this short token (it mangled the old 200-char
+    # verbatim command). Resolve the request + pending nonce from persisted
+    # state, then fall through as a normal second-turn confirm (--action start
+    # --bed-clear-confirmed). Single-use: the token is consumed on resolve.
+    _confirm_token = getattr(args, "confirm_start", None)
+    if _confirm_token:
+        _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
+        _state = u1_request.read_request(_rid) if _rid else None
+        _pending = ((_state or {}).get("safety") or {}).get("pending_bed_clear_start") or {}
+        if not (_rid and _state and _pending.get("nonce")):
+            print(json.dumps({
+                "stage": "bed_clear_confirm_token_invalid",
+                "reason": ("confirm token is invalid, already used, or expired. "
+                           "Re-run --action start (no --bed-clear-confirmed) to "
+                           "get a fresh bed-clear prompt."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_token_invalid",
+                    "confirm_token": _confirm_token}
+        args.request_id = _rid
+        args.action = "start"
+        args.bed_clear_confirmed = True
+        args.pending_nonce = _pending.get("nonce")
+        _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
+               token_first6=str(_confirm_token)[:6])
     # Fence 1 companion: visible stderr banner whenever the workflow is
     # invoked under a test-prefixed operator. Same prefix list as
     # u1_print_start_gate.py's gate refusal. Prevents the "oh it looked
@@ -2631,7 +2657,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             f"start-gated. Plates 2..{len(plates_state)} are already uploaded; "
             "start them from the Snapmaker app after plate 1 finishes."
             if len(plates_state) > 1 else
-            "Single plate. `start` will ask for a fresh bed-clear yes/no before firing."
+            "Single plate. Slice & review, then a fresh bed-clear yes/no starts the print."
         ),
     }
     _emit(events_file, readiness, json_events)
@@ -2649,7 +2675,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         # is NOT surfaced here — that would be a
         # bypass path any adapter could grab.
         options.append({
-            "label": "Start — I'll ask you to confirm bed-clear before the print fires",
+            "label": "Slice & review — then a fresh bed-clear yes/no starts the print",
             "value": "start",
             "next_command": _build_next_command(
                 archive, request_id, parts=parts_answer, tool=tool_choice,
@@ -3012,12 +3038,18 @@ def _action_start(events_file: Path | None, request_id: str,
         # exact request revision + gcode hash. If either drifts before
         # the operator says yes, the second call will refuse.
         nonce = secrets.token_urlsafe(24)
+        # Short confirm token the model relays instead of the full command
+        # (gemma4 mangled the long verbatim relay — see u1_form confirm-token
+        # note). Maps to this request; single-use; the nonce still does the
+        # real auth.
+        confirm_token = u1_form.new_confirm_token()
         pending = {
             "issued_at": datetime.now(timezone.utc).isoformat(),
             "request_revision": request_revision,
             "gcode_hash": gcode_hash,
             "prompt_key": "bed_clear_start",
             "nonce": nonce,
+            "confirm_token": confirm_token,
         }
         # Persist the pending approval into safety block, preserving
         # existing safety fields (token/snapshot_path/etc).
@@ -3026,6 +3058,11 @@ def _action_start(events_file: Path | None, request_id: str,
         u1_request.write_request(request_id,
                                  phase="awaiting_bed_clear_start",
                                  safety=new_safety)
+        try:
+            u1_form.persist_confirm_token(confirm_token, request_id)
+        except Exception as _ct_exc:
+            _audit(request_id, "confirm_token_persist_failed", operator,
+                   error=f"{type(_ct_exc).__name__}: {_ct_exc}"[:160])
         # Reference the photo the operator already saw with the print
         # plan card (attached at the confirm turn). Do NOT say "the
         # attached photo" — no fresh attachment on this turn (Brent UX
@@ -3045,23 +3082,14 @@ def _action_start(events_file: Path | None, request_id: str,
             "approval_prompt_key": "bed_clear_start",
             "prompt": prompt,
             "expected_answers": ["yes", "no"],
-            # Yes-command carries full kit context (parts/tool/material/
-            # profile/orient/supports/nozzle) plus --bed-clear-confirmed.
-            # a hand-built version that omitted these
-            # caused the workflow to restart at Turn 1 (awaiting_parts)
-            # on the resume call.
-            # The pending nonce rides the yes-command: the second call must
-            # present it, so only the VERBATIM emitted command can confirm —
-            # a hand-assembled --bed-clear-confirmed call is refused.
-            "next_command_on_yes": (yes_command or (
-                # Legacy fallback (state-recovery path) — the workflow's
-                # self-heal on --request-id may fill in missing args, but
-                # this is a defense-in-depth path; callers should always
-                # pass yes_command.
+            # Short confirm token instead of a ~200-char verbatim command:
+            # the model relays ONE opaque token, the workflow resolves the
+            # request + nonce + full kit context from persisted state. This
+            # stopped gemma4 mangling the request_id mid-command. Single-use;
+            # the nonce still does the auth (revision + gcode binding).
+            "next_command_on_yes": (
                 f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                f"--request-id {request_id} --action start "
-                f"--bed-clear-confirmed"
-            )) + f" --pending-nonce {nonce}",
+                f"--confirm-start {confirm_token}"),
             "next_command_on_no": None,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
@@ -3319,7 +3347,7 @@ def _action_refresh_bed_photo(args, events_file: Path | None, request_id: str,
             "Type `start` — I'll ask for a fresh bed-clear yes/no before firing."
         ),
         "options": [{
-            "label": "Start — I'll ask you to confirm bed-clear before the print fires",
+            "label": "Slice & review — then a fresh bed-clear yes/no starts the print",
             "value": "start",
             # Carry the FULL persisted answer set — a start command missing
             # orient/profile/supports would fall back into the staged Q&A
@@ -4245,6 +4273,12 @@ def main(argv=None) -> int:
                           "file by form_id (single-use, bound to the form this "
                           "request emitted). The model relays this command "
                           "verbatim; answer content never passes through it."))
+    ap.add_argument("--confirm-start", default=None, dest="confirm_start",
+                    help=("v2.2 bed-clear confirm: the operator answered 'yes' "
+                          "at the bed-clear prompt. The model relays ONLY this "
+                          "short token (it mangled the old long command); the "
+                          "workflow resolves the request + single-use nonce "
+                          "from persisted state. Never hand-assemble it."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "

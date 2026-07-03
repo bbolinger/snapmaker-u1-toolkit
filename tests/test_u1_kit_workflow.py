@@ -568,3 +568,35 @@ def test_form_start_reaches_bed_clear_gate_and_mints_nonce(tmp_path, fake_profil
         action="start", bed_clear_confirmed=True, pending_nonce=pending["nonce"]))
     safety2 = ur.read_request(rid).get("safety") or {}
     assert safety2.get("stage2_approval_nonce"), "Stage-2 nonce was never minted"
+
+
+def test_confirm_start_token_redeems_and_mints_nonce(tmp_path, fake_profiles, fake_slice_upload):
+    """The bed-clear 'yes' is now a short `--confirm-start <token>` (a 26B model
+    mangled the old ~200-char command). Redeeming the token resolves the request
+    + single-use nonce from state and mints the Stage-2 approval nonce."""
+    ur = __import__("u1_request")
+    zip_path = _kit_zip(tmp_path, 3)
+    res = kw.run_kit_workflow(_args(
+        zip_path, form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start"))
+    rid = res["request_id"]
+    assert res["phase"] == "awaiting_bed_clear_start"
+    tok = ur.read_request(rid)["safety"]["pending_bed_clear_start"]["confirm_token"]
+    assert tok and tok.startswith("c")
+
+    # the operator says yes -> the model relays ONLY the short token
+    kw.run_kit_workflow(_args(zip_path, confirm_start=tok))
+    assert ur.read_request(rid)["safety"].get("stage2_approval_nonce"), \
+        "Stage-2 nonce not minted via --confirm-start"
+
+    # single-use: the token is consumed and cannot be replayed
+    import u1_form
+    assert u1_form.resolve_confirm_token(tok, consume=False) is None
+
+
+def test_confirm_start_invalid_token_refused(tmp_path, fake_profiles, fake_slice_upload):
+    """An unknown / already-used / traversal token is refused with a structured
+    event — never a crash, never a start."""
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), confirm_start="cdeadbeef00"))
+    assert res["phase"] == "bed_clear_confirm_token_invalid"
+    res2 = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), confirm_start="../../etc/passwd"))
+    assert res2["phase"] == "bed_clear_confirm_token_invalid"

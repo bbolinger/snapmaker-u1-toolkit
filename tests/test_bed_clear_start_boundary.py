@@ -190,7 +190,7 @@ def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys)
     assert need["approval_prompt_key"] == "bed_clear_start"
     assert need["requires_fresh_operator_bed_clear"] is True
     assert "next_command_on_yes" in need
-    assert "--bed-clear-confirmed" in need["next_command_on_yes"]
+    assert "--confirm-start " in need["next_command_on_yes"]
     assert need["next_command_on_no"] is None
 
 
@@ -1371,10 +1371,12 @@ def test_action_start_confirm_without_pending_nonce_refused(sandbox_requests):
     assert any("nonce" in r for r in result["reasons"])
 
 
-def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys):
-    """The emitted next_command_on_yes must include --pending-nonce so the
-    copy-verbatim contract is mechanically enforced, not just documented."""
-    import io, json as _json
+def test_action_start_yes_command_uses_short_confirm_token(sandbox_requests, capsys):
+    """The emitted next_command_on_yes is a SHORT `--confirm-start <token>`
+    (a 26B model mangled the old ~200-char verbatim command). The token maps
+    to this request; the single-use nonce it fronts for still does the auth."""
+    import re as _re, json as _json
+    import u1_form
     rid = "u1_test_nonce_cmd"
     _seed_request(sandbox_requests, rid)
     kw._action_start(None, rid, True, yes_command="python3 kit.py --action start --bed-clear-confirmed",
@@ -1382,9 +1384,11 @@ def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys
     out = capsys.readouterr().out
     evs = [_json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
     need = next(e for e in evs if e.get("stage") == "need_input")
-    pn = (u1_request.read_request(rid)["safety"]
-          ["pending_bed_clear_start"]["nonce"])
-    assert f"--pending-nonce {pn}" in need["next_command_on_yes"]
+    cmd = need["next_command_on_yes"]
+    assert "--confirm-start " in cmd and "--pending-nonce" not in cmd
+    tok = _re.search(r"--confirm-start (\S+)", cmd).group(1)
+    assert u1_form.resolve_confirm_token(tok, consume=False) == rid
+    assert u1_request.read_request(rid)["safety"]["pending_bed_clear_start"]["nonce"]
 
 
 def test_manual_bed_check_refused_when_camera_verification_available(sandbox_requests):
