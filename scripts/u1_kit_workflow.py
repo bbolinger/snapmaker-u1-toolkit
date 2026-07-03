@@ -2043,16 +2043,19 @@ def run_kit_workflow(args) -> dict[str, Any]:
             "form": schema["text_fallback"],
             "next_command": redeem_cmd,
             "instruction": (
-                "FIRST surface the parts_thumbnail_grid image path from the "
-                "render event above BARE (no backticks) so the operator sees "
-                "the pieces, THEN pass form_schema to the form tool (button "
-                "UX). When the gateway confirms the answers file is written, "
-                "tool-call next_command VERBATIM — do not add, remove, or "
-                "restate any answer. If the form tool errors, is unavailable, "
-                "or times out: re-run THIS SAME kit command with "
-                "--interaction-mode text appended — that starts the staged "
-                "one-question-per-turn flow. NEVER paste this event's "
-                "text_fallback block into the chat as one message."),
+                "Your VERY NEXT action is a single tool call: pass form_schema "
+                "to the form tool (button UX). Do NOT write any text or surface "
+                "any image path first — the form renderer sends the parts "
+                "thumbnail with the first screen automatically. (A weaker model "
+                "that surfaced the thumbnail 'first' then stopped, never calling "
+                "the form tool, leaving the operator with no buttons — so go "
+                "straight to the form tool.) When the gateway confirms the "
+                "answers file is written, tool-call next_command VERBATIM — do "
+                "not add, remove, or restate any answer. If the form tool "
+                "errors, is unavailable, or times out: re-run THIS SAME kit "
+                "command with --interaction-mode text appended — that starts "
+                "the staged one-question-per-turn flow. NEVER paste this "
+                "event's text_fallback block into the chat as one message."),
         }, json_events)
         _emit(events_file, {"stage": "awaiting_input", "need": "kit_form",
                             "request_id": request_id}, json_events)
