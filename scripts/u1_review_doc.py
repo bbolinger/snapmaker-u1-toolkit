@@ -56,22 +56,36 @@ _KEY_SETTINGS: list[tuple[str, list[str]]] = [
 _CONFIG_LINE_RE = re.compile(r"^;\s*([A-Za-z0-9_ \[\]()]+?)\s*=\s*(.*)$")
 
 
+def _num_canon(x: Any) -> str:
+    """Canonicalize a numeric token so equal numbers compare equal:
+    ``0.20`` → ``0.2``, ``1.0`` → ``1``, ``1`` → ``1``. Non-numeric tokens
+    pass through unchanged. Without this the deviation sweep flagged
+    ``0.2`` vs ``0.20`` and ``1`` vs ``1.0`` as differences (operator
+    feedback 2026-07-02: the review doc filled with false ⚠ noise)."""
+    s = str(x).strip()
+    try:
+        f = float(s)
+    except (ValueError, TypeError):
+        return s
+    if f == int(f):
+        return str(int(f))
+    return ("%.6f" % f).rstrip("0").rstrip(".")
+
+
 def _norm(v: Any) -> str:
     """Normalize a profile/config value for comparison. Profiles store
     per-filament lists (["240"] / ["240","240"]); gcode config emits the
-    joined form ("240,240"). Collapse both to a canonical string."""
+    joined form ("240,240"). Collapse both to a canonical string, and
+    canonicalize numeric tokens (0.20≡0.2, 1.0≡1) so equal values don't
+    read as deviations."""
     if isinstance(v, list):
-        parts = [str(x).strip() for x in v]
-        if parts and all(x == parts[0] for x in parts):
-            return parts[0]
-        return ",".join(parts)
-    v = str(v).strip()
-    if "," in v:
-        parts = [x.strip() for x in v.split(",")]
-        if parts and all(x == parts[0] for x in parts):
-            return parts[0]
-        return ",".join(parts)
-    return v
+        parts = [_num_canon(x) for x in v]
+    else:
+        v = str(v).strip()
+        parts = [_num_canon(x) for x in v.split(",")] if "," in v else [_num_canon(v)]
+    if parts and all(x == parts[0] for x in parts):
+        return parts[0]
+    return ",".join(parts)
 
 
 def build_reference(profile_slug: str | None, material: str | None,
@@ -230,8 +244,10 @@ def _sweep_deviations(config, reference, skip_keys):
         if ref_v is None:
             continue
         got = _norm(config[key])
-        if got != ref_v:
-            out.append((key, got, ref_v))
+        ref_norm = _norm(ref_v)
+        # Both-empty is not a deviation (e.g. an unset start_gcode on each side).
+        if got != ref_norm and not (got == "" and ref_norm == ""):
+            out.append((key, got, ref_norm))
     return out
 
 
@@ -340,7 +356,7 @@ def generate(
                 # Flag values that differ from the chosen preset — the
                 # tweaked-and-forgotten temp is the classic trust-killer.
                 ref_v = next((reference[k] for k in keys if k in reference), None)
-                if ref_v is not None and _norm(v) != ref_v:
+                if ref_v is not None and _norm(v) != _norm(ref_v):
                     cell = f"`{v}` ⚠ *preset: `{ref_v}`*"
                     deviations += 1
             L.append(f"| {label} | {cell} |")

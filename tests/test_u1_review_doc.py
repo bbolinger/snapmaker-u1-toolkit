@@ -359,3 +359,25 @@ def test_kit_commit_survives_review_doc_failure(tmp_path, capsys, monkeypatch):
         # before the review_doc check)
         raised = "review_doc event must be emitted" in str(exc)
     assert raised, "workflow must complete cleanly with the doc generator broken"
+
+
+def test_norm_numeric_and_empty_equivalence_no_false_deviations():
+    # Operator feedback 2026-07-02: 0.2 vs 0.20, 1 vs 1.0, "" vs "" flagged as
+    # deviations, filling the doc with false ⚠ noise. They must compare equal.
+    assert u1_review_doc._norm("0.2") == u1_review_doc._norm("0.20")
+    assert u1_review_doc._norm("1") == u1_review_doc._norm("1.0")
+    assert u1_review_doc._norm("") == u1_review_doc._norm("")
+    assert u1_review_doc._norm(["240", "240"]) == u1_review_doc._norm("240,240")
+    # real differences still register
+    assert u1_review_doc._norm("0") != u1_review_doc._norm("1")
+    assert u1_review_doc._norm("gyroid") != u1_review_doc._norm("grid")
+
+
+def test_sweep_skips_numeric_and_empty_equivalents():
+    config = {"top_shell_thickness": "1", "layer_height": "0.2",
+              "start_gcode": "", "infill": "25%", "walls": "6"}
+    reference = {"top_shell_thickness": "1.0", "layer_height": "0.20",
+                 "start_gcode": "", "infill": "20%", "walls": "6"}
+    out = u1_review_doc._sweep_deviations(config, reference, skip_keys=set())
+    keys = {k for k, _, _ in out}
+    assert keys == {"infill"}, keys   # only the genuine 25% vs 20% remains
