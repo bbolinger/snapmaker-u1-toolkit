@@ -280,9 +280,13 @@ def _ascii(v: Any) -> str:
     (degree signs, arrows, em-dashes) shows as mojibake (operator 2026-07-03:
     "it looks like hieroglyphics"). Map the common typographic chars, then drop
     anything else non-ASCII."""
+    import unicodedata
     out = str(v)
     for k, rep in _ASCII_MAP.items():
         out = out.replace(k, rep)
+    # NFKD decomposes accented letters (cafe\u0301) so stripping combining
+    # marks yields "cafe", not "caf" - transliterate rather than mangle names.
+    out = unicodedata.normalize("NFKD", out)
     return out.encode("ascii", "ignore").decode("ascii")
 
 

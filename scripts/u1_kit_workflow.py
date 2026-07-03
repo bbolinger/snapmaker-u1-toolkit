@@ -4028,7 +4028,12 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             _emit(events_file, {"stage": "render", "request_id": request_id,
                                 "kind": "kit_plate_preview",
                                 "plate_idx": _ps.get("plate_idx"),
-                                "image": _pv}, json_events)
+                                "image": _pv,
+                                "instruction": ("Surface this image path BARE (no "
+                                                "backticks) in your reply so the "
+                                                "operator sees the sliced plate "
+                                                "layout before the bed-clear prompt.")},
+                  json_events)
 
     plate1 = plates_state[0]
     _tidx = _tool_to_index(tool)
@@ -4175,7 +4180,11 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     })
     u1_request.write_request(request_id, safety=_safety)
     _emit(events_file, {"stage": "render", "request_id": request_id,
-                        "kind": "bed_snapshot", "image": bed_result["snapshot_path"]},
+                        "kind": "bed_snapshot", "image": bed_result["snapshot_path"],
+                        "instruction": ("Surface this bed photo path BARE (no backticks) "
+                                        "in your reply BEFORE the bed-clear yes/no "
+                                        "prompt - the prompt refers to 'the bed photo I "
+                                        "sent', so it must actually be sent.")},
           json_events)
     yes_command = _build_next_command(
         archive, request_id, action="start", nozzle=nozzle,
