@@ -180,6 +180,17 @@ def ensure_patched(adapter_cls) -> bool:
         """
         from telegram.constants import ParseMode  # type: ignore
         _ensure_cb_handler(self)  # before send: no tap may beat the handler
+        # Send the header image (STL thumbnail grid) FIRST so the operator sees
+        # the pieces while picking — independent of the agent surfacing it.
+        header_image = (form_schema or {}).get("header_image")
+        if header_image:
+            try:
+                import os as _os
+                if _os.path.isfile(header_image):
+                    with open(header_image, "rb") as _img:
+                        await self._bot.send_photo(chat_id=int(chat_id), photo=_img)
+            except Exception as exc:
+                logger.warning("u1-form: header image send failed: %s", exc)
         form = _tg.new_form(form_schema)
         screen = _tg.render_screen(form)
         kwargs = {

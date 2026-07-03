@@ -2023,6 +2023,12 @@ def run_kit_workflow(args) -> dict[str, Any]:
                                 "image": _thumb["path"]}, json_events)
         schema = u1_form.build_form_schema(
             spec, submit={"mode": "file", "form_id": form_id})
+        # Carry the thumbnail path IN the schema so the form renderer sends it
+        # as a photo with the first screen — the operator sees the pieces
+        # while picking, without relying on the agent to surface the render
+        # (operator feedback 2026-07-02: picked parts with no photo).
+        if _thumb.get("ok"):
+            schema["header_image"] = _thumb["path"]
         redeem_cmd = _build_next_command(
             archive, request_id, nozzle=nozzle,
             no_live_upload=no_live_upload,
@@ -2604,15 +2610,15 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         "printer_busy": printer_busy,
         "printer_busy_reason": printer_state.get("reason"),
         "gated_plate": plate1["printer_storage_filename"],
-        # NOT A START AUTHORIZATION. This is a Stage 1 command that
-        # captures a bed photo and writes an approval token; it does
-        # NOT command the printer. For kit requests the gate refuses
-        # any Stage 2 that arrives without a nonce
-        # (see u1_print_start_gate.py:is_kit_request refusal path), so
-        # this command CANNOT be chained into a print start on its
-        # own. Named the way it is for backward compat with older
-        # skills that grep this key for the photo-refresh flow.
-        "start_gate_stage1_command": stage1_cmd,
+        # start_gate_stage1_command is deliberately NOT surfaced here anymore.
+        # It's a runnable gate command, and a confused agent grabbed it and ran
+        # the gate directly — Stage 1 then a Stage 2 with no nonce, which the
+        # gate correctly refused, costing the operator a scary turn (live
+        # 2026-07-02, twice). The ONLY start path is the `start` option's
+        # next_command (--action start), which drives the bed-clear yes/no and
+        # emits the nonce-bound Stage 2 command itself. The command is still
+        # persisted in request state (write_request below) for _action_start's
+        # own no-token fallback.
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Plate 1 ({plate1['printer_storage_filename']}) is "
             f"start-gated. Plates 2..{len(plates_state)} are already uploaded; "

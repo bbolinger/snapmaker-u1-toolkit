@@ -381,3 +381,18 @@ def test_sweep_skips_numeric_and_empty_equivalents():
     out = u1_review_doc._sweep_deviations(config, reference, skip_keys=set())
     keys = {k for k, _, _ in out}
     assert keys == {"infill"}, keys   # only the genuine 25% vs 20% remains
+
+
+def test_norm_strips_quotes_so_empty_and_text_fields_match():
+    # Live 2026-07-02: the sliced gcode emits empty fields as the 2-char token
+    # `""` and text fields as `"foo"`, while the preset stores them unquoted.
+    # These are the SAME value and must not read as deviations.
+    q = chr(34)
+    assert u1_review_doc._norm(q + q) == u1_review_doc._norm("")        # "" == empty
+    assert u1_review_doc._norm(q + "PETG" + q) == u1_review_doc._norm("PETG")
+    cfg = {"default_filament_colour": q + q, "filament_end_gcode": q + q,
+           "enable_prime_tower": "0"}
+    ref = {"default_filament_colour": "", "filament_end_gcode": "",
+           "enable_prime_tower": "1"}
+    out = u1_review_doc._sweep_deviations(cfg, ref, skip_keys=set())
+    assert {k for k, _, _ in out} == {"enable_prime_tower"}   # only the real one
