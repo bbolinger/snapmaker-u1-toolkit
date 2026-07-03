@@ -99,6 +99,44 @@ The U1 implementation is the proving ground for the safety model + event contrac
 
 ---
 
+## Phase 10 — Single-STL system-width parity (NEXT)
+
+**Status:** 🔜 NEXT WORK (2026-07-03)
+
+The kit / multi-STL flow (`u1_kit_workflow.py`) was brought to full parity across
+all interaction modes — button form, text fallback, and direct CLI all share
+`_action_start` and use the "Slice & review" verb + the short-token
+`--confirm-start` bed-clear confirm (Gemma-proof). The **single-STL** flow
+(`u1_slice_workflow.py`) is a separate, older implementation that did NOT get any
+of it and is the remaining "path parity" gap for tiny local models:
+
+1. **Verbiage.** "Upload + start gate" → "Slice & review" framing (the `Upload?`
+   prompt options + any pre-commit "Start" wording). Collapse the double-yes the
+   same way: the bed-clear yes/no is the single start decision.
+2. **Short-token confirm (safety-critical).** Single-STL currently makes the
+   agent run a Stage-1 command, then *extract the approval token from the output
+   and hand-rebuild the Stage-2 command* (`--bed-clear start --approval-token
+   <token>`). This is the worst-case mangle pattern — a 26B model butchers it.
+   Give single-STL a `--confirm-start <token>` path (its own, or refactor it to
+   share the kit's `_action_start`). Keep the nonce/approval-token as the auth.
+3. **Buttons (was Phase-4 / Increment 4).** Single-STL has no form mode yet.
+   A shared decision-collection module gives it the same button UX as the kit.
+
+Also fold in the small consistency cleanup: the kit **manual-bed-check override**
+path still emits the long yes-command instead of a short token (rare degraded /
+camera-failed path) — tokenize it for uniformity.
+
+Rationale for "system width": a super-tiny model that can't drive buttons must
+still work through the text fallback, and a human at a terminal must work through
+the CLI — all three modes need the same verbiage + the same Gemma-proof confirm.
+The kit flow already delivers this; single-STL must too before the demo can claim
+path parity (kit AND single-STL both work on the model users actually run).
+
+Reference: Ollama/gemma4 tool-call bug + the fixes are documented in the README
+"Local model & serving requirements" section and TROUBLESHOOTING.md.
+
+---
+
 ## How to pick up this work cold
 
 1. Read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the immutable system contracts.
