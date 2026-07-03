@@ -143,7 +143,7 @@ def test_tg_review_card_after_last_field_lists_all_and_offers_edit():
     form["current"] = tg.REVIEW_FIELD
     s = tg.render_screen(form)
     assert "Review" in s["text"]
-    assert "auto" in s["text"] and "T0" in s["text"]
+    assert "Auto-rotate" in s["text"] and "T0" in s["text"]
     cbs = _ids_in_keyboard(s["keyboard"])
     # Action is a submit_choice now: two submit verbs (S:<f>:<o>) replace the
     # bare Submit button; Cancel stays. Action gets no Edit row of its own.
@@ -182,11 +182,14 @@ def test_tg_bare_S_on_verb_schema_rerenders_to_pick_a_verb():
 def test_tg_submit_with_all_required_yields_answer_json():
     form = tg.new_form(_schema(n_parts=3))
     form["selections"]["parts"] = {0, 2}
-    form["selections"]["orient"] = 1            # auto
+    def _opt_i(fid, oid):
+        f = next(f for f in form["schema"]["fields"] if f["id"] == fid)
+        return next(i for i, o in enumerate(f["options"]) if tg._opt_id(o) == oid)
+    form["selections"]["orient"] = _opt_i("orient", "auto")
     form["selections"]["tool"] = 0              # T0
     form["selections"]["material"] = 0          # PLA
     form["selections"]["profile"] = 1           # profile2
-    form["selections"]["supports"] = 1          # no-supports
+    form["selections"]["supports"] = _opt_i("supports", "no-supports")
     form["current"] = tg.REVIEW_FIELD
     ev = tg.apply_callback(form, "S:%d:0" % _fi(form["schema"], "action"))   # start verb
     assert ev["kind"] == "submit"
@@ -1042,12 +1045,13 @@ def test_setup_group_renders_head_orient_supports_on_one_screen():
     assert form["current"] == "tool"
     s = tg.render_screen(form)
     assert "Print head &amp; layout" in s["text"]   # group title (HTML-escaped &)
-    # all three sub-fields' labels present
-    for lbl in ("Print head", "Orientation", "Supports"):
-        assert lbl in s["text"]
+    assert "orientation and supports" in s["text"].lower()   # instruction line
+    # humanized, side-by-side toggle labels are on the buttons (not headers)
+    btn_text = " ".join(b["text"] for row in s["keyboard"] for b in row)
+    for lbl in ("Head 1 (T0)", "As-authored", "Auto-rotate", "No supports", "Add supports"):
+        assert lbl in btn_text, lbl
     cbs = _ids_in_keyboard(s["keyboard"])
-    # exactly one shared Next, one Cancel
-    assert sum(c.startswith("n:") for c in cbs) == 1
+    assert sum(c.startswith("n:") for c in cbs) == 1   # one shared Next
     assert cbs.count("X") == 1
 
 

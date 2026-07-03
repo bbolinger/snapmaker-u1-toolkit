@@ -71,13 +71,29 @@ def _first_screen_field(fields: list[dict[str, Any]]) -> str:
     return next((f["id"] for f in fields if _is_screen_field(f)), REVIEW_FIELD)
 
 
+def _default_index(field: dict[str, Any]):
+    """Option index matching a single_select field's ``default``, or None."""
+    d = field.get("default")
+    if d is None:
+        return None
+    for i, o in enumerate(field["options"]):
+        if _opt_id(o) == d:
+            return i
+    return None
+
+
 def new_form(schema: dict[str, Any]) -> dict[str, Any]:
-    """Initial form state: cursor at the first screen field, empty selections."""
+    """Initial form state: cursor at the first screen field. single_select
+    fields with a default start pre-selected (the operator only taps to change
+    it); multi_select and required-no-default fields start empty."""
     fields = schema["fields"]
     return {
         "schema": schema,
         "current": _first_screen_field(fields),
-        "selections": {f["id"]: (set() if f["type"] == "multi_select" else None) for f in fields},
+        "selections": {
+            f["id"]: (set() if f["type"] == "multi_select" else _default_index(f))
+            for f in fields
+        },
         "pages": {f["id"]: 0 for f in fields},
     }
 
@@ -170,6 +186,19 @@ def render_screen(form: dict[str, Any]) -> dict[str, Any]:
     return _render_field(form, screen[0])
 
 
+def _join_human(items: list[str]) -> str:
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _screen_pos(form: dict[str, Any], fid: str) -> str:
+    screens = _screens(form)
+    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), 0)
+    return f"Step {pos + 1} of {len(screens)}"
+
+
 def _step_suffix(form: dict[str, Any], fid: str) -> str:
     """"Step N of M" over SCREENS (a group counts as one screen)."""
     screens = _screens(form)
@@ -189,6 +218,8 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any]) -> list[lis
     is_multi = field["type"] == "multi_select"
     page_offset = page * PAGE_SIZE
     sel = form["selections"][field["id"]]
+    compact = field.get("compact") and not is_multi
+    _pending: list[dict[str, str]] = []
     for local_oi, opt in enumerate(slice_):
         oi = page_offset + local_oi
         if is_multi:
@@ -197,7 +228,16 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any]) -> list[lis
         else:
             mark = "● " if sel == oi else "○ "
             cb = f"s:{fi}:{oi}"
-        rows.append([{"text": f"{mark}{_opt_label(opt)}", "callback_data": cb}])
+        btn = {"text": f"{mark}{_opt_label(opt)}", "callback_data": cb}
+        if compact:
+            _pending.append(btn)
+            if len(_pending) == 2:
+                rows.append(_pending)
+                _pending = []
+        else:
+            rows.append([btn])
+    if _pending:
+        rows.append(_pending)
     if paginated and total_pages > 1:
         nav: list[dict[str, str]] = []
         if page > 0:
@@ -243,16 +283,16 @@ def _render_group(form: dict[str, Any], screen: list[dict[str, Any]]) -> dict[st
     each as a labelled block, with a single shared Next ➜."""
     first = screen[0]
     title = _esc(first.get("group_label") or "Setup")
-    lines = [f"<b>{title}</b>" + _step_suffix(form, first["id"])]
+    labels = [str(f.get("label", f["id"])).lower() for f in screen]
+    instruction = "Pick " + _join_human(labels) + ", then Next \u279c."
+    lines = [f"<b>{title}</b> \u00b7 {_screen_pos(form, first['id'])}", instruction]
     rows: list[list[dict[str, str]]] = []
     for field in screen:
-        sub = _esc(field.get("label", field["id"]))
-        if field["type"] == "multi_select":
-            sub += _multi_hint(field, form["selections"][field["id"]])
-        lines.append(f"\n<b>{sub}</b>")
         rows.extend(_field_control_rows(form, field))
-    rows.append([{"text": "Next ➜", "callback_data": f"n:{_field_index(form, first['id'])}"}])
-    rows.append([{"text": "✖ Cancel", "callback_data": "X"}])
+    rows.append([
+        {"text": "Next \u279c", "callback_data": f"n:{_field_index(form, first['id'])}"},
+        {"text": "\u2716 Cancel", "callback_data": "X"},
+    ])
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
