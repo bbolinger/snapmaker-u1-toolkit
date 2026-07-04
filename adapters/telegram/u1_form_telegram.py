@@ -286,6 +286,12 @@ def _render_group(form: dict[str, Any], screen: list[dict[str, Any]]) -> dict[st
     labels = [str(f.get("label", f["id"])).lower() for f in screen]
     instruction = "Pick " + _join_human(labels) + ", then Next \u279c."
     lines = [f"<b>{title}</b> \u00b7 {_screen_pos(form, first['id'])}", instruction]
+    # Field-level notes (e.g. the single-model orientation verdict from Orca:
+    # "as-authored has floating regions \u2192 auto-orient is clean"). Surfaced so
+    # the operator sees WHY a pose is recommended before picking.
+    for field in screen:
+        if field.get("note"):
+            lines.append(f"<i>{_esc(str(field['note']))}</i>")
     rows: list[list[dict[str, str]]] = []
     for field in screen:
         rows.extend(_field_control_rows(form, field))
