@@ -201,6 +201,7 @@ def render_view(
     *,
     view: str = "iso",
     overhang_flags: np.ndarray | None = None,
+    base_colors: np.ndarray | None = None,
     bg: tuple[int, int, int] = DEFAULT_BG,
     model_top: tuple[int, int, int] = DEFAULT_MODEL_TOP,
     model_bottom: tuple[int, int, int] = DEFAULT_MODEL_BOTTOM,
@@ -209,7 +210,13 @@ def render_view(
 ) -> Image.Image:
     """Render a triangle mesh from one named view with Lambertian shading +
     painter's algorithm. Optional `overhang_flags` boolean mask paints
-    flagged triangles in `overhang_color` regardless of shading."""
+    flagged triangles in `overhang_color` regardless of shading.
+
+    Optional `base_colors` (N, 3 uint8) gives a per-triangle base color — each
+    triangle is shaded between its own color (lit) and 40% of it (shadow). Used
+    to colour multi-part plates so each part is a distinct hue while keeping one
+    correct global depth sort (compositing separate renders would break
+    occlusion between parts)."""
     if tris.shape[0] == 0:
         return Image.new("RGB", (width, height), bg)
 
@@ -254,6 +261,11 @@ def render_view(
     for idx in order:
         if overhang_flags is not None and overhang_flags[idx]:
             shade = overhang_color
+        elif base_colors is not None:
+            _bc = base_colors[idx]
+            _top = (int(_bc[0]), int(_bc[1]), int(_bc[2]))
+            _bot = (int(_top[0] * 0.4), int(_top[1] * 0.4), int(_top[2] * 0.4))
+            shade = _shade(float(intensity[idx]), _top, _bot)
         else:
             shade = _shade(float(intensity[idx]), model_top, model_bottom)
         poly = [(float(screen[idx, k, 0]), float(screen[idx, k, 1])) for k in range(3)]
