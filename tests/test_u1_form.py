@@ -399,3 +399,26 @@ def test_form_text_sanitizes_injected_labels():
     parts_field = next(f for f in schema["fields"] if f["id"] == "parts")
     label = parts_field["options"][0]["label"]
     assert "\n" not in label and "|" not in label
+
+
+def test_orient_recommendation_marks_option_default_and_note():
+    """Unified kit-of-1: when the caller passes Orca's verdict, the orient
+    button recommends that pose (default + '(recommended)' label + note).
+    Absent a verdict, orient stays as-authored (no recommendation)."""
+    spec = {"parts": [], "tools": ["T0"], "materials": ["PLA"],
+            "profiles": [{"idx": 1, "label": "Std"}],
+            "supports": ["supports", "no-supports"],
+            "orient_recommendation": "auto",
+            "orient_note": "As-authored has floating regions; auto is clean."}
+    sc = u1_form.build_form_schema(spec)
+    o = next(f for f in sc["fields"] if f["id"] == "orient")
+    assert o["default"] == "auto"
+    auto = next(x for x in o["options"] if x["id"] == "auto")
+    assert auto.get("recommended") is True and "(recommended)" in auto["label"]
+    assert "floating regions" in o.get("note", "")
+    # no verdict -> as-authored default, no recommendation, no note
+    spec2 = dict(spec); spec2.pop("orient_recommendation"); spec2.pop("orient_note")
+    o2 = next(f for f in u1_form.build_form_schema(spec2)["fields"] if f["id"] == "orient")
+    assert o2["default"] == "as-authored"
+    assert all(not x.get("recommended") for x in o2["options"])
+    assert "note" not in o2

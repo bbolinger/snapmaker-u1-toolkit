@@ -2072,6 +2072,39 @@ def run_kit_workflow(args) -> dict[str, Any]:
         _existing = u1_request.read_request(request_id) or {}
         spec = _build_form_spec(kit, nozzle,
                                 persisted_profiles=_existing.get("form_profiles"))
+        # Kit-of-1 (a lone STL routed through the unified flow): run the
+        # single-model orientation verdict so the orient button is data-driven —
+        # recommend the pose Orca actually prefers, with the reason. Proven to
+        # earn its cost (2026-07-03: catches floating regions as-authored →
+        # recommends auto). Cheap: one model, and orient_verdict only draft-
+        # slices the SECOND pose when the first has overhangs. Computed once and
+        # persisted so an idempotent re-emit reuses it. Skipped for true
+        # multi-part kits (draft-slicing every part is too expensive; they
+        # already auto-orient at slice time).
+        if len(kit.get("parts", [])) == 1:
+            _ov = _existing.get("orient_verdict")
+            if _ov is None:
+                _ov = {}
+                try:
+                    import u1_slice_workflow as _sw
+                    _pv = (spec.get("_prof_opts") or [{}])[0].get("value")
+                    if _pv:
+                        _od = (u1_request.ensure_request_dir(request_id)
+                               / "orient_analysis")
+                        _od.mkdir(parents=True, exist_ok=True)
+                        _res = _sw.orient_verdict(
+                            Path(kit["parts"][0]["path"]), _od,
+                            Path(_sw.profile_path(_pv)),
+                            _sw.filament_path(DEFAULT_MATERIALS[0], nozzle=nozzle))
+                        if _res.get("ok"):
+                            _ov = {"recommendation": _res["recommendation"],
+                                   "note": _res.get("note")}
+                except Exception:
+                    _ov = {}  # verdict is a nicety; never block the form on it
+                u1_request.write_request(request_id, orient_verdict=_ov)
+            if _ov:
+                spec["orient_recommendation"] = _ov.get("recommendation")
+                spec["orient_note"] = _ov.get("note")
         if not spec["profiles"]:
             _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
                                 "message": ("No profiles found. Run "

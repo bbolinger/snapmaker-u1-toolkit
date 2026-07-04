@@ -663,11 +663,25 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
             fields.append({"id": "material", "type": "single_select", "label": "Material",
                            "group": _GROUP,
                            "options": [{"id": m, "label": m} for m in mats], "required": True})
-    fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
-                   "group": _GROUP, "compact": True,
-                   "options": [{"id": "as-authored", "label": "As-authored"},
-                               {"id": "auto", "label": "Auto-rotate"}],
-                   "default": "as-authored"})
+    # Orientation. For a single model the caller may pass Orca's real verdict
+    # (spec["orient_recommendation"] = 'auto'|'asauthored' + spec["orient_note"])
+    # so the button recommends the pose Orca prefers, with the reason. Default
+    # follows the recommendation; absent a verdict it stays 'as-authored'.
+    _o_rec = spec.get("orient_recommendation")
+    _rec_id = {"auto": "auto", "asauthored": "as-authored"}.get(_o_rec)
+    _o_opts = []
+    for _oid, _olbl in (("as-authored", "As-authored"), ("auto", "Auto-rotate")):
+        _opt = {"id": _oid,
+                "label": _olbl + (" (recommended)" if _oid == _rec_id else "")}
+        if _oid == _rec_id:
+            _opt["recommended"] = True
+        _o_opts.append(_opt)
+    _orient_field = {"id": "orient", "type": "single_select",
+                     "label": "Orientation", "group": _GROUP, "compact": True,
+                     "options": _o_opts, "default": _rec_id or "as-authored"}
+    if spec.get("orient_note"):
+        _orient_field["note"] = spec["orient_note"]
+    fields.append(_orient_field)
     # Humanize + put the default (no-supports) first so the toggle reads
     # left-to-right with the safe choice on the left.
     _sup = list(spec.get("supports", ["supports", "no-supports"]))

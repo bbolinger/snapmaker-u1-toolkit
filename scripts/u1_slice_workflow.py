@@ -446,6 +446,53 @@ def _decide_orient_recommendation(
     return 'auto'
 
 
+def orient_verdict(model: Path, out_dir: Path, production_process: Path,
+                   filament: Path, down_vec: Any = None,
+                   orca_bin: Path = DEFAULT_ORCA) -> dict[str, Any]:
+    """Shared single-model orientation verdict — the "fancy bit".
+
+    Draft-slices the as-authored pose and — ONLY when that pose has overhangs —
+    the auto-oriented pose, then returns Orca's real recommendation + a
+    plain-language note. Data-driven (proven 2026-07-03: on a floating-regions
+    model this catches 3%→0% and flips the recommendation to auto). Both the
+    single-model path and the unified kit-of-1 path call this so the verdict is
+    one source of truth. Never raises. Returns::
+
+        {'recommendation': 'auto'|'asauthored',
+         'note': str|None, 'ok': bool, 'error': str (only when not ok)}
+    """
+    try:
+        src_res = orient_model(model, out_dir, orient='asauthored', down_vec=None)
+        source_stl = out_dir / 'source.stl'
+        Path(src_res['oriented_stl']).rename(source_stl)
+        auto_stl = source_stl
+        auto_res = orient_model(model, out_dir, orient='auto', down_vec=down_vec)
+        cand = out_dir / 'auto_oriented.stl'
+        Path(auto_res['oriented_stl']).rename(cand)
+        if _bboxes_differ(source_stl, cand):
+            auto_stl = cand
+        fil = _materialize_flat_filament(filament, out_dir)
+        source_draft = _draft_slice_analysis(
+            source_stl, out_dir, production_process, fil, orca_bin=orca_bin)
+        auto_draft = None
+        skip_reason: str | None = None
+        # Cheap-when-it-can-be: only draft the SECOND pose when the first has
+        # overhangs worth fixing (a clean source needs no comparison).
+        if source_draft.get('clean'):
+            skip_reason = 'source_clean'
+        elif auto_stl == source_stl:
+            skip_reason = 'auto_identical'
+        else:
+            auto_draft = _draft_slice_analysis(
+                auto_stl, out_dir, production_process, fil, orca_bin=orca_bin)
+        rec = _decide_orient_recommendation(source_draft, auto_draft)
+        note = _compose_orient_note(source_draft, auto_draft, skip_reason)
+        return {'recommendation': rec, 'note': note, 'ok': True}
+    except Exception as e:  # never break the caller's flow over an analysis miss
+        return {'recommendation': 'asauthored', 'note': None, 'ok': False,
+                'error': f'{type(e).__name__}: {e}'[:200]}
+
+
 # =============================================================================
 # v1.5.2 (2026-06-26): next_command per option. The workflow is the source
 # of truth for "what to run next" — the agent never synthesizes commands
