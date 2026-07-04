@@ -2042,6 +2042,13 @@ def run_kit_workflow(args) -> dict[str, Any]:
     answers = getattr(args, "form_answers", None)
     answers_json = getattr(args, "form_answers_json", None)
     answers_from = getattr(args, "form_answers_from", None)
+    if getattr(args, "redeem_pending_form", False) and not answers_from:
+        # The model relays NO form_id — it derives from the request, which
+        # persisted form_id at emit time. gemma4 mangled the random-hex form_id
+        # in the verbatim redeem command (live 2026-07-03: f7b273e3536 →
+        # f7b273e3504 → "form id mismatch"), the same failure mode the
+        # confirm-start short token fixed. Deriving it kills the manglable token.
+        answers_from = (u1_request.read_request(request_id) or {}).get("form_id")
     if answers or answers_json or answers_from:
         return _run_legacy_form_answers(
             args, operator, archive, kit, request_id, out_dir, events_file,
@@ -2148,10 +2155,13 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # event is also kept SLIM (no schema/text_fallback) so the model
         # never sees nested JSON it might try to echo.
         u1_form.persist_schema(form_id, schema)
+        # Redeem WITHOUT relaying the form_id — the model mangled the random-hex
+        # id in the verbatim command (gemma4, live 2026-07-03). --redeem-pending-
+        # form makes the workflow read form_id off the request instead.
         redeem_cmd = _build_next_command(
             archive, request_id, nozzle=nozzle,
             no_live_upload=no_live_upload,
-            no_live_material=no_live_material) + f" --form-answers-from={form_id}"  # = form: legacy ids may start with "-"
+            no_live_material=no_live_material) + " --redeem-pending-form"
         if not no_live_upload:
             redeem_cmd += " --live-upload"
         _emit(events_file, {
@@ -4422,6 +4432,13 @@ def main(argv=None) -> int:
                           "file by form_id (single-use, bound to the form this "
                           "request emitted). The model relays this command "
                           "verbatim; answer content never passes through it."))
+    ap.add_argument("--redeem-pending-form", action="store_true",
+                    dest="redeem_pending_form", default=False,
+                    help=("Redeem the pending form WITHOUT relaying its form_id — "
+                          "the workflow reads form_id off the request. Preferred "
+                          "over --form-answers-from for model-relayed redeems: a "
+                          "26B model mangled the random-hex id verbatim "
+                          "(live 2026-07-03)."))
     ap.add_argument("--confirm-start", default=None, dest="confirm_start",
                     help=("v2.2 bed-clear confirm: the operator answered 'yes' "
                           "at the bed-clear prompt. The model relays ONLY this "
