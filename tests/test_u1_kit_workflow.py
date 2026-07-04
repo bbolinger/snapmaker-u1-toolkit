@@ -618,3 +618,22 @@ def test_confirm_start_invalid_token_refused(tmp_path, fake_profiles, fake_slice
     assert res["phase"] == "bed_clear_confirm_token_invalid"
     res2 = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), confirm_start="../../etc/passwd"))
     assert res2["phase"] == "bed_clear_confirm_token_invalid"
+
+
+def test_printer_filename_strips_doc_cache_prefix(tmp_path, fake_profiles, fake_slice_upload):
+    """The Hermes doc-cache prefix (doc_<hash>_) must NOT lead the printer
+    filename — otherwise every file shows as 'doc_55da…' and the operator can
+    only tell them apart by thumbnail (operator 2026-07-04). The gcode hash is
+    content-based, so the rename doesn't affect tracking."""
+    zp = _kit_zip(tmp_path, 2)
+    doc_zip = zp.with_name("doc_55da642fda9e_angles_teaching_kit.zip")
+    zp.rename(doc_zip)
+    res = kw.run_kit_workflow(_args(
+        doc_zip, form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    req = __import__("u1_request").read_request(res["request_id"])
+    fn = req["printer_storage_filename"]
+    assert not fn.startswith("doc_"), fn
+    assert fn.startswith("angles_teaching_kit_plate1"), fn
+    # unit check on the helper
+    assert kw._strip_doc_prefix("doc_98e0403a8bc4_bracket") == "bracket"
+    assert kw._strip_doc_prefix("my_bracket") == "my_bracket"

@@ -1788,6 +1788,20 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
 _GATE_PREGRACE_WAIT = 25  # seconds to catch a fast refusal before detaching
 
 
+_DOC_PREFIX_RE = re.compile(r"^doc_[0-9a-f]{8,}_")
+
+
+def _strip_doc_prefix(stem: str) -> str:
+    """Drop Hermes' document-cache prefix (``doc_<hash>_``) so the filename that
+    lands on the printer LEADS with the model name, not the hash. Otherwise
+    every plate shows as ``doc_55da642fda9e…`` in the printer's file list and the
+    operator can only tell them apart by the thumbnail (operator 2026-07-04). The
+    gcode hash is content-based (u1_request.compute_model_hash), so the rename
+    does not affect request tracking/recovery."""
+    stripped = _DOC_PREFIX_RE.sub("", str(stem))
+    return stripped or str(stem)
+
+
 def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
     """Launch the Stage-2 gate DETACHED and return its result, or None if it's
     still running (in the grace window).
@@ -2357,7 +2371,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
 
     # Upload each plate. Plate 1 is the gated one.
     live_upload = not no_live_upload
-    kit_stem = u1_kit._sanitize(archive.stem)
+    kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     # Plate filenames are deterministic ({kit_stem}_plateN.gcode), so an
     # adjust → re-confirm on the SAME request always collides with its own
     # earlier upload — rc=5 dead-ended the advertised adjust option. When
@@ -4063,7 +4077,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
            parts=len(selected_paths), tool=tool, material=material, profile=profile_slug)
 
-    kit_stem = u1_kit._sanitize(archive.stem)
+    kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     live = bool(getattr(args, "live_upload", False))
     plates_state: list[dict[str, Any]] = []
     upload_failures: list[dict[str, Any]] = []
