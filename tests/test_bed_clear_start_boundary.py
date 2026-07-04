@@ -26,7 +26,7 @@ def _fake_stage2_gate(monkeypatch):
     Moonraker or block for the grace window. Returns a dict tests can inspect."""
     calls = {}
 
-    def _fake(gate_py, argv, timeout):
+    def _fake(gate_py, argv, out_dir):
         calls["argv"] = list(argv)
         calls["cmd"] = " ".join(argv)
         out = json.dumps({"stage": "start_attempt", "ok": True,
@@ -190,6 +190,23 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests, _
     assert binds["request_revision"] == 1
     assert binds["gcode_hash"] == "sha256:abc123"
     assert binds["prompt_key"] == "bed_clear_start"
+
+
+def test_action_start_grace_in_progress_when_gate_detaches(sandbox_requests, monkeypatch):
+    """When the gate is still running (grace window) after the bounded pre-grace
+    wait, _invoke_stage2_gate returns None and _action_start reports
+    grace_in_progress — the gate runs detached; the tool call must NOT block the
+    full ~120s (it times out at 60s and kills the gate — live 2026-07-04)."""
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", lambda gate_py, argv, out_dir: None)
+    rid = "u1_test_grace"
+    _seed_request(sandbox_requests, rid)
+    kw._action_start(None, rid, False, bed_clear_confirmed=False)
+    pn = u1_request.read_request(rid)["safety"]["pending_bed_clear_start"]["nonce"]
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True, pending_nonce=pn)
+    assert result["phase"] == "grace_in_progress"
+    assert result["started"] is None
+    # nonce was still minted (the gate got it)
+    assert u1_request.read_request(rid)["safety"].get("stage2_approval_nonce")
 
 
 def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys):

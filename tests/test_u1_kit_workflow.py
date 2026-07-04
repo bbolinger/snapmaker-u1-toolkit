@@ -30,7 +30,7 @@ def _fake_stage2_gate(monkeypatch):
     Moonraker or block for the grace window. Returns a dict tests can inspect."""
     calls = {}
 
-    def _fake(gate_py, argv, timeout):
+    def _fake(gate_py, argv, out_dir):
         calls["argv"] = list(argv)
         calls["cmd"] = " ".join(argv)
         out = json.dumps({"stage": "start_attempt", "ok": True,
