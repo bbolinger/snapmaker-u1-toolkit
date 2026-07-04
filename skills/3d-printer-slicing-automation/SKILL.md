@@ -40,7 +40,7 @@ The workflow IS the source of truth for what command to run next. You never cons
 
 For both: copy the string, do not edit, do not paraphrase, do not add or remove flags. The workflow handles state.
 
-The workflow walks the operator through five prompts one at a time: **orient → tool → preset → supports → upload**. Each turn = one tool call. The workflow tracks state via the CLI flags it pre-wrote into each next_command.
+Every model — a lone `.stl`/`.3mf` OR a multi-part `.zip` kit — routes to the SAME unified workflow (v2.2): Step 1 emits a `kit_detected` event whose `command` runs `u1_kit_workflow.py` (a single model is handled as a kit of one). That command drives either a button **form** (one submit collects the whole plan) or, on small/text models, a staged `need_input` fallback. Either way the workflow tracks state via the CLI flags it pre-wrote into each `next_command` — you only ever relay them verbatim.
 
 ### YOU MUST
 
@@ -48,7 +48,7 @@ The workflow walks the operator through five prompts one at a time: **orient →
 ```bash
 python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
-If the messaging platform rejects raw `.stl` but accepts `.zip` (single STL inside), extract the STL from the ZIP first, then run the workflow on the extracted model path. For zip archives with **multiple STLs (a kit)**, pass the ZIP DIRECTLY to `u1_slice_workflow.py` — the workflow emits `kit_detected` whose `command` field runs `u1_kit_workflow.py`. When you see `kit_detected`, tool-call that `command` verbatim via terminal. The kit workflow then drives a **3-turn staged Q&A**: parts → tool → confirm. Each turn emits a `need_input` event with options carrying baked-in `next_command` strings — same per-field pattern as Step 2 below (`references/multipart-kits.md`).
+If the messaging platform rejects raw `.stl` but accepts `.zip` (single STL inside), extract the STL from the ZIP first, then run the workflow on the extracted model path. This Step-1 command is the entry for EVERYTHING — a single `.stl`/`.3mf` and a multi-part `.zip` kit alike. The workflow inspects the input and emits `kit_detected` whose `command` runs `u1_kit_workflow.py` (a single model = a kit of one). When you see `kit_detected`, tool-call that `command` verbatim via terminal, then follow its events: a `kit_form` event (call the `form` tool with its `form_id`) — or, in the text fallback, staged `need_input` prompts — then a plate preview + a 3D isometric view + a fresh bed photo + ONE bed-clear yes/no. Surface the images bare before each prompt (`references/multipart-kits.md`).
 
 Optionally `--no-live-material` if Moonraker isn't reachable. Do not ask the user anything before this runs.
 
