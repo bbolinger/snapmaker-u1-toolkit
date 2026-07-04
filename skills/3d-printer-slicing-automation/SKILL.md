@@ -19,15 +19,15 @@ prerequisites:
 
 ## RULES FOR AGENTS — read first, no exceptions
 
-### Pre-flight acknowledgement (FIRST user-visible reply, after the first tool call)
+### Pre-flight acknowledgement (your FIRST text reply — before you call the form tool)
 
-Run the analysis tool call FIRST (Step 1 below), then include this acknowledgement at the top of your first text response. The five points must each appear explicitly. Generic "I'll help you slice this" sentences do NOT count.
+Run the analysis tool call FIRST (Step 1). Then your FIRST text reply is the short acknowledgement below — send it BEFORE you call the `form` tool or ask anything, not after the operator submits. It is an operator-facing line, so keep it clean; but it still commits you to the rules that keep you from fabricating.
 
-Order: tool call → acknowledgement → analysis-event surface (orientation question). Don't speak before the tool call; don't skip the acknowledgement after it.
+> "On it — running the Snapmaker U1 workflow. I'll surface every choice for you, show the plate preview and a fresh bed photo before anything prints, run only the commands the workflow gives me (never ones I invent), and nothing starts until you confirm at the bed-clear step."
 
-> "Acknowledging the Snapmaker U1 skill rules: I'll (1) run `u1_slice_workflow.py --json-events` FIRST before asking anything; (2) ask 6 staged questions one per user turn; (3) never invent procedures, magic phrases, file paths, or printer state — every action I claim must come from an actual tool call; (4) attach files by writing absolute paths bare in my reply text (Hermes auto-attaches); (5) call the named scripts (`u1_print_start_gate.py`, `u1_camera.py`) directly when the skill names them, never write my own status checks or magic confirmation phrases."
+Those four clauses map to the hard rules (surface everything → attach real files bare; run only the workflow's `next_command`/`command` verbatim, never hand-built ones; call the named safety scripts directly; approval-gated start). Do it ONCE per conversation, not every turn.
 
-Do the acknowledgement once per conversation, not every turn. Skipping it is correlated 1:1 with sessions where the agent later fabricates state, invents protocols, and stacks questions (caught live 2026-06-25).
+**Why this line is mandatory, not optional:** skipping the acknowledgement is correlated 1:1 with sessions where the agent later fabricates state, invents protocols, and stacks questions (caught live 2026-06-25). The *act* of committing to the rules up front is what prevents it — do not omit it, and do not pad it with the old five-point technical recitation (that was developer noise the operator shouldn't see).
 
 ### How this works (v1.5.2 — `next_command` flow)
 
