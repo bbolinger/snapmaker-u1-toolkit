@@ -126,7 +126,11 @@ def test_form_mode_emits_schema_with_bound_form_id(tmp_path, hermetic_commit, ca
     schema = json.loads((u1_form.schemas_dir() / f"{fid}.json").read_text())
     assert schema["version"] == 1 and schema["fields"]
     assert schema["submit"] == {"mode": "file", "form_id": fid}
-    assert f"--form-answers-from={fid}" in form_ev["next_command"]
+    # v2.2: the redeem relays NO form_id (gemma4 mangled the random hex, live
+    # 2026-07-03) — --redeem-pending-form makes the workflow read it off the
+    # request. So the form_id must NOT appear in the redeem command at all.
+    assert "--redeem-pending-form" in form_ev["next_command"]
+    assert fid not in form_ev["next_command"]
     # answer content can't be in the command — only the opaque id
     st = u1_request.read_request(res["request_id"])
     assert st["phase"] == "awaiting_form" and st["form_id"] == fid
@@ -156,6 +160,26 @@ def test_redeem_answers_file_commits_without_model_carrying_answers(
     stages = [e.get("stage") for e in events]
     assert "form_accepted" in stages
     # single-use: the file is consumed
+    with pytest.raises(FileNotFoundError):
+        u1_form.read_and_consume_answers(fid)
+
+
+def test_redeem_pending_form_derives_form_id_from_request(
+        tmp_path, hermetic_commit, capsys):
+    """--redeem-pending-form commits WITHOUT the model relaying the form_id (it
+    reads form_id off the request). gemma4 mangled the random-hex id in the
+    verbatim redeem command (live 2026-07-03: f7b273e3536 → f7b273e3504 → 'form
+    id mismatch'); deriving it removes the manglable token."""
+    zp = _kit_zip(tmp_path)
+    r1 = kw.run_kit_workflow(_args(zp, interaction_mode="form"))
+    fid, rid = r1["form_id"], r1["request_id"]
+    u1_form.write_answers_file(fid, {
+        "parts": "all", "tool": "T0", "material": "PLA",
+        "profile": 1, "supports": "no-supports", "action": "upload-only"})
+    # NOTE: no form_answers_from — only the flag. The workflow finds fid itself.
+    res = kw.run_kit_workflow(_args(zp, request_id=rid,
+                                    redeem_pending_form=True, live_upload=True))
+    assert res["phase"] == "complete", res
     with pytest.raises(FileNotFoundError):
         u1_form.read_and_consume_answers(fid)
 
