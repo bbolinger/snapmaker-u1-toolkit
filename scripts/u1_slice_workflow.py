@@ -1542,32 +1542,36 @@ def run_workflow(args)->dict[str,Any]:
                                   'operator.')},
                  args.json_events)
             return {'phase': 'kit_detection_failed', 'model': str(model)}
-    if _is_kit:
-        # Carry invocation context into the kit command. --operator is baked
-        # ONLY when explicit on this CLI (env-resolved identity stays
-        # env-resolved, replay-safe) — this keeps a test-flavored operator
-        # sticky across the whole kit chain (Fence 1).
-        _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
-                    f'{_shell_quote(str(model))} --json-events')
-        _cli_op = getattr(args, 'operator', None)
-        if _cli_op:
-            _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
-        _nozzle = getattr(args, 'nozzle', None)
-        if _nozzle and str(_nozzle) != '0.4':
-            _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
-        emit({'stage': 'kit_detected',
-              'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
-              'command': _kit_cmd,
-              'instruction': ('Run this command via terminal. The kit workflow '
-                              'walks the operator through a staged Q&A '
-                              '(parts → orient → tool → material → profile → '
-                              'supports → confirm) — each turn emits one '
-                              'need_input event with the next CLI flag baked '
-                              'into its options. Follow the per-field staging '
-                              'pattern the same way the single-STL workflow '
-                              'does (Step 2 of the skill).')},
-             args.json_events)
-        return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
+    # v2.2 UNIFIED FLOW: every model routes to the kit workflow. A single STL is
+    # a kit-of-1 — the kit workflow ingests a lone STL as one part, and Phase 1
+    # gave it the single-model orientation verdict — so it handles single AND
+    # multi with one code path (button form → one bed-clear decision → detached
+    # gate). The staged single-STL flow below is retired (delegation is now
+    # unconditional). --operator is baked ONLY when explicit on this CLI so a
+    # test-flavored operator stays sticky across the chain (Fence 1);
+    # env-resolved identity stays env-resolved (replay-safe).
+    _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
+                f'{_shell_quote(str(model))} --json-events')
+    _cli_op = getattr(args, 'operator', None)
+    if _cli_op:
+        _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
+    _nozzle = getattr(args, 'nozzle', None)
+    if _nozzle and str(_nozzle) != '0.4':
+        _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
+    _reason = ('Archive contains multiple STLs — a multi-part kit.' if _is_kit
+               else 'Single model — the unified workflow handles it as a kit of one.')
+    emit({'stage': 'kit_detected',
+          'reason': _reason,
+          'command': _kit_cmd,
+          'instruction': ('Run this command via terminal. It drives the whole '
+                          'job: it emits a form to fill (button UX) — or a '
+                          'need_input to answer in the text fallback — then a '
+                          'plate preview + a fresh bed photo + ONE bed-clear '
+                          'decision. Follow its events exactly (per the skill). '
+                          'Do NOT slice, extract, or run any gate command '
+                          'yourself.')},
+         args.json_events)
+    return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
     # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
     # request_id (explicit --request-id, recovery via content hash, or
     # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;

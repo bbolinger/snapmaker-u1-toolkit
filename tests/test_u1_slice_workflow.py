@@ -183,44 +183,6 @@ def _events_until_orca_dies(tmp_path, capsys, profile, supports_flag):
 # enable_support patched to the user's binary answer. Tests cover both
 # directions + the 'overhangs' deferral.
 
-def test_supports_supports_emits_supports_override_event_and_uses_temp_profile(tmp_path, capsys, monkeypatch):
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    events=_events_until_orca_dies(tmp_path, capsys, '020_strength', 'supports')
-    override=[e for e in events if e.get('stage')=='supports_override']
-    assert len(override)==1, f"expected one supports_override event, got {len(override)}"
-    assert override[0]['enable_support']=='1'
-    assert '__force_supports' in override[0]['process_path']
-    # No old promote_to_supports_variant events expected anymore.
-    assert not any(e.get('stage')=='preset_promoted' for e in events)
-    assert not any(e.get('stage')=='warning' and e.get('kind')=='no_supports_variant' for e in events)
-
-
-def test_supports_no_supports_emits_override_zero_regardless_of_preset(tmp_path, capsys, monkeypatch):
-    # Preset has enable_support='1' but user picked 'No supports' → temp profile
-    # forces enable_support to '0'. Preset's built-in setting is overridden.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength_supports', True))
-    events=_events_until_orca_dies(tmp_path, capsys, '020_strength_supports', 'no_supports')
-    override=[e for e in events if e.get('stage')=='supports_override']
-    assert len(override)==1
-    assert override[0]['enable_support']=='0'
-    assert '__no_supports' in override[0]['process_path']
-
-
-def test_supports_overhangs_exits_awaiting_input_without_slicing(tmp_path, capsys, monkeypatch):
-    # 'overhangs' answer means agent walks the user through the overhang
-    # analysis and re-asks Supports?. Workflow shouldn't slice yet.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    src=_stl(tmp_path)
-    main([str(src),'--json-events','--yes','--no-live-material',
-          '--tool','T1','--material','PETG','--profile','020_strength',
-          '--supports','overhangs','--out-dir',str(tmp_path/'o')])
-    events=[json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    awaiting=[e for e in events if e.get('stage')=='awaiting_input']
-    assert awaiting, "expected awaiting_input event when --supports overhangs"
-    assert not any(e.get('stage')=='slicing' for e in events)
-    assert not any(e.get('stage')=='supports_override' for e in events)
-
-
 def test_supports_auto_legacy_alias_does_not_override(tmp_path, capsys, monkeypatch):
     # Backwards-compat: --supports auto = "use preset as-is, no override".
     # Pre-v1.5.1 callers that pass auto still get the legacy behavior of
@@ -267,31 +229,6 @@ def _preset_options(tmp_path, capsys):
     return {o['value']: o for o in preset_events[0]['options']}
 
 
-def test_preset_options_carry_supports_status_self(tmp_path, capsys, monkeypatch):
-    _stock_fixture(tmp_path, monkeypatch,
-                   ('020_strength', False), ('020_strength_supports', True))
-    opts=_preset_options(tmp_path, capsys)
-    assert '020_strength_supports' in opts, f"got {list(opts.keys())}"
-    assert opts['020_strength_supports']['supports_status']=='self'
-
-
-def test_preset_options_carry_supports_status_variant_name(tmp_path, capsys, monkeypatch):
-    _stock_fixture(tmp_path, monkeypatch,
-                   ('020_strength', False), ('020_strength_supports', True))
-    opts=_preset_options(tmp_path, capsys)
-    assert '020_strength' in opts, f"got {list(opts.keys())}"
-    assert opts['020_strength']['supports_status']=='020_strength_supports'
-
-
-def test_preset_options_carry_supports_status_null_for_no_variant(tmp_path, capsys, monkeypatch):
-    _stock_fixture(tmp_path, monkeypatch, ('016_optimal', False))
-    opts=_preset_options(tmp_path, capsys)
-    assert '016_optimal' in opts, f"got {list(opts.keys())}"
-    assert opts['016_optimal']['supports_status'] is None
-
-
-# ---------- filament_path multi-source (H1 cold-review fix) ----------
-
 def _filament_fixture(tmp_path, monkeypatch, *filament_specs):
     """Provision a fake snapmaker-stock dir with filament/ subdir, monkeypatch
     DEFAULT_SOURCES to point at it. filament_specs is a list of filename
@@ -334,29 +271,6 @@ def test_filament_path_raises_runtime_error_when_no_source(tmp_path, monkeypatch
 
 # ---------- setup_required event when picker is empty (M2) ----------
 
-def test_empty_picker_emits_setup_required_and_exits_clean(tmp_path, capsys, monkeypatch):
-    # Point DEFAULT_SOURCES at a dir with no profiles at all.
-    empty = tmp_path / 'empty-stock'
-    empty.mkdir()
-    import u1_profile_picker as upp
-    monkeypatch.setattr(upp, 'DEFAULT_SOURCES', (('snapmaker-stock', empty),))
-
-    src = _stl(tmp_path)
-    rc = main([str(src), '--json-events', '--no-live-material',
-               '--out-dir', str(tmp_path / 'o')])
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    setup = [e for e in events if e.get('stage') == 'setup_required']
-    assert len(setup) == 1, f"expected setup_required event, got {[e.get('stage') for e in events]}"
-    assert setup[0].get('kind') == 'no_profiles'
-    assert 'fetch_snapmaker_profiles' in setup[0]['message']
-    assert 'extract_profiles_from_printer' in setup[0]['message']
-    # Should NOT then emit the Preset? need_input question (we exited early).
-    assert not any(e.get('stage') == 'need_input' and e.get('key') == 'preset' for e in events)
-    assert rc == 0
-
-
-# ---------- slicer_warning event (#7) ----------
-
 def _mock_slice_pipeline(monkeypatch, tmp_path, warnings):
     """Stand in for real_orca_slice + thumbnail injection + upload — none of
     which are alpine-compatible. Returns a slice_res with the given warnings."""
@@ -381,53 +295,6 @@ def _mock_slice_pipeline(monkeypatch, tmp_path, warnings):
     # real_orca_slice (which we already mocked), so the real function never
     # runs in tests.
 
-
-def test_slicer_warnings_emit_as_warning_event(tmp_path, capsys, monkeypatch):
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    _mock_slice_pipeline(monkeypatch, tmp_path, [
-        'WARNING: floating cantilever on Object_1',
-        'WARNING: overhang region too steep on Object_2',
-    ])
-    src = _stl(tmp_path)
-    main([str(src), '--yes', '--upload-only', '--no-live-material',
-          '--tool', 'T1', '--material', 'PETG', '--profile', '020_strength',
-          '--json-events', '--out-dir', str(tmp_path / 'out')])
-
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    slicer_warnings = [e for e in events
-                       if e.get('stage') == 'warning' and e.get('kind') == 'slicer_warning']
-    assert len(slicer_warnings) == 1, (
-        f"expected one slicer_warning event, got {len(slicer_warnings)} "
-        f"in stages {[e.get('stage') for e in events]}")
-    w = slicer_warnings[0]
-    assert w['count'] == 2
-    assert 'floating cantilever' in w['messages'][0]
-    assert 'overhang region' in w['messages'][1]
-    assert 'note' in w and w['note']
-
-
-def test_no_slicer_warning_event_when_orca_emits_none(tmp_path, capsys, monkeypatch):
-    # Clean slice → no warning event. The summary event still carries the
-    # (empty) warnings list per the backward-compat contract.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    _mock_slice_pipeline(monkeypatch, tmp_path, [])
-    src = _stl(tmp_path)
-    main([str(src), '--yes', '--upload-only', '--no-live-material',
-          '--tool', 'T1', '--material', 'PETG', '--profile', '020_strength',
-          '--json-events', '--out-dir', str(tmp_path / 'out')])
-
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    slicer_warnings = [e for e in events
-                       if e.get('stage') == 'warning' and e.get('kind') == 'slicer_warning']
-    assert slicer_warnings == [], (
-        f"clean slice should not emit slicer_warning, got {slicer_warnings}")
-    # Summary still emitted with empty warnings list.
-    summary = [e for e in events if e.get('stage') == 'summary']
-    assert len(summary) == 1
-    assert summary[0].get('warnings') == []
-
-
-# ---------- parse_orca_warnings tightened filter (L1 cold-review fix) ----------
 
 def test_parse_orca_warnings_picks_up_floating_cantilever():
     out = "WARNING: floating cantilever on Object_1\nG1 X10 Y10\n"
@@ -473,33 +340,6 @@ def test_parse_orca_warnings_dedupes():
 def test_parse_orca_warnings_empty_input():
     assert parse_orca_warnings("") == []
 
-
-def test_slicer_warning_event_fires_before_preview_render(tmp_path, capsys, monkeypatch):
-    # Ordering: warning must come BEFORE preview render so the agent can
-    # surface it before the user trusts the preview.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    _mock_slice_pipeline(monkeypatch, tmp_path, ['WARNING: test'])
-    src = _stl(tmp_path)
-    main([str(src), '--yes', '--upload-only', '--no-live-material',
-          '--tool', 'T1', '--material', 'PETG', '--profile', '020_strength',
-          '--json-events', '--out-dir', str(tmp_path / 'out')])
-
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    stages = [(e.get('stage'), e.get('kind'), e.get('kind') if e.get('stage') == 'render' else None) for e in events]
-    warning_idx = next((i for i, e in enumerate(events)
-                        if e.get('stage') == 'warning' and e.get('kind') == 'slicer_warning'), None)
-    preview_idx = next((i for i, e in enumerate(events)
-                        if e.get('stage') == 'render' and e.get('kind') == 'preview'), None)
-    assert warning_idx is not None, f"no slicer_warning event found; stages: {stages}"
-    assert preview_idx is not None, f"no preview render event found; stages: {stages}"
-    assert warning_idx < preview_idx, (
-        f"slicer_warning must come before preview render; got "
-        f"warning@{warning_idx}, preview@{preview_idx}")
-
-
-# ---------- profile_path coverage (#15) ----------
-# normalize_value unifies user-typed names + picker slugs. profile_path
-# raises RuntimeError when nothing matches.
 
 def test_profile_path_resolves_slug_form(tmp_path, monkeypatch):
     _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
@@ -803,28 +643,6 @@ def test_filament_path_keeps_filament_when_compatible_printers_unset(tmp_path, m
     assert result.name == 'Snapmaker PETG @U1.json'
 
 
-def test_workflow_always_emits_history_hint_even_when_no_history(tmp_path, capsys, monkeypatch):
-    # F18: agent needs an affirmative signal that history was checked.
-    # Without history (no print_history.json in the data dir), the workflow
-    # should still emit a history_hint event with installed=false and a
-    # 'no prior prints' message.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    # Repoint get_data_dir to a tmp dir with NO print_history.json
-    empty_data_dir = tmp_path / 'empty_data'
-    empty_data_dir.mkdir()
-    import u1_config
-    monkeypatch.setattr(u1_config, 'get_data_dir', lambda: empty_data_dir)
-    src=_stl(tmp_path)
-    main([str(src),'--json-events','--no-live-material','--tool','T1',
-          '--material','PETG','--out-dir',str(tmp_path/'o')])
-    events=[json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    hints=[e for e in events if e.get('stage')=='history_hint']
-    assert len(hints)==1, f'expected one history_hint event when no history, got {len(hints)}'
-    assert hints[0]['last_used_print_settings_id'] is None
-    assert hints[0]['installed'] is False
-    assert 'No prior prints' in hints[0]['message']
-
-
 def test_extract_layer_height_falls_back_to_json_for_off_convention_names(tmp_path):
     # F2: a profile whose filename doesn't start with a height prefix
     # (e.g., user-renamed 'my_strength.json') should still get the right
@@ -909,53 +727,6 @@ def test_last_used_per_tool_empty_when_no_history(tmp_path):
     hist.write_text(json.dumps({'records': []}))
     assert last_used_per_tool(nozzle='0.4', history_path=hist) == {}
 
-
-def test_workflow_history_hint_includes_per_tool_and_tool_filtered(tmp_path, capsys, monkeypatch):
-    # G16: analysis-phase history_hint event carries tool_filtered=false and
-    # per_tool map so the agent can pick the right history per Filament answer.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    # Set up history with different presets per tool
-    data_dir = tmp_path / 'data'
-    data_dir.mkdir()
-    (data_dir / 'print_history.json').write_text(json.dumps({'records': [
-        {'last_seen_at': '2026-06-25T00:00:00', 'printer_settings_id': 'Snapmaker U1 (0.4 nozzle)',
-         'print_settings_id': '020_strength', 'active_tool': {'tool': 'T0'}},
-        {'last_seen_at': '2026-06-24T00:00:00', 'printer_settings_id': 'Snapmaker U1 (0.4 nozzle)',
-         'print_settings_id': 'other_preset', 'active_tool': {'tool': 'T1'}},
-    ]}))
-    import u1_config
-    monkeypatch.setattr(u1_config, 'get_data_dir', lambda: data_dir)
-    src = _stl(tmp_path)
-    # Analysis phase — no --tool, no --yes
-    main([str(src),'--json-events','--no-live-material','--material','PETG','--out-dir',str(tmp_path/'o')])
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    hints = [e for e in events if e.get('stage') == 'history_hint']
-    assert len(hints) == 1
-    h = hints[0]
-    assert h['tool_filtered'] is False  # no --tool at analysis phase
-    assert h['per_tool'] == {'T0': '020_strength', 'T1': 'other_preset'}
-
-
-def test_workflow_upload_question_label_has_print_false_parenthetical(tmp_path, capsys, monkeypatch):
-    # G22: workflow's Upload? options now include '(print=false)' so the
-    # skill's documented label is the verbatim event label — no more
-    # paraphrasing forced on the agent.
-    _stock_fixture(tmp_path, monkeypatch, ('020_strength', False))
-    src = _stl(tmp_path)
-    # v1.5.2: workflow emits one need_input at a time. Pass all 4 prior
-    # answers so the workflow walks to the Upload? prompt.
-    main([str(src),'--json-events','--no-live-material',
-          '--orient','asauthored','--tool','T1','--material','PETG',
-          '--profile','020_strength','--supports','no_supports',
-          '--out-dir',str(tmp_path/'o')])
-    events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    upload_evt = next((e for e in events if e.get('stage') == 'need_input' and e.get('key') == 'upload'), None)
-    assert upload_evt is not None, 'expected Upload? need_input event'
-    labels = [o['label'] for o in upload_evt['options']]
-    assert labels == ['Upload only (print=false)', 'Upload + start gate', 'Cancel'], f'unexpected labels: {labels}'
-
-
-# ---------- Audit 2026-06-26: upload return-code contract + collision ----------
 
 def test_suggested_rename_appends_utc_timestamp():
     from u1_upload_gcode import _suggested_rename
@@ -1410,34 +1181,6 @@ def _read_events_jsonl(out_dir):
     return [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
 
 
-def test_phase_aware_skip_fires_on_awaiting_start_approval_resume(tmp_path):
-    """Phase 2 polish: when request.json has phase='awaiting_start_approval'
-    + saved payloads, the resume must NOT re-walk analysis/slice/upload/
-    Upload?/collision. It must emit ONLY the resumed readiness_card + the
-    saved next_action_required, then return early."""
-    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
-    out_dir = tmp_path / 'out'
-    args = _build_phase2_args(stl, out_dir, rid)
-    result = run_workflow(args)
-    # The short-circuit returns a dict shaped explicitly for this case.
-    assert result['phase'] == 'awaiting_start_approval'
-    assert result['resumed'] is True
-    assert result['request_id'] == rid
-    assert result['printer_storage_filename'] == 'cable_holder.gcode'
-
-    # Events: request_resumed → readiness_card_resumed → next_action_required.
-    # CRITICALLY: no 'triage', no 'render', no 'slice', no 'uploaded', no
-    # 'readiness_card' (the original — only the _resumed variant).
-    events = _read_events_jsonl(out_dir)
-    stages = [e.get('stage') for e in events]
-    assert 'request_resumed' in stages
-    assert 'readiness_card_resumed' in stages
-    assert 'next_action_required' in stages
-    forbidden = {'triage', 'render', 'slice', 'uploaded', 'readiness_card', 'profile_picked'}
-    leaked = forbidden.intersection(stages)
-    assert not leaked, f'short-circuit failed — these stages should NOT have fired: {leaked}'
-
-
 def test_phase_aware_skip_falls_through_when_no_saved_payload(tmp_path):
     """Backward-compat guard: a request created by an OLDER workflow won't
     have readiness_card_event saved. The short-circuit must NOT fire — it
@@ -1491,93 +1234,6 @@ def test_med2_phase_not_clobbered_on_resume(tmp_path):
 # ============================================================================
 # Phase 3a — workflow emits audit rows
 # ============================================================================
-
-def test_phase3a_workflow_emits_audit_rows_on_resume(tmp_path, monkeypatch):
-    """When the workflow short-circuits via phase-aware resume, audit.jsonl
-    should contain at least request_resumed + readiness_card_replayed_from_resume,
-    and the rows should carry the operator identity from --operator."""
-    import u1_audit
-    import u1_request as _u1r
-    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
-    out_dir = tmp_path / 'out'
-    args = _build_phase2_args(stl, out_dir, rid)
-    args.operator = 'telegram:brent'  # exercise the CLI flag path
-    run_workflow(args)
-    rows = list(u1_audit.read(rid))
-    events = [r['event'] for r in rows]
-    assert 'request_resumed' in events
-    assert 'readiness_card_replayed_from_resume' in events
-    # Operator stamped on every row
-    for r in rows:
-        assert r.get('operator') == 'telegram:brent', \
-            f'expected operator=telegram:brent, got {r.get("operator")!r} for event={r["event"]}'
-
-
-def test_replayed_readiness_audit_row_carries_gcode_hash(tmp_path):
-    """Live bug regression 2026-06-28: when the workflow resumes via
-    phase-aware skip, the readiness_card_replayed_from_resume audit row
-    MUST include gcode_hash. Without it, can_start() saw None on the audit
-    row and rejected the next Stage 2 dispatch as 'gcode regenerated since
-    operator reviewed' — even though nothing had drifted; the audit row
-    was just incomplete.
-
-    Operator hit this while waiting >5 min between Stage 1 and Stage 2:
-      Token expired → re-ran workflow → resumed via phase-aware skip
-      → new Stage 1 → said yes → can_start refused on phantom gcode_hash
-      mismatch."""
-    import u1_audit
-    import u1_request as _u1r
-    import u1_safety
-    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
-    # Seed the gcode_hash that a real slice would have produced. The seed
-    # function doesn't include it by default; this test specifically
-    # exercises the case where a real prior workflow run did slice + hash.
-    _real_gcode_hash = 'sha256:caaaaaaaaaaaa00000000000000000000000000000000000000000000000feed'
-    _u1r.write_request(rid, gcode_hash=_real_gcode_hash,
-                       safety={'bed_clear_check_required': True,
-                               'bed_clear_photo_captured': True})
-    args = _build_phase2_args(stl, tmp_path / 'out', rid)
-    run_workflow(args)
-    rows = list(u1_audit.read(rid))
-    replay_rows = [r for r in rows if r['event'] == 'readiness_card_replayed_from_resume']
-    assert replay_rows, 'expected at least one readiness_card_replayed_from_resume row'
-    last_replay = replay_rows[-1]
-    details = last_replay.get('details', {})
-    assert details.get('gcode_hash') == _real_gcode_hash, \
-        f"replayed audit row missing gcode_hash: {details!r} (the live bug — can_start refuses with None vs sha256:...)"
-    # And can_start should now be happy: replay row's gcode_hash matches
-    # the request's current gcode_hash → no drift detected.
-    req = _u1r.read_request(rid)
-    allowed, reason = u1_safety.can_start(req)
-    assert allowed, f'can_start refused after phase-aware-skip resume: {reason}'
-
-
-def test_phase3a_operator_falls_back_to_env(tmp_path, monkeypatch):
-    """When --operator is not passed, the workflow falls back to U1_OPERATOR
-    env var. When neither, it stamps 'unknown:cli'."""
-    import u1_audit
-    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
-    out_dir = tmp_path / 'out'
-    args = _build_phase2_args(stl, out_dir, rid)
-    # No CLI operator, env set
-    monkeypatch.setenv('U1_OPERATOR', 'cron:nightly')
-    args.operator = None
-    run_workflow(args)
-    rows = list(u1_audit.read(rid))
-    assert any(r.get('operator') == 'cron:nightly' for r in rows)
-
-
-def test_phase3a_operator_unknown_when_no_cli_and_no_env(tmp_path, monkeypatch):
-    import u1_audit
-    rid, stl = _seed_awaiting_start_approval_request(tmp_path)
-    out_dir = tmp_path / 'out'
-    args = _build_phase2_args(stl, out_dir, rid)
-    monkeypatch.delenv('U1_OPERATOR', raising=False)
-    args.operator = None
-    run_workflow(args)
-    rows = list(u1_audit.read(rid))
-    assert any(r.get('operator') == 'unknown:cli' for r in rows)
-
 
 def _build_phase2_args_with_operator(model_path, out_dir, request_id, *, operator=None):
     """Wrap _build_phase2_args to allow setting the new --operator field."""

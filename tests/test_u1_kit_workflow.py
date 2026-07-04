@@ -657,3 +657,26 @@ def test_form_start_camera_fail_offers_upload_only_no_crash(
         form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
     assert res["phase"] == "awaiting_confirm", res
     assert res.get("bed_capture_failed") is True
+
+
+def test_resolve_operator_env_fallback_and_unknown(monkeypatch):
+    """Shared _resolve_operator (the unified flow's operator identity):
+    --operator wins, else U1_OPERATOR env, else 'unknown:cli'. Migrated from the
+    retired single-flow operator tests now that single delegates to the kit."""
+    from types import SimpleNamespace
+    import u1_config
+    monkeypatch.setattr(u1_config, "_load_dotenv_if_present", lambda: None)
+    monkeypatch.setenv("U1_OPERATOR", "cron:nightly")
+    assert kw._resolve_operator(SimpleNamespace(operator=None)) == "cron:nightly"
+    assert kw._resolve_operator(
+        SimpleNamespace(operator="telegram:brent")) == "telegram:brent"
+    monkeypatch.delenv("U1_OPERATOR", raising=False)
+    assert kw._resolve_operator(SimpleNamespace(operator=None)) == "unknown:cli"
+
+
+def test_kit_setup_required_when_no_profiles(tmp_path, monkeypatch):
+    """No profiles → the unified flow emits setup_required(no_profiles) and exits
+    clean, not a crash. Migrated from the retired single-flow empty_picker test."""
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [])
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 1), interaction_mode="form"))
+    assert res["phase"] == "setup_required"
