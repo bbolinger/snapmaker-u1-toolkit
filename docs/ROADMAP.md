@@ -135,6 +135,7 @@ path parity (kit AND single-STL both work on the model users actually run).
 **UX order + wording (from live kit/Gemma run 2026-07-04) — apply to kit AND single-STL buttons:**
 - ORDER: surface [plate preview + bed photo + review.md] BEFORE the decision (currently the question shows above the photo); do not let the verbose skill-ack land mid-flow.
 - WORDING: hide the request-id from operator-facing text (leaks in the prompt, cancel hint, and cancelled message); one decision not a double question; plain "Reply CANCEL" (no `cancel <id>` targeting — single printer).
+- Strip the Hermes doc-cache prefix (doc_<hash>_) from the printer filename too (kit got this in 82a9681; single-STL names off archive.stem the same way).
 - KEEP: the parts thumbnail grid, "Submitted - slicing in the background", and surfacing preview+bed photo+review.
 
 Reference: Ollama/gemma4 tool-call bug + the fixes are documented in the README
