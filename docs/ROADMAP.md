@@ -132,6 +132,11 @@ the CLI — all three modes need the same verbiage + the same Gemma-proof confir
 The kit flow already delivers this; single-STL must too before the demo can claim
 path parity (kit AND single-STL both work on the model users actually run).
 
+**UX order + wording (from live kit/Gemma run 2026-07-04) — apply to kit AND single-STL buttons:**
+- ORDER: surface [plate preview + bed photo + review.md] BEFORE the decision (currently the question shows above the photo); do not let the verbose skill-ack land mid-flow.
+- WORDING: hide the request-id from operator-facing text (leaks in the prompt, cancel hint, and cancelled message); one decision not a double question; plain "Reply CANCEL" (no `cancel <id>` targeting — single printer).
+- KEEP: the parts thumbnail grid, "Submitted - slicing in the background", and surfacing preview+bed photo+review.
+
 Reference: Ollama/gemma4 tool-call bug + the fixes are documented in the README
 "Local model & serving requirements" section and TROUBLESHOOTING.md.
 
