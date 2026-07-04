@@ -637,3 +637,23 @@ def test_printer_filename_strips_doc_cache_prefix(tmp_path, fake_profiles, fake_
     # unit check on the helper
     assert kw._strip_doc_prefix("doc_98e0403a8bc4_bracket") == "bracket"
     assert kw._strip_doc_prefix("my_bracket") == "my_bracket"
+
+
+def test_form_start_camera_fail_offers_upload_only_no_crash(
+        tmp_path, fake_profiles, fake_slice_upload, monkeypatch):
+    """Camera-unreachable at the bed-clear step must gracefully offer upload-only,
+    NOT crash. Regression: _commit_kit_legacy's camera-fail branch referenced bare
+    no_live_upload / no_live_material where only the _-prefixed locals exist →
+    NameError (found via kit-of-1 unification 2026-07-03; would bite any operator
+    whose camera is unreachable, single OR multi)."""
+    monkeypatch.setattr(
+        kw, "_capture_bed_and_issue_token",
+        lambda out_dir: {"ok": False, "reason": "camera unreachable",
+                         "snapshot_path": None, "token": None,
+                         "approval_ttl_seconds": None, "approval_expires_at": None,
+                         "captured_at_utc": None})
+    res = kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 2),
+        form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    assert res["phase"] == "awaiting_confirm", res
+    assert res.get("bed_capture_failed") is True
