@@ -121,7 +121,9 @@ def test_action_start_first_call_emits_bed_clear_start_need_input(
                               json_events=False, bed_clear_confirmed=False)
     assert result["phase"] == "awaiting_bed_clear_start"
     assert "prompt" in result
-    assert "yes/no" in result["prompt"]
+    # v2.2 one-decision wording: YES starts, NO keeps it uploaded; no request-id.
+    assert "YES to start" in result["prompt"] and "NO to keep" in result["prompt"]
+    assert "u1_test_first_call" not in result["prompt"]
     # Verify pending object persisted
     state = u1_request.read_request("u1_test_first_call")
     pending = state.get("safety", {}).get("pending_bed_clear_start")

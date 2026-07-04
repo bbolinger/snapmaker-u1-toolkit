@@ -42,6 +42,25 @@ def _schema(n_parts=3, n_profiles=2):
     return u1_form.build_form_schema(spec)
 
 
+def _schema_action(n_parts=3, n_profiles=2):
+    """v2.2 kit forms dropped the submit_choice action field (one-decision).
+    The renderer still SUPPORTS submit verbs, so these helpers keep a schema
+    that has one for the verb-mechanism tests."""
+    sc = _schema(n_parts, n_profiles)
+    sc["fields"].append({"id": "action", "type": "single_select", "label": "Action",
+                         "submit_choice": True,
+                         "options": ["start", "upload-only"], "default": "start"})
+    return sc
+
+
+def _heads_schema_action(n_parts=2):
+    sc = u1_form.build_form_schema(_heads_spec(n_parts))
+    sc["fields"].append({"id": "action", "type": "single_select", "label": "Action",
+                         "submit_choice": True,
+                         "options": ["start", "upload-only"], "default": "start"})
+    return sc
+
+
 # --------------------------------------------------------------------------- #
 # Telegram pure core — step-by-step state machine
 # --------------------------------------------------------------------------- #
@@ -139,21 +158,19 @@ def test_tg_review_card_after_last_field_lists_all_and_offers_edit():
     form["selections"]["material"] = 0          # PLA
     form["selections"]["profile"] = 0           # profile1
     form["selections"]["supports"] = 1          # no-supports
-    form["selections"]["action"] = 0            # start
     form["current"] = tg.REVIEW_FIELD
     s = tg.render_screen(form)
     assert "Review" in s["text"]
     assert "Auto-rotate" in s["text"] and "T0" in s["text"]
     cbs = _ids_in_keyboard(s["keyboard"])
-    # Action is a submit_choice now: two submit verbs (S:<f>:<o>) replace the
-    # bare Submit button; Cancel stays. Action gets no Edit row of its own.
-    assert any(c.startswith("S:") for c in cbs) and "X" in cbs
-    assert sum(c.startswith("S:") for c in cbs) == 2   # Upload only + Upload+Start
-    assert any(c.startswith("e:") for c in cbs)        # Edit buttons
+    # v2.2: no action field -> a single plain Submit (bare "S") + Cancel.
+    assert "S" in cbs and "X" in cbs
+    assert not any(c.startswith("S:") for c in cbs)     # no submit verbs
+    assert any(c.startswith("e:") for c in cbs)         # Edit buttons
 
 
 def test_tg_submit_blocks_when_required_unset_and_jumps_back():
-    schema = _schema()
+    schema = _schema_action()
     form = tg.new_form(schema)
     # tap a submit verb straight from review without setting tool/material/profile
     form["current"] = tg.REVIEW_FIELD
@@ -168,7 +185,7 @@ def test_tg_bare_S_on_verb_schema_rerenders_to_pick_a_verb():
     # Safety: a stale/injected bare "S" must NOT submit with a silently
     # defaulted (start) action — it re-shows the review so the operator picks
     # an explicit verb.
-    schema = _schema(n_parts=0)
+    schema = _schema_action(n_parts=0)
     form = tg.new_form(schema)
     for f in schema["fields"]:
         if f.get("required"):
@@ -180,7 +197,7 @@ def test_tg_bare_S_on_verb_schema_rerenders_to_pick_a_verb():
 
 
 def test_tg_submit_with_all_required_yields_answer_json():
-    form = tg.new_form(_schema(n_parts=3))
+    form = tg.new_form(_schema_action(n_parts=3))
     form["selections"]["parts"] = {0, 2}
     def _opt_i(fid, oid):
         f = next(f for f in form["schema"]["fields"] if f["id"] == fid)
@@ -245,7 +262,7 @@ def test_tg_full_walkthrough_feeds_parse_answers_json():
     tg.apply_callback(form, "n:%d" % fi("tool"))         # shared Next -> profile
     tg.apply_callback(form, "s:%d:1" % fi("profile"))    # Opt (advances)
     assert form["current"] == tg.REVIEW_FIELD
-    ev = tg.apply_callback(form, "S:%d:0" % fi("action"))   # start verb
+    ev = tg.apply_callback(form, "S")   # plain Submit (no action field now)
     assert ev["kind"] == "submit"
     r = u1_form.parse_answers_json(ev["answer"], spec)
     assert r["ok"], r["errors"]
@@ -329,7 +346,7 @@ def test_tg_X_and_S_still_work_alongside_defensive_wrap():
     # Make sure the defensive wrap didn't break the happy paths.
     form = tg.new_form(_schema())
     assert tg.apply_callback(form, "X")["kind"] == "cancel"
-    form2 = tg.new_form(_schema(n_parts=0))
+    form2 = tg.new_form(_schema_action(n_parts=0))
     # set required fields then submit
     form2["selections"]["tool"] = 0
     form2["selections"]["material"] = 0
@@ -374,7 +391,7 @@ def test_tg_review_card_escapes_labels_and_echo_but_not_button_text():
 
 
 def test_tg_required_warning_escapes_field_labels():
-    schema = _schema()
+    schema = _schema_action()
     for f in schema["fields"]:
         if f["id"] == "tool":
             f["label"] = "<b>Tool</b>"
@@ -982,7 +999,7 @@ def test_single_part_skips_parts_screen():
 
 
 def test_submit_verb_sets_action_and_submits():
-    schema = u1_form.build_form_schema(_heads_spec())
+    schema = _heads_schema_action()
     form = tg.new_form(schema)
     # satisfy required screen fields
     form["selections"]["tool"] = 0
@@ -1003,7 +1020,7 @@ def test_submit_verb_sets_action_and_submits():
 
 
 def test_submit_verb_still_blocks_on_missing_required():
-    schema = u1_form.build_form_schema(_heads_spec())
+    schema = _heads_schema_action()
     form = tg.new_form(schema)
     form["current"] = tg.REVIEW_FIELD       # nothing picked
     afi = _fidx(schema, "action")
@@ -1039,7 +1056,7 @@ def test_setup_group_renders_head_orient_supports_on_one_screen():
     schema = u1_form.build_form_schema(_heads_spec())
     # order + grouping
     assert [f["id"] for f in schema["fields"]] == \
-        ["parts", "tool", "orient", "supports", "profile", "action"]
+        ["parts", "tool", "orient", "supports", "profile"]
     form = tg.new_form(schema)
     screens = [[f["id"] for f in sc] for sc in tg._screens(form)]
     assert screens == [["parts"], ["tool", "orient", "supports"], ["profile"]]
