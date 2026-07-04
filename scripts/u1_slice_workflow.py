@@ -113,7 +113,7 @@ if __name__ == '__main__':
     _ensure_compat_python()
 
 # === After env check passes, do the rest of the imports ===
-import argparse, json, re, shutil, time
+import argparse, json, re, time
 from typing import Any
 
 HERE=Path(__file__).resolve().parent
@@ -123,13 +123,9 @@ sys.path.insert(0, str(HERE)); sys.path.insert(0, str(TOOLS))
 from _stl_render import parse_stl, bbox  # type: ignore
 from u1_orient import orient_model, DEFAULT_ORCA, orca_env
 from u1_profile_picker import list_profiles
-from u1_material_picker import query_material_options, status_to_options
 from u1_upload_gcode import parse_gcode_metadata
-from u1_print_start_gate import build_stage1_command
-from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
-import u1_request
 import u1_audit
 
 
