@@ -4315,8 +4315,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                          "value": "upload-only",
                          "next_command": _build_next_command(
                              archive, request_id, action="upload-only", nozzle=nozzle,
-                             no_live_upload=no_live_upload,
-                             no_live_material=no_live_material)}],
+                             no_live_upload=_no_live_upload,
+                             no_live_material=_no_live_material)}],
         }, json_events)
         return {"phase": "awaiting_confirm", "request_id": request_id,
                 "out_dir": str(out_dir), "bed_capture_failed": True}
