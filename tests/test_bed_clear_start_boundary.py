@@ -19,6 +19,24 @@ import u1_kit_workflow as kw
 import u1_request
 
 
+@pytest.fixture(autouse=True)
+def _fake_stage2_gate(monkeypatch):
+    """_action_start now RUNS the Stage-2 gate as a subprocess (the model no
+    longer relays the token+nonce command). Mock it so unit tests never contact
+    Moonraker or block for the grace window. Returns a dict tests can inspect."""
+    calls = {}
+
+    def _fake(gate_py, argv, timeout):
+        calls["argv"] = list(argv)
+        calls["cmd"] = " ".join(argv)
+        out = json.dumps({"stage": "start_attempt", "ok": True,
+                          "started": True, "blockers": []})
+        return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake)
+    return calls
+
+
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def _seed_request(tmp_path: Path, request_id: str, **overrides):
@@ -142,7 +160,7 @@ def test_action_start_second_call_refuses_mismatched_gcode_hash(
     assert any("gcode_hash mismatch" in r for r in result["reasons"])
 
 
-def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
+def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests, _fake_stage2_gate):
     """Happy path: pending matches + hash matches + phase matches → emits
     Stage 2 command that includes --stage2-approval-nonce; pending is
     consumed; safety.stage2_approval_nonce is persisted."""
@@ -153,11 +171,14 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
     pn = (u1_request.read_request(rid)["safety"]
           ["pending_bed_clear_start"]["nonce"])
     result = kw._action_start(None, rid, False, bed_clear_confirmed=True,
-                              pending_nonce=pn)
-    assert result["phase"] == "awaiting_print_start"
-    cmd = result["command"]
-    assert "--bed-clear start" in cmd
-    assert "--stage2-approval-nonce" in cmd
+                              pending_nonce=pn, )
+    # The workflow RUNS the gate itself now — the model never relays it.
+    assert result["phase"] == "print_started"
+    assert result["started"] is True
+    gate_argv = _fake_stage2_gate["argv"]
+    assert "--bed-clear" in gate_argv and "start" in gate_argv
+    assert any(a.startswith("--stage2-approval-nonce=") for a in gate_argv)
+    assert any(a.startswith("--approval-token=") for a in gate_argv)
     # pending is consumed
     state = u1_request.read_request(rid)
     assert state["safety"].get("pending_bed_clear_start") is None

@@ -21,6 +21,24 @@ def _sha256_of(path: Path) -> str:
     return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 import u1_kit_workflow as kw
+
+
+@pytest.fixture(autouse=True)
+def _fake_stage2_gate(monkeypatch):
+    """_action_start now RUNS the Stage-2 gate as a subprocess (the model no
+    longer relays the token+nonce command). Mock it so unit tests never contact
+    Moonraker or block for the grace window. Returns a dict tests can inspect."""
+    calls = {}
+
+    def _fake(gate_py, argv, timeout):
+        calls["argv"] = list(argv)
+        calls["cmd"] = " ".join(argv)
+        out = json.dumps({"stage": "start_attempt", "ok": True,
+                          "started": True, "blockers": []})
+        return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake)
+    return calls
 from u1_orient import write_binary_stl
 
 
