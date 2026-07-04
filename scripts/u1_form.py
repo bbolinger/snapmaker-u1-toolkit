@@ -682,18 +682,17 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
                        "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
                        "required": True})
-    # Action is a SUBMIT choice, not its own screen: the review card renders it
-    # as two verbs (Upload only / Upload + Start). Kept in the schema so parse
-    # + defaults + validation stay identical to the text intake.
-    fields.append({"id": "action", "type": "single_select", "label": "Action",
-                   "submit_choice": True,
-                   "options": list(spec.get("actions", ["start", "upload-only"])), "default": "start"})
-
+    # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
+    # The single print/keep-staged decision happens AFTER slice + a FRESH bed
+    # photo (you decide with the real bed in view) — not up front, before the
+    # photo even exists. `_finalize` still defaults action="start" so the commit
+    # always slices + uploads + captures the bed + offers the one decision.
     schema: dict[str, Any] = {
         "version": FORM_SCHEMA_VERSION,
         "fields": fields,
+        "submit_label": "\U0001f52a Slice it",
         "text_fallback": build_form(spec),
-        "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports | start",
+        "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports",
     }
     if submit:
         schema["submit"] = submit

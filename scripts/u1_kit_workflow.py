@@ -3078,9 +3078,14 @@ def _action_start(events_file: Path | None, request_id: str,
         # 2026-07-01). Agents that resurface the photo at this turn get
         # dupes; agents that don't leave the operator wondering where
         # the photo went.
+        # ONE decision, made looking at the fresh bed photo. No request-id (noise
+        # for a single-user/single-printer setup), no double question — "bed's
+        # clear, print it?" IS the bed affirmation. NO = keep the gcode staged
+        # (it's already uploaded), not an abort.
         prompt = (
-            f"Review the bed photo I sent with the print plan above. "
-            f"Bed clear and you want to start request {request_id}? (yes/no)"
+            "Sliced plate, review doc, and a fresh bed photo are attached. "
+            "Bed clear and ready to print? Reply YES to start now, or NO to "
+            "keep the gcode uploaded without printing."
         )
         need = {
             "stage": "need_input",
@@ -3090,6 +3095,11 @@ def _action_start(events_file: Path | None, request_id: str,
             "requires_fresh_operator_bed_clear": True,
             "approval_prompt_key": "bed_clear_start",
             "prompt": prompt,
+            "instruction": ("FIRST surface the kit_plate_preview + bed_snapshot "
+                            "image paths BARE and attach the review_doc, THEN "
+                            "the prompt — the operator decides looking at the "
+                            "real bed. On NO: the gcode stays uploaded (staged), "
+                            "nothing prints; acknowledge and stop."),
             "expected_answers": ["yes", "no"],
             # Short confirm token instead of a ~200-char verbatim command:
             # the model relays ONE opaque token, the workflow resolves the

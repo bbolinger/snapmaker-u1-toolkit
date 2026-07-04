@@ -331,11 +331,12 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         rows.append([{"text": "\u2716 Cancel", "callback_data": "X"}])
     else:
         rows.append([
-            {"text": "\u2705 Submit", "callback_data": "S"},
+            {"text": form["schema"].get("submit_label", "\u2705 Submit"),
+             "callback_data": "S"},
             {"text": "\u2716 Cancel", "callback_data": "X"},
         ])
     lines.append("")
-    lines.append("<i>Submit runs the same safety pipeline as the typed form (slicer warnings \u2192 readiness card \u2192 Stage-1 photo gate). The buttons only collect \u2014 they never bypass.</i>")
+    lines.append("<i>This only slices + uploads and shows you the plate, the review, and a fresh bed photo. Nothing prints until you confirm at the bed-clear step.</i>")
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
