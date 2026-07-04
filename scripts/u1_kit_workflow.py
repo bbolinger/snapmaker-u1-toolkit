@@ -1785,13 +1785,41 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     return spec
 
 
-def _invoke_stage2_gate(gate_py: str, argv: list[str], timeout: int):
-    """Run the Stage-2 print-start gate as a subprocess and return the
-    CompletedProcess. Isolated so tests can monkeypatch it (the real gate
-    contacts Moonraker + blocks for the grace window — never in a unit test)."""
-    return subprocess.run(
+_GATE_PREGRACE_WAIT = 25  # seconds to catch a fast refusal before detaching
+
+
+def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
+    """Launch the Stage-2 gate DETACHED and return its result, or None if it's
+    still running (in the grace window).
+
+    Why detached: the gate blocks up to ~120s for the pre-start grace/cancel
+    window, but the agent's terminal tool call for --confirm-start times out at
+    ~60s and kills its process tree — which killed the gate mid-grace and the
+    print never started (live 2026-07-04). ``start_new_session=True`` puts the
+    gate in its own process group so it survives the tool call returning. We
+    wait a bounded ``_GATE_PREGRACE_WAIT`` to catch a fast pre-grace refusal
+    (bad token / blockers, which happen in a few seconds); if it's still running
+    after that it has passed the safety checks and is in the grace window, so we
+    leave it running and return None. The operator already has the grace DM (the
+    gate sent it) and reply-CANCEL still works out-of-band. Isolated so tests
+    monkeypatch it (never contact Moonraker / block)."""
+    from types import SimpleNamespace
+    log_path = Path(out_dir) / "stage2_gate.log"
+    logf = open(log_path, "w")
+    proc = subprocess.Popen(
         [sys.executable, gate_py] + argv,
-        capture_output=True, text=True, timeout=timeout)
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        proc.wait(timeout=_GATE_PREGRACE_WAIT)
+    except subprocess.TimeoutExpired:
+        logf.close()
+        return None  # passed pre-grace checks; in the grace window, detached
+    logf.close()
+    try:
+        out = log_path.read_text(errors="replace")
+    except Exception:
+        out = ""
+    return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr="")
 
 
 def run_kit_workflow(args) -> dict[str, Any]:
@@ -3212,19 +3240,24 @@ def _action_start(events_file: Path | None, request_id: str,
                        "command is never relayed by the model."),
             "command": stage2_cmd,
         }, json_events)
-        try:
-            _grace = int(os.environ.get("U1_GRACE_PERIOD_SECONDS", "120") or "120")
-        except ValueError:
-            _grace = 120
-        try:
-            _res = _invoke_stage2_gate(gate_py, stage2_argv, _grace + 180)
-        except subprocess.TimeoutExpired:
-            _emit(events_file, {"stage": "gate_timeout", "request_id": request_id,
-                                "error": f"gate did not return within {_grace + 180}s"},
-                  json_events)
-            return {"phase": "gate_timeout", "request_id": request_id}
-        # Surface the gate's own events (start_attempt / grace / cancel) so the
-        # operator sees the outcome exactly as if the agent had run it.
+        _res = _invoke_stage2_gate(gate_py, stage2_argv,
+                                   u1_request.ensure_request_dir(request_id))
+        if _res is None:
+            # Gate passed its pre-grace safety checks and is in the grace window,
+            # running DETACHED. Blocking the agent's tool call through the full
+            # ~120s grace timed it out at 60s and killed the gate mid-grace
+            # (live 2026-07-04). The operator already has the grace DM from the
+            # gate and reply-CANCEL works out-of-band; nothing more for the agent.
+            _emit(events_file, {
+                "stage": "grace_in_progress", "request_id": request_id,
+                "reason": ("Print is in the pre-start grace window — reply CANCEL "
+                           "to abort, or ignore to let it start. The gate runs to "
+                           "completion on its own; do NOT re-run anything."),
+            }, json_events)
+            return {"phase": "grace_in_progress", "request_id": request_id,
+                    "started": None}
+        # Gate exited within the pre-grace wait (a fast refusal, or a fast
+        # outcome) — surface its events + outcome.
         for _line in (_res.stdout or "").splitlines():
             if _line.strip():
                 print(_line, flush=True)
