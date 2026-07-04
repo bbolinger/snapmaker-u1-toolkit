@@ -1026,6 +1026,85 @@ def _render_plate_layout_from_m486_outer_walls(
     return {"ok": True, "path": str(out_path), "part_count": n, "error": None}
 
 
+def _render_plate_isometric(
+    stl_paths: list[str] | list[Path],
+    out_path: Path,
+    *,
+    title: str | None = None,
+    label_below: str | None = None,
+    canvas_px: int = 1000,
+) -> dict[str, Any]:
+    """Isometric 3D plate preview from the ARRANGED part STLs — the actual print
+    pose, each part a distinct hue.
+
+    Complements (does NOT replace) the M486 top-down footprint: this view is
+    built from the arranged STLs, that one is traced from the sliced gcode — two
+    corroborating views from DIFFERENT sources, which is what gives a human
+    confidence the render is real (operator 2026-07-04, public/competition
+    context). It also shows orientation / "how it's sitting", which a flat
+    footprint can't. Single part renders in the default blue; multi gets per-part
+    HSV colors so tightly-packed parts stay distinguishable. Best-effort: returns
+    ``ok: False`` (deps missing / no arranged STLs) so the caller simply omits
+    the 3D view and still shows the footprint."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import numpy as np
+        import colorsys
+        from _stl_render import parse_stl, render_view  # type: ignore
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0, "error": f"deps: {exc}"}
+    paths = [Path(p) for p in (stl_paths or []) if Path(p).exists()]
+    if not paths:
+        return {"ok": False, "path": None, "part_count": 0,
+                "error": "no arranged STLs (export was best-effort)"}
+    try:
+        n = len(paths)
+        all_t: list[Any] = []
+        all_c: list[Any] = []
+        for i, p in enumerate(paths):
+            t = parse_stl(p)
+            if len(t) == 0:
+                continue
+            if n > 1:
+                r, g, b = colorsys.hsv_to_rgb(i / n, 0.62, 1.0)
+                col = np.array([int(r * 255), int(g * 255), int(b * 255)],
+                               dtype=np.uint8)
+            else:
+                col = np.array([98, 178, 235], dtype=np.uint8)  # default blue
+            all_t.append(t)
+            all_c.append(np.tile(col, (len(t), 1)))
+        if not all_t:
+            return {"ok": False, "path": None, "part_count": 0,
+                    "error": "empty meshes"}
+        tris = np.concatenate(all_t, 0)
+        cols = np.concatenate(all_c, 0).astype(np.uint8)
+        body = render_view(tris, canvas_px, int(canvas_px * 0.8), view="iso",
+                           base_colors=cols, bg=(22, 26, 31), pad=0.09)
+        try:
+            big = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+            small = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        except Exception:
+            big = small = ImageFont.load_default()
+        th = 48 if title else 0
+        lh = 30 if label_below else 0
+        canvas = Image.new("RGB", (body.width, body.height + th + lh),
+                           (22, 26, 31))
+        d = ImageDraw.Draw(canvas)
+        if title:
+            d.text((14, 10), title, fill=(235, 235, 240), font=big)
+        canvas.paste(body, (0, th))
+        if label_below:
+            d.text((14, th + body.height + 4), label_below,
+                   fill=(150, 156, 170), font=small)
+        canvas.save(out_path)
+        return {"ok": True, "path": str(out_path), "part_count": n, "error": None}
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 def _render_and_inject_plate_preview(
     plate_gcode_path: Path,
     plate_idx: int,
@@ -1056,7 +1135,8 @@ def _render_and_inject_plate_preview(
     Returns ``(layout, injection)``.
     """
     plate_preview_path = out_dir / f"plate_{plate_idx}_preview.png"
-    label_below = (f"{selected_count} parts • {tool_choice} {material}"
+    label_below = (f"{selected_count} part{'s' if selected_count != 1 else ''}"
+                   f" • {tool_choice} {material}"
                    if plate_idx == 1 else None)
     title = f"Plate {plate_idx} of {plate_count}"
 
@@ -1099,6 +1179,15 @@ def _render_and_inject_plate_preview(
             plate_gcode_path, plate_preview_path,
             bed_mm=bed_mm, title=title, label_below=label_below,
         )
+    # Isometric 3D companion view from the arranged STLs (the actual print
+    # pose). Corroborates the footprint above + shows orientation. Best-effort:
+    # if the arranged-STL export failed, we just skip it (footprint still shows).
+    iso = _render_plate_isometric(
+        arranged_stls, out_dir / f"plate_{plate_idx}_iso.png",
+        title=f"Plate {plate_idx} of {plate_count} — 3D view",
+        label_below=label_below)
+    if iso.get("ok"):
+        layout["iso_path"] = iso["path"]
     injection = {"ok": False, "sizes": [],
                  "error": "render failed; nothing to inject"}
     if layout.get("ok"):
@@ -2524,6 +2613,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             "metadata": pl.get("metadata", {}),
             "arranged_stls": pl.get("arranged_stls") or [],
             "preview_path": layout.get("path"),
+            "iso_path": layout.get("iso_path"),
             "thumbnail_injection": injection,
         })
 
@@ -2842,6 +2932,10 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         _emit(events_file, {"stage": "render", "request_id": request_id,
                             "kind": "kit_plate_preview",
                             "image": preview_result["path"]}, json_events)
+        if preview_result.get("iso_path"):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_isometric",
+                                "image": preview_result["iso_path"]}, json_events)
     if bed_result["ok"]:
         _emit(events_file, {"stage": "render", "request_id": request_id,
                             "kind": "bed_snapshot",
@@ -4189,6 +4283,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                                 for s in _arranged],
             "arranged_stls": _arranged,
             "preview_path": layout.get("path"),
+            "iso_path": layout.get("iso_path"),
             "thumbnail_injection": injection,
         })
     if upload_failures:
@@ -4227,6 +4322,17 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                                                 "backticks) in your reply so the "
                                                 "operator sees the sliced plate "
                                                 "layout before the bed-clear prompt.")},
+                  json_events)
+        _iso = _ps.get("iso_path")
+        if _iso and os.path.isfile(_iso):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_isometric",
+                                "plate_idx": _ps.get("plate_idx"),
+                                "image": _iso,
+                                "instruction": ("Surface this 3D view path BARE too "
+                                                "(alongside the top-down plate) — it "
+                                                "shows the operator the real print "
+                                                "pose to sanity-check before start.")},
                   json_events)
 
     plate1 = plates_state[0]

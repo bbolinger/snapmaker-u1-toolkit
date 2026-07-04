@@ -680,3 +680,20 @@ def test_kit_setup_required_when_no_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [])
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 1), interaction_mode="form"))
     assert res["phase"] == "setup_required"
+
+
+def test_plate_isometric_renders_from_stls(tmp_path):
+    """The isometric 3D plate view renders from arranged STLs — the confidence
+    companion to the top-down footprint (corroborating view from a different
+    data source, operator 2026-07-04). Single = blue; multi = distinct hues;
+    empty = graceful skip (footprint still shows), never a crash."""
+    a = _cube(tmp_path / "a.stl", 20)
+    b = _cube(tmp_path / "b.stl", 25)
+    r1 = kw._render_plate_isometric([str(a)], tmp_path / "iso1.png",
+                                    title="Plate 1 of 1 — 3D view",
+                                    label_below="1 part")
+    assert r1["ok"] and (tmp_path / "iso1.png").stat().st_size > 800
+    r2 = kw._render_plate_isometric([str(a), str(b)], tmp_path / "iso2.png")
+    assert r2["ok"] and r2["part_count"] == 2
+    r3 = kw._render_plate_isometric([], tmp_path / "iso3.png")
+    assert r3["ok"] is False
