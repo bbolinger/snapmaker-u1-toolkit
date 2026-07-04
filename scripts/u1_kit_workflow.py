@@ -1785,6 +1785,15 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     return spec
 
 
+def _invoke_stage2_gate(gate_py: str, argv: list[str], timeout: int):
+    """Run the Stage-2 print-start gate as a subprocess and return the
+    CompletedProcess. Isolated so tests can monkeypatch it (the real gate
+    contacts Moonraker + blocks for the grace window — never in a unit test)."""
+    return subprocess.run(
+        [sys.executable, gate_py] + argv,
+        capture_output=True, text=True, timeout=timeout)
+
+
 def run_kit_workflow(args) -> dict[str, Any]:
     """Orchestrate the kit path. See module docstring for the staged flow."""
     global _CLI_OPERATOR
@@ -3158,29 +3167,79 @@ def _action_start(events_file: Path | None, request_id: str,
         u1_request.write_request(request_id,
                                  phase="awaiting_print_start",
                                  safety=new_safety)
-        stage2_cmd = (
-            f"python3 /opt/data/scripts/u1_print_start_gate.py "
-            f"{_shell_quote(plate_filename)} "
-            f"--intended-tool {extruder} --requested-material {_shell_quote(material)} "
-            f"--request-id {request_id} --bed-clear start "
-            f"--approval-token {token} "
-            f"--stage2-approval-nonce {stage2_nonce}"
-        )
+        # The workflow RUNS the gate itself — it does NOT hand the Stage-2
+        # command back to the model to retype. A 26B model (gemma4) appended
+        # garbage to the approval token when relaying this long token+nonce
+        # command (live 2026-07-03), and the gate correctly refused. The human
+        # already authorized via the bed-clear confirm; the workflow holds the
+        # token + nonce. The 120s grace CANCEL is model-free (gateway hook
+        # touches a marker the gate polls — docs/verify-cancel-hook.md), so
+        # blocking here does NOT break cancel: the operator still gets the live
+        # grace DM from the gate and can abort out-of-band.
+        gate_py = "/opt/data/scripts/u1_print_start_gate.py"
+        # Equals-form for the two random values: secrets.token_urlsafe can start
+        # with '-', and argparse would treat a leading-dash VALUE as a flag
+        # ("expected one argument"). This bug was latent in the old agent-relayed
+        # command too (~1.5% of nonces). `--flag=value` is dash-safe.
+        stage2_argv = [
+            plate_filename,
+            "--intended-tool", extruder,
+            "--requested-material", material,
+            "--request-id", request_id,
+            "--bed-clear", "start",
+            "--approval-token=" + token,
+            "--stage2-approval-nonce=" + stage2_nonce,
+        ]
         if operator:
-            stage2_cmd += f" --operator {_shell_quote(operator)}"
-        next_action = {
-            "stage": "next_action_required",
+            stage2_argv += ["--operator", operator]
+        stage2_cmd = "python3 " + gate_py + " " + " ".join(
+            _shell_quote(a) for a in stage2_argv)
+        _emit(events_file, {
+            "stage": "gate_invoked_by_workflow",
             "request_id": request_id,
-            "reason": ("Operator confirmed bed-clear at the fresh yes/no "
-                       "turn. Firing Stage 2 with single-use nonce "
-                       "(safety check + print start)."),
+            "reason": ("Operator confirmed bed-clear. Workflow runs the Stage 2 "
+                       "gate directly (single-use nonce) — the safety-critical "
+                       "command is never relayed by the model."),
             "command": stage2_cmd,
-        }
-        _emit(events_file, next_action, json_events)
-        u1_request.write_request(request_id,
-                                 next_action_required_event=next_action)
-        return {"phase": "awaiting_print_start", "request_id": request_id,
-                "command": stage2_cmd}
+        }, json_events)
+        try:
+            _grace = int(os.environ.get("U1_GRACE_PERIOD_SECONDS", "120") or "120")
+        except ValueError:
+            _grace = 120
+        try:
+            _res = _invoke_stage2_gate(gate_py, stage2_argv, _grace + 180)
+        except subprocess.TimeoutExpired:
+            _emit(events_file, {"stage": "gate_timeout", "request_id": request_id,
+                                "error": f"gate did not return within {_grace + 180}s"},
+                  json_events)
+            return {"phase": "gate_timeout", "request_id": request_id}
+        # Surface the gate's own events (start_attempt / grace / cancel) so the
+        # operator sees the outcome exactly as if the agent had run it.
+        for _line in (_res.stdout or "").splitlines():
+            if _line.strip():
+                print(_line, flush=True)
+        if (_res.stderr or "").strip():
+            sys.stderr.write(_res.stderr)
+        # Parse the outcome from the last JSON object the gate emitted.
+        _outcome: dict[str, Any] = {}
+        for _line in reversed((_res.stdout or "").splitlines()):
+            _s = _line.strip()
+            if _s.startswith("{"):
+                try:
+                    _o = json.loads(_s)
+                except Exception:
+                    continue
+                if "started" in _o or "ok" in _o or _o.get("stage") in (
+                        "start_attempt", "print_started", "start_cancelled",
+                        "gate_refused_file_missing"):
+                    _outcome = _o
+                    break
+        _started = bool(_outcome.get("started"))
+        return {"phase": "print_started" if _started else "start_not_completed",
+                "request_id": request_id,
+                "gate_exit_code": _res.returncode,
+                "started": _started,
+                "gate_outcome": _outcome}
     # Fallback to legacy Stage 1 (no token persisted).
     stage1_cmd = state.get("start_gate_stage1_command")
     if not stage1_cmd:
