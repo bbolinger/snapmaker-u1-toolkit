@@ -592,6 +592,11 @@ def test_hook_patches_live_telegram_adapter_class(monkeypatch, tmp_path):
 def test_cb_handler_registered_on_live_app_not_class(monkeypatch, tmp_path):
     """_ensure_cb_handler registers pattern-scoped on the PTB app, group -11,
     idempotent per app object (a reconnect's fresh app re-registers)."""
+    # python-telegram-bot is an OPTIONAL runtime dep — the adapter imports
+    # telegram.ext lazily inside _u1_ensure_cb_handler, and this is the only
+    # test that actually drives that path. Skip cleanly when it's absent (CI's
+    # requirements.txt is stdlib + numpy/PIL only) instead of hard-failing.
+    pytest.importorskip("telegram")
     import re
     mod = _load_plugin_pkg(monkeypatch, tmp_path)
     tp = sys.modules["hermes_plugins.u1_form.telegram_patch"]
