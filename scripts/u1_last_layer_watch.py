@@ -287,6 +287,12 @@ def main() -> int:
             prev_state_recorded == "printing"
             and print_state in LED_FINISHED_STATES
             and prev_job_key
+            # SAME job only: the U1 persists print_stats.filename through the
+            # terminal state (verified 2026-07-05), so a mismatched non-empty
+            # filename means a DIFFERENT job appeared complete between ticks
+            # (e.g. plate N finished + plate N+1 auto-started + finished) — do
+            # not capture the current bed and mislabel it as the prior job.
+            and (not filename or filename == prev_filename)
             and state.get("last_layer_fired_job_key") != prev_job_key
         ):
             fb_layer = current_layer if isinstance(current_layer, int) else prev_layer

@@ -54,7 +54,7 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 
 **Step 3 — surface the readiness card.** On `kit_readiness_card`:
 
-- Surface `composite_preview`'s image path bare (auto-attaches the plate render + 3D isometric view).
+- Surface the plate-render image paths bare — the workflow emits them as `render` events: `kit_plate_preview` (top-down footprint) and `kit_plate_isometric` (the 3D view). Both attach; surface both.
 - Surface `review_doc_path` bare (the operator's human-readable print plan — attach it, don't summarize in its place).
 - If a `slicer_warning` event fired, surface every entry in `messages` verbatim first.
 - If `overhang_buckets`/`supports_summary` flags heavy overhang risk, mention it before the bed-clear question.
@@ -64,7 +64,7 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 **Step 4 — the ONE bed-clear decision.** After the readiness card (or after the operator submits the form), the workflow emits `need_input` with `key`/`need: "bed_clear_start"` — this is the single approval boundary, form and text alike. It carries a bed photo (already captured) and a `prompt` that IS the bed-clear question; surface any attached bed-photo path bare, then ask that exact prompt, then wait.
 
 - If `bed_snapshot_path` is null, do **not** fabricate or re-capture a photo — ask the prompt as-is.
-- On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` or `--redeem-pending-form` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
+- On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
 - On **no** / anything else: tool-call nothing, tell the operator it's cancelled or staged, stop.
 - **Never** construct a `--bed-clear start` / approval-token command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start command, fail closed and say so.
 
