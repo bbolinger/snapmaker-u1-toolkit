@@ -6,10 +6,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [Unreleased — v2.2 line]
+## [2.2.0-rc1] — 2026-07-05
+
+Release candidate for the v2.2 line. Every safety-critical claim below was
+verified **live on hardware** (gemma4-26b over Telegram), not only in tests —
+including a single session that both **refused** a real material mismatch and
+then ran a **full matching-material print to completion**.
+
+### Safety
+
+- **Material-mismatch gate now ENFORCES a refusal (was detect-only).** Live-caught
+  2026-07-05: sliced PETG, physically swapped to PLA, approved — the print
+  *started*. Root cause: `u1_toolmap.py` returned exit `0` even when it had found
+  a blocking gate (it correctly detected and printed the mismatch), and
+  `run_tool_gate()` decides pass/fail purely on the exit code — so the material
+  check had been detect-and-print only, never enforcing. Fixed: the probe exits
+  non-zero when a requested material/tool gate is blocking. Verified live end to
+  end — PETG-requested vs PLA-loaded now refuses at Stage 2
+  (`stage2_preflight_blocked`), the print never starts, and the operator is told
+  why; matching material still passes. Added enforcement-layer tests (the prior
+  tests only exercised detection, one layer above the bug). The wrong-*extruder*
+  gcode-preamble check was unaffected and always enforced.
+
+### Added
+
+- **Unified single-STL + multi-part-kit flow.** A lone `.stl`/`.3mf` is now
+  handled as a "kit of one" through the same path as a multi-part zip — one
+  entrypoint, one form, one safety boundary. Removed the entire parallel
+  single-STL staged flow (~1000 lines) so there is one code path to reason
+  about, and single models gain everything kits had (consolidated form,
+  composite preview, review doc) for free. Orca's real orientation verdict now
+  rides in the form for a single model, so the recommended pose is Orca's actual
+  call, not a face-angle approximation.
+- **Two corroborating plate previews.** Alongside the top-down footprint traced
+  from the *sliced gcode*, the readiness card now also emits an **isometric 3D
+  render of the actual arranged, oriented parts** (`kit_plate_isometric`), each
+  part in a distinct hue for a multi-part plate. Two views built from different
+  data sources — when they agree, you are seeing the truth.
 
 ### Fixed
 
+- **Re-printing a model no longer fails on a filename collision.** When printer
+  filenames dropped their `doc_<hash>_` prefix (for readability), re-printing the
+  same model produced the same base name as a *prior* request's upload — which
+  the kit flow only auto-overwrote for its own request, so a cross-request
+  collision dead-ended as `kit_upload_failed`. Now any non-own collision uploads
+  with a timestamp suffix (`<name>_<ts>.gcode`): the first print keeps the clean
+  name, a re-print never fails and never clobbers a different job. Proven on the
+  real printer.
+- **Last-layer photo missed on fast-finishing prints.** A print whose tail
+  extruded between two 1-minute monitor ticks could transition
+  `printing → complete` without any poll landing inside the last-layer window,
+  silently losing the completion photo. The watcher now also catches the
+  `printing → terminal` transition for the same job and captures a fallback
+  photo. (No prior test coverage existed for this cron; added.)
+- **Detached start gate — grace window survives the tool-call timeout.** The
+  ~120s pre-start grace/cancel window ran inside the agent's terminal call and
+  could be killed by the ~60s tool timeout mid-grace. The workflow now runs the
+  Stage-2 gate detached so the full cancel window always completes.
+- **Form redeem no longer relays a manglable id.** The bed-clear confirm and
+  form redeem derive their token/id from the request instead of routing a
+  random hex string through the model (which small models corrupted, stalling
+  with "form id mismatch"). `--confirm-start` / `--redeem-pending-form`.
+- **No crash when the bed camera is unreachable at the bed-clear step** — the
+  upload-only fallback path referenced undefined locals (`NameError`); now
+  degrades cleanly to offering upload-without-start.
+- **CI green on a fresh environment.** A live-adapter test hard-failed under CI
+  (`python-telegram-bot` is an optional runtime dep, not in `requirements.txt`);
+  it now `importorskip`s cleanly, matching how the adapter treats the dep.
 - **Test suite could DM the operator a real "print starting" notification**
   (live 2026-07-02, "spam every time you run the suite"). `test_u1_config`
   loads the real `/opt/data/.env` into `os.environ`, leaking
@@ -37,6 +101,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Skill rewritten imperative-first and corrected to the unified flow.** The
+  body described the retired single-STL staged mechanism (events the code no
+  longer emits); it now matches what the unified workflow actually emits, opens
+  with an act-by-calling-tools directive, and shed ~7KB. Verified not to regress
+  gemma4's tool-calling. All safety rules (anti-fabrication, the single bed-clear
+  boundary, verbatim command relay) preserved.
+- **README brought to v2.2 reality** + a new **"Always-on print monitoring"**
+  section documenting the three no-agent cron jobs (first/last-layer + post-resume
+  photos, quiet health watchdog, print-history ledger) that run with no LLM in
+  the loop — surfacing a capability that existed but was buried.
 - **Form UX v2.2.1 — fewer, clearer screens (operator feedback 2026-07-02).**
   - **Setup screen: print head + orientation + supports on ONE screen.** The
     renderer gained a `group` model — fields sharing a group render together as
