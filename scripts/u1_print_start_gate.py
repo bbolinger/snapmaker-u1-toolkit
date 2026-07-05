@@ -815,13 +815,18 @@ def run_gate(filename: str,
                          host=host, port=port,
                          gcode_path=_gcode_path,
                          accept_material_mismatch=accept_material_mismatch)
-    # Layer 3 override: when --accept-material-mismatch
-    # is set, preflight tags the material-mismatch line with [OVERRIDE:...].
-    # Filter those out of the active blocker list + audit the override so it's
-    # visible forensically. The hardware safety isn't bypassed — just the
-    # mismatch refusal. Tool/material-temp damage is on the operator.
+    # Layer 3 override: when --accept-material-mismatch is set, preflight tags
+    # the material-mismatch line with [OVERRIDE:...]. The override is honored
+    # ONLY when a real operator authorizing phrase is supplied (v2.2.1 #1). The
+    # provenance is NEVER defaulted: without operator_text the override does not
+    # apply and the material blocker stands (a rogue agent cannot mint
+    # authorization it did not receive). main() additionally refuses the flag
+    # unless invoked from an interactive terminal, so an agent-mediated /
+    # subprocess start can never reach this branch with the override honored.
+    # The hardware safety isn't bypassed even then — just the mismatch refusal.
     overrides_used: list[dict[str, Any]] = []
-    if accept_material_mismatch:
+    _override_ok = bool(accept_material_mismatch and operator_text)
+    if _override_ok:
         kept: list[str] = []
         for line in blockers:
             if line.startswith("[OVERRIDE:material_mismatch] "):
@@ -836,13 +841,26 @@ def run_gate(filename: str,
             _audit_gate(request_id, "operator_override", resolved_operator,
                         override_kind="material_mismatch",
                         reason="loaded_material_does_not_match_requested",
-                        verification_method=(verification_method
-                                             or "unspecified_manual"),
-                        operator_text=(operator_text
-                                       or "accept-material-mismatch"),
+                        verification_method=verification_method,
+                        operator_text=operator_text,
                         expected_tool=intended_tool,
                         expected_material=requested_material,
                         blocker_text=overrides_used[0].get("blocker_text"))
+    elif accept_material_mismatch and not operator_text:
+        # Override requested with no operator authorization: refuse. Un-tag the
+        # [OVERRIDE:...] marker back to a clean hard blocker so the refusal reads
+        # normally, and audit the rejected attempt for forensics.
+        blockers = [
+            (l[len("[OVERRIDE:material_mismatch] "):]
+             if l.startswith("[OVERRIDE:material_mismatch] ") else l)
+            for l in blockers
+        ]
+        if request_id:
+            _audit_gate(request_id, "operator_override_rejected", resolved_operator,
+                        override_kind="material_mismatch",
+                        reason="override_missing_operator_text",
+                        expected_tool=intended_tool,
+                        expected_material=requested_material)
 
     if bed_clear != 'start':
         # Stage 1 — capture real photo, write token, return readiness.
@@ -1306,17 +1324,19 @@ def main(argv=None):
                     help='v2.0 Phase 3a: operator identity for audit + approval rows '
                          '(e.g. "telegram:brent"). Falls back to env U1_OPERATOR, '
                          'then "unknown:gate".')
-    # Layer 3 override flags. The material-mismatch
-    # blocker is loud-by-default; the operator can take explicit responsibility
-    # by passing --accept-material-mismatch. The forensic-control guarantee
-    # comes from the audit row capturing --operator-text verbatim. The agent
-    # CAN fabricate this text (no software gate prevents it); session-log
-    # review is the post-hoc check.
+    # Layer 3 override flags. The material-mismatch blocker is loud-by-default.
+    # v2.2.1 #1: the override is now MECHANICALLY constrained, not merely
+    # forensic. It is refused unless invoked from an interactive terminal (an
+    # agent-mediated / workflow-subprocess start has no TTY) AND --operator-text
+    # is supplied. Provenance is never defaulted, so an agent cannot mint an
+    # override it did not receive. This is a deliberate CLI-only escape hatch
+    # for an operator physically at the machine.
     ap.add_argument('--accept-material-mismatch', action='store_true',
-                    help=('Layer 3 override: operator explicitly accepts a '
-                          'material-mismatch (loaded filament does not match '
-                          'requested material). Audited. Requires '
-                          '--operator-text capturing the operator phrase.'))
+                    help=('Layer 3 override (INTERACTIVE TERMINAL ONLY): operator '
+                          'physically at the CLI accepts a material mismatch '
+                          '(loaded filament does not match requested material). '
+                          'REQUIRES --operator-text and a real TTY; refused for '
+                          'agent-mediated / subprocess starts. Audited.'))
     ap.add_argument('--operator-text', default=None,
                     help=('Layer 3 override: verbatim operator phrase '
                           'authorizing the override. Audited.'))
@@ -1346,6 +1366,28 @@ def main(argv=None):
                           "$U1_CANCEL_MARKER to abort.\"'. Overrides env "
                           'U1_GRACE_NOTIFY_CMD.'))
     a = ap.parse_args(argv)
+    # v2.2.1 #1: the material-mismatch override must be a deliberate operator
+    # action, never something an agent can forge. Refuse the flag unless it comes
+    # from a real interactive terminal (an agent-mediated / workflow-subprocess
+    # start has no TTY and cannot fake one) AND the operator's authorizing phrase
+    # is actually supplied. Provenance is not defaulted.
+    if a.accept_material_mismatch:
+        if not (sys.stdin and sys.stdin.isatty()):
+            print(json.dumps({
+                "phase": "refused",
+                "reason": ("material-mismatch override refused: it requires an "
+                           "interactive terminal. Agent-mediated or workflow "
+                           "starts cannot override a material mismatch. Load the "
+                           "correct material, or run this gate directly from a "
+                           "terminal.")}, indent=2))
+            return 3
+        if not a.operator_text:
+            print(json.dumps({
+                "phase": "refused",
+                "reason": ("material-mismatch override refused: --operator-text "
+                           "is required (the phrase authorizing this override). "
+                           "It is never defaulted.")}, indent=2))
+            return 3
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
                    requested_material=a.requested_material,
