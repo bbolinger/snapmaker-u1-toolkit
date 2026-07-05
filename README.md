@@ -1159,7 +1159,7 @@ safety-model rules that PRs need to respect.
 
 ## Acknowledgments
 
-These scripts were developed against a single U1 over its first ~3 days. Real-world print validation across 4+ distinct workflows (single + multi-tool, generic + brand-specific PETG, support + no-support, ~25min and ~6h prints).
+These scripts were developed and validated against a real Snapmaker U1 over weeks of daily use. Real prints span single models and multi-part kits, generic and brand-specific PETG plus PLA, supports and no-supports, and run times from ~25 minutes to ~12 hours. The safety gate has both blocked a real material mismatch before any heat and carried full prints to completion, driven live over Telegram by a local model.
 
 **Philosophy**: profiles should be YOUR profiles, extracted from YOUR successful prints, mapped to YOUR extruders. The included `profiles/` directory shows the *shape* of those files but is environment-specific. The toolmap gate enforces per-extruder material assignment so wrong-slot mistakes don't waste filament.
 
