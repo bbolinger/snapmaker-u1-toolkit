@@ -1105,6 +1105,182 @@ def _render_plate_isometric(
                 "error": f"{type(exc).__name__}: {exc}"[:160]}
 
 
+def _render_plate_isometric_from_gcode(
+    gcode_path: Path,
+    out_path: Path,
+    *,
+    bed_mm: tuple[float, float] = (270.0, 270.0),
+    title: str | None = None,
+    label_below: str | None = None,
+    canvas_px: int = 1000,
+) -> dict[str, Any]:
+    """3D plate view built from the SAME sliced-gcode M486 outer walls as the
+    top-down footprint, so the two views corroborate BY CONSTRUCTION.
+
+    v2.2.1 fix: the previous isometric parsed Orca's ``--export-stl`` output,
+    which uses a different (buggy) packer than ``--slice`` and produced a garbled
+    overlapping layout that flatly disagreed with the footprint (live 2026-07-05).
+    This reuses the proven M486 outer-wall extraction (same regex + arc handling
+    the top-down uses), takes each part's mid-body outer boundary, extrudes it to
+    its real Z height, and draws with an ELEVATED TOP-DOWN projection so the
+    footprint's orientation is preserved (a rotating isometric mismatched the
+    layout). Per-part colors match the top-down. Best-effort: returns ``ok:False``
+    so the caller omits the 3D and still shows the footprint."""
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+        import colorsys
+        from collections import defaultdict
+        import re
+        import math
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0, "error": f"deps: {exc}"}
+    NUM = r"(-?\d*\.?\d+)"
+    G_RE = re.compile(r"^G[0123]\b"); G23_RE = re.compile(r"^G[23]\b")
+    X_RE = re.compile(r"\bX" + NUM); Y_RE = re.compile(r"\bY" + NUM)
+    Z_RE = re.compile(r"\bZ" + NUM); E_RE = re.compile(r"\bE" + NUM)
+    I_RE = re.compile(r"\bI" + NUM); J_RE = re.compile(r"\bJ" + NUM)
+    M486_A = re.compile(r"^M486 A(.+?)\s*$"); M486_S = re.compile(r"^M486 S(-?\d+)")
+    try:
+        lines = Path(gcode_path).read_text().splitlines()
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0, "error": f"gcode read: {exc}"}
+    id_to_name: dict[int, str] = {}
+    layers: dict[str, dict[float, list]] = defaultdict(lambda: defaultdict(list))
+    heights: dict[str, float] = defaultdict(float)
+    cid = None; cbase = None; ctype = None; prevx = prevy = None; cz = 0.0
+    poly: list[tuple[float, float]] = []
+
+    def flush() -> None:
+        nonlocal poly
+        if cbase and len(poly) >= 3:
+            layers[cbase][round(cz, 2)].append(poly[:])
+        poly = []
+
+    for ln in lines:
+        ma = M486_A.match(ln)
+        if ma:
+            if cid is not None:
+                id_to_name[cid] = ma.group(1).strip()
+            continue
+        ms = M486_S.match(ln)
+        if ms:
+            flush(); nid = int(ms.group(1)); cid = None if nid < 0 else nid; cbase = None
+            if cid is not None:
+                nm = id_to_name.get(cid, ""); cbase = re.sub(r"_id_\d+_copy_\d+$", "", nm) or None
+            continue
+        zm = Z_RE.search(ln)
+        if zm:
+            cz = float(zm.group(1))
+        if ln.startswith(";TYPE:"):
+            flush(); ctype = ln[6:].strip(); continue
+        if not G_RE.match(ln):
+            continue
+        xm = X_RE.search(ln); ym = Y_RE.search(ln); em = E_RE.search(ln)
+        if not xm and not ym and not em:
+            continue
+        nx = float(xm.group(1)) if xm else prevx
+        ny = float(ym.group(1)) if ym else prevy
+        is_arc = bool(G23_RE.match(ln)); is_g2 = ln.startswith("G2")
+        if em and cbase is not None and ctype == "Outer wall" and nx is not None and ny is not None:
+            if float(em.group(1)) > 0 and prevx is not None:
+                if not poly:
+                    poly.append((prevx, prevy))
+                if is_arc:
+                    im = I_RE.search(ln); jm = J_RE.search(ln)
+                    cx = prevx + (float(im.group(1)) if im else 0.0)
+                    cyy = prevy + (float(jm.group(1)) if jm else 0.0)
+                    r = math.hypot(prevx - cx, prevy - cyy)
+                    sa = math.atan2(prevy - cyy, prevx - cx); ea = math.atan2(ny - cyy, nx - cx)
+                    if is_g2:
+                        if ea > sa: ea -= 2 * math.pi
+                        sweep = sa - ea
+                    else:
+                        if ea < sa: ea += 2 * math.pi
+                        sweep = ea - sa
+                    nseg = max(2, int(abs(sweep) * r / 1.0))
+                    for k in range(1, nseg + 1):
+                        t = k / nseg; a = sa - sweep * t if is_g2 else sa + sweep * t
+                        poly.append((cx + r * math.cos(a), cyy + r * math.sin(a)))
+                else:
+                    poly.append((nx, ny))
+                heights[cbase] = max(heights[cbase], cz)
+            else:
+                flush()
+        else:
+            flush()
+        prevx, prevy = nx, ny
+    flush()
+
+    if not layers:
+        return {"ok": False, "path": None, "part_count": 0,
+                "error": "no M486 outer-wall data (gcode missing per-part labels)"}
+
+    def _area(lp) -> float:
+        xs = [a for a, b in lp]; ys = [b for a, b in lp]
+        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+    parts = sorted(layers)
+    rep: dict[str, list] = {}
+    for p in parts:
+        zs = sorted(layers[p]); mid = zs[len(zs) // 2]
+        rep[p] = max(layers[p][mid], key=_area)  # mid-body outer boundary
+
+    E = math.radians(58)  # elevated top-down: preserves footprint orientation
+
+    def proj(x, y, z):
+        return (x, -(y * math.sin(E) + z * math.cos(E)))
+
+    allp = []
+    for p in parts:
+        h = max(heights[p], 1.0)
+        for (x, y) in rep[p]:
+            allp.append(proj(x, y, 0)); allp.append(proj(x, y, h))
+    ix = [a for a, _ in allp]; iy = [b for _, b in allp]
+    if max(ix) == min(ix) or max(iy) == min(iy):
+        return {"ok": False, "path": None, "part_count": len(parts), "error": "degenerate extent"}
+
+    big_font, small_font = _load_pil_fonts()
+    pad = 40; top_h = 84
+    s = min(canvas_px / (max(ix) - min(ix)), (canvas_px * 0.82) / (max(iy) - min(iy)))
+
+    def scr(pt):
+        return (pad + (pt[0] - min(ix)) * s, top_h + pad + (pt[1] - min(iy)) * s)
+
+    cw = int((max(ix) - min(ix)) * s) + 2 * pad
+    ch = int((max(iy) - min(iy)) * s) + top_h + 2 * pad
+    img = Image.new("RGB", (cw, ch), (22, 26, 31))
+    d = ImageDraw.Draw(img, "RGBA")
+    if title:
+        d.text((pad, 18), title, fill=(232, 238, 245), font=big_font)
+    sub = (f"{label_below}  -  " if label_below else "") + \
+        "from the real sliced gcode (matches the footprint)"
+    d.text((pad, 52), sub, fill=(140, 150, 160), font=small_font)
+    n = len(parts)
+
+    def _depth(p):  # draw parts further back (higher y) first
+        lp = rep[p]; return -sum(b for _, b in lp) / len(lp)
+
+    for p in sorted(parts, key=_depth):
+        i = parts.index(p)
+        r, g, b = colorsys.hsv_to_rgb(i / max(n, 1), 0.55, 0.9)  # match top-down
+        bright = (int(r * 255), int(g * 255), int(b * 255))
+        dim = tuple(int(c * 0.5) for c in bright)
+        h = max(heights[p], 1.0); lp = rep[p]
+        bot = [scr(proj(x, y, 0)) for x, y in lp]
+        top = [scr(proj(x, y, h)) for x, y in lp]
+        for k in range(len(lp) - 1):
+            d.polygon([bot[k], bot[k + 1], top[k + 1], top[k]], fill=dim + (70,))
+        d.line(bot + [bot[0]], fill=dim + (255,), width=2)
+        d.line(top + [top[0]], fill=bright + (255,), width=3)
+
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_path, format="PNG", optimize=True)
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": len(parts), "error": f"save: {exc}"}
+    return {"ok": True, "path": str(out_path), "part_count": len(parts), "error": None}
+
+
 def _render_and_inject_plate_preview(
     plate_gcode_path: Path,
     plate_idx: int,
@@ -1179,12 +1355,15 @@ def _render_and_inject_plate_preview(
             plate_gcode_path, plate_preview_path,
             bed_mm=bed_mm, title=title, label_below=label_below,
         )
-    # Isometric 3D companion view from the arranged STLs (the actual print
-    # pose). Corroborates the footprint above + shows orientation. Best-effort:
-    # if the arranged-STL export failed, we just skip it (footprint still shows).
-    iso = _render_plate_isometric(
-        arranged_stls, out_dir / f"plate_{plate_idx}_iso.png",
-        title=f"Plate {plate_idx} of {plate_count} — 3D view",
+    # Isometric 3D companion view built from the SAME sliced gcode as the
+    # footprint above (v2.2.1: the old arranged-STL source used Orca's buggy
+    # --export-stl packer and produced a garbled layout that disagreed with the
+    # footprint). Corroborates by construction + shows height/orientation.
+    # Best-effort: if it fails we skip it (the footprint still shows).
+    iso = _render_plate_isometric_from_gcode(
+        plate_gcode_path, out_dir / f"plate_{plate_idx}_iso.png",
+        bed_mm=bed_mm,
+        title=f"Plate {plate_idx} of {plate_count}  -  3D view",
         label_below=label_below)
     if iso.get("ok"):
         layout["iso_path"] = iso["path"]
