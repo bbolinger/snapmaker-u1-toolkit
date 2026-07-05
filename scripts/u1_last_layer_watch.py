@@ -216,6 +216,7 @@ def main() -> int:
     # previous run and every fired_*_job_key marker silently suppresses
     # re-firing milestone photos for the new session.
     prev_layer = state.get("current_layer")
+    prev_total_layer = state.get("total_layer")
     prev_filename = state.get("filename") or ""
     prev_state_recorded = state.get("print_state")
     is_layer_regression = (
@@ -272,6 +273,49 @@ def main() -> int:
 
     active = bool(vsd.get("is_active")) and print_state == "printing" and not pause.get("is_paused")
     if not active or not filename or not isinstance(current_layer, int) or not isinstance(total_layer, int) or total_layer <= 0:
+        # Fallback: catch a job that finished so fast its LAST_LAYER_WINDOW never
+        # overlapped a poll tick while print_state was still "printing" (live
+        # 2026-07-05: a 48-layer/43-min print went printing -> complete between
+        # two 1-minute ticks, so the in-progress branch below never fired).
+        # Detect the printing -> terminal transition for the SAME job and, if
+        # last_layer never fired for it, capture one now using the last known
+        # layer numbers (this tick's, if Moonraker still serves them; else the
+        # previous tick's snapshot) instead of silently losing the milestone.
+        prev_job_key = (f"{prev_filename}|{prev_total_layer}"
+                        if prev_filename and prev_total_layer else None)
+        if (
+            prev_state_recorded == "printing"
+            and print_state in LED_FINISHED_STATES
+            and prev_job_key
+            and state.get("last_layer_fired_job_key") != prev_job_key
+        ):
+            fb_layer = current_layer if isinstance(current_layer, int) else prev_layer
+            fb_total = total_layer if isinstance(total_layer, int) and total_layer > 0 else prev_total_layer
+            if isinstance(fb_layer, int) and isinstance(fb_total, int) and fb_total > 0:
+                try:
+                    image, cam = capture_photo(prev_filename, "last_layer_post_complete", fb_layer, fb_total)
+                except Exception as exc:
+                    state.update({"last_capture_error": str(exc),
+                                 "last_capture_error_at": datetime.now(timezone.utc).isoformat()})
+                    save_state(state)
+                    return 0
+                fired_at = datetime.now(timezone.utc).isoformat()
+                state.update({
+                    "last_layer_fired_job_key": prev_job_key,
+                    "last_layer_fired_at": fired_at,
+                    "last_layer_fired_layer": fb_layer,
+                    "last_layer_fired_total_layer": fb_total,
+                    "last_layer_image": str(image),
+                    "last_layer_camera_changed": bool((cam.get("result") or {}).get("changed")),
+                    "last_layer_caught_post_complete": True,
+                })
+                save_state(state)
+                print(
+                    f"U1 finished before the live last-layer window landed a poll — "
+                    f"capturing now.\n- File: {prev_filename}\n- Layer: {fb_layer} / {fb_total}\n"
+                    f"- Final state: {print_state}"
+                )
+                return 0
         save_state(state)
         return 0
 
