@@ -2556,8 +2556,16 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         })
         # ── NOW upload (gcode has thumbnail baked in) ──
         _oc = getattr(args, "on_collision", None)
-        if _oc is None and named.name in _own_prior_names:
-            _oc = "overwrite"
+        if _oc is None:
+            # Re-uploading THIS request's own prior name (adjust -> re-confirm)
+            # overwrites it. ANY OTHER collision -> rename with a timestamp
+            # suffix so the upload never fails and never clobbers a different
+            # job's file. This is the common case now that doc-hash filename
+            # prefixes are dropped (82a9681): re-printing a model a PRIOR
+            # request already uploaded = same base name. rename appends the
+            # timestamp ONLY on collision, so the first print keeps the clean
+            # name and the model name still leads (printer-list readability).
+            _oc = "overwrite" if named.name in _own_prior_names else "rename"
         up = (_real_upload(named,
                             on_collision=_oc,
                             material=material)
@@ -4245,8 +4253,16 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             source_stls=pl.get("source_stls"),
         )
         _oc = getattr(args, "on_collision", None)
-        if _oc is None and named.name in _own_prior_names:
-            _oc = "overwrite"
+        if _oc is None:
+            # Re-uploading THIS request's own prior name (adjust -> re-confirm)
+            # overwrites it. ANY OTHER collision -> rename with a timestamp
+            # suffix so the upload never fails and never clobbers a different
+            # job's file. This is the common case now that doc-hash filename
+            # prefixes are dropped (82a9681): re-printing a model a PRIOR
+            # request already uploaded = same base name. rename appends the
+            # timestamp ONLY on collision, so the first print keeps the clean
+            # name and the model name still leads (printer-list readability).
+            _oc = "overwrite" if named.name in _own_prior_names else "rename"
         up = _real_upload(named,
                           on_collision=_oc,
                           material=material) if live else {

@@ -444,17 +444,38 @@ def _fake_arrange(monkeypatch, n_plates=1):
 def test_reupload_of_own_plate_defaults_to_overwrite(tmp_path, fake_profiles,
                                                      recording_upload, monkeypatch):
     # adjust -> re-confirm re-slices to the SAME deterministic plate name.
-    # First upload: no collision default. Second (same request): overwrite —
-    # rc=5 previously dead-ended the advertised adjust option.
+    # First upload of a request: "rename" (timestamp ONLY on collision, so a
+    # clean name when free, but graceful when the name is already on the printer
+    # from a DIFFERENT request — the doc-strip re-print bug). Second upload of
+    # the SAME request (own prior name): overwrite.
     _fake_arrange(monkeypatch)
     zp = _kit_zip(tmp_path, 2)
     ans = "all | T0 | PLA | profile 1 | no-supports | start"
     r1 = kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
     rid = r1["request_id"]
-    assert recording_upload["uploads"][0]["on_collision"] is None
+    assert recording_upload["uploads"][0]["on_collision"] == "rename"
     kw.run_kit_workflow(_args(zp, request_id=rid, form_answers=ans,
                               live_upload=True))
     assert recording_upload["uploads"][1]["on_collision"] == "overwrite"
+
+
+def test_reprint_of_another_requests_model_renames_not_fails(tmp_path, fake_profiles,
+                                                             recording_upload, monkeypatch):
+    """Regression (live 2026-07-05): re-printing a model a DIFFERENT prior request
+    already uploaded must NOT fail. Since doc-hash filename prefixes were dropped
+    (82a9681), same model = same base name across requests. A NEW request whose
+    plate name is NOT its own prior upload must pass on_collision='rename' (the
+    uploader timestamps only on real collision) — never None (which dead-ended
+    on rc=5 as kit_upload_failed)."""
+    _fake_arrange(monkeypatch)
+    zp = _kit_zip(tmp_path, 2)
+    ans = "all | T0 | PLA | profile 1 | no-supports | start"
+    # two independent requests (fresh each), same model -> same plate name
+    kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
+    kw.run_kit_workflow(_args(zp, fresh=True, form_answers=ans, live_upload=True))
+    # both uploads (each request's first) use rename, so neither dead-ends rc=5
+    assert recording_upload["uploads"][0]["on_collision"] == "rename"
+    assert recording_upload["uploads"][1]["on_collision"] == "rename"
 
 
 def test_legacy_upload_failure_does_not_claim_uploaded(tmp_path, fake_profiles,
