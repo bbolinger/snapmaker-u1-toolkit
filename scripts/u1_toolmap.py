@@ -375,7 +375,15 @@ def main() -> int:
     else:
         print(render(summary))
         print(f"\nArtifacts: {outdir / 'latest_toolmap.json'} | {outdir / 'latest_toolmap.txt'}")
-    return 0
+    # CRITICAL (safety): exit NON-ZERO when a requested material/tool gate is
+    # BLOCKING. run_tool_gate() (u1_print_start_gate + u1_upload_gcode) keys
+    # purely on `returncode == 0` to decide pass/fail. Returning 0 here even with
+    # blocking gates meant the material-mismatch check DETECTED + printed the
+    # block but the start gate treated it as PASSED — a non-enforcing safety
+    # check (live 2026-07-05: sliced PETG, loaded PLA, gate passed, print
+    # started). `gates` is populated only when --requested-material was given,
+    # so plain read-only probes (no gate requested) still exit 0.
+    return 2 if summary.get("gates") else 0
 
 
 if __name__ == "__main__":
