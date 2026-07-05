@@ -401,6 +401,27 @@ def _write_approval_token(out_dir: Path, snapshot: dict[str, Any]) -> str:
     return token
 
 
+def _gate_state_path(out_dir) -> Path:
+    return Path(out_dir) / 'stage2_gate_state.json'
+
+
+def _write_gate_state(out_dir, state: str, **extra) -> None:
+    """v2.2.1 #2: persist an explicit Stage-2 lifecycle marker (grace_started /
+    started / refused) so the DETACHED parent can distinguish 'the grace window
+    genuinely opened' from 'child still alive but stalled or heading to a late
+    refusal'. Previously the parent inferred grace purely from the child still
+    being alive after 25s, which reported a stall as a healthy grace window.
+    Best-effort: a marker write never blocks the gate."""
+    try:
+        p = _gate_state_path(out_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + '.tmp')
+        tmp.write_text(json.dumps({'state': state, **extra}))
+        tmp.replace(p)  # atomic
+    except Exception:
+        pass
+
+
 def _approval_token_valid(stored: dict[str, Any], offered: str) -> tuple[bool, str]:
     """Verify operator's offered token matches stored, within TTL."""
     if not stored:
@@ -1251,6 +1272,11 @@ def run_gate(filename: str,
         }
 
     if _resolved_grace > 0:
+        # v2.2.1 #2: mark grace as genuinely started BEFORE the blocking wait,
+        # so the detached parent polling this marker knows the ~120s window
+        # actually opened (vs. the child stalling in a pre-grace check).
+        _write_gate_state(out_dir, 'grace_started', request_id=request_id,
+                          grace_seconds=_resolved_grace)
         if not _wait_pre_start_grace_period(
                 cancel_marker, _resolved_grace, request_id,
                 resolved_operator,
@@ -1284,6 +1310,7 @@ def run_gate(filename: str,
                 printer_storage_filename=printer_filename,
                 request_revision=(req or {}).get('request_revision'),
                 gcode_hash=(req or {}).get('gcode_hash'))
+    _write_gate_state(out_dir, 'started', request_id=request_id)
     return {
         'stage': 'start_attempt',
         'filename': printer_filename,

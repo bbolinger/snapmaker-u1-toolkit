@@ -1445,3 +1445,4 @@ def test_manual_bed_check_refused_when_camera_verification_available(sandbox_req
         verification_method="snapmaker_app",
         bed_clear_confirmed=False)
     assert result["phase"] == "manual_bed_check_refused"
+
