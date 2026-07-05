@@ -6,12 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [2.2.0-rc1] — 2026-07-05
+## [2.2.0] — 2026-07-05
 
-Release candidate for the v2.2 line. Every safety-critical claim below was
-verified **live on hardware** (gemma4-26b over Telegram), not only in tests —
-including a single session that both **refused** a real material mismatch and
-then ran a **full matching-material print to completion**.
+Every safety-critical claim below was verified **live on hardware** (gemma4-26b
+over Telegram), not only in tests — including a single session that both
+**refused** a real material mismatch and then ran a **full matching-material
+print to completion**, followed by a cold, adversarial pre-ship regression audit
+of the whole v2.1.0 → v2.2 change surface (0 HIGH, 0 MED findings).
 
 ### Safety
 
