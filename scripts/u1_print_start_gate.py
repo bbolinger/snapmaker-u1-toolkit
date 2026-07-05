@@ -422,6 +422,42 @@ def _write_gate_state(out_dir, state: str, **extra) -> None:
         pass
 
 
+def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
+    """v2.2.1 #3: atomically consume the single-use Stage-2 nonce under a
+    per-request file lock. Re-reads the nonce INSIDE the lock and consumes it
+    only if it is still present and still equals expected, so two concurrent
+    gate processes (double-click / retry / duplicate delivery that got past the
+    confirm-token claim, or a direct-gate race) cannot both validate and consume
+    the same nonce. Returns True if THIS call consumed it, False if it was
+    already consumed/changed (the caller must then refuse the start)."""
+    import u1_request
+    try:
+        import fcntl
+        req_dir = Path(u1_request.ensure_request_dir(request_id))
+        with open(req_dir / '.stage2_nonce.lock', 'w') as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
+            if fresh_safety.get('stage2_approval_nonce') != expected_nonce:
+                return False  # already consumed / changed by a concurrent start
+            for k in ('stage2_approval_nonce', 'stage2_approval_issued_at',
+                      'stage2_approval_binds'):
+                fresh_safety.pop(k, None)
+            u1_request.write_request(request_id, safety=fresh_safety)
+            return True
+    except Exception:
+        # Locking unavailable (non-Unix / fs quirk): best-effort consume. The
+        # confirm-token atomic claim already serialises the realistic triggers.
+        try:
+            fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
+            for k in ('stage2_approval_nonce', 'stage2_approval_issued_at',
+                      'stage2_approval_binds'):
+                fresh_safety.pop(k, None)
+            u1_request.write_request(request_id, safety=fresh_safety)
+        except Exception:
+            pass
+        return True
+
+
 def _approval_token_valid(stored: dict[str, Any], offered: str) -> tuple[bool, str]:
     """Verify operator's offered token matches stored, within TTL."""
     if not stored:
@@ -1042,16 +1078,22 @@ def run_gate(filename: str,
                     'reason': ("Stage 2 nonce rejected: "
                                + "; ".join(problems)),
                 }
-            # Consume the nonce (single-use). Wipe binds too so a replay
-            # attempt can't re-use them.
-            try:
-                new_safety = dict(safety_for_nonce)
-                new_safety.pop('stage2_approval_nonce', None)
-                new_safety.pop('stage2_approval_issued_at', None)
-                new_safety.pop('stage2_approval_binds', None)
-                u1_request.write_request(request_id, safety=new_safety)
-            except Exception:
-                pass
+            # Consume the nonce (single-use, ATOMIC under a per-request lock).
+            # Wipes binds too so a replay can't re-use them. If a concurrent
+            # start already consumed it, refuse — exactly one start proceeds.
+            if not _consume_stage2_nonce(request_id, expected_nonce):
+                _audit_gate(request_id, 'stage2_nonce_double_consume_refused',
+                            resolved_operator)
+                return {
+                    'stage': 'start_attempt',
+                    'filename': printer_filename,
+                    'blockers': blockers,
+                    'snapshot': None,
+                    'ok': False, 'started': False,
+                    'reason': ("Stage 2 nonce was already consumed by a "
+                               "concurrent start (double-click / retry). Exactly "
+                               "one start proceeds; this one is refused."),
+                }
             _audit_gate(request_id, 'stage2_nonce_verified',
                         resolved_operator,
                         nonce_prefix=stage2_approval_nonce[:8] + '...')
