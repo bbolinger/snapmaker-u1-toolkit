@@ -43,7 +43,7 @@ python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 
 **Step 2 (staged text fallback) — for each `need_input` event (text fallback only; form mode is one screen).**
 
-Order: `parts` (skipped for a single model) → `tool` → `orient` → `supports` → `profile` → `confirm`.
+Order: `parts` (skipped for a single model) → `orient` → `tool` → `preset` → `supports` → `confirm`. (Follow whatever order the workflow actually emits — this is just what to expect.)
 
 1. Surface the event's `prompt` as a bold header, then each option's `label` numbered 1, 2, 3. Nothing else — no paraphrasing, no defaults. Surface a `note` field verbatim, after the options.
 2. For the `orient` prompt: also surface any attached `render` image paths bare, BEFORE the prompt text (not in backticks — the gateway skips those).
