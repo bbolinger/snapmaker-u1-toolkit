@@ -335,6 +335,41 @@ Then restart Hermes (`docker restart hermes-agent-stack` on the typical layout) 
 2. The skill's YOU MUST NOT section names this pattern explicitly. Agents that follow the skill don't do this.
 3. If you catch this, surface it to whoever's driving the agent. The fix is upstream — don't trust agent-written verification.
 
+### Form buttons never render; agent stalls after the thumbnail (local model)
+
+**Symptom:** In **form mode** on a small local model (e.g. `gemma4-26b-64k` via
+Ollama), the agent surfaces the parts thumbnail (or nothing), then just stops —
+no buttons, no prompt. The session strands. In the raw model output you may see
+`finish_reason: stop` with content like `thought\n<channel|>` or a tool call
+leaking as plain text (`form{form_schema:{...<|"|>...}`).
+
+**Cause:** An Ollama gemma4 tool-call parser bug — the model's tool call leaks
+into message content as raw template tokens instead of being parsed as a tool
+call, so the agent thinks the model just sent a normal reply and stops. Ollama
+issues [#15539](https://github.com/ollama/ollama/issues/15539),
+[#15798](https://github.com/ollama/ollama/issues/15798),
+[#15943](https://github.com/ollama/ollama/issues/15943). It gets worse the
+larger the tool call, and worse at high temperature.
+
+**Fix:** See [Local model & serving requirements](README.md#local-model--serving-requirements-form-mode--button-ux) — the short version:
+
+1. **Ollama 0.31.1+** (0.30.x has the parser bug).
+2. **Run the model at temperature ~0.2** for tool turns (Gemma's default `1` is
+   only ~2/3 reliable). Make a low-temp variant of the same weights:
+   ```bash
+   printf 'FROM gemma4-26b-64k:latest\nPARAMETER temperature 0.2\nPARAMETER num_ctx 65536\n' \
+     | ollama create gemma4-26b-64k-tool -f -
+   ```
+   and point your agent at it.
+3. Keep the bundled `u1-form` plugin current — the toolkit already sends only a
+   short `form_id` (not the full nested schema) precisely so small models don't
+   choke reproducing it.
+
+**Immediate workaround (no serving changes):** re-run the same kit command with
+`--interaction-mode text` — the staged one-question-per-turn flow uses only
+simple `terminal` calls, which small models handle reliably.
+
+
 ---
 
 ## Filing issues

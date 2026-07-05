@@ -19,6 +19,24 @@ import u1_kit_workflow as kw
 import u1_request
 
 
+@pytest.fixture(autouse=True)
+def _fake_stage2_gate(monkeypatch):
+    """_action_start now RUNS the Stage-2 gate as a subprocess (the model no
+    longer relays the token+nonce command). Mock it so unit tests never contact
+    Moonraker or block for the grace window. Returns a dict tests can inspect."""
+    calls = {}
+
+    def _fake(gate_py, argv, out_dir):
+        calls["argv"] = list(argv)
+        calls["cmd"] = " ".join(argv)
+        out = json.dumps({"stage": "start_attempt", "ok": True,
+                          "started": True, "blockers": []})
+        return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake)
+    return calls
+
+
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def _seed_request(tmp_path: Path, request_id: str, **overrides):
@@ -103,7 +121,9 @@ def test_action_start_first_call_emits_bed_clear_start_need_input(
                               json_events=False, bed_clear_confirmed=False)
     assert result["phase"] == "awaiting_bed_clear_start"
     assert "prompt" in result
-    assert "yes/no" in result["prompt"]
+    # v2.2 one-decision wording: YES starts, NO keeps it uploaded; no request-id.
+    assert "YES to start" in result["prompt"] and "NO to keep" in result["prompt"]
+    assert "u1_test_first_call" not in result["prompt"]
     # Verify pending object persisted
     state = u1_request.read_request("u1_test_first_call")
     pending = state.get("safety", {}).get("pending_bed_clear_start")
@@ -142,7 +162,7 @@ def test_action_start_second_call_refuses_mismatched_gcode_hash(
     assert any("gcode_hash mismatch" in r for r in result["reasons"])
 
 
-def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
+def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests, _fake_stage2_gate):
     """Happy path: pending matches + hash matches + phase matches → emits
     Stage 2 command that includes --stage2-approval-nonce; pending is
     consumed; safety.stage2_approval_nonce is persisted."""
@@ -153,11 +173,14 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
     pn = (u1_request.read_request(rid)["safety"]
           ["pending_bed_clear_start"]["nonce"])
     result = kw._action_start(None, rid, False, bed_clear_confirmed=True,
-                              pending_nonce=pn)
-    assert result["phase"] == "awaiting_print_start"
-    cmd = result["command"]
-    assert "--bed-clear start" in cmd
-    assert "--stage2-approval-nonce" in cmd
+                              pending_nonce=pn, )
+    # The workflow RUNS the gate itself now — the model never relays it.
+    assert result["phase"] == "print_started"
+    assert result["started"] is True
+    gate_argv = _fake_stage2_gate["argv"]
+    assert "--bed-clear" in gate_argv and "start" in gate_argv
+    assert any(a.startswith("--stage2-approval-nonce=") for a in gate_argv)
+    assert any(a.startswith("--approval-token=") for a in gate_argv)
     # pending is consumed
     state = u1_request.read_request(rid)
     assert state["safety"].get("pending_bed_clear_start") is None
@@ -167,6 +190,23 @@ def test_action_start_second_call_success_mints_stage2_nonce(sandbox_requests):
     assert binds["request_revision"] == 1
     assert binds["gcode_hash"] == "sha256:abc123"
     assert binds["prompt_key"] == "bed_clear_start"
+
+
+def test_action_start_grace_in_progress_when_gate_detaches(sandbox_requests, monkeypatch):
+    """When the gate is still running (grace window) after the bounded pre-grace
+    wait, _invoke_stage2_gate returns None and _action_start reports
+    grace_in_progress — the gate runs detached; the tool call must NOT block the
+    full ~120s (it times out at 60s and kills the gate — live 2026-07-04)."""
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", lambda gate_py, argv, out_dir: None)
+    rid = "u1_test_grace"
+    _seed_request(sandbox_requests, rid)
+    kw._action_start(None, rid, False, bed_clear_confirmed=False)
+    pn = u1_request.read_request(rid)["safety"]["pending_bed_clear_start"]["nonce"]
+    result = kw._action_start(None, rid, False, bed_clear_confirmed=True, pending_nonce=pn)
+    assert result["phase"] == "grace_in_progress"
+    assert result["started"] is None
+    # nonce was still minted (the gate got it)
+    assert u1_request.read_request(rid)["safety"].get("stage2_approval_nonce")
 
 
 def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys):
@@ -190,7 +230,7 @@ def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys)
     assert need["approval_prompt_key"] == "bed_clear_start"
     assert need["requires_fresh_operator_bed_clear"] is True
     assert "next_command_on_yes" in need
-    assert "--bed-clear-confirmed" in need["next_command_on_yes"]
+    assert "--confirm-start " in need["next_command_on_yes"]
     assert need["next_command_on_no"] is None
 
 
@@ -1371,10 +1411,12 @@ def test_action_start_confirm_without_pending_nonce_refused(sandbox_requests):
     assert any("nonce" in r for r in result["reasons"])
 
 
-def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys):
-    """The emitted next_command_on_yes must include --pending-nonce so the
-    copy-verbatim contract is mechanically enforced, not just documented."""
-    import io, json as _json
+def test_action_start_yes_command_uses_short_confirm_token(sandbox_requests, capsys):
+    """The emitted next_command_on_yes is a SHORT `--confirm-start <token>`
+    (a 26B model mangled the old ~200-char verbatim command). The token maps
+    to this request; the single-use nonce it fronts for still does the auth."""
+    import re as _re, json as _json
+    import u1_form
     rid = "u1_test_nonce_cmd"
     _seed_request(sandbox_requests, rid)
     kw._action_start(None, rid, True, yes_command="python3 kit.py --action start --bed-clear-confirmed",
@@ -1382,9 +1424,11 @@ def test_action_start_yes_command_carries_pending_nonce(sandbox_requests, capsys
     out = capsys.readouterr().out
     evs = [_json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
     need = next(e for e in evs if e.get("stage") == "need_input")
-    pn = (u1_request.read_request(rid)["safety"]
-          ["pending_bed_clear_start"]["nonce"])
-    assert f"--pending-nonce {pn}" in need["next_command_on_yes"]
+    cmd = need["next_command_on_yes"]
+    assert "--confirm-start " in cmd and "--pending-nonce" not in cmd
+    tok = _re.search(r"--confirm-start (\S+)", cmd).group(1)
+    assert u1_form.resolve_confirm_token(tok, consume=False) == rid
+    assert u1_request.read_request(rid)["safety"]["pending_bed_clear_start"]["nonce"]
 
 
 def test_manual_bed_check_refused_when_camera_verification_available(sandbox_requests):

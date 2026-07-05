@@ -19,22 +19,22 @@ hardware. See the [CHANGELOG](CHANGELOG.md).
 
 ## What This Is
 
-A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I have a zip of twelve STLs" — into a staged, auditable, operator-gated print job:
+A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I have a zip of twelve STLs" — into an auditable, operator-gated print job. **A single STL and a multi-part kit run the same flow** (a lone model is just a kit of one). On a tool-capable model the plan is collected in **one native button form**; on a small local model it falls back to a typed one-liner — the *safety boundary is identical either way*:
 
 1. **Triage** the model (dimensions, triangle count, mesh validity)
 2. **Orient** it — show both as-authored and Orca's auto-orient, with the real mesh-topology verdict (`floating cantilever` / `clean` / overhang layer fraction) so the operator picks based on Orca's actual call, not a face-angle approximation
 3. **Tool / filament / preset / supports** — surface live U1 state (what's actually loaded), recommend, never assume
 4. **Slice** through OrcaSlicer with the chosen profile, T0→T<chosen> rewriting, Snapmaker thumbnail injection, real Orca warnings surfaced
-5. **Preview** — show the slice render + footprint dimensions + slicer warnings
+5. **Preview — two corroborating views**: a top-down footprint traced from the *sliced gcode* (the real toolpath) and an isometric 3D render of the *actual arranged, oriented parts*. Built from different sources, so if they agree you're seeing the truth; plus footprint dimensions + real Orca warnings
 6. **Upload** to the U1's Moonraker storage with `print=false` (file lands; printer does NOT start)
 7. **Bed-clear photo** captured fresh by the U1's onboard camera, surfaced to the operator
-8. **Explicit operator approval** — yes/no on the real bed photo
+8. **One explicit bed-clear decision** — yes/no on the *fresh* bed photo (yes starts; no keeps the gcode staged, doesn't print)
 9. **Start** — only after approval, only via a token handed off from the photo step (30-min TTL)
-10. **Monitor** — first-layer photo, last-layer check, completion
+10. **Monitor** — first-layer photo (the earliest real tell a print is about to fail), last-layer check, completion — see [Always-on print monitoring](#always-on-print-monitoring--no-agent-required)
 
 Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
 
-### Multi-part kits (v2.1.0)
+### Multi-part kits + the unified flow (v2.2)
 
 Send a **zip of STLs** — the common Printables shape — and the kit workflow
 takes it from there:
@@ -42,10 +42,13 @@ takes it from there:
 1. **Ingest** every part (footprints measured, oversized parts flagged, hostile
    archives refused with a clean error instead of a crash)
 2. **One consolidated decision form** — parts, orientation, tool, material,
-   profile, supports, action — answered in a single line, in any order.
-   **A script parses and validates the answer; the model never interprets it.**
-   Conflicting or ambiguous input fails loudly with a re-prompt, never a
-   silent guess.
+   profile, supports. On a tool-capable model it renders as **native buttons**
+   (one submit); on a small model, a typed one-liner in any order. Either way
+   **a script parses and validates the answer; the model never interprets it**,
+   and the answer content never rides through the model — only an opaque form
+   id it can't corrupt. Conflicting or ambiguous input fails loudly, never a
+   silent guess. For a single model, Orca's real orientation verdict rides in
+   the form so you pick the pose Orca actually prefers.
 3. **Arrange + slice** onto as many plates as the bed needs, with a
    gcode-extent guard that refuses any plate whose extrusion would leave the
    bed (built from a real incident, not a hypothetical)
@@ -57,6 +60,20 @@ The operator's confirm rides on a single-use nonce baked into the emitted
 command, so even the agent relaying your answers can't hand-assemble its way
 past the boundary. A single STL is just a kit of one — same entrypoint,
 auto-detected.
+
+## Always-on print monitoring — no agent required
+
+The start decision needs an LLM + your explicit approval. **Watching the print once it's running does not** — that part is three quiet cron jobs, no agent turn, no LLM in the loop at all.
+
+**Why first-layer specifically matters:** it's the earliest real tell a print is about to fail — bed adhesion problems, warping, a shifted part, wrong Z-offset all show up in the first few layers, long before you'd otherwise notice. A last-layer photo confirms it finished; a first-layer photo is the one that could actually save you hours of wasted filament and time if you catch it early.
+
+| Job | Cadence | What it does |
+|---|---|---|
+| `u1_last_layer_watch.py` | every 1 min | Snaps a photo at **first-layer** (layers 2–5, the bed-adhesion check), at **last-layer** (final ~6 layers), and after a **pause/resume** (an extra confidence check). Delivers each straight to Telegram. Auto-dims the cavity LED a few minutes after the job completes/errors/cancels. |
+| `u1_print_watchdog.py` | every 5 min | Silent health poll across *any* active U1 print, not just Hermes-started ones. Alerts once per distinct issue, with cooldown so it never spams. |
+| `u1_print_history.py` | every 5 min | Appends to a durable print ledger. |
+
+All three run in Hermes' `no_agent` cron mode — a plain script invocation with no persona and no model call, so there's nothing for a weak or a strong model to get wrong, and nothing that can fabricate a milestone that didn't happen (the photo either exists or the job says nothing). They watch *every* active print, whether it was started through this toolkit, the Snapmaker app, or anything else touching the same Moonraker.
 
 ## What This Is Not
 
@@ -140,6 +157,7 @@ Every operator decision is concrete and tied to a specific artifact:
 | Upload | Three options: upload-only / upload+start gate / cancel |
 | Filename collision | Three options: timestamped rename / overwrite / cancel |
 | Kit decisions (v2.1.0) | One consolidated form (parts / orient / tool / material / profile / supports / action) — script-parsed, echoed back verbatim for confirmation before anything slices |
+| Pre-print review (v2.2) | A `review.md` flight plan generated from the sliced gcode's own config block: what will print, the ~12 settings that matter, your decisions and overrides — bound to the plan's revision + hash so what you read is what prints |
 | **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. The operator types yes/no. Default is no. |
 
 If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
@@ -237,6 +255,51 @@ Operator-facing change: every approval question now includes the `request_id` ve
 - `numpy` + `Pillow` — installed via `requirements.txt`
 - [OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary (extracted AppImage path is fine; full install steps in [Headless slicing setup](#headless-slicing-setup-no-gui--scripted))
 - Network reachability from your host to your U1's Moonraker port (default `7125`)
+
+### Local model & serving requirements (form mode / button UX)
+
+The button-based **form mode** (the rich Telegram UX in the demo) asks the local
+model to emit one tool call. Small local models are inconsistent at tool-calling,
+so form mode has hard serving requirements — verified end-to-end on
+`gemma4-26b-64k` via [Ollama](https://ollama.com/) on an NVIDIA Quadro P6000:
+
+- **Ollama 0.31.1 or newer.** Ollama 0.30.x has a gemma4 tool-call parser bug
+  ([#15539](https://github.com/ollama/ollama/issues/15539),
+  [#15798](https://github.com/ollama/ollama/issues/15798),
+  [#15943](https://github.com/ollama/ollama/issues/15943)): the model's tool
+  call leaks into the message *content* as raw template tokens (`<|channel|>`,
+  `<|"|>`), the parser misses it, `finish_reason` is `stop`, and the agent
+  stalls with no buttons.
+
+- **Run the model at low temperature (~0.2) for tool turns.** Gemma's default
+  Modelfile ships `temperature 1`, which is unreliable for tool calls (~2 of 3
+  succeed in testing — one run in three strands the operator). A temp-0.2 variant
+  is 3 of 3. Create one (it shares the same weights blob — no extra disk):
+
+  ```bash
+  printf 'FROM gemma4-26b-64k:latest\nPARAMETER temperature 0.2\nPARAMETER num_ctx 65536\n' \
+    | ollama create gemma4-26b-64k-tool -f -
+  ```
+
+  then point your agent's model at `gemma4-26b-64k-tool`.
+
+- **The toolkit already does its part.** The `kit_form` event carries only a short
+  `form_id`; the full form definition is persisted to disk and loaded by the form
+  plugin, so the model never has to reproduce a large nested schema in its tool
+  call (what small models fail at). Nothing to configure — just don't downgrade
+  the bundled `u1-form` plugin.
+
+All three are needed together: on 0.30.8 the model failed even with the flat
+`form_id` call; on 0.31.1 the flat call works, but only at low temperature is it
+reliable. If tool calls still fail, fall back to **text mode**
+(`--interaction-mode text`) — the staged one-question-per-turn flow uses only
+simple `terminal` calls that even small models handle reliably.
+
+> **Hardware note (Pascal / older GPUs).** Ollama 0.31's `cuda_v13` runtime
+> dropped Pascal (compute capability 6.1); it falls back to the bundled
+> `cuda_v12`, so a P6000 / GTX-10-series still works today — but a future Ollama
+> that drops `cuda_v12` would break it. Benign `driverInitFileInfo ... result=11`
+> lines at startup are that fallback, not a failure.
 
 ### Install
 

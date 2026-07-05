@@ -50,7 +50,7 @@ EXPIRES_AT="$(python3 -c "from datetime import datetime, timezone, timedelta; im
 CODE="${U1_REQUEST_ID: -6}"
 
 if [[ -f "${HOOK_RECEIPT}" ]]; then
-    CANCEL_LINE="Reply **CANCEL** to abort (or \`cancel ${CODE}\` to target just this print). Ignore this to let the print start."
+    CANCEL_LINE="Reply **CANCEL** to abort. Ignore this to let the print start."
 else
     CANCEL_LINE="⚠️ Reply-to-cancel hook NOT detected on this host (run tools/install_hermes_cancel_hook.sh). To abort, SSH: touch '${U1_CANCEL_MARKER}'"
 fi
@@ -59,7 +59,6 @@ read -r -d '' MSG <<EOF || true
 ⚠️ Snapmaker U1 print starting in ${U1_GRACE_SECONDS}s
 
 File:     ${U1_FILENAME}
-Request:  ${U1_REQUEST_ID}
 
 ${CANCEL_LINE}
 EOF

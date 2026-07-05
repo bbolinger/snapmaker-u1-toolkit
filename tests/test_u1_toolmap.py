@@ -133,3 +133,86 @@ def test_load_material_map_with_non_object_root_fails_closed(tmp_path, capsys):
     bad.write_text("[]")
     mmap = u1_toolmap.load_material_map(bad)
     assert all(t["material"] == "unknown" for t in mmap["tools"].values())
+
+
+# --------------------------------------------------------------------------- #
+# load_head_options — merged head/material screen source (v2.2.1)
+# --------------------------------------------------------------------------- #
+
+def _write_toolmap(data_dir, tools):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "latest_toolmap.json").write_text(json.dumps({"tools": tools}))
+
+
+def test_load_head_options_reads_printer_reported(tmp_path):
+    _write_toolmap(tmp_path, {
+        "extruder":  {"printer_reported": {"material": "PETG", "color_rgba": "FFFFFFFF", "exists": True, "vendor": "Generic"}},
+        "extruder1": {"printer_reported": {"material": "PETG", "color_rgba": "000000FF", "exists": True}},
+        "extruder2": {"printer_reported": {"material": "PLA",  "color_rgba": "F78E0EFF", "exists": True, "vendor": "Polymaker"}},
+        "extruder3": {"printer_reported": {"material": "unknown", "exists": True}},
+    })
+    heads = u1_toolmap.load_head_options(data_dir=tmp_path)
+    tools = [h["tool"] for h in heads]
+    assert tools == ["T0", "T1", "T2"]         # unknown head T3 not offered
+    assert heads[0]["material"] == "PETG" and heads[0]["color"] == "white"
+    assert heads[1]["color"] == "black"
+    assert heads[2]["material"] == "PLA" and heads[2]["color"] == "orange"
+
+
+def test_load_head_options_skips_empty_heads(tmp_path):
+    _write_toolmap(tmp_path, {
+        "extruder":  {"printer_reported": {"material": "PLA", "color_rgba": "FFFFFFFF", "exists": True}},
+        "extruder1": {"printer_reported": {"material": "PETG", "exists": False}},   # not loaded
+        "extruder2": {"printer_reported": {"material": "", "exists": True}},        # unknown
+    })
+    heads = u1_toolmap.load_head_options(data_dir=tmp_path)
+    assert [h["tool"] for h in heads] == ["T0"]
+
+
+def test_load_head_options_missing_toolmap_returns_empty(tmp_path):
+    # No file → [] so the form falls back to generic tool+material fields.
+    assert u1_toolmap.load_head_options(data_dir=tmp_path) == []
+
+
+# ── Enforcement-layer tests (2026-07-05) ─────────────────────────────────────
+# The tests above verify summarize() DETECTS gates. But the live bug was that
+# main() returned exit 0 REGARDLESS of gates, and run_tool_gate() keys purely on
+# `returncode == 0` — so a detected mismatch (sliced PETG, loaded PLA) sailed
+# through as "safe" and the print started. These test the ENFORCEMENT layer:
+# a blocking gate MUST produce a non-zero exit code.
+
+def _run_main(monkeypatch, tmp_path, requested, intended, e1_material="PETG"):
+    monkeypatch.setattr(u1_toolmap, "query_u1",
+                        lambda *a, **k: _fake_printer_raw(e1_material=e1_material))
+    monkeypatch.setattr(u1_toolmap, "get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(u1_toolmap, "_default_map_path", lambda: tmp_path / "map.json")
+    (tmp_path / "map.json").write_text(json.dumps(_material_map(material="PETG")))
+    argv = ["u1_toolmap.py", "--host", "x", "--port", "1",
+            "--requested-material", requested, "--intended-tool", intended]
+    monkeypatch.setattr("sys.argv", argv)
+    return u1_toolmap.main()
+
+
+def test_main_exits_nonzero_when_gate_blocks(monkeypatch, tmp_path):
+    """The bug: main() returned 0 even with a blocking gate, so run_tool_gate
+    (returncode-keyed) treated a real PLA-vs-PETG mismatch as PASSED."""
+    rc = _run_main(monkeypatch, tmp_path, requested="PLA", intended="extruder1",
+                   e1_material="PETG")
+    assert rc != 0, "a blocking material gate MUST exit non-zero so run_tool_gate refuses"
+
+
+def test_main_exits_zero_when_material_matches(monkeypatch, tmp_path):
+    """Legit prints (requested == loaded) must still pass, or every start breaks."""
+    rc = _run_main(monkeypatch, tmp_path, requested="PETG", intended="extruder1",
+                   e1_material="PETG")
+    assert rc == 0
+
+
+def test_main_exits_zero_for_plain_probe_no_request(monkeypatch, tmp_path):
+    """A read-only probe (no --requested-material) has no gate and must exit 0."""
+    monkeypatch.setattr(u1_toolmap, "query_u1", lambda *a, **k: _fake_printer_raw())
+    monkeypatch.setattr(u1_toolmap, "get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(u1_toolmap, "_default_map_path", lambda: tmp_path / "map.json")
+    (tmp_path / "map.json").write_text(json.dumps(_material_map()))
+    monkeypatch.setattr("sys.argv", ["u1_toolmap.py", "--host", "x", "--port", "1"])
+    assert u1_toolmap.main() == 0

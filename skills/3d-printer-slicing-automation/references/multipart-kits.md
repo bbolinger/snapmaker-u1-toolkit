@@ -15,6 +15,18 @@ action).
 - **Relay their reply VERBATIM** into `--form-answers '<their line>'` on the
   command in `next_command`. Do NOT interpret, reorder, or normalize it — the
   script parses it. One quoted line.
+- **Form mode (v2.2, buttons):** when the `kit_form` event carries
+  `form_schema` + `form_id`, pass the schema to the form tool. When the
+  tool result says the answers file was written, tool-call the event's
+  `next_command` (it carries `--form-answers-from=<form_id>`) VERBATIM.
+  Never read, restate, or reconstruct the answers — you never had them.
+- **Form timeout/failure fallback:** if the form tool returns `_timeout`,
+  `cancelled`, or an error, re-run the SAME `u1_kit_workflow.py` command
+  with `--interaction-mode text` appended — the workflow then drives the
+  staged one-question-per-turn flow (parts → orient → tool → material →
+  profile → confirm). NEVER paste the event's `form`/`text_fallback` block
+  into the chat as a single message, and never ask every field at once —
+  the operator gets ONE question per turn, always.
 - The operator answers all fields at once in any order, e.g.:
   `parts 1,3 | auto | T0 | PLA | profile 2 | no-supports | start`
   - `parts`: `all`, or `1,3,5`, or a range `1-4`
@@ -27,7 +39,9 @@ If the answer doesn't validate, the workflow emits `form_rejected` with
 `errors` + the form again — show the errors and ask once more. Never guess.
 
 After a valid answer the workflow slices all selected parts onto plate(s),
-uploads them, and emits `kit_readiness_card`. The card's `parsed_echo`
+uploads them, and emits `kit_readiness_card` (preceded by a `review_doc`
+event — attach its `path` so the operator can read the flight plan before
+answering). The card's `parsed_echo`
 ("I read: …") is what the operator confirms — surface it.
 
 ## Trigger 2 — the photo gate (plate 1 only)

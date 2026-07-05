@@ -113,7 +113,7 @@ if __name__ == '__main__':
     _ensure_compat_python()
 
 # === After env check passes, do the rest of the imports ===
-import argparse, json, re, shutil, time
+import argparse, json, re, time
 from typing import Any
 
 HERE=Path(__file__).resolve().parent
@@ -123,13 +123,9 @@ sys.path.insert(0, str(HERE)); sys.path.insert(0, str(TOOLS))
 from _stl_render import parse_stl, bbox  # type: ignore
 from u1_orient import orient_model, DEFAULT_ORCA, orca_env
 from u1_profile_picker import list_profiles
-from u1_material_picker import query_material_options, status_to_options
 from u1_upload_gcode import parse_gcode_metadata
-from u1_print_start_gate import build_stage1_command
-from render_slice_review import render_slice_review, pick_recommended_orient
 import u1_profile_picker as upp
 from render_slice_review import first_layer_bbox as parse_first_layer_bbox
-import u1_request
 import u1_audit
 
 
@@ -444,6 +440,53 @@ def _decide_orient_recommendation(
     if source_draft.get('overhang_pct', 100.0) <= auto_draft.get('overhang_pct', 100.0):
         return 'asauthored'
     return 'auto'
+
+
+def orient_verdict(model: Path, out_dir: Path, production_process: Path,
+                   filament: Path, down_vec: Any = None,
+                   orca_bin: Path = DEFAULT_ORCA) -> dict[str, Any]:
+    """Shared single-model orientation verdict — the "fancy bit".
+
+    Draft-slices the as-authored pose and — ONLY when that pose has overhangs —
+    the auto-oriented pose, then returns Orca's real recommendation + a
+    plain-language note. Data-driven (proven 2026-07-03: on a floating-regions
+    model this catches 3%→0% and flips the recommendation to auto). Both the
+    single-model path and the unified kit-of-1 path call this so the verdict is
+    one source of truth. Never raises. Returns::
+
+        {'recommendation': 'auto'|'asauthored',
+         'note': str|None, 'ok': bool, 'error': str (only when not ok)}
+    """
+    try:
+        src_res = orient_model(model, out_dir, orient='asauthored', down_vec=None)
+        source_stl = out_dir / 'source.stl'
+        Path(src_res['oriented_stl']).rename(source_stl)
+        auto_stl = source_stl
+        auto_res = orient_model(model, out_dir, orient='auto', down_vec=down_vec)
+        cand = out_dir / 'auto_oriented.stl'
+        Path(auto_res['oriented_stl']).rename(cand)
+        if _bboxes_differ(source_stl, cand):
+            auto_stl = cand
+        fil = _materialize_flat_filament(filament, out_dir)
+        source_draft = _draft_slice_analysis(
+            source_stl, out_dir, production_process, fil, orca_bin=orca_bin)
+        auto_draft = None
+        skip_reason: str | None = None
+        # Cheap-when-it-can-be: only draft the SECOND pose when the first has
+        # overhangs worth fixing (a clean source needs no comparison).
+        if source_draft.get('clean'):
+            skip_reason = 'source_clean'
+        elif auto_stl == source_stl:
+            skip_reason = 'auto_identical'
+        else:
+            auto_draft = _draft_slice_analysis(
+                auto_stl, out_dir, production_process, fil, orca_bin=orca_bin)
+        rec = _decide_orient_recommendation(source_draft, auto_draft)
+        note = _compose_orient_note(source_draft, auto_draft, skip_reason)
+        return {'recommendation': rec, 'note': note, 'ok': True}
+    except Exception as e:  # never break the caller's flow over an analysis miss
+        return {'recommendation': 'asauthored', 'note': None, 'ok': False,
+                'error': f'{type(e).__name__}: {e}'[:200]}
 
 
 # =============================================================================
@@ -1495,944 +1538,37 @@ def run_workflow(args)->dict[str,Any]:
                                   'operator.')},
                  args.json_events)
             return {'phase': 'kit_detection_failed', 'model': str(model)}
-    if _is_kit:
-        # Carry invocation context into the kit command. --operator is baked
-        # ONLY when explicit on this CLI (env-resolved identity stays
-        # env-resolved, replay-safe) — this keeps a test-flavored operator
-        # sticky across the whole kit chain (Fence 1).
-        _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
-                    f'{_shell_quote(str(model))} --json-events')
-        _cli_op = getattr(args, 'operator', None)
-        if _cli_op:
-            _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
-        _nozzle = getattr(args, 'nozzle', None)
-        if _nozzle and str(_nozzle) != '0.4':
-            _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
-        emit({'stage': 'kit_detected',
-              'reason': 'Archive contains multiple STLs — this is a multi-part kit.',
-              'command': _kit_cmd,
-              'instruction': ('Run this command via terminal. The kit workflow '
-                              'walks the operator through a staged Q&A '
-                              '(parts → orient → tool → material → profile → '
-                              'supports → confirm) — each turn emits one '
-                              'need_input event with the next CLI flag baked '
-                              'into its options. Follow the per-field staging '
-                              'pattern the same way the single-STL workflow '
-                              'does (Step 2 of the skill).')},
-             args.json_events)
-        return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
-    # v2.0 Phase 2: Print Request Objects. Every invocation resolves a
-    # request_id (explicit --request-id, recovery via content hash, or
-    # fresh). Output lands in <data_dir>/requests/<request_id>/ by default;
-    # --out-dir is preserved as a legacy escape hatch for tests + direct CLI
-    # use that wants a specific output location. Either way, the workflow
-    # writes request.json so the request object is the source of truth.
-    request_id, was_resumed = u1_request.resolve_request_id(
-        cli_request_id=getattr(args, 'request_id', None),
-        cli_fresh=getattr(args, 'fresh', False),
-        stl=model,
-    )
-    # Pin the resolved id back onto args so _cmd_prefix picks it up for
-    # every emitted next_command — chained invocations all target the same
-    # on-disk request, no recovery lookup needed on subsequent turns.
-    args.request_id = request_id
+    # v2.2 UNIFIED FLOW: every model routes to the kit workflow. A single STL is
+    # a kit-of-1 — the kit workflow ingests a lone STL as one part, and Phase 1
+    # gave it the single-model orientation verdict — so it handles single AND
+    # multi with one code path (button form → one bed-clear decision → detached
+    # gate). The staged single-STL flow below is retired (delegation is now
+    # unconditional). --operator is baked ONLY when explicit on this CLI so a
+    # test-flavored operator stays sticky across the chain (Fence 1);
+    # env-resolved identity stays env-resolved (replay-safe).
+    _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
+                f'{_shell_quote(str(model))} --json-events')
+    _cli_op = getattr(args, 'operator', None)
+    if _cli_op:
+        _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
+    _nozzle = getattr(args, 'nozzle', None)
+    if _nozzle and str(_nozzle) != '0.4':
+        _kit_cmd += f' --nozzle {_shell_quote(str(_nozzle))}'
+    _reason = ('Archive contains multiple STLs — a multi-part kit.' if _is_kit
+               else 'Single model — the unified workflow handles it as a kit of one.')
+    emit({'stage': 'kit_detected',
+          'reason': _reason,
+          'command': _kit_cmd,
+          'instruction': ('Run this command via terminal. It drives the whole '
+                          'job: it emits a form to fill (button UX) — or a '
+                          'need_input to answer in the text fallback — then a '
+                          'plate preview + a fresh bed photo + ONE bed-clear '
+                          'decision. Follow its events exactly (per the skill). '
+                          'Do NOT slice, extract, or run any gate command '
+                          'yourself.')},
+         args.json_events)
+    return {'phase': 'kit_redirect', 'command': _kit_cmd, 'model': str(model)}
 
-    # v3a: resolve operator identity. Used for every audit row + every
-    # approval record on this run.
-    operator = _resolve_operator(args)
-
-    if args.out_dir:
-        # argparse already returns Path via type=Path; no re-wrap needed (L6).
-        out_dir = args.out_dir.resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        out_dir = u1_request.ensure_request_dir(request_id)
-
-    # Mirror every emit() to <out_dir>/events.jsonl so harness + agent
-    # have a recoverable audit trail independent of stdout capture.
-    global _EVENTS_FILE
-    _EVENTS_FILE = out_dir / 'events.jsonl'
-
-    # Initial request.json write (idempotent on resume). The workflow updates
-    # this file at every state transition so request.json is the durable view
-    # of "what's been answered so far."
-    _existing = u1_request.read_request(request_id) or {}
-    _request_fields = {
-        'model_file': model.name,
-        'model_path': str(model),
-        'model_hash': u1_request.compute_model_hash(model) if model.exists() else None,
-        'out_dir': str(out_dir),
-        # v3a: stamp the operator on every write so the operator field is
-        # always current (catches the case where one invocation came from
-        # CLI and the next from Telegram against the same request_id).
-        'operator': operator,
-    }
-    # Merge any CLI args the operator has already answered so the request
-    # reflects the latest decision state.
-    for fld in ('orient', 'tool', 'material', 'profile', 'supports', 'upload_decision', 'nozzle'):
-        v = getattr(args, fld, None)
-        if v is not None:
-            _request_fields[fld] = v
-    # MED-2 fix (Phase 2 cold review): only stamp initial phase when there
-    # isn't one already on disk. Phase advances monotonically forward via
-    # the H5 sites below (analysis → sliced → uploaded → awaiting_start_approval),
-    # so unconditionally writing 'analysis' here would clobber a forward
-    # phase on every resume — breaking phase-based skip logic + misleading
-    # any future audit that reads the phase field. (The legacy --fresh path
-    # already generates a new request_id, so _existing is empty there.)
-    if not _existing.get('phase'):
-        _request_fields['phase'] = 'commit' if (args.yes or args.upload_only) else 'analysis'
-    u1_request.write_request(request_id, **_request_fields)
-
-    # Emit the lifecycle event so the agent (and harness scoring) can tell
-    # which path we took.
-    if was_resumed:
-        # L10: hoist dict-comprehension out of f-string for readability.
-        _resumed_answers = {k: _existing.get(k) for k in ('orient', 'tool', 'material', 'profile', 'supports') if _existing.get(k)}
-        emit({
-            'stage': 'request_resumed',
-            'request_id': request_id,
-            'out_dir': str(out_dir),
-            'resumed_from': _existing.get('phase', 'unknown'),
-            'note': (f'Recovered in-flight request {request_id} from disk. '
-                     f'Pre-existing answers: {_resumed_answers}'),
-        }, args.json_events)
-        # v3a: forensic record of the resume (separate from the chatty
-        # agent-facing emit). Captures which phase we resumed from + the
-        # operator who triggered the resume.
-        _audit(request_id, 'request_resumed', operator,
-               resumed_from=_existing.get('phase', 'unknown'),
-               request_revision=_existing.get('request_revision', 1))
-        # Backfill the args with the resumed answers so the rest of the
-        # workflow walks through to the next unanswered prompt.
-        for fld in ('orient', 'tool', 'material', 'profile', 'supports', 'upload_decision', 'nozzle'):
-            if getattr(args, fld, None) is None and _existing.get(fld):
-                setattr(args, fld, _existing[fld])
-
-        # Phase-aware skip (Phase 2 polish): when the prior run reached the
-        # readiness_card and operator just lost agent context, don't re-walk
-        # ANALYSIS → orient → slice → Upload? → collision. All answers are
-        # already on disk and the start_gate command was already issued. Just
-        # re-emit the saved readiness_card + next_action_required and return
-        # so the operator only sees ONE approval prompt instead of three
-        # redundant ones. Gated on all required fields being present; if any
-        # missing, fall through and let the workflow rebuild from scratch.
-        if (_existing.get('phase') == 'awaiting_start_approval'
-                and _existing.get('readiness_card_event')
-                and _existing.get('printer_storage_filename')
-                and _existing.get('start_gate_stage1_command')):
-            _saved_card = dict(_existing['readiness_card_event'])
-            _saved_card['stage'] = 'readiness_card_resumed'
-            _saved_card['resumed_from_phase'] = 'awaiting_start_approval'
-            emit(_saved_card, args.json_events)
-            _saved_next = _existing.get('next_action_required_event')
-            if _saved_next:
-                emit(dict(_saved_next), args.json_events)
-            else:
-                # Backward compat: a prior version stored phase but not the
-                # full next_action payload. Rebuild a minimal one from the
-                # start_gate command so the agent still has an imperative.
-                emit({
-                    'stage': 'next_action_required',
-                    'reason': ('Resumed in-flight request already at the start gate. '
-                               'Run Stage 1 to capture a real bed photo + approval token.'),
-                    'command': _existing['start_gate_stage1_command'],
-                }, args.json_events)
-            # v3a: forensic record that the workflow short-circuited via
-            # the phase-aware resume (skipped Upload?/collision prompts).
-            # MUST include gcode_hash so can_start()'s drift check has a
-            # reviewed_gcode_hash to compare against. Live bug 2026-06-28:
-            # without this, can_start saw None on the audit row and
-            # rejected the start as "gcode regenerated since operator
-            # reviewed" — even though nothing had drifted; the audit row
-            # was just incomplete.
-            _existing_gcode_hash = _existing.get('gcode_hash')
-            if not _existing_gcode_hash:
-                # Fall back to the saved readiness_card_event's gcode_hash
-                # (set at the original readiness_card emit).
-                _existing_gcode_hash = (_existing.get('readiness_card_event') or {}).get('gcode_hash')
-            _audit(request_id, 'readiness_card_replayed_from_resume', operator,
-                   printer_storage_filename=_existing['printer_storage_filename'],
-                   request_revision=_existing.get('request_revision', 1),
-                   gcode_hash=_existing_gcode_hash)
-            return {
-                'phase': 'awaiting_start_approval',
-                'request_id': request_id,
-                'out_dir': str(out_dir),
-                'resumed': True,
-                'start_gate_stage1_command': _existing['start_gate_stage1_command'],
-                'printer_storage_filename': _existing['printer_storage_filename'],
-            }
-    else:
-        emit({
-            'stage': 'request_created',
-            'request_id': request_id,
-            'out_dir': str(out_dir),
-            'note': f'New print request {request_id} created for {model.name}.',
-        }, args.json_events)
-        # v3a: forensic record of new-request creation. model_hash is the
-        # cross-model recovery key (see Phase 2 content-hash design).
-        _audit(request_id, 'request_created', operator,
-               model_file=model.name,
-               model_hash=_request_fields.get('model_hash'))
-
-    # === ANALYSIS PHASE ===
-    # Always create the source-as-authored STL (no rotation applied).
-    # orient_model writes to a fixed 'oriented.stl' in out_dir, so we rename
-    # to 'source.stl' to free that name for the auto-orient pass below.
-    source_res = orient_model(model, out_dir, orient='asauthored', down_vec=None)
-    source_stl = out_dir / 'source.stl'
-    Path(source_res['oriented_stl']).rename(source_stl)
-    emit({'stage':'triage', **triage_stl(source_stl)}, args.json_events)
-
-    # v1.5.2: only emit renders when the operator hasn't picked orient yet
-    # (args.orient is None). Once picked, the renders are operator-noise — they
-    # were the basis for the orient decision; nothing new to look at after.
-    # Gemma4-26b in run 8 surfaced render paths on every turn because the
-    # workflow re-emitted them every call. Source of truth fix: workflow
-    # withholds the emit, agent has nothing to surface.
-    _emit_renders = args.orient is None
-    source_render = out_dir/'source_as_authored.png'
-    source_review = render_slice_review(source_stl, source_render, title='Source mesh — as authored (no rotation)')
-    if _emit_renders:
-        emit({'stage':'render','image':str(source_render),'kind':'source_as_authored',
-              'overhang_area_pct': source_review['overhang_area_pct'],
-              'supports_tier': source_review['supports_tier']}, args.json_events)
-
-    # Auto-orient render: produce + emit when args.orient is None (first call —
-    # operator needs both renders to compare) OR explicit 'auto'. Skip when
-    # 'asauthored' is set — auto-orient never used in that branch.
-    auto_stl: Path = source_stl
-    auto_orient_meta: dict[str, Any] | None = None
-    # Default: recommend auto-orient. When both orientations get rendered
-    # below (bbox-differ case), this may flip to 'asauthored' if the
-    # as-authored pose has a strictly lower supports_tier.
-    recommended_orient = 'auto'
-    recommendation_reason: str | None = None
-    if args.orient in (None, 'auto'):
-        try:
-            auto_res = orient_model(model, out_dir, orient='auto', down_vec=args.down_vec)
-            # Same rename trick — orient_model wrote to oriented.stl; rename so we
-            # don't clobber source on next workflow phase / re-invocation.
-            candidate_auto_stl = out_dir / 'auto_oriented.stl'
-            Path(auto_res['oriented_stl']).rename(candidate_auto_stl)
-            auto_orient_meta = auto_res
-            if _bboxes_differ(source_stl, candidate_auto_stl):
-                auto_stl = candidate_auto_stl
-                auto_render = out_dir/'auto_oriented.png'
-                auto_review = render_slice_review(auto_stl, auto_render, title='Auto-oriented (Orca cost-optimal)')
-                if _emit_renders:
-                    emit({'stage':'render','image':str(auto_render),'kind':'auto_oriented',
-                          'overhang_area_pct': auto_review['overhang_area_pct'],
-                          'supports_tier': auto_review['supports_tier']}, args.json_events)
-                recommended_orient, recommendation_reason = pick_recommended_orient(
-                    source_review['supports_tier'], auto_review['supports_tier'])
-                # Aspect-ratio warning: if auto is dramatically taller than source's smallest axis,
-                # surface a hint that the user might prefer as-authored or a different rotation.
-                src_dims = _bbox_dims(source_stl); auto_dims = _bbox_dims(auto_stl)
-                emit({
-                    'stage':'orient_analysis',
-                    'source_dims_mm': list(src_dims),
-                    'auto_dims_mm': list(auto_dims),
-                    'auto_down_vec': auto_res.get('down_vec'),
-                    'source_overhang_area_pct': source_review['overhang_area_pct'],
-                    'auto_overhang_area_pct': auto_review['overhang_area_pct'],
-                    'source_supports_tier': source_review['supports_tier'],
-                    'auto_supports_tier': auto_review['supports_tier'],
-                    'recommended_orient': recommended_orient,
-                    'recommendation_reason': recommendation_reason,
-                    'note': (
-                        f"Auto picked Z={auto_dims[2]:.0f}mm; source Z={src_dims[2]:.0f}mm. "
-                        f"Auto height is {auto_dims[2]/max(src_dims[2],0.01):.1f}× source — "
-                        "consider as-authored if taller print = unwanted."
-                    ) if auto_dims[2] > src_dims[2] * 1.5 else None,
-                }, args.json_events)
-        except Exception as e:
-            # Auto-orient failed (Orca missing on review host etc.) — fail-soft.
-            # Source is still available; user can choose as-authored or notes.
-            # Flip the orient prompt's default to as-authored so the user
-            # doesn't pick "Auto-orient (recommended)" and re-trigger the same
-            # failure on the next invocation — that's an infinite loop trap.
-            recommended_orient = 'asauthored'
-            recommendation_reason = (
-                f"auto-orient failed ({type(e).__name__}); falling back to "
-                "as-authored — re-picking auto would just re-fail")
-            emit({'stage':'orient_analysis',
-                  'error': f'auto-orient unavailable: {type(e).__name__}: {e}',
-                  'recommended_orient': recommended_orient,
-                  'recommendation_reason': recommendation_reason}, args.json_events)
-
-    # === DECISION PHASE ===
-    # Material options first — query live state if possible, else fall back to supplied.
-    try:
-        mat_opts=query_material_options(requested_material=args.material) if not args.no_live_material else []
-    except Exception:
-        mat_opts=[]
-    if not mat_opts:
-        mat_opts=[{'label':f'{args.tool or "T1"}: {args.material or "PETG"} (supplied/headless)', 'value':args.tool or 'T1', 'material': args.material or 'PETG', 'loaded': None, 'recommended': True}]
-    # History-aware recommendation: ask print_history.json what the user last
-    # printed on this tool/nozzle. The picker uses that to flag the matching
-    # preset as previously_used + dominate the recommendation score. Fail-soft
-    # — empty history is the common new-user case, no need to surface.
-    history_psid = last_used_print_settings_id(tool=args.tool, nozzle=args.nozzle)
-    prof_opts=list_profiles(
-        class_hint=args.class_hint or model.stem,
-        nozzle=args.nozzle,
-        history_print_settings_id=history_psid,
-    )
-    # Cold-review F18 + G16: always emit history_hint with the per-tool
-    # breakdown so the agent has accurate info even when no tool is picked
-    # yet (analysis phase: args.tool is None → history_psid is the
-    # most-recent-ANY-tool, which can mismatch the eventual chosen tool).
-    # tool_filtered tells the agent whether the headline psid was
-    # tool-scoped or any-tool. per_tool gives the full breakdown so the
-    # agent can show the right preset after the user picks Filament.
-    per_tool = last_used_per_tool(nozzle=args.nozzle)
-    if history_psid:
-        installed_match = any(o.get('previously_used') for o in prof_opts)
-        if installed_match:
-            emit({'stage': 'history_hint',
-                  'last_used_print_settings_id': history_psid,
-                  'installed': True,
-                  'tool_filtered': bool(args.tool),
-                  'per_tool': per_tool}, args.json_events)
-        else:
-            emit({'stage': 'history_hint',
-                  'last_used_print_settings_id': history_psid,
-                  'installed': False,
-                  'tool_filtered': bool(args.tool),
-                  'per_tool': per_tool,
-                  'message': (
-                      f"Your last print on this tool/nozzle used preset "
-                      f"{history_psid!r}, but it isn't installed in the picker. "
-                      "Either pick something close from the options, or copy the "
-                      "JSON into profiles/user/ before slicing."
-                  )}, args.json_events)
-    else:
-        emit({'stage': 'history_hint',
-              'last_used_print_settings_id': None,
-              'installed': False,
-              'tool_filtered': bool(args.tool),
-              'per_tool': per_tool,
-              'message': (
-                  "No prior prints recorded for this tool/nozzle in "
-                  "print_history.json. Recommendation falls back to class/height "
-                  "heuristics; surface that to the user instead of inventing a "
-                  "previously-used preset."
-              )}, args.json_events)
-    # Fail-fast for the empty-picker case: better to emit a structured
-    # setup_required event right here than let the workflow stumble into
-    # profile_path's RuntimeError after rendering. The agent surfaces this
-    # to the user with the right "run fetch/extract" guidance.
-    if not prof_opts:
-        emit({
-            'stage': 'setup_required',
-            'kind': 'no_profiles',
-            'message': (
-                "No profiles found in profiles/{from-printer,user,snapmaker-stock}. "
-                "Run `python3 tools/fetch_snapmaker_profiles.py` to bundle Snapmaker's "
-                "official U1 stock, or `python3 tools/extract_profiles_from_printer.py` "
-                "to extract profiles from your printer's recent print history."
-            ),
-            'missing_sources': [str(d) for _, d in upp.DEFAULT_SOURCES if not d.exists()],
-        }, args.json_events)
-        return {'phase': 'setup_required', 'out_dir': str(out_dir)}
-    # Annotate each preset with its supports relationship so the agent can
-    # pre-warn the user before they pick "Add supports" at the next prompt.
-    # 'self' = preset already enables supports (read from JSON's
-    # enable_support field — works for Snapmaker stock + extracted +
-    # community alike); '<name>' = workflow would promote to a same-source
-    # sibling on --supports supports; null = no supports variant available
-    # in the same source.
-    for opt in prof_opts:
-        if opt.get('has_supports'):
-            opt['supports_status'] = 'self'
-        else:
-            opt['supports_status'] = promote_to_supports_variant(opt['value'])
-
-    # Audit #6 (2026-06-25): only emit need_input events at analysis phase.
-    # At commit phase (--yes provided), all answers are in args; re-emitting
-    # the prompts produces stale noise the agent has to filter out.
-    _is_analysis_phase = not (args.yes or args.upload_only)
-    # v1.5.2: compute the per-call script + model path here so they're
-    # visible in both analysis-phase emits AND the COMMIT-phase collision
-    # emit (which is structurally outside _is_analysis_phase).
-    SCRIPT_PATH = str(Path(__file__).resolve())
-    MODEL_PATH = str(model)
-
-    if _is_analysis_phase:
-        # Orientation option enrichment (audit #9): include compact dimensions
-        # + overhang descriptor so the user can decide without re-reading
-        # orient_analysis. Falls back to bare labels when bbox-differ is false.
-        _auto_rec = recommended_orient == 'auto'
-        _as_authored_rec = recommended_orient == 'asauthored'
-
-        # =====================================================================
-        # v1.6 (A) — pre-slice Orca mesh-topology analysis
-        # =====================================================================
-        # Run a fast draft slice (v1.6 v2 settings: production layer_height +
-        # compute-skipping overrides) on the source STL; if source is risky,
-        # also draft auto. Surface the categorized Orca verdict in the orient
-        # need_input's `note` field. See docs/v1.6-design.md for the empirical
-        # evidence backing the draft profile and the clean-case skip.
-        #
-        # Profile-INVARIANCE of warning_message (proven by v1.6 empirical
-        # study) means we can use any sensible default process profile here —
-        # we don't need the operator to have picked one yet. We choose
-        # whichever profile the picker recommends for this model's class.
-        _v16_source_draft = None
-        _v16_auto_draft = None
-        _v16_auto_skip_reason: str | None = None
-        _v16_note_override = None
-        _v16_skipped_reason = None
-        try:
-            _v16_prof_opts = list_profiles(
-                class_hint=args.class_hint or model.stem,
-                nozzle=args.nozzle,
-                history_print_settings_id=None,
-            )
-            _v16_top = next((p for p in _v16_prof_opts if p.get('recommended')),
-                            _v16_prof_opts[0] if _v16_prof_opts else None)
-            if _v16_top is None:
-                _v16_skipped_reason = 'no profiles available (run setup scripts)'
-            else:
-                _v16_prod_proc = Path(_v16_top['path'])
-                _v16_filament_raw = filament_path(args.material or 'PETG', nozzle=args.nozzle)
-                _v16_filament = _materialize_flat_filament(_v16_filament_raw, out_dir)
-                _v16_source_draft = _draft_slice_analysis(
-                    source_stl, out_dir, _v16_prod_proc, _v16_filament,
-                )
-                # Decide whether to also draft auto. Three skip paths:
-                #   1. source.clean  → operator usually wants as-authored
-                #   2. auto identical → Orca found no better rotation
-                #   3. (success)     → draft auto for comparison
-                if _v16_source_draft.get('clean'):
-                    _v16_auto_skip_reason = 'source_clean'
-                elif auto_stl == source_stl:
-                    _v16_auto_skip_reason = 'auto_identical'
-                else:
-                    _v16_auto_draft = _draft_slice_analysis(
-                        auto_stl, out_dir, _v16_prod_proc, _v16_filament,
-                    )
-        except Exception as e:
-            _v16_skipped_reason = f'{type(e).__name__}: {e}'
-
-        if _v16_source_draft is not None:
-            # Override v1.5.x face-angle recommendation with Orca's real verdict.
-            _v16_rec = _decide_orient_recommendation(_v16_source_draft, _v16_auto_draft)
-            _v16_note_override = _compose_orient_note(
-                _v16_source_draft, _v16_auto_draft, _v16_auto_skip_reason,
-            )
-            recommended_orient = _v16_rec
-            _auto_rec = _v16_rec == 'auto'
-            _as_authored_rec = _v16_rec == 'asauthored'
-            emit({
-                'stage': 'orient_analysis_v16',
-                'as_authored': _v16_source_draft,
-                'auto': _v16_auto_draft,  # may be None if skipped
-                'auto_skip_reason': _v16_auto_skip_reason,
-                'recommended_orient': _v16_rec,
-                'note': _v16_note_override,
-            }, args.json_events)
-        else:
-            emit({
-                'stage': 'orient_analysis_v16',
-                'kind': 'skipped',
-                'reason': _v16_skipped_reason or 'unknown',
-                'note': 'pre-slice Orca analysis unavailable; using v1.5 face-angle recommendation',
-            }, args.json_events)
-
-        def _dims_text(stl: Path | None) -> str:
-            if not stl or not stl.exists():
-                return ''
-            try:
-                d = _bbox_dims(stl)
-                return f'{d[0]:.0f}×{d[1]:.0f}×{d[2]:.0f}mm'
-            except Exception:
-                return ''
-
-        _src_dims = _dims_text(source_stl)
-        _auto_dims = _dims_text(auto_stl) if auto_stl != source_stl else ''
-        _src_tier = source_review['supports_tier']
-        _auto_tier = ''
-        try:
-            if auto_stl != source_stl:
-                _auto_tier = (render_slice_review.__wrapped__ if hasattr(render_slice_review, '__wrapped__') else lambda *a, **k: {})  # noqa: F841
-        except Exception:
-            pass
-        # Pull auto_tier from orient_analysis (already computed above) instead
-        # of re-rendering. The orient_analysis event was emitted with this data.
-        # If auto_stl == source_stl, no orient_analysis is emitted; no auto tier.
-        if auto_stl != source_stl and 'auto_review' in dir():
-            _auto_tier = locals().get('auto_review', {}).get('supports_tier', '')
-
-        def _auto_label() -> str:
-            base = 'Auto-orient (recommended)' if _auto_rec else 'Auto-orient'
-            if _auto_dims:
-                base += f' — {_auto_dims}'
-                if _auto_tier:
-                    base += f', {_auto_tier} overhang'
-            return base
-
-        def _as_authored_label() -> str:
-            base = 'As-authored (recommended — lower overhangs)' if _as_authored_rec else 'As-authored'
-            if _src_dims:
-                base += f' — {_src_dims}'
-                if _src_tier:
-                    base += f', {_src_tier} overhang'
-            return base
-
-        # v1.5.2 (2026-06-26): emit ONE need_input at a time — whichever is
-        # still None — with per-option next_command. Workflow is the source
-        # of truth for "what to run next"; agent just copies the string.
-        # Sequential flow: orient → tool/material (paired) → preset → supports → upload.
-        prefix = _cmd_prefix(SCRIPT_PATH, MODEL_PATH, args)
-
-        if args.orient is None:
-            _orient_prompt = {'stage': 'need_input', 'key': 'orient', 'prompt': 'Orientation?', 'options': [
-                {'label': _auto_label(), 'value': 'auto', 'recommended': _auto_rec,
-                 'next_command': f'{prefix} --orient auto'},
-                {'label': _as_authored_label(), 'value': 'asauthored', 'recommended': _as_authored_rec,
-                 'next_command': f'{prefix} --orient asauthored'},
-            ]}
-            # v1.6 (A): if Orca pre-slice analysis succeeded, use its
-            # plain-language note. Otherwise fall back to v1.5's face-angle
-            # recommendation_reason. Both pathways surface as the same `note`
-            # field so the agent's contract doesn't change.
-            if _v16_note_override:
-                _orient_prompt['note'] = _v16_note_override
-            elif _as_authored_rec and recommendation_reason:
-                _orient_prompt['note'] = recommendation_reason
-            emit(_orient_prompt, args.json_events)
-            emit({'stage':'awaiting_input','need':'orient'}, args.json_events)
-            return {'phase':'analysis_complete','out_dir': str(out_dir),'source_stl': str(source_stl),
-                    'source_render': str(source_render),
-                    'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None}
-
-        if args.tool is None or args.material is None:
-            # Tool + material are paired: each option's value is the tool slug
-            # AND carries the material. The next_command sets BOTH flags so the
-            # agent doesn't have to track the material separately.
-            _tool_opts = []
-            for opt in _trim_option_payload(mat_opts):
-                mat = opt.get('material') or 'PETG'
-                tool_v = opt.get('value', 'T1')
-                _tool_opts.append({**opt,
-                                   'next_command': f'{prefix} --tool {tool_v} --material {_shell_quote(mat)}'})
-            emit({'stage':'need_input','key':'tool','prompt':'Toolhead & filament?',
-                  'options':_tool_opts}, args.json_events)
-            emit({'stage':'awaiting_input','need':'tool'}, args.json_events)
-            return {'phase':'analysis_complete','out_dir': str(out_dir),'source_stl': str(source_stl),
-                    'source_render': str(source_render),
-                    'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None}
-
-        if args.profile is None:
-            _preset_opts = []
-            for opt in _trim_option_payload(prof_opts[:8]):
-                slug = opt.get('value', '')
-                _preset_opts.append({**opt,
-                                     'next_command': f'{prefix} --profile {_shell_quote(slug)}'})
-            emit({'stage':'need_input','key':'preset','prompt':'Print preset (process profile)?',
-                  'options':_preset_opts,
-                  'total_available': len(prof_opts),
-                  'truncated': len(prof_opts) > 8,
-                  'note': (
-                      f'Showing the {min(8, len(prof_opts))} highest-scoring presets out of {len(prof_opts)} for this nozzle. '
-                      'You can also type a preset name or substring (e.g. "0.16 fine", "support w", "strength") — the workflow will resolve it. '
-                      'Or reply "list" to see all options.'
-                  ) if len(prof_opts) > 8 else None}, args.json_events)
-            emit({'stage':'awaiting_input','need':'preset'}, args.json_events)
-            return {'phase':'analysis_complete','out_dir': str(out_dir),'source_stl': str(source_stl),
-                    'source_render': str(source_render),
-                    'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None}
-
-        if args.supports is None:
-            emit({'stage':'need_input','key':'supports','prompt':'Supports?','options':[
-                {'label':'Supports','value':'supports',
-                 'next_command': f'{prefix} --supports supports'},
-                {'label':'No supports','value':'no_supports',
-                 'next_command': f'{prefix} --supports no_supports'},
-                {'label':'Ask about overhang','value':'overhangs',
-                 'next_command': f'{prefix} --supports overhangs'},
-            ]}, args.json_events)
-            emit({'stage':'awaiting_input','need':'supports'}, args.json_events)
-            return {'phase':'analysis_complete','out_dir': str(out_dir),'source_stl': str(source_stl),
-                    'source_render': str(source_render),
-                    'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None}
-
-        # All 4 prompts answered, but --yes not set → ask Upload?. Each option
-        # routes through --upload-decision so the post-COMMIT next_action
-        # event knows which path to emit (Stage 1 or just "done").
-        if not (args.yes or args.upload_only):
-            _commit_upload     = f'{prefix} --upload-only --live-upload --yes --upload-decision upload'
-            _commit_with_stage = f'{prefix} --upload-only --live-upload --yes --upload-decision upload_start'
-            emit({'stage':'need_input','key':'upload','prompt':'Upload?','options':[
-                {'label':'Upload only (print=false)','value':'upload','recommended':True,
-                 'next_command': _commit_upload},
-                {'label':'Upload + start gate','value':'upload_start',
-                 'next_command': _commit_with_stage},
-                {'label':'Cancel','value':'cancel',
-                 'next_command': None},
-            ]}, args.json_events)
-
-    # === COMMIT PHASE === (only runs when --yes / --upload-only present)
-    # Without --yes, we exit after DECISION so the agent can collect answers
-    # across user turns without burning a real slice on speculation.
-    if not (args.yes or args.upload_only):
-        emit({'stage':'awaiting_input','note':'no slice performed — re-invoke with --yes plus collected answers'}, args.json_events)
-        return {
-            'phase':'analysis_complete',
-            'out_dir': str(out_dir),
-            'source_stl': str(source_stl),
-            'source_render': str(source_render),
-            'auto_oriented_stl': str(auto_stl) if auto_stl != source_stl else None,
-        }
-
-    # v1.5.2: with None defaults for collected answers, fall back to sane
-    # values in the COMMIT phase so direct-CLI users + tests don't break.
-    if args.supports is None: args.supports = 'no_supports'
-    if args.orient is None: args.orient = 'auto'
-    tool=choose_default(mat_opts, args.tool) or 'T1'
-    material=args.material or mat_opts[0].get('material','PETG')
-    profile=choose_default(prof_opts, args.profile) or '020_strength'
-
-    # P5: fail-fast pre-validation. If the resolved profile slug isn't in
-    # the freshly-listed pickable profiles, surface the mismatch BEFORE
-    # slicing — agents have been known to recommend a preset from chat
-    # memory that's no longer in the picker (e.g. v1.4.x community
-    # profiles moved to examples/). Cheaper to fail here than after a
-    # render + Orca invocation that'll RuntimeError in profile_path().
-    _resolved = upp.normalize_value(str(profile))
-    _all_slugs = {o['value'] for o in list_profiles()}
-    if _resolved not in _all_slugs:
-        nearby = [s for s in _all_slugs if _resolved.split('_')[0] in s][:5]
-        emit({'stage':'setup_required','kind':'profile_not_in_picker',
-              'requested': str(profile), 'resolved_slug': _resolved,
-              'message': (f"profile {profile!r} (slug {_resolved!r}) not found in any source. "
-                          "Likely recommended from history but not currently installed. "
-                          "Either pick a slug from the Preset? need_input event or copy "
-                          "the missing JSON into profiles/user/."),
-              'nearby_slugs': nearby}, args.json_events)
-        return {'phase':'setup_required','out_dir': str(out_dir)}
-
-    # v1.5.1 Supports? plumbing: the user's binary answer wins over the
-    # preset's enable_support state. If user picked 'supports' or 'no_supports'
-    # we materialize a temp process profile JSON with the field overridden
-    # and pass that to Orca instead of the picker's original. If user picked
-    # 'overhangs' (= "ask about overhang"), the workflow can't run the slice
-    # until the agent re-prompts — emit a hint and exit at decision phase.
-    #
-    # The toolkit invokes Orca without a supports CLI flag — supports state
-    # flows through the resolved profile's `enable_support` field. So the
-    # temp profile is the final say on whether the slice has supports.
-    process_path_resolved = profile_path(profile)
-    if args.supports == 'overhangs':
-        emit({'stage':'awaiting_input',
-              'note': ("user picked 'Ask about overhang' — workflow won't slice "
-                       "until the agent surfaces overhang_area_pct + supports_tier "
-                       "from the orient_analysis event, then re-asks Supports? "
-                       "with a concrete supports / no_supports answer.")},
-             args.json_events)
-        return {'phase':'awaiting_user_supports_decision','out_dir': str(out_dir)}
-    if args.supports in ('supports', 'no_supports'):
-        enable = args.supports == 'supports'
-        process_path_resolved = apply_supports_override(process_path_resolved, enable, out_dir)
-        emit({'stage':'supports_override',
-              'enable_support': '1' if enable else '0',
-              'process_path': str(process_path_resolved),
-              'reason': f"user picked '{'Supports' if enable else 'No supports'}' — "
-                       'apply_supports_override materialized a temp profile with '
-                       f'enable_support={"1" if enable else "0"}'},
-             args.json_events)
-
-    chosen_stl = auto_stl if args.orient == 'auto' else source_stl
-    gcode=out_dir/(model.stem.replace(' ','_')+'_plate_1.gcode')
-    # Cold review 2026-06-26: skip re-slicing on collision-resolution re-runs.
-    # First run writes gcode + slice_res.json before exiting at the collision
-    # prompt. Operator picks rename/overwrite, agent re-invokes with
-    # --on-collision <answer> + --out-dir <same_dir>; we reload the cached
-    # slice instead of paying ~50-100s for another Orca call. Force a re-slice
-    # by passing a fresh --out-dir.
-    slice_cache = out_dir / 'slice_res.json'
-    if args.on_collision and gcode.exists() and slice_cache.exists():
-        slice_res = json.loads(slice_cache.read_text())
-        emit({'stage': 'slice_reused',
-              'gcode': str(gcode),
-              'note': ('Skipped re-slicing — reusing artifacts from the prior '
-                       'run that exited at the filename-collision prompt. Pass '
-                       'a fresh --out-dir to force a re-slice.')},
-             args.json_events)
-    else:
-        emit({'stage':'slicing'}, args.json_events)
-        slice_res=real_orca_slice(chosen_stl, gcode, str(tool), str(material), str(profile), nozzle=args.nozzle, process_path_override=process_path_resolved)
-        try:
-            slice_cache.write_text(json.dumps(slice_res, default=str))
-        except Exception:
-            pass  # cache is an optimization — don't break the slice if disk write fails
-    # Surface Orca-emitted slicer warnings (floating cantilever, overhang
-    # regions, etc.) as a discrete event BEFORE the preview render. Same
-    # event shape as the supports plumbing's warning events — kind names
-    # the bucket, messages carries the list. The summary stage still
-    # carries warnings too, for backward-compat with consumers that
-    # already key on it; this event is the "surface prominently" signal
-    # for the agent.
-    if slice_res.get('warnings'):
-        emit({'stage':'warning','kind':'slicer_warning',
-              'messages':list(slice_res['warnings']),
-              'count':len(slice_res['warnings']),
-              'note':("Orca flagged geometric concerns in the sliced output "
-                      "(floating cantilever, overhang region, etc.). Review "
-                      "with the user before they trust the preview.")},
-             args.json_events)
-    preview=out_dir/'preview.png'
-    review=render_slice_review(chosen_stl, preview, gcode=gcode, title='Final preview from oriented STL + G-code')
-    emit({'stage':'render','image':str(preview),'kind':'preview'}, args.json_events)
-    # Write slice_summary.txt — terse text artifact the agent should read
-    # instead of re-parsing the gcode (which inlines thumbnail base64 blobs).
-    summary_path = write_slice_summary(out_dir, slice_res)
-    # P6: derive width/depth (mm) from the raw bbox so the agent doesn't have
-    # to render it as the four-number tuple. bbox = (xmin, xmax, ymin, ymax).
-    _flb = review['first_layer_bbox']
-    _flw = round(_flb[1] - _flb[0], 1) if _flb and len(_flb) >= 2 else None
-    _fld = round(_flb[3] - _flb[2], 1) if _flb and len(_flb) >= 4 else None
-    emit({'stage':'summary',
-          'time':slice_res['time'],
-          'weight_g':slice_res['weight_g'],
-          'warnings':slice_res['warnings'],
-          'first_layer_bbox':_flb,
-          'first_layer_width_mm': _flw,
-          'first_layer_depth_mm': _fld,
-          'summary_file': str(summary_path),
-         }, args.json_events)
-    # H5 fix (Phase 2 cold review): persist sliced state so resume after
-    # context loss doesn't re-run the slice. If the agent loses context
-    # AFTER COMMIT but BEFORE Stage 1, request.json knows the slice
-    # finished + carries the gcode hash for the readiness card to recover.
-    _sliced_gcode_hash = u1_request.compute_model_hash(gcode) if gcode.exists() else None
-    try:
-        u1_request.write_request(
-            request_id,
-            phase='sliced',
-            gcode_path=str(gcode),
-            gcode_hash=_sliced_gcode_hash,
-            estimated_time=slice_res.get('time'),
-            estimated_filament_g=slice_res.get('weight_g'),
-            preview_image=str(preview) if preview.exists() else None,
-        )
-    except Exception:
-        pass  # phase tracking is observability — never break the slice on disk-write failure
-    # v3a: forensic record of slicing completion. gcode_hash is what binds
-    # an approval to this exact output via can_start() in Phase 3b.
-    _audit(request_id, 'slicing_completed', operator,
-           gcode_hash=_sliced_gcode_hash,
-           estimated_time=slice_res.get('time'),
-           estimated_filament_g=slice_res.get('weight_g'))
-    if args.cancel:
-        emit({'stage':'cancelled'}, args.json_events); return {'cancelled': True, 'out_dir': str(out_dir)}
-    if args.upload_only or args.yes:
-        # Audit 2026-06-26: pass the operator's collision-resolution answer
-        # through to the helper. None = no answer yet → helper detects
-        # collision + emits prompt (returncode 5).
-        if not args.live_upload:
-            up = upload_only(gcode, dry_run=True)
-        else:
-            up = _real_upload(gcode, on_collision=args.on_collision,
-                              material=getattr(args, "material", None))
-        emit({'stage':'uploaded', **up}, args.json_events)
-        # H5 fix: persist upload-completed state. If agent loses context now,
-        # request.json says phase='uploaded' so resume routes to Stage 1
-        # (readiness_card recovery) instead of re-running the slice.
-        try:
-            u1_request.write_request(
-                request_id,
-                phase='uploaded',
-                uploaded_filename=up.get('uploaded_filename'),
-                upload_returncode=up.get('returncode'),
-                upload_moonraker_ok=up.get('moonraker_upload_ok'),
-            )
-        except Exception:
-            pass
-        # v3a: forensic record of upload. uploaded_filename is the printer
-        # storage filename Stage 2 will reference; capturing it here ties
-        # the audit trail to whatever Moonraker actually accepted.
-        _audit(request_id, 'upload_completed', operator,
-               uploaded_filename=up.get('uploaded_filename'),
-               moonraker_upload_ok=up.get('moonraker_upload_ok'),
-               dry_run=up.get('dry_run', False))
-        # If the helper detected a collision and no resolution was supplied,
-        # emit a structured need_input prompt + exit so the agent surfaces it.
-        if up.get('cancelled'):
-            # F9: rc=6 from helper means the user explicitly cancelled at the
-            # collision prompt. Emit a cancelled stage event and stop —
-            # don't re-prompt.
-            emit({'stage': 'cancelled',
-                  'reason': up.get('cancelled_reason', 'upload cancelled')},
-                 args.json_events)
-            return {'cancelled': True, 'out_dir': str(out_dir)}
-        if up.get('filename_collision'):
-            # Cold review F3 (2026-06-26): don't pre-compute a timestamp in the
-            # label. The helper picks one at upload time; pre-computing here
-            # would mislead the operator with a name that's not what actually
-            # ends up on the printer.
-            # v1.5.2: collision options carry per-option next_command. The
-            # workflow already wrote slice_res.json to out_dir, so the agent
-            # just runs the option's command — no synthesis, no risk of
-            # missing --out-dir and triggering a wasteful re-slice.
-            _collision_prefix = f'{_cmd_prefix(SCRIPT_PATH, MODEL_PATH, args)} --upload-only --live-upload --yes --upload-decision {args.upload_decision} --out-dir {_shell_quote(str(out_dir))}'
-            emit({
-                'stage': 'need_input',
-                'key': 'filename_collision',
-                'prompt': 'Filename collision?',
-                'options': [
-                    {'label': 'Upload with timestamped name (UTC stamp added at upload time)',
-                     'value': 'rename', 'recommended': True,
-                     'next_command': f'{_collision_prefix} --on-collision rename'},
-                    {'label': f'Overwrite existing {up["target_filename"]}',
-                     'value': 'overwrite',
-                     'next_command': f'{_collision_prefix} --on-collision overwrite'},
-                    {'label': 'Cancel', 'value': 'cancel',
-                     'next_command': None},
-                ],
-                'note': up['human_summary'],
-                'out_dir': str(out_dir),
-                'resume_hint': ('Each option\'s next_command already includes '
-                                '--out-dir + --on-collision. Tool-call verbatim. '
-                                'The workflow will emit slice_reused on the next '
-                                'turn to confirm the cached slice was reused.'),
-            }, args.json_events)
-            return {'phase': 'awaiting_collision_resolution', 'out_dir': str(out_dir)}
-        # Audit #7 (2026-06-25): readiness_card consolidates the final
-        # decision-relevant facts for the agent's pre-start narrative.
-        # Especially: the CHOSEN orientation's overhang tier (not whichever
-        # orientation was scored higher) so the agent surfaces the actual
-        # print-risk for the user's decision, not the abstract one.
-        _chosen_orient_tier = (
-            source_review['supports_tier'] if args.orient == 'asauthored'
-            else (locals().get('auto_review', {}).get('supports_tier') or source_review['supports_tier'])
-        )
-        _chosen_overhang_pct = (
-            source_review['overhang_area_pct'] if args.orient == 'asauthored'
-            else (locals().get('auto_review', {}).get('overhang_area_pct') or source_review['overhang_area_pct'])
-        )
-        # Audit response (round 11): use printer storage filename (basename)
-        # in the start command. Moonraker's /printer/print/start looks up by
-        # storage name, not host path. Passing the host path produced HTTP 400.
-        # Cold review F10 (2026-06-26): if a collision was resolved as rename,
-        # the actual storage name has the timestamp suffix — pull from the
-        # helper's reported uploaded_filename, not the original gcode name.
-        _printer_filename = up.get('uploaded_filename') or gcode.name
-        _tool_idx = slice_res.get('tool_idx', 0)
-        _start_extruder = 'extruder' if _tool_idx == 0 else f'extruder{_tool_idx}'
-        # Phase 3b: pass --request-id on every gate invocation so Stage 1 can
-        # stamp safety.bed_clear_photo_captured and Stage 2 can call
-        # can_start() to verify plan stability. SKILL.md doesn't need to
-        # assemble it from chat memory — it's baked into the command the
-        # workflow emits.
-        #
-        # NB: we deliberately do NOT bake --operator here. The gate resolves
-        # operator from U1_OPERATOR env at execution time. Live harness
-        # regression 2026-06-28: when phase-aware-skip replays an OLD
-        # readiness_card_event from disk, the baked-in --operator from
-        # whenever the card was first written wins over current state. The
-        # env-resolved path is forward-compatible across replays + container
-        # restarts.
-        _stage1_cmd = build_stage1_command(
-            printer_filename=_printer_filename,
-            intended_tool=_start_extruder,
-            material=str(material),
-            request_id=request_id,
-        )
-        # Build the readiness_card payload once, then emit + persist together
-        # so the phase-aware resume short-circuit upstream has the same
-        # event payload to replay verbatim (no re-derivation).
-        _readiness_card_payload = {
-            'stage': 'readiness_card',
-            'orient': args.orient,
-            'orient_supports_tier': _chosen_orient_tier,
-            'orient_overhang_area_pct': _chosen_overhang_pct,
-            'tool': str(tool),
-            'material': str(material),
-            'profile': str(profile),
-            'supports_override': args.supports,
-            'first_layer_width_mm': _flw,
-            'first_layer_depth_mm': _fld,
-            'gcode_host_path': str(gcode),
-            'printer_storage_filename': _printer_filename,
-            'uploaded': up,
-            'start_gate_stage1_command': _stage1_cmd,
-            'next_step_if_starting': (
-                f"Stage 1: run start_gate_stage1_command. The gate captures a "
-                f"REAL bed photo + writes an approval token. Surface the photo "
-                f"to the operator; they say yes/no. If yes, re-run with "
-                f"--bed-clear start --approval-token <token-from-stage-1>."
-            ),
-            'warning_if_overhang_risky': (
-                f"Chosen orientation has {_chosen_overhang_pct:.1f}% overhang ({_chosen_orient_tier} tier). "
-                'Surface this before the start question if no_supports was picked.'
-                if args.supports == 'no_supports' and _chosen_orient_tier in ('heavy', 'very heavy')
-                else None
-            ),
-        }
-        emit(_readiness_card_payload, args.json_events)
-
-        # v1.5.2 (2026-06-26): emit a next_action_required event AFTER the
-        # readiness_card so the agent's flow stays "tool-call the command
-        # the workflow handed me" — same shape as the per-option
-        # next_command in the slice loop. Gemma4-26b skipped Stage 1 in
-        # harness run 6 because the readiness_card was descriptive rather
-        # than imperative. This event is imperative: agent SHOULD just
-        # tool-call command. No synthesis, no decision tree.
-        _next_action_payload = None
-        if args.upload_decision == 'upload_start':
-            _next_action_payload = {
-                'stage': 'next_action_required',
-                'reason': ('Operator chose "Upload + start gate" at Upload?. '
-                           'Run Stage 1 to capture a real bed photo + approval token. '
-                           'This call NEVER starts the print — only the photo+token. '
-                           'The operator then visually approves the photo before Stage 2.'),
-                'command': _stage1_cmd,
-            }
-            emit(_next_action_payload, args.json_events)
-        else:
-            # 'upload' (no start) or fallback — workflow is complete here.
-            emit({
-                'stage': 'complete',
-                'reason': ('Operator chose "Upload only" at Upload?. File is on the '
-                           'printer; no Stage 1 photo is needed. Workflow is done — '
-                           'tell the operator the upload finished and stop.'),
-            }, args.json_events)
-
-        # H5 fix + phase-aware skip: persist phase + the full event payloads
-        # so a context-loss resume can replay them without re-walking
-        # analysis → slice → upload → Upload?/collision prompts. Phase
-        # depends on upload_decision: upload-only is 'complete'; upload+start
-        # (and legacy default) is 'awaiting_start_approval'.
-        _persist_phase = 'complete' if args.upload_decision == 'upload' else 'awaiting_start_approval'
-        try:
-            u1_request.write_request(
-                request_id,
-                phase=_persist_phase,
-                printer_storage_filename=_printer_filename,
-                start_gate_stage1_command=_stage1_cmd,
-                readiness_card_event=_readiness_card_payload,
-                next_action_required_event=_next_action_payload,
-            )
-        except Exception:
-            pass
-        # v3a: forensic record that the workflow has reached its terminal
-        # state (either start-approval-ready or upload-only complete). This
-        # is the audit boundary BEFORE Stage 2 dispatch — anything Stage 2
-        # does in Phase 3b lands after this row.
-        # H6 fix (cold review 2026-06-27): read request.json ONCE — the prior
-        # version called read_request twice inline in the kwarg expression.
-        _post_readiness_req = u1_request.read_request(request_id) or {}
-        _audit(request_id,
-               'readiness_card_emitted' if _persist_phase == 'awaiting_start_approval' else 'upload_only_complete',
-               operator,
-               printer_storage_filename=_printer_filename,
-               gcode_hash=_sliced_gcode_hash,
-               request_revision=_post_readiness_req.get('request_revision'))
-    return {'out_dir': str(out_dir), 'oriented_stl': str(chosen_stl), 'source_render': str(source_render), 'preview': str(preview), 'gcode': str(gcode), 'slice': slice_res, 'summary_file': str(summary_path)}
 
 def main(argv=None)->int:
     ap=argparse.ArgumentParser(description='Canonical U1 slice workflow')

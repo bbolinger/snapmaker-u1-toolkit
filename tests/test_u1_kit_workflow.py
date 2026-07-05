@@ -21,6 +21,24 @@ def _sha256_of(path: Path) -> str:
     return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 import u1_kit_workflow as kw
+
+
+@pytest.fixture(autouse=True)
+def _fake_stage2_gate(monkeypatch):
+    """_action_start now RUNS the Stage-2 gate as a subprocess (the model no
+    longer relays the token+nonce command). Mock it so unit tests never contact
+    Moonraker or block for the grace window. Returns a dict tests can inspect."""
+    calls = {}
+
+    def _fake(gate_py, argv, out_dir):
+        calls["argv"] = list(argv)
+        calls["cmd"] = " ".join(argv)
+        out = json.dumps({"stage": "start_attempt", "ok": True,
+                          "started": True, "blockers": []})
+        return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake)
+    return calls
 from u1_orient import write_binary_stl
 
 
@@ -152,8 +170,9 @@ def test_commit_happy_path_gates_plate_1(tmp_path, fake_profiles, fake_slice_upl
         _kit_zip(tmp_path, 3),
         form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start",
     ))
-    assert res["phase"] == "awaiting_start_approval"
-    assert res["plate_count"] == 2
+    # form action=start now routes into the two-turn bed-clear gate (like the
+    # staged path) instead of handing out a raw Stage-1 command.
+    assert res["phase"] == "awaiting_bed_clear_start"
     rid = res["request_id"]
     u1_request = __import__("u1_request")
     req = u1_request.read_request(rid)
@@ -166,9 +185,9 @@ def test_commit_happy_path_gates_plate_1(tmp_path, fake_profiles, fake_slice_upl
     assert req["printer_storage_filename"].endswith("_plate1.gcode")
     # selection persisted
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
-    # stage-1 command targets plate 1 + the request
-    assert "_plate1.gcode" in res["start_gate_stage1_command"]
-    assert rid in res["start_gate_stage1_command"]
+    # stage-1 command (persisted for the fallback) targets plate 1 + the request
+    assert "_plate1.gcode" in req["start_gate_stage1_command"]
+    assert rid in req["start_gate_stage1_command"]
 
 
 def test_commit_uploads_all_plates_with_distinct_names(tmp_path, fake_profiles, fake_slice_upload):
@@ -185,15 +204,16 @@ def test_commit_uploads_all_plates_with_distinct_names(tmp_path, fake_profiles, 
 def test_extruder_mapping_matches_single_workflow(tmp_path, fake_profiles, fake_slice_upload):
     # SAFETY: T0 -> 'extruder' (NOT extruder1); T1 -> 'extruder1'. Must match
     # u1_slice_workflow's mapping or the gate's tool-match check heats wrong head.
+    _ur = __import__("u1_request")
     r0 = kw.run_kit_workflow(_args(
         _kit_zip(tmp_path, 1), fresh=True,
         form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
-    assert "--intended-tool extruder " in r0["start_gate_stage1_command"]
+    assert "--intended-tool extruder " in _ur.read_request(r0["request_id"])["start_gate_stage1_command"]
 
     r1 = kw.run_kit_workflow(_args(
         _kit_zip(tmp_path, 1), fresh=True,
         form_answers="all | T1 | PLA | profile 1 | no-supports | start"))
-    assert "--intended-tool extruder1 " in r1["start_gate_stage1_command"]
+    assert "--intended-tool extruder1 " in _ur.read_request(r1["request_id"])["start_gate_stage1_command"]
 
 
 def test_upload_only_action_completes_without_gate(tmp_path, fake_profiles, fake_slice_upload):
@@ -272,7 +292,7 @@ def test_resume_by_request_id_after_form(tmp_path, fake_profiles, fake_slice_upl
         form_answers="all | T0 | PLA | profile 1 | no-supports | start",
     ))
     assert r2["request_id"] == rid
-    assert r2["phase"] == "awaiting_start_approval"
+    assert r2["phase"] == "awaiting_bed_clear_start"
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +325,7 @@ def test_commit_via_form_answers_json(tmp_path, fake_profiles, fake_slice_upload
         form_answers_json='{"parts": ["01_part0", "03_part2"], "tool": "T0", '
                           '"material": "PLA", "profile": 1, "supports": "no-supports", "action": "start"}',
     ))
-    assert res["phase"] == "awaiting_start_approval"
+    assert res["phase"] == "awaiting_bed_clear_start"
     rid = res["request_id"]
     req = __import__("u1_request").read_request(rid)
     assert req["kit"]["selected"] == ["01_part0", "03_part2"]
@@ -424,17 +444,38 @@ def _fake_arrange(monkeypatch, n_plates=1):
 def test_reupload_of_own_plate_defaults_to_overwrite(tmp_path, fake_profiles,
                                                      recording_upload, monkeypatch):
     # adjust -> re-confirm re-slices to the SAME deterministic plate name.
-    # First upload: no collision default. Second (same request): overwrite —
-    # rc=5 previously dead-ended the advertised adjust option.
+    # First upload of a request: "rename" (timestamp ONLY on collision, so a
+    # clean name when free, but graceful when the name is already on the printer
+    # from a DIFFERENT request — the doc-strip re-print bug). Second upload of
+    # the SAME request (own prior name): overwrite.
     _fake_arrange(monkeypatch)
     zp = _kit_zip(tmp_path, 2)
     ans = "all | T0 | PLA | profile 1 | no-supports | start"
     r1 = kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
     rid = r1["request_id"]
-    assert recording_upload["uploads"][0]["on_collision"] is None
+    assert recording_upload["uploads"][0]["on_collision"] == "rename"
     kw.run_kit_workflow(_args(zp, request_id=rid, form_answers=ans,
                               live_upload=True))
     assert recording_upload["uploads"][1]["on_collision"] == "overwrite"
+
+
+def test_reprint_of_another_requests_model_renames_not_fails(tmp_path, fake_profiles,
+                                                             recording_upload, monkeypatch):
+    """Regression (live 2026-07-05): re-printing a model a DIFFERENT prior request
+    already uploaded must NOT fail. Since doc-hash filename prefixes were dropped
+    (82a9681), same model = same base name across requests. A NEW request whose
+    plate name is NOT its own prior upload must pass on_collision='rename' (the
+    uploader timestamps only on real collision) — never None (which dead-ended
+    on rc=5 as kit_upload_failed)."""
+    _fake_arrange(monkeypatch)
+    zp = _kit_zip(tmp_path, 2)
+    ans = "all | T0 | PLA | profile 1 | no-supports | start"
+    # two independent requests (fresh each), same model -> same plate name
+    kw.run_kit_workflow(_args(zp, form_answers=ans, live_upload=True))
+    kw.run_kit_workflow(_args(zp, fresh=True, form_answers=ans, live_upload=True))
+    # both uploads (each request's first) use rename, so neither dead-ends rc=5
+    assert recording_upload["uploads"][0]["on_collision"] == "rename"
+    assert recording_upload["uploads"][1]["on_collision"] == "rename"
 
 
 def test_legacy_upload_failure_does_not_claim_uploaded(tmp_path, fake_profiles,
@@ -519,3 +560,161 @@ def test_over_limit_zip_emits_kit_rejected(tmp_path, fake_profiles, capsys, monk
     evs = _stdout_events(capsys)
     rej = next(e for e in evs if e.get("stage") == "kit_rejected")
     assert "limit is 2" in rej["error"]
+
+
+@pytest.fixture(autouse=True)
+def _fake_bed_capture(monkeypatch):
+    """Form-mode `action=start` now captures a bed photo + token and routes into
+    the two-turn bed-clear gate (like the staged path), instead of handing out a
+    raw Stage-1 command. Mock the capture so tests are fast + deterministic and
+    don't touch a real camera. Tests wanting capture-failure override this."""
+    def _fake(out_dir):
+        snap = Path(out_dir) / "bed_snapshot.jpg"
+        try:
+            snap.write_bytes(b"\xff\xd8\xff\xe0fakejpeg")
+        except Exception:
+            pass
+        return {"ok": True, "snapshot_path": str(snap), "token": "faketoken123",
+                "approval_ttl_seconds": 2700, "approval_expires_at": None,
+                "captured_at_utc": None, "reason": None}
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake)
+
+
+def test_form_start_reaches_bed_clear_gate_and_mints_nonce(tmp_path, fake_profiles, fake_slice_upload):
+    """Regression (operator 2026-07-03, every run): form action=start used to
+    hand out a raw Stage-1 command with NO nonce path, so the kit gate refused
+    every start. It must now route into the two-turn bed-clear gate — the first
+    call persists a pending_bed_clear_start nonce, and the yes-turn mints the
+    Stage-2 approval nonce (the value the gate consumes)."""
+    ur = __import__("u1_request")
+    # Reuse the SAME zip for both calls, exactly like production: the real
+    # yes-command carries the same archive path, so model_hash is unchanged and
+    # request_revision does not bump (a fresh zip per call bumps model_hash ->
+    # revision -> the pending binding mismatches; that was a test artifact).
+    zip_path = _kit_zip(tmp_path, 3)
+    res = kw.run_kit_workflow(_args(
+        zip_path,
+        form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start"))
+    rid = res["request_id"]
+    assert res["phase"] == "awaiting_bed_clear_start"
+    pending = (ur.read_request(rid).get("safety") or {}).get("pending_bed_clear_start")
+    assert pending and pending.get("nonce")
+    assert pending.get("prompt_key") == "bed_clear_start"
+
+    # operator says yes -> the Stage-2 nonce gets minted (the missing path)
+    kw.run_kit_workflow(_args(
+        zip_path, request_id=rid,
+        action="start", bed_clear_confirmed=True, pending_nonce=pending["nonce"]))
+    safety2 = ur.read_request(rid).get("safety") or {}
+    assert safety2.get("stage2_approval_nonce"), "Stage-2 nonce was never minted"
+
+
+def test_confirm_start_token_redeems_and_mints_nonce(tmp_path, fake_profiles, fake_slice_upload):
+    """The bed-clear 'yes' is now a short `--confirm-start <token>` (a 26B model
+    mangled the old ~200-char command). Redeeming the token resolves the request
+    + single-use nonce from state and mints the Stage-2 approval nonce."""
+    ur = __import__("u1_request")
+    zip_path = _kit_zip(tmp_path, 3)
+    res = kw.run_kit_workflow(_args(
+        zip_path, form_answers="parts 1,3 | T0 | PLA | profile 1 | no-supports | start"))
+    rid = res["request_id"]
+    assert res["phase"] == "awaiting_bed_clear_start"
+    tok = ur.read_request(rid)["safety"]["pending_bed_clear_start"]["confirm_token"]
+    assert tok and tok.startswith("c")
+
+    # the operator says yes -> the model relays ONLY the short token
+    kw.run_kit_workflow(_args(zip_path, confirm_start=tok))
+    assert ur.read_request(rid)["safety"].get("stage2_approval_nonce"), \
+        "Stage-2 nonce not minted via --confirm-start"
+
+    # single-use: the token is consumed and cannot be replayed
+    import u1_form
+    assert u1_form.resolve_confirm_token(tok, consume=False) is None
+
+
+def test_confirm_start_invalid_token_refused(tmp_path, fake_profiles, fake_slice_upload):
+    """An unknown / already-used / traversal token is refused with a structured
+    event — never a crash, never a start."""
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), confirm_start="cdeadbeef00"))
+    assert res["phase"] == "bed_clear_confirm_token_invalid"
+    res2 = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 2), confirm_start="../../etc/passwd"))
+    assert res2["phase"] == "bed_clear_confirm_token_invalid"
+
+
+def test_printer_filename_strips_doc_cache_prefix(tmp_path, fake_profiles, fake_slice_upload):
+    """The Hermes doc-cache prefix (doc_<hash>_) must NOT lead the printer
+    filename — otherwise every file shows as 'doc_55da…' and the operator can
+    only tell them apart by thumbnail (operator 2026-07-04). The gcode hash is
+    content-based, so the rename doesn't affect tracking."""
+    zp = _kit_zip(tmp_path, 2)
+    doc_zip = zp.with_name("doc_55da642fda9e_angles_teaching_kit.zip")
+    zp.rename(doc_zip)
+    res = kw.run_kit_workflow(_args(
+        doc_zip, form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    req = __import__("u1_request").read_request(res["request_id"])
+    fn = req["printer_storage_filename"]
+    assert not fn.startswith("doc_"), fn
+    assert fn.startswith("angles_teaching_kit_plate1"), fn
+    # unit check on the helper
+    assert kw._strip_doc_prefix("doc_98e0403a8bc4_bracket") == "bracket"
+    assert kw._strip_doc_prefix("my_bracket") == "my_bracket"
+
+
+def test_form_start_camera_fail_offers_upload_only_no_crash(
+        tmp_path, fake_profiles, fake_slice_upload, monkeypatch):
+    """Camera-unreachable at the bed-clear step must gracefully offer upload-only,
+    NOT crash. Regression: _commit_kit_legacy's camera-fail branch referenced bare
+    no_live_upload / no_live_material where only the _-prefixed locals exist →
+    NameError (found via kit-of-1 unification 2026-07-03; would bite any operator
+    whose camera is unreachable, single OR multi)."""
+    monkeypatch.setattr(
+        kw, "_capture_bed_and_issue_token",
+        lambda out_dir: {"ok": False, "reason": "camera unreachable",
+                         "snapshot_path": None, "token": None,
+                         "approval_ttl_seconds": None, "approval_expires_at": None,
+                         "captured_at_utc": None})
+    res = kw.run_kit_workflow(_args(
+        _kit_zip(tmp_path, 2),
+        form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+    assert res["phase"] == "awaiting_confirm", res
+    assert res.get("bed_capture_failed") is True
+
+
+def test_resolve_operator_env_fallback_and_unknown(monkeypatch):
+    """Shared _resolve_operator (the unified flow's operator identity):
+    --operator wins, else U1_OPERATOR env, else 'unknown:cli'. Migrated from the
+    retired single-flow operator tests now that single delegates to the kit."""
+    from types import SimpleNamespace
+    import u1_config
+    monkeypatch.setattr(u1_config, "_load_dotenv_if_present", lambda: None)
+    monkeypatch.setenv("U1_OPERATOR", "cron:nightly")
+    assert kw._resolve_operator(SimpleNamespace(operator=None)) == "cron:nightly"
+    assert kw._resolve_operator(
+        SimpleNamespace(operator="telegram:brent")) == "telegram:brent"
+    monkeypatch.delenv("U1_OPERATOR", raising=False)
+    assert kw._resolve_operator(SimpleNamespace(operator=None)) == "unknown:cli"
+
+
+def test_kit_setup_required_when_no_profiles(tmp_path, monkeypatch):
+    """No profiles → the unified flow emits setup_required(no_profiles) and exits
+    clean, not a crash. Migrated from the retired single-flow empty_picker test."""
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [])
+    res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 1), interaction_mode="form"))
+    assert res["phase"] == "setup_required"
+
+
+def test_plate_isometric_renders_from_stls(tmp_path):
+    """The isometric 3D plate view renders from arranged STLs — the confidence
+    companion to the top-down footprint (corroborating view from a different
+    data source, operator 2026-07-04). Single = blue; multi = distinct hues;
+    empty = graceful skip (footprint still shows), never a crash."""
+    a = _cube(tmp_path / "a.stl", 20)
+    b = _cube(tmp_path / "b.stl", 25)
+    r1 = kw._render_plate_isometric([str(a)], tmp_path / "iso1.png",
+                                    title="Plate 1 of 1 — 3D view",
+                                    label_below="1 part")
+    assert r1["ok"] and (tmp_path / "iso1.png").stat().st_size > 800
+    r2 = kw._render_plate_isometric([str(a), str(b)], tmp_path / "iso2.png")
+    assert r2["ok"] and r2["part_count"] == 2
+    r3 = kw._render_plate_isometric([], tmp_path / "iso3.png")
+    assert r3["ok"] is False
