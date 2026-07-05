@@ -66,6 +66,14 @@ _ACTIONS = {
     "upload-start": "start",
     "print": "start",
     "go": "start",
+    # v2.2: the button verb is "Slice & review" — the value stays "start"
+    # (the bed-clear yes/no is the real start decision). Accept the new
+    # phrasing from text-mode typers too.
+    "slice & review": "start",
+    "slice and review": "start",
+    "slice-review": "start",
+    "slice review": "start",
+    "review": "start",
     "upload-only": "upload-only",
     "uploadonly": "upload-only",
     "upload only": "upload-only",
@@ -292,6 +300,15 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
     values.setdefault("action", "start" if "start" in actions_allowed
                       else (actions_offered[0] if actions_offered else "start"))
 
+    # Merged head/material: when the head carries its loaded filament (live
+    # tool map), picking the head sets the material — no Material screen. Derive
+    # it here, in the shared core, so BOTH intakes satisfy the required-field
+    # check and downstream slice. The start gate still physically re-verifies
+    # loaded material at print time.
+    tool_materials = spec.get("tool_materials") or {}
+    if "material" not in values and values.get("tool") in tool_materials:
+        values["material"] = tool_materials[values["tool"]]
+
     for f in REQUIRED_FIELDS:
         if f not in values:
             errors.append(f"missing required field: {f}")
@@ -314,7 +331,7 @@ _MATERIAL_FAMILIES = {
 def _looks_like_material(low: str, materials: list[str]) -> bool:
     """Whether an (unmatched) bare token reads as a material name — either a
     known filament family or related by substring to an offered material."""
-    lead = re.split(r"[^a-z]", low, 1)[0]
+    lead = re.split(r"[^a-z]", low, maxsplit=1)[0]
     if lead in _MATERIAL_FAMILIES:
         return True
     for m in materials:
@@ -362,6 +379,34 @@ def _match_profile_name(text: str, profiles: list, values: dict,
     return False
 
 
+_COLOR_SWATCH = {
+    "white": "⚪", "black": "⚫", "gray": "⚫", "silver": "⚪", "beige": "⚪",
+    "red": "🔴", "orange": "🟠", "yellow": "🟡", "green": "🟢", "cyan": "🔵",
+    "blue": "🔵", "purple": "🟣", "pink": "🩷", "brown": "🟤",
+}
+
+
+def _head_label(head: dict[str, Any]) -> str:
+    """One button label for a print head: 'Head 2 (T1) — PETG ⚫ black'.
+    Channel is 0-based on the wire (T0..T3); operators count from 1."""
+    swatch = _COLOR_SWATCH.get(str(head.get("color", "")).lower(), "⬤")
+    ch = head.get("channel", 0)
+    bits = f"Head {ch + 1} ({head.get('tool', f'T{ch}')}) — {head.get('material', '?')}"
+    color = head.get("color")
+    if color and color != "unknown":
+        bits += f" {swatch} {color}"
+    return _clean_label(bits)
+
+
+_PROFILE_SUFFIX_RE = re.compile(r"\s*@\s*Snapmaker\s*U1\s*\([^)]*\)\s*$", re.IGNORECASE)
+
+
+def _strip_profile_suffix(label: Any) -> str:
+    """Drop the '@Snapmaker U1 (0.4 nozzle)' noise every profile label carries —
+    it's on all of them, so it distinguishes nothing and just eats width."""
+    return _PROFILE_SUFFIX_RE.sub("", str(label)).strip() or str(label)
+
+
 def _clean_label(label: Any, max_len: int = 96) -> str:
     """Sanitize an operator-facing label. Part labels come from zip entry
     names — a filename containing `|`, `;`, or newlines could otherwise
@@ -402,6 +447,174 @@ def build_form(spec: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ── Form-answers file handoff (v2.2) ────────────────────────────────────────
+#
+# The button UX collects answers at the GATEWAY (no LLM sees them) and
+# writes them to a file keyed by form_id; the workflow redeems the file via
+# --form-answers-from <form_id>. The model's only job is relaying the
+# emitted command verbatim — the same trust level as --pending-nonce.
+
+FORM_ANSWERS_DIR_ENV = "U1_FORM_ANSWERS_DIR"
+_FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+
+def new_form_id() -> str:
+    """Opaque single-form token (filename-safe, unguessable).
+
+    Alphanumeric only: token_urlsafe's alphabet includes '-', and a LEADING
+    dash turns ``--form-answers-from <id>`` into an argparse flag (live
+    v2.2 finding: '-hNjdN7HGrTf'). Prefix guarantees a letter first.
+    """
+    import secrets
+    return "f" + secrets.token_hex(5)
+
+
+def answers_dir() -> "Path":
+    """Where answer files live. Env override first (the Hermes gateway sets
+    it to a path both containers can see); else <data_dir>/form_answers."""
+    from pathlib import Path
+    import os
+    env = os.environ.get(FORM_ANSWERS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "form_answers"
+
+
+def _answers_path(form_id: str) -> "Path":
+    if not _FORM_ID_RE.match(str(form_id or "")):
+        raise ValueError(f"invalid form_id: {form_id!r}")
+    return answers_dir() / f"{form_id}.json"
+
+
+FORM_SCHEMAS_DIR_ENV = "U1_FORM_SCHEMAS_DIR"
+
+
+def schemas_dir() -> "Path":
+    """Where persisted form schemas live (sibling of form_answers).
+
+    The agent no longer relays the schema through its tool call — a 26B
+    local model (gemma4) reproduced the nested JSON as template-token soup
+    (finish=stop, special-token leaks) and the flow stranded. The workflow
+    persists the schema here keyed by form_id; the agent passes ONLY the
+    flat form_id and the form plugin loads the schema from disk."""
+    from pathlib import Path
+    import os
+    env = os.environ.get(FORM_SCHEMAS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "form_schemas"
+
+
+def persist_schema(form_id: str, schema: dict) -> "Path":
+    """Write the schema JSON for ``form_id``; returns the path. Raises on
+    an invalid form_id (same filename-safety rule as answer files)."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(form_id or "")):
+        raise ValueError(f"invalid form_id: {form_id!r}")
+    d = schemas_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{form_id}.json"
+    p.write_text(_json.dumps(schema, ensure_ascii=False))
+    return p
+
+
+# --------------------------------------------------------------------------- #
+# Bed-clear confirm tokens
+# --------------------------------------------------------------------------- #
+# The bed-clear yes-command used to be a ~200-char command the model relayed
+# verbatim (full path + --request-id + all answer flags + --pending-nonce). A
+# 26B local model (gemma4) mangled the request_id mid-string
+# ('u1_2026_...' -> 'u1_202rad_...') and the gate refused. Same medicine as the
+# form: the model now relays ONE short opaque token; the workflow resolves the
+# request from it. Single-use (consumed on redeem); the nonce it maps to still
+# does all the real auth (single-use + revision/gcode binding).
+
+CONFIRM_TOKENS_DIR_ENV = "U1_CONFIRM_TOKENS_DIR"
+
+
+def confirm_tokens_dir() -> "Path":
+    from pathlib import Path
+    import os
+    env = os.environ.get(CONFIRM_TOKENS_DIR_ENV, "").strip()
+    if env:
+        return Path(env)
+    from u1_config import get_data_dir
+    return Path(get_data_dir()) / "confirm_tokens"
+
+
+def new_confirm_token() -> str:
+    """Short, filename-safe, unguessable. ``c`` prefix guarantees a leading
+    letter (a leading '-' would turn ``--confirm-start <tok>`` into a flag) and
+    distinguishes it from a form id."""
+    import secrets
+    return "c" + secrets.token_hex(5)
+
+
+def persist_confirm_token(token: str, request_id: str) -> "Path":
+    """Map a confirm token to a request id on disk. Raises on a bad token."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(token or "")):
+        raise ValueError(f"invalid confirm token: {token!r}")
+    d = confirm_tokens_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{token}.json"
+    p.write_text(_json.dumps({"request_id": request_id}, ensure_ascii=False))
+    return p
+
+
+def resolve_confirm_token(token: str, consume: bool = True):
+    """Return the request_id a confirm token maps to (or None). When
+    ``consume`` (default), delete the token file so it can't be replayed —
+    single-use, like the nonce it fronts for. Strict pattern also blocks
+    traversal."""
+    import json as _json
+    if not _FORM_ID_RE.match(str(token or "")):
+        return None
+    p = confirm_tokens_dir() / f"{token}.json"
+    try:
+        rid = _json.loads(p.read_text()).get("request_id")
+    except Exception:
+        return None
+    if consume:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    return rid
+
+
+def write_answers_file(form_id: str, obj: dict) -> "Path":
+    """Atomically persist a structured answer set for later redemption."""
+    import json as _json
+    import os
+    p = _answers_path(form_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(_json.dumps(obj, indent=2))
+    os.replace(tmp, p)
+    return p
+
+
+def read_and_consume_answers(form_id: str) -> dict:
+    """Read an answer file and consume it (single-use — renamed on read so
+    a replayed --form-answers-from redeems nothing). Raises FileNotFoundError
+    when absent/already consumed and ValueError on a bad id or bad JSON."""
+    import json as _json
+    import os
+    p = _answers_path(form_id)
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"no pending answers for form {form_id!r} (missing or already used)")
+    text = p.read_text()
+    os.replace(p, p.with_suffix(".json.consumed"))
+    obj = _json.loads(text)
+    if not isinstance(obj, dict):
+        raise ValueError("answers file must contain a JSON object")
+    return obj
+
+
 FORM_SCHEMA_VERSION = 1
 
 
@@ -416,38 +629,84 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     """
     fields: list[dict[str, Any]] = []
     parts = spec.get("parts", [])
-    if parts:
+    # A single-part kit has nothing to choose — the workflow still renders the
+    # thumbnail, but a one-option "which parts?" screen is pure friction. Skip
+    # the field; _finalize defaults parts to the whole (one-item) list.
+    if len(parts) > 1:
         fields.append({
             "id": "parts", "type": "multi_select", "label": "Parts",
             "options": [{"id": p["id"], "label": _clean_label(p.get("label", p["id"]))} for p in parts],
             "default": "all", "required": False,
         })
-    fields.append({"id": "orient", "type": "single_select", "label": "Orientation",
-                   "options": ["as-authored", "auto"], "default": "as-authored"})
-    tools = [str(t).upper() for t in spec.get("tools", [])]
-    if tools:
-        fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
-                       "options": [{"id": t, "label": t} for t in tools], "required": True})
-    mats = spec.get("materials", [])
-    if mats:
-        fields.append({"id": "material", "type": "single_select", "label": "Material",
-                       "options": [{"id": m, "label": m} for m in mats], "required": True})
+    # Setup screen (v2.2.1): print head + orientation + supports render TOGETHER
+    # on one screen (group="setup"). Head first, then the two toggles. When the
+    # live tool map is available each head option carries its loaded material +
+    # colour, so picking the head IS picking the filament and the separate
+    # Material screen is dropped; offline it falls back to generic T0–T3 + a
+    # Material control (still inside the setup group).
+    _GROUP = "setup"
+    _GLABEL = "Print head & layout"
+    heads = spec.get("heads") or []
+    if heads:
+        fields.append({"id": "tool", "type": "single_select", "label": "Print head",
+                       "group": _GROUP, "group_label": _GLABEL,
+                       "options": [{"id": h["tool"], "label": _head_label(h)} for h in heads],
+                       "required": True})
+    else:
+        tools = [str(t).upper() for t in spec.get("tools", [])]
+        if tools:
+            fields.append({"id": "tool", "type": "single_select", "label": "Toolhead",
+                           "group": _GROUP, "group_label": _GLABEL,
+                           "options": [{"id": t, "label": t} for t in tools], "required": True})
+        mats = spec.get("materials", [])
+        if mats:
+            fields.append({"id": "material", "type": "single_select", "label": "Material",
+                           "group": _GROUP,
+                           "options": [{"id": m, "label": m} for m in mats], "required": True})
+    # Orientation. For a single model the caller may pass Orca's real verdict
+    # (spec["orient_recommendation"] = 'auto'|'asauthored' + spec["orient_note"])
+    # so the button recommends the pose Orca prefers, with the reason. Default
+    # follows the recommendation; absent a verdict it stays 'as-authored'.
+    _o_rec = spec.get("orient_recommendation")
+    _rec_id = {"auto": "auto", "asauthored": "as-authored"}.get(_o_rec)
+    _o_opts = []
+    for _oid, _olbl in (("as-authored", "As-authored"), ("auto", "Auto-rotate")):
+        _opt = {"id": _oid,
+                "label": _olbl + (" (recommended)" if _oid == _rec_id else "")}
+        if _oid == _rec_id:
+            _opt["recommended"] = True
+        _o_opts.append(_opt)
+    _orient_field = {"id": "orient", "type": "single_select",
+                     "label": "Orientation", "group": _GROUP, "compact": True,
+                     "options": _o_opts, "default": _rec_id or "as-authored"}
+    if spec.get("orient_note"):
+        _orient_field["note"] = spec["orient_note"]
+    fields.append(_orient_field)
+    # Humanize + put the default (no-supports) first so the toggle reads
+    # left-to-right with the safe choice on the left.
+    _sup = list(spec.get("supports", ["supports", "no-supports"]))
+    _sup_lbl = {"no-supports": "No supports", "supports": "Add supports"}
+    _sup_ordered = sorted(_sup, key=lambda s: 0 if s == "no-supports" else 1)
+    fields.append({"id": "supports", "type": "single_select", "label": "Supports",
+                   "group": _GROUP, "compact": True,
+                   "options": [{"id": s, "label": _sup_lbl.get(s, s)} for s in _sup_ordered],
+                   "default": "no-supports"})
     profiles = spec.get("profiles", [])
     if profiles:
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
-                       "options": [{"id": p.get("idx"), "label": _clean_label(p.get("label"))} for p in profiles],
+                       "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
                        "required": True})
-    fields.append({"id": "supports", "type": "single_select", "label": "Supports",
-                   "options": list(spec.get("supports", ["supports", "no-supports"])),
-                   "default": "no-supports"})
-    fields.append({"id": "action", "type": "single_select", "label": "Action",
-                   "options": list(spec.get("actions", ["start", "upload-only"])), "default": "start"})
-
+    # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
+    # The single print/keep-staged decision happens AFTER slice + a FRESH bed
+    # photo (you decide with the real bed in view) — not up front, before the
+    # photo even exists. `_finalize` still defaults action="start" so the commit
+    # always slices + uploads + captures the bed + offers the one decision.
     schema: dict[str, Any] = {
         "version": FORM_SCHEMA_VERSION,
         "fields": fields,
+        "submit_label": "\U0001f52a Slice it",
         "text_fallback": build_form(spec),
-        "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports | start",
+        "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports",
     }
     if submit:
         schema["submit"] = submit

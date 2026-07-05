@@ -6,6 +6,237 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.2.0] — 2026-07-05
+
+Every safety-critical claim below was verified **live on hardware** (gemma4-26b
+over Telegram), not only in tests — including a single session that both
+**refused** a real material mismatch and then ran a **full matching-material
+print to completion**, followed by a cold, adversarial pre-ship regression audit
+of the whole v2.1.0 → v2.2 change surface (0 HIGH, 0 MED findings).
+
+### Safety
+
+- **Material-mismatch gate now ENFORCES a refusal (was detect-only).** Live-caught
+  2026-07-05: sliced PETG, physically swapped to PLA, approved — the print
+  *started*. Root cause: `u1_toolmap.py` returned exit `0` even when it had found
+  a blocking gate (it correctly detected and printed the mismatch), and
+  `run_tool_gate()` decides pass/fail purely on the exit code — so the material
+  check had been detect-and-print only, never enforcing. Fixed: the probe exits
+  non-zero when a requested material/tool gate is blocking. Verified live end to
+  end — PETG-requested vs PLA-loaded now refuses at Stage 2
+  (`stage2_preflight_blocked`), the print never starts, and the operator is told
+  why; matching material still passes. Added enforcement-layer tests (the prior
+  tests only exercised detection, one layer above the bug). The wrong-*extruder*
+  gcode-preamble check was unaffected and always enforced.
+
+### Added
+
+- **Unified single-STL + multi-part-kit flow.** A lone `.stl`/`.3mf` is now
+  handled as a "kit of one" through the same path as a multi-part zip — one
+  entrypoint, one form, one safety boundary. Removed the entire parallel
+  single-STL staged flow (~1000 lines) so there is one code path to reason
+  about, and single models gain everything kits had (consolidated form,
+  composite preview, review doc) for free. Orca's real orientation verdict now
+  rides in the form for a single model, so the recommended pose is Orca's actual
+  call, not a face-angle approximation.
+- **Two corroborating plate previews.** Alongside the top-down footprint traced
+  from the *sliced gcode*, the readiness card now also emits an **isometric 3D
+  render of the actual arranged, oriented parts** (`kit_plate_isometric`), each
+  part in a distinct hue for a multi-part plate. Two views built from different
+  data sources — when they agree, you are seeing the truth.
+
+### Fixed
+
+- **Re-printing a model no longer fails on a filename collision.** When printer
+  filenames dropped their `doc_<hash>_` prefix (for readability), re-printing the
+  same model produced the same base name as a *prior* request's upload — which
+  the kit flow only auto-overwrote for its own request, so a cross-request
+  collision dead-ended as `kit_upload_failed`. Now any non-own collision uploads
+  with a timestamp suffix (`<name>_<ts>.gcode`): the first print keeps the clean
+  name, a re-print never fails and never clobbers a different job. Proven on the
+  real printer.
+- **Last-layer photo missed on fast-finishing prints.** A print whose tail
+  extruded between two 1-minute monitor ticks could transition
+  `printing → complete` without any poll landing inside the last-layer window,
+  silently losing the completion photo. The watcher now also catches the
+  `printing → terminal` transition for the same job and captures a fallback
+  photo. (No prior test coverage existed for this cron; added.)
+- **Detached start gate — grace window survives the tool-call timeout.** The
+  ~120s pre-start grace/cancel window ran inside the agent's terminal call and
+  could be killed by the ~60s tool timeout mid-grace. The workflow now runs the
+  Stage-2 gate detached so the full cancel window always completes.
+- **Form redeem no longer relays a manglable id.** The bed-clear confirm and
+  form redeem derive their token/id from the request instead of routing a
+  random hex string through the model (which small models corrupted, stalling
+  with "form id mismatch"). `--confirm-start` / `--redeem-pending-form`.
+- **No crash when the bed camera is unreachable at the bed-clear step** — the
+  upload-only fallback path referenced undefined locals (`NameError`); now
+  degrades cleanly to offering upload-without-start.
+- **CI green on a fresh environment.** A live-adapter test hard-failed under CI
+  (`python-telegram-bot` is an optional runtime dep, not in `requirements.txt`);
+  it now `importorskip`s cleanly, matching how the adapter treats the dep.
+- **Test suite could DM the operator a real "print starting" notification**
+  (live 2026-07-02, "spam every time you run the suite"). `test_u1_config`
+  loads the real `/opt/data/.env` into `os.environ`, leaking
+  `U1_GRACE_NOTIFY_CMD`; later start-path tests resolved it and the notify
+  script defaults `HERMES_BIN`→`hermes` + dest→`telegram`, sending to the real
+  chat. conftest now: stubs `HERMES_BIN` + shadows `hermes` on PATH (the suite
+  is structurally unable to reach Telegram; any attempt is logged), defaults
+  the grace window to 0 so non-grace tests skip it (no notify, no 120s sleep —
+  the suite also got ~13× faster), and scrubs the notify env per test.
+- **False "print starting" notification loop** (live 2026-07-02). A confused
+  agent that invoked the print-start flow with a placeholder/nonexistent
+  filename (gpt-5.5 looping on `x.gcode` / `wall_mount.gcode` from the skill
+  examples) fired a real operator "print starting in 120s" notification each
+  time — grace-period-paced, ~every 2 minutes, for over an hour — for prints
+  that could never happen. Two guards in `u1_print_start_gate`:
+  - **Fence 2:** the gcode must exist in the printer's storage (Moonraker
+    `files/metadata`) BEFORE the grace window + notification fire. A
+    confirmed-absent file (404) is a fast, silent refusal
+    (`gate_refused_file_missing`) — no notification. Fails open on a flaky
+    metadata query so a transient error never blocks a real print.
+  - **Loop guard:** a per-request cap (4) on grace notifications. A loop on a
+    *real* uploaded file (which the existence check can't catch) trips it and
+    the DM is suppressed (`pre_start_grace_notify_suppressed_loop_guard`); the
+    grace WAIT still runs, so the cancel safety net is untouched.
+
+### Changed
+
+- **Skill rewritten imperative-first and corrected to the unified flow.** The
+  body described the retired single-STL staged mechanism (events the code no
+  longer emits); it now matches what the unified workflow actually emits, opens
+  with an act-by-calling-tools directive, and shed ~7KB. Verified not to regress
+  gemma4's tool-calling. All safety rules (anti-fabrication, the single bed-clear
+  boundary, verbatim command relay) preserved.
+- **README brought to v2.2 reality** + a new **"Always-on print monitoring"**
+  section documenting the three no-agent cron jobs (first/last-layer + post-resume
+  photos, quiet health watchdog, print-history ledger) that run with no LLM in
+  the loop — surfacing a capability that existed but was buried.
+- **Form UX v2.2.1 — fewer, clearer screens (operator feedback 2026-07-02).**
+  - **Setup screen: print head + orientation + supports on ONE screen.** The
+    renderer gained a `group` model — fields sharing a group render together as
+    labelled blocks under one shared `Next ➜`. Grouped single-selects behave as
+    radios (tap marks, doesn't advance); ungrouped ones (profile) still advance
+    on tap. Step counter counts screens, so a group is one step.
+  - **Print head carries the filament.** When the live tool map is present, the
+    head screen shows each head's loaded material + colour
+    (`Head 2 (T1) — PETG ⚫ black`, read from `printer_reported`), and picking
+    the head sets the material — the separate Material screen is gone. Falls
+    back to generic T0–T3 + a Material screen when offline. The start gate still
+    physically re-verifies loaded material at print time.
+  - **Action → two submit verbs** on the review card (`⬆ Upload only` /
+    `▶ Upload + Start`) instead of its own screen.
+  - **Single-part kit skips the Parts screen** (nothing to choose).
+  - **Profile labels** drop the `@Snapmaker U1 (0.4 nozzle)` suffix that every
+    entry shared.
+  - Step counter now counts only the screens the operator taps through.
+
+### Fixed
+
+- **Telegram form taps never reached the form handler** (live 2026-07-02).
+  The plugin swapped `_handle_callback_query` on the adapter class, but PTB
+  captured the bound method at `connect()` — the swap was invisible, every
+  tap routed to Hermes' native dispatcher, and forms sat untouched until the
+  600s timeout, after which the agent fell back to free-text questioning.
+  The patch now registers its own pattern-scoped `CallbackQueryHandler`
+  (group −11, `ApplicationHandlerStop`) on the live PTB application at
+  `send_form` time — timing-independent, reconnect-safe, and the native
+  dispatcher is never touched.
+- **`form_id` could start with `-`** (`token_urlsafe` alphabet), turning
+  `--form-answers-from <id>` into an argparse flag. New ids are
+  alphanumeric (`f` + hex); `next_command` now uses the
+  `--form-answers-from=<id>` form so legacy persisted ids keep working.
+- **Multi-select affordance** (operator feedback): action row is now
+  `Select all / Clear / Next ➜` (was `All / None / ✅ Done`), the header
+  shows `(n of N selected)` or `(none picked → all N)`, plus a
+  "tap to toggle ✔" hint — so the checkbox behavior is discoverable and
+  "Done" no longer reads as submit.
+- **Skill contract:** on form timeout/cancel/error the agent must resume
+  the staged one-line text flow — never dump all fields as free-text
+  questions in a single message.
+
+### Added
+
+- **Pre-print review document** ([`scripts/u1_review_doc.py`](scripts/u1_review_doc.py)).
+  Every readiness card now ships with a `review.md` flight plan the operator
+  can actually read before saying yes: what will print (per-plate files,
+  estimates, parts), the ~12 settings that decide success, and the operator's
+  own decisions/overrides. Settings come from the config block inside the
+  sliced gcode — what the printer will execute, never what the workflow
+  intended — and the doc header carries request revision + gcode hash, so
+  `can_start()`'s drift check guarantees the reviewed plan is the printed
+  plan. Informational by design: generation failures audit
+  `review_doc_failed` and never block the flow. Emitted as a `review_doc`
+  event by both kit paths and the single-STL workflow; readiness cards carry
+  `review_doc_path`.
+- **Preset-deviation markers + full-config sweep.** Every setting present in
+  both the gcode and the chosen preset (process + filament, inheritance
+  flattened) is compared: curated rows flag inline (`240` ⚠ *preset: 230*),
+  everything else that deviates renders in an "Other deviations" table —
+  ironing, retraction, any of the ~300 keys. Deviations-only output is
+  self-curating; ids/provenance metadata are excluded as noise. Baseline is
+  the preset the operator PICKED (integrity, not orthodoxy — a custom
+  profile is compared against itself, not against Snapmaker stock).
+- **Material-envelope sanity check.** Nozzle temps in the gcode are checked
+  against the range the material's own filament profile declares
+  (`nozzle_temperature_range_low/high`) — the layer that catches a custom
+  profile that matches itself perfectly but runs 275°C on a 220–260 material.
+  In-range prints a quiet confirmation; no declared range, no invented norm.
+- The doc also now states that the chosen material is re-verified against
+  what is physically loaded at start time (the gate check that already
+  existed, made visible).
+- **Form mode + answers-file handoff.** `--interaction-mode form` (or
+  `U1_INTERACTION_MODE=form`) emits one consolidated `kit_form` event with
+  `form_schema` + a single-form `form_id`; the Hermes/Telegram button
+  adapter writes the collected answers to
+  `<U1_FORM_ANSWERS_DIR>/<form_id>.json` at the GATEWAY, and the workflow
+  redeems the file via `--form-answers-from <form_id>` — single-use
+  (consumed on read), bound to the persisted form id (mismatch refused,
+  file preserved for the rightful redeemer). Answer content never passes
+  through the model in either direction; the model relays one opaque id,
+  the same trust level as `--pending-nonce`. Staged text flow unchanged
+  and still the default — buttons are for reliability, not a requirement.
+- **hermes-agent 0.18 compatibility** ("The Judgment Release" moved
+  platform adapters into a plugin system; the Telegram class moved from
+  `gateway.platforms.telegram.TelegramPlatform` to a plugin-loaded
+  `TelegramAdapter`). Solved structurally by the plugin rebuild below:
+  the adapter patch never imports a class by module path anymore — it
+  patches the live instance's class — so adapter relocations stop being
+  breaking events. `SendResult` construction degrades to a duck-typed
+  stand-in if `gateway/platforms/base.py` ever moves, and a missing
+  `_handle_callback_query` hook point skips the patch loudly instead of
+  raising.
+- **Hermes integration rebuilt as a first-party plugin**
+  ([`adapters/hermes/plugin/`](adapters/hermes/plugin/)), replacing the
+  tools/-drop + monkey-patch approach after three visibility fixes in a
+  row proved wrong against the real package. Root causes, all verified in
+  hermes-agent 0.18 source: (1) platform agents get a per-toolset
+  allowlist and bare-composite configs enable toolsets by
+  subset-inference — a runtime-registered toolset never qualifies, and
+  joining `clarify` evicts clarify itself; plugin-provided toolsets are
+  the first-party path (auto-enabled per platform, no inference, operator
+  can toggle in `hermes tools`). (2) Generic registry dispatch passes
+  handlers no callback and no agent — the gateway's run.py patch now
+  publishes its per-turn form callback into `tools.form_gateway` keyed by
+  `agent.session_id`, exactly what dispatch hands the handler. (3) The
+  Telegram adapter class loads under two module names — import-side
+  patching can hit the copy the gateway never instantiates; the plugin's
+  `pre_gateway_dispatch` hook patches `type()` of the live adapter
+  instances in `gateway.adapters` instead. `install.py` now deploys +
+  enables the plugin, removes pre-plugin layout files, replaces the
+  run.py block in place on upgrades, and verifies the real invariant in
+  the venv (clarify held AND form offered on a bare-composite config).
+- **Real-package regression tests**
+  ([`tests/test_hermes_real_package.py`](tests/test_hermes_real_package.py)):
+  run against an actual hermes-agent tree (`U1_HERMES_AGENT_SRC`; CI
+  skips) — baseline bug reproduction, the no-eviction superset invariant
+  (`with_plugin == baseline | {"form"}`), schema delivery through
+  `get_tool_definitions`, clean plugin load, and the run.py patcher
+  against the real `gateway/run.py`. Exists because this bug class is
+  invisible to hermetic tests.
+
+---
+
 ## [2.1.0] — 2026-07-02
 
 **Multi-part kit support, the pre-start grace period with model-free

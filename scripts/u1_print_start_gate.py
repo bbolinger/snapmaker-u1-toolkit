@@ -426,6 +426,35 @@ def start_print(host, port, filename):
     return post_json(f'http://{host}:{port}/printer/print/start', {'filename': filename})
 
 
+def gcode_exists_on_printer(host, port, filename):
+    """Does ``filename`` actually exist in the printer's gcodes storage?
+
+    Returns True (confirmed present), False (confirmed ABSENT — Moonraker 404),
+    or None (couldn't verify: network/other error → the caller fails OPEN so a
+    flaky metadata query never blocks a real print).
+
+    Why the gate needs this: the grace window fires an operator "print
+    starting" notification BEFORE the actual start. A confused agent that
+    invokes the start command with a placeholder/nonexistent filename (live
+    2026-07-02: gpt-5.5 looping on `x.gcode` / `wall_mount.gcode` from the
+    skill examples) would otherwise spam real print-start alarms for prints
+    that can never happen. Confirming the file exists first turns those into a
+    fast, silent refusal — no notification.
+    """
+    import urllib.error
+    url = (f'http://{host}:{port}/server/files/metadata'
+           f'?filename={urllib.parse.quote(str(filename))}')
+    try:
+        http_json(url, timeout=8.0)
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        return None  # 500 etc. — can't be sure; fail open
+    except Exception:
+        return None  # unreachable / timeout — fail open (don't block real prints)
+
+
 def _resolve_operator_for_gate(cli_operator: str | None) -> str:
     """Phase 3b: resolve operator identity for audit + approval rows.
 
@@ -562,6 +591,32 @@ def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
     return result
 
 
+GRACE_NOTIFY_CAP = 4
+
+
+def _grace_notify_allowed(request_id: str | None, cap: int = GRACE_NOTIFY_CAP) -> bool:
+    """Loop guard: cap how many "print starting" notifications one request may
+    send. A normal flow notifies once per start; a couple of legitimate
+    cancel-then-retry cycles stay well under the cap. A confused agent looping
+    the start command on a REAL uploaded file (which Fence 2's existence check
+    can't catch) trips it. The grace WAIT still runs when suppressed — only the
+    DM is muted — so the cancel safety net is untouched. No request_id (nothing
+    to track) → always allowed.
+    """
+    if not request_id:
+        return True
+    try:
+        import u1_request
+        req = u1_request.read_request(request_id) or {}
+        safety = dict(req.get('safety') or {})
+        count = int(safety.get('grace_notify_count') or 0) + 1
+        safety['grace_notify_count'] = count
+        u1_request.write_request(request_id, safety=safety)
+        return count <= cap
+    except Exception:
+        return True  # never let bookkeeping block a legitimate notification
+
+
 def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                                  request_id: str | None,
                                  resolved_operator: str,
@@ -603,12 +658,18 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
     # by subtracting notify latency; that would shorten the window below
     # what the DM promised.
     if notify_cmd:
-        _notify(notify_cmd,
-                request_id=request_id,
-                filename=filename,
-                grace_seconds=grace_seconds,
-                cancel_marker=cancel_marker,
-                operator=resolved_operator)
+        if _grace_notify_allowed(request_id):
+            _notify(notify_cmd,
+                    request_id=request_id,
+                    filename=filename,
+                    grace_seconds=grace_seconds,
+                    cancel_marker=cancel_marker,
+                    operator=resolved_operator)
+        else:
+            # Loop guard tripped: suppress the DM but STILL run the wait so the
+            # cancel safety net is intact. Audited so a real loop is visible.
+            _audit_gate(request_id, 'pre_start_grace_notify_suppressed_loop_guard',
+                        resolved_operator, cap=GRACE_NOTIFY_CAP)
     # Contract with the Hermes gateway hook + notify script: the notify
     # script wrote /tmp/u1_pending_cancel/<request_id>.json so a
     # `cancel <code>` reply in Telegram routes to the right marker.
@@ -667,7 +728,8 @@ def run_gate(filename: str,
              grace_seconds: int | None = None,
              grace_sleep_fn=None,
              grace_notify_cmd: str | None = None,
-             grace_notify_fn=None):
+             grace_notify_fn=None,
+             gcode_exists_fn=gcode_exists_on_printer):
     host = host or get_u1_host()
     port = port or get_u1_port()
     # Per-request token + photo storage: if we have a
@@ -1114,6 +1176,29 @@ def run_gate(filename: str,
     _resolved_grace = _resolve_grace_seconds(grace_seconds)
     _resolved_notify = _resolve_grace_notify_cmd(grace_notify_cmd)
     cancel_marker = out_dir / 'pre_start_cancel.marker'
+
+    # Fence 2 — the file must actually exist on the printer BEFORE the grace
+    # window fires its "print starting" notification. Closes the false-alarm
+    # class where a confused agent loops the start command with a placeholder/
+    # nonexistent filename and spams real print-start alerts for prints that
+    # can never happen (live 2026-07-02: gpt-5.5 on x.gcode / wall_mount.gcode).
+    # Fails OPEN: only a CONFIRMED-absent file (Moonraker 404) refuses; a flaky
+    # metadata query (None) proceeds so a transient error never blocks a real
+    # print — the start itself still fails safely if the file is truly gone.
+    _exists = gcode_exists_fn(host, port, printer_filename)
+    if _exists is False:
+        _audit_gate(request_id, 'gate_refused_file_missing',
+                    resolved_operator, printer_storage_filename=printer_filename)
+        return {
+            'stage': 'gate_refused_file_missing',
+            'filename': printer_filename,
+            'ok': False, 'started': False,
+            'reason': (
+                f"gate refuses: {printer_filename!r} is not in the printer's "
+                "gcode storage, so there is nothing to start. No notification "
+                "was sent. If you meant a real plate, re-run the workflow so "
+                "the sliced file is uploaded first."),
+        }
 
     def _grace_cancel_refusal() -> dict[str, Any]:
         # A grace-cancel consumed the Stage 2 nonce, but the slice, the

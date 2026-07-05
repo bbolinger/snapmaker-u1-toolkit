@@ -376,7 +376,7 @@ def test_notify_message_advertises_ssh_fallback_without_hook_receipt(notify_env)
         "would silently do nothing")
 
 
-def test_notify_message_advertises_reply_cancel_with_code_when_hook_installed(notify_env):
+def test_notify_message_advertises_reply_cancel_when_hook_installed(notify_env):
     env, tmp = notify_env
     env = dict(env)
     receipt = tmp / "receipt.json"
@@ -385,9 +385,12 @@ def test_notify_message_advertises_reply_cancel_with_code_when_hook_installed(no
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
     assert r.returncode == 0, r.stderr
     sent = (tmp / "hermes_calls.log").read_text()
+    # v2.2: plain "Reply CANCEL" only — no per-id `cancel <code>` targeting
+    # (one printer, one thing to cancel) and no request-id in the message.
     assert "Reply **CANCEL**" in sent
     code = env["U1_REQUEST_ID"][-6:]
-    assert f"cancel {code}" in sent
+    assert f"cancel {code}" not in sent
+    assert env["U1_REQUEST_ID"] not in sent
 
 
 # ─── Urgency punctuation: "CANCEL!!!" must fire; extra words must not ───────

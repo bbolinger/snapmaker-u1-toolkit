@@ -61,13 +61,39 @@ def _opt_label(opt: Any) -> str:
     return str(opt["label"] if isinstance(opt, dict) else opt)
 
 
+def _is_screen_field(f: dict[str, Any]) -> bool:
+    """A field that gets its own screen. ``submit_choice`` fields (e.g. Action)
+    are rendered as verbs on the review card, never a standalone screen."""
+    return not f.get("submit_choice")
+
+
+def _first_screen_field(fields: list[dict[str, Any]]) -> str:
+    return next((f["id"] for f in fields if _is_screen_field(f)), REVIEW_FIELD)
+
+
+def _default_index(field: dict[str, Any]):
+    """Option index matching a single_select field's ``default``, or None."""
+    d = field.get("default")
+    if d is None:
+        return None
+    for i, o in enumerate(field["options"]):
+        if _opt_id(o) == d:
+            return i
+    return None
+
+
 def new_form(schema: dict[str, Any]) -> dict[str, Any]:
-    """Initial form state: cursor at the first field, empty selections."""
+    """Initial form state: cursor at the first screen field. single_select
+    fields with a default start pre-selected (the operator only taps to change
+    it); multi_select and required-no-default fields start empty."""
     fields = schema["fields"]
     return {
         "schema": schema,
-        "current": fields[0]["id"] if fields else REVIEW_FIELD,
-        "selections": {f["id"]: (set() if f["type"] == "multi_select" else None) for f in fields},
+        "current": _first_screen_field(fields),
+        "selections": {
+            f["id"]: (set() if f["type"] == "multi_select" else _default_index(f))
+            for f in fields
+        },
         "pages": {f["id"]: 0 for f in fields},
     }
 
@@ -80,13 +106,46 @@ def _field_index(form: dict[str, Any], fid: str) -> int:
     return next(i for i, f in enumerate(form["schema"]["fields"]) if f["id"] == fid)
 
 
+def _screens(form: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    """Ordered list of screens. A screen is a maximal run of CONSECUTIVE
+    screen-fields sharing a non-empty ``group`` (e.g. head + orient + supports
+    render together), or a single ungrouped field. submit_choice fields have no
+    screen."""
+    fields = [f for f in form["schema"]["fields"] if _is_screen_field(f)]
+    screens: list[list[dict[str, Any]]] = []
+    i = 0
+    while i < len(fields):
+        grp = fields[i].get("group")
+        if grp:
+            j = i
+            while j + 1 < len(fields) and fields[j + 1].get("group") == grp:
+                j += 1
+            screens.append(fields[i:j + 1])
+            i = j + 1
+        else:
+            screens.append([fields[i]])
+            i += 1
+    return screens
+
+
+def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
+    """The screen (list of fields) that renders together with ``fid``."""
+    for screen in _screens(form):
+        if any(f["id"] == fid for f in screen):
+            return screen
+    return [_field(form, fid)]
+
+
 def _next_field(form: dict[str, Any]) -> str:
-    """Advance the cursor: next field, or REVIEW_FIELD when past the end."""
-    fields = form["schema"]["fields"]
+    """Advance the cursor to the first field of the NEXT screen, or
+    REVIEW_FIELD past the end."""
     if form["current"] == REVIEW_FIELD:
         return REVIEW_FIELD
-    idx = _field_index(form, form["current"])
-    return fields[idx + 1]["id"] if idx + 1 < len(fields) else REVIEW_FIELD
+    screens = _screens(form)
+    for si, screen in enumerate(screens):
+        if any(f["id"] == form["current"] for f in screen):
+            return screens[si + 1][0]["id"] if si + 1 < len(screens) else REVIEW_FIELD
+    return REVIEW_FIELD
 
 
 def _paginate(opts: list, page: int, size: int) -> tuple[list, int, int]:
@@ -121,31 +180,64 @@ def render_screen(form: dict[str, Any]) -> dict[str, Any]:
     """
     if form["current"] == REVIEW_FIELD:
         return _render_review(form)
-    field = _field(form, form["current"])
-    return _render_field(form, field)
+    screen = _screen_of(form, form["current"])
+    if len(screen) > 1:
+        return _render_group(form, screen)
+    return _render_field(form, screen[0])
 
 
-def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]:
+def _join_human(items: list[str]) -> str:
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _screen_pos(form: dict[str, Any], fid: str) -> str:
+    screens = _screens(form)
+    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), 0)
+    return f"Step {pos + 1} of {len(screens)}"
+
+
+def _step_suffix(form: dict[str, Any], fid: str) -> str:
+    """"Step N of M" over SCREENS (a group counts as one screen)."""
+    screens = _screens(form)
+    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), 0)
+    return f"\n<i>Step {pos + 1} of {len(screens)}</i>"
+
+
+def _field_control_rows(form: dict[str, Any], field: dict[str, Any]) -> list[list[dict[str, str]]]:
+    """Option rows (+ pagination, + multi Select-all/Clear) for ONE field.
+    Shared by single-field and grouped screens. Callback field indices are
+    ABSOLUTE into schema['fields'] so apply_callback resolves them directly."""
     fi = _field_index(form, field["id"])
     page = form["pages"][field["id"]]
     paginated = len(field["options"]) > PAGE_SIZE
     slice_, page, total_pages = _paginate(field["options"], page, PAGE_SIZE)
     rows: list[list[dict[str, str]]] = []
     is_multi = field["type"] == "multi_select"
-
     page_offset = page * PAGE_SIZE
     sel = form["selections"][field["id"]]
+    compact = field.get("compact") and not is_multi
+    _pending: list[dict[str, str]] = []
     for local_oi, opt in enumerate(slice_):
         oi = page_offset + local_oi
         if is_multi:
             mark = "✔ " if oi in sel else ""
             cb = f"t:{fi}:{oi}"
         else:
-            mark = "● " if sel == oi else ""
+            mark = "● " if sel == oi else "○ "
             cb = f"s:{fi}:{oi}"
-        rows.append([{"text": f"{mark}{_opt_label(opt)}", "callback_data": cb}])
-
-    # Pagination row
+        btn = {"text": f"{mark}{_opt_label(opt)}", "callback_data": cb}
+        if compact:
+            _pending.append(btn)
+            if len(_pending) == 2:
+                rows.append(_pending)
+                _pending = []
+        else:
+            rows.append([btn])
+    if _pending:
+        rows.append(_pending)
     if paginated and total_pages > 1:
         nav: list[dict[str, str]] = []
         if page > 0:
@@ -154,43 +246,103 @@ def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]
         if page + 1 < total_pages:
             nav.append({"text": "Next ›", "callback_data": f"p:{fi}:{page + 1}"})
         rows.append(nav)
-
-    # Multi-select action row: All / None / Done
     if is_multi:
-        rows.append([
-            {"text": "All", "callback_data": f"a:{fi}"},
-            {"text": "None", "callback_data": f"z:{fi}"},
-            {"text": "✅ Done", "callback_data": f"n:{fi}"},
-        ])
+        multi_row = [
+            {"text": "Select all", "callback_data": f"a:{fi}"},
+            {"text": "Clear", "callback_data": f"z:{fi}"},
+        ]
+        # On its OWN screen a multi keeps its Next; in a group the Next is
+        # shared (added by _render_group).
+        if not field.get("group"):
+            multi_row.append({"text": "Next ➜", "callback_data": f"n:{fi}"})
+        rows.append(multi_row)
+    return rows
 
-    # Cancel always present
+
+def _multi_hint(field: dict[str, Any], sel) -> str:
+    n = len(sel) if sel else 0
+    if n == 0 and field.get("default") == "all":
+        return f"  (none picked → all {len(field['options'])})"
+    return f"  ({n} of {len(field['options'])} selected)"
+
+
+def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]:
+    rows = _field_control_rows(form, field)
     rows.append([{"text": "✖ Cancel", "callback_data": "X"}])
-
     label = _esc(field.get("label", field["id"]))
-    hint = ""
-    if is_multi:
-        n = len(sel) if sel else 0
-        hint = f"  ({n} selected)"
-    text = f"<b>{label}</b>{hint}\n<i>Step {fi + 1} of {len(form['schema']['fields'])}</i>"
+    hint = tip = ""
+    if field["type"] == "multi_select":
+        hint = _multi_hint(field, form["selections"][field["id"]])
+        tip = "\n<i>Tap options to toggle ✔, then Next ➜</i>"
+    text = f"<b>{label}</b>{hint}{tip}" + _step_suffix(form, field["id"])
     return {"text": text, "keyboard": rows}
+
+
+def _render_group(form: dict[str, Any], screen: list[dict[str, Any]]) -> dict[str, Any]:
+    """Render several fields on ONE screen (e.g. head + orient + supports),
+    each as a labelled block, with a single shared Next ➜."""
+    first = screen[0]
+    title = _esc(first.get("group_label") or "Setup")
+    labels = [str(f.get("label", f["id"])).lower() for f in screen]
+    instruction = "Pick " + _join_human(labels) + ", then Next \u279c."
+    lines = [f"<b>{title}</b> \u00b7 {_screen_pos(form, first['id'])}", instruction]
+    # Field-level notes (e.g. the single-model orientation verdict from Orca:
+    # "as-authored has floating regions \u2192 auto-orient is clean"). Surfaced so
+    # the operator sees WHY a pose is recommended before picking.
+    for field in screen:
+        if field.get("note"):
+            lines.append(f"<i>{_esc(str(field['note']))}</i>")
+    rows: list[list[dict[str, str]]] = []
+    for field in screen:
+        rows.extend(_field_control_rows(form, field))
+    rows.append([
+        {"text": "Next \u279c", "callback_data": f"n:{_field_index(form, first['id'])}"},
+        {"text": "\u2716 Cancel", "callback_data": "X"},
+    ])
+    return {"text": "\n".join(lines), "keyboard": rows}
+
+
+# Submit-verb button styling per action option id.
+_SUBMIT_VERBS = {
+    "upload-only": "\u2b06 Upload only",
+    # NOT "Start": submitting slices + shows the plate/review/bed photo, then a
+    # single bed-clear yes/no is the actual start decision (against a fresh bed
+    # photo). Avoids the "say yes to start, then say yes again" double-confirm.
+    "start": "\U0001f50d Slice & review",
+}
 
 
 def _render_review(form: dict[str, Any]) -> dict[str, Any]:
     lines = ["<b>Review</b>", ""]
     rows: list[list[dict[str, str]]] = []
     for fi, field in enumerate(form["schema"]["fields"]):
+        if not _is_screen_field(field):
+            continue  # submit_choice (Action) is the verb row below, not a line
         echo = _selection_label_for(form, field)
-        # Message text is ParseMode.HTML → escape schema-derived strings.
-        # Button text is NOT parsed as HTML → leave the Edit label raw.
-        lines.append(f"• <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
-        rows.append([{"text": f"✎ Edit {field.get('label', field['id'])}",
+        # Message text is ParseMode.HTML \u2192 escape schema-derived strings.
+        # Button text is NOT parsed as HTML \u2192 leave the Edit label raw.
+        lines.append(f"\u2022 <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
+        rows.append([{"text": f"\u270e Edit {field.get('label', field['id'])}",
                       "callback_data": f"e:{fi}"}])
-    rows.append([
-        {"text": "✅ Submit", "callback_data": "S"},
-        {"text": "✖ Cancel", "callback_data": "X"},
-    ])
+    # Action becomes the submit verbs: each option submits with that action.
+    submit_field = next((f for f in form["schema"]["fields"] if f.get("submit_choice")), None)
+    if submit_field:
+        sfi = _field_index(form, submit_field["id"])
+        verb_row = [
+            {"text": _SUBMIT_VERBS.get(_opt_id(opt), f"Submit ({_opt_id(opt)})"),
+             "callback_data": f"S:{sfi}:{oi}"}
+            for oi, opt in enumerate(submit_field["options"])
+        ]
+        rows.append(verb_row)
+        rows.append([{"text": "\u2716 Cancel", "callback_data": "X"}])
+    else:
+        rows.append([
+            {"text": form["schema"].get("submit_label", "\u2705 Submit"),
+             "callback_data": "S"},
+            {"text": "\u2716 Cancel", "callback_data": "X"},
+        ])
     lines.append("")
-    lines.append("<i>Submit runs the same safety pipeline as the typed form (slicer warnings → readiness card → Stage-1 photo gate). The buttons only collect — they never bypass.</i>")
+    lines.append("<i>This only slices + uploads and shows you the plate, the review, and a fresh bed photo. Nothing prints until you confirm at the bed-clear step.</i>")
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
@@ -226,10 +378,27 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         return {"kind": "cancel"}
 
     if kind == "S":
-        # Validate required fields are answered before letting submit through.
+        # A submit-verb (S:<action_field>:<option>) also SETS the action before
+        # submitting; a bare "S" (legacy / no submit_choice field) just submits.
+        submit_field = next((f for f in fields if f.get("submit_choice")), None)
+        if len(parts) == 3:
+            afi, aoi = int(parts[1]), int(parts[2])
+            afield = fields[afi]
+            if afield.get("submit_choice") and 0 <= aoi < len(afield["options"]):
+                form["selections"][afield["id"]] = aoi
+        elif submit_field is not None:
+            # Bare "S" on a submit-verb schema (a stale button from a pre-verb
+            # render, or an injected callback). Do NOT submit with a silently
+            # defaulted action — that would pick "start" (the print path) on
+            # ambiguity. Re-show the review so the operator taps an explicit
+            # verb; the verbs are the only sanctioned submit path here.
+            form["current"] = REVIEW_FIELD
+            return {"kind": "rerender",
+                    "warning": "Choose “Slice & review” or “Upload only”."}
+        # Validate required SCREEN fields are answered before submit.
         missing = []
         for f in fields:
-            if f.get("required"):
+            if f.get("required") and _is_screen_field(f):
                 val = form["selections"][f["id"]]
                 if (f["type"] == "multi_select" and not val) or (f["type"] != "multi_select" and val is None):
                     missing.append(f.get("label", f["id"]))
@@ -283,7 +452,10 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
             return {"kind": "rerender",
                     "warning": f"Stale button (option {oi} out of range for {_esc(repr(fid))})."}
         form["selections"][fid] = oi
-        form["current"] = _next_field(form)
+        # A single-select on its own screen advances on tap; one inside a
+        # group is a radio — it only marks, the shared Next advances.
+        if not field.get("group"):
+            form["current"] = _next_field(form)
         return {"kind": "rerender"}
 
     raise ValueError(f"bad callback_data: {data!r}")

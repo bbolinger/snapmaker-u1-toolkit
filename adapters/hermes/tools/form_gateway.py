@@ -214,3 +214,46 @@ def get_form_timeout() -> float:
         return float(os.environ.get("U1_FORM_TIMEOUT_SEC", DEFAULT_FORM_TIMEOUT_SEC))
     except (TypeError, ValueError):
         return float(DEFAULT_FORM_TIMEOUT_SEC)
+
+
+# =========================================================================
+# Form-callback registry — bridges the generic tool dispatch to the gateway
+# =========================================================================
+#
+# Hermes' registry dispatch hands tool handlers only (task_id, session_id,
+# user_task) — there is no callback kwarg and no agent reference (only
+# hardcoded tools like clarify get agent.clarify_callback in the executor).
+# So the gateway's run.py patch PUBLISHES its per-turn form callback here,
+# keyed by agent.session_id — the exact value dispatch later passes to the
+# handler — and the u1-form plugin's handler looks it up by that key.
+# "__default__" always tracks the most recent registration so a session_id
+# mismatch degrades to the latest gateway turn instead of a dead tool
+# (right answer for a single-operator gateway; keyed lookup keeps
+# concurrent sessions honest).
+
+_CB_MAX_ENTRIES = 32  # bound per-session slots; __default__ never evicted
+
+_cb_lock = threading.Lock()
+_form_callbacks: Dict[str, Any] = {}
+_cb_order: List[str] = []
+
+
+def set_form_callback(session_id: str, callback: Any) -> None:
+    """Publish the gateway's form callback for a session (and as default)."""
+    key = str(session_id or "").strip() or "__default__"
+    with _cb_lock:
+        if key not in _form_callbacks and key != "__default__":
+            _cb_order.append(key)
+            while len(_cb_order) > _CB_MAX_ENTRIES:
+                _form_callbacks.pop(_cb_order.pop(0), None)
+        _form_callbacks[key] = callback
+        _form_callbacks["__default__"] = callback
+
+
+def get_form_callback(session_id: str = "") -> Optional[Any]:
+    """Resolve the form callback for a session, else the latest default."""
+    key = str(session_id or "").strip()
+    with _cb_lock:
+        if key and key in _form_callbacks:
+            return _form_callbacks[key]
+        return _form_callbacks.get("__default__")

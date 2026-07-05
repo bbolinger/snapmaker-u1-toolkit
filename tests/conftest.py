@@ -22,9 +22,54 @@ import pytest
 # (and don't accidentally trigger find_recent_request_for_model hits in
 # integration tests). u1_config.get_data_dir reads this env var first.
 @pytest.fixture(autouse=True)
-def _isolated_data_dir(tmp_path, monkeypatch):
+def _isolated_data_dir(tmp_path, monkeypatch, request):
     """Per-test data dir so requests/ + state files are sandboxed."""
     monkeypatch.setenv('SNAPMAKER_U1_DATA_DIR', str(tmp_path / '_data_dir'))
+    # Deterministic interaction mode: u1_config._load_dotenv_if_present()
+    # falls back to /opt/data/.env, so an operator running the suite on a
+    # box with U1_INTERACTION_MODE=form live (e.g. during v2.2 form testing)
+    # silently flips every staged-flow test into form mode (live 2026-07-02:
+    # two "failures" that were really env leakage). Kill the fallback for
+    # tests and scrub anything already loaded into this process; tests that
+    # want form mode set U1_INTERACTION_MODE explicitly. Exemption: the
+    # loader's own tests (test_u1_config.py) exercise the real walk with
+    # their own tmp .env files.
+    if request.node.fspath.basename != 'test_u1_config.py':
+        import u1_config
+        monkeypatch.setattr(u1_config, '_load_dotenv_if_present', lambda: None)
+    monkeypatch.delenv('U1_INTERACTION_MODE', raising=False)
+
+    # HARD SAFETY: the test suite must NEVER reach the operator's real Telegram.
+    # tools/u1_grace_notify_hermes.sh defaults HERMES_BIN->`hermes` (the real
+    # binary on PATH) and DEST->`telegram` (the real chat), so any test that
+    # runs the real notify path DMs the operator. Live 2026-07-02: every full
+    # suite run spammed Brent a "print starting" notification. Force a no-op
+    # sender + a non-telegram destination for EVERY test, and shadow `hermes`
+    # on PATH so a bare `hermes` call can't hit the real binary either. Any
+    # invocation is logged so the offending test is identifiable. Tests that
+    # assert on notify behaviour set their own stub, which overrides this.
+    _stub_dir = tmp_path / "_hermes_stub"
+    _stub_dir.mkdir(exist_ok=True)
+    _log = os.environ.get("U1_TEST_HERMES_LOG", "/tmp/u1_test_hermes_calls.log")
+    _stub = _stub_dir / "hermes"
+    _stub.write_text(
+        "#!/bin/bash\n"
+        f'echo "SEND-ATTEMPT test=${{PYTEST_CURRENT_TEST:-?}} args=$*" >> "{_log}"\n'
+        "exit 0\n")
+    _stub.chmod(0o755)
+    monkeypatch.setenv("HERMES_BIN", str(_stub))
+    monkeypatch.setenv("U1_GRACE_NOTIFY_DEST", "test-noop-not-telegram")
+    monkeypatch.setenv("PATH", str(_stub_dir) + os.pathsep + os.environ.get("PATH", ""))
+    # Belt to the HERMES_BIN suspenders: the gate reads U1_GRACE_NOTIFY_CMD from
+    # os.environ DIRECTLY (not via u1_config's dotenv loader), so a leaked value
+    # (test_u1_config loads the real /opt/data/.env into os.environ) would make a
+    # start-path test run the real notify command. Scrub it for every test; and
+    # default the grace window to 0 so a start-path test that doesn't explicitly
+    # set grace_seconds skips the window entirely — no notify attempt, and no
+    # 120s real-time sleep. Tests that exercise grace/notify set these
+    # explicitly (via grace_seconds= or monkeypatch), which overrides the below.
+    monkeypatch.delenv("U1_GRACE_NOTIFY_CMD", raising=False)
+    monkeypatch.setenv("U1_GRACE_PERIOD_SECONDS", "0")
     yield
 
 # Real-Orca test harness (added 2026-06-26). When pytest runs from

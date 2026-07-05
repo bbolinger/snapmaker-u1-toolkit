@@ -116,6 +116,7 @@ import u1_kit
 import u1_form
 import u1_arrange
 import u1_request
+import u1_review_doc
 from u1_print_start_gate import build_stage1_command
 from u1_slice_workflow import (
     _resolve_operator,
@@ -1025,6 +1026,85 @@ def _render_plate_layout_from_m486_outer_walls(
     return {"ok": True, "path": str(out_path), "part_count": n, "error": None}
 
 
+def _render_plate_isometric(
+    stl_paths: list[str] | list[Path],
+    out_path: Path,
+    *,
+    title: str | None = None,
+    label_below: str | None = None,
+    canvas_px: int = 1000,
+) -> dict[str, Any]:
+    """Isometric 3D plate preview from the ARRANGED part STLs — the actual print
+    pose, each part a distinct hue.
+
+    Complements (does NOT replace) the M486 top-down footprint: this view is
+    built from the arranged STLs, that one is traced from the sliced gcode — two
+    corroborating views from DIFFERENT sources, which is what gives a human
+    confidence the render is real (operator 2026-07-04, public/competition
+    context). It also shows orientation / "how it's sitting", which a flat
+    footprint can't. Single part renders in the default blue; multi gets per-part
+    HSV colors so tightly-packed parts stay distinguishable. Best-effort: returns
+    ``ok: False`` (deps missing / no arranged STLs) so the caller simply omits
+    the 3D view and still shows the footprint."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import numpy as np
+        import colorsys
+        from _stl_render import parse_stl, render_view  # type: ignore
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0, "error": f"deps: {exc}"}
+    paths = [Path(p) for p in (stl_paths or []) if Path(p).exists()]
+    if not paths:
+        return {"ok": False, "path": None, "part_count": 0,
+                "error": "no arranged STLs (export was best-effort)"}
+    try:
+        n = len(paths)
+        all_t: list[Any] = []
+        all_c: list[Any] = []
+        for i, p in enumerate(paths):
+            t = parse_stl(p)
+            if len(t) == 0:
+                continue
+            if n > 1:
+                r, g, b = colorsys.hsv_to_rgb(i / n, 0.62, 1.0)
+                col = np.array([int(r * 255), int(g * 255), int(b * 255)],
+                               dtype=np.uint8)
+            else:
+                col = np.array([98, 178, 235], dtype=np.uint8)  # default blue
+            all_t.append(t)
+            all_c.append(np.tile(col, (len(t), 1)))
+        if not all_t:
+            return {"ok": False, "path": None, "part_count": 0,
+                    "error": "empty meshes"}
+        tris = np.concatenate(all_t, 0)
+        cols = np.concatenate(all_c, 0).astype(np.uint8)
+        body = render_view(tris, canvas_px, int(canvas_px * 0.8), view="iso",
+                           base_colors=cols, bg=(22, 26, 31), pad=0.09)
+        try:
+            big = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+            small = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        except Exception:
+            big = small = ImageFont.load_default()
+        th = 48 if title else 0
+        lh = 30 if label_below else 0
+        canvas = Image.new("RGB", (body.width, body.height + th + lh),
+                           (22, 26, 31))
+        d = ImageDraw.Draw(canvas)
+        if title:
+            d.text((14, 10), title, fill=(235, 235, 240), font=big)
+        canvas.paste(body, (0, th))
+        if label_below:
+            d.text((14, th + body.height + 4), label_below,
+                   fill=(150, 156, 170), font=small)
+        canvas.save(out_path)
+        return {"ok": True, "path": str(out_path), "part_count": n, "error": None}
+    except Exception as exc:
+        return {"ok": False, "path": None, "part_count": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
 def _render_and_inject_plate_preview(
     plate_gcode_path: Path,
     plate_idx: int,
@@ -1055,7 +1135,8 @@ def _render_and_inject_plate_preview(
     Returns ``(layout, injection)``.
     """
     plate_preview_path = out_dir / f"plate_{plate_idx}_preview.png"
-    label_below = (f"{selected_count} parts • {tool_choice} {material}"
+    label_below = (f"{selected_count} part{'s' if selected_count != 1 else ''}"
+                   f" • {tool_choice} {material}"
                    if plate_idx == 1 else None)
     title = f"Plate {plate_idx} of {plate_count}"
 
@@ -1098,6 +1179,15 @@ def _render_and_inject_plate_preview(
             plate_gcode_path, plate_preview_path,
             bed_mm=bed_mm, title=title, label_below=label_below,
         )
+    # Isometric 3D companion view from the arranged STLs (the actual print
+    # pose). Corroborates the footprint above + shows orientation. Best-effort:
+    # if the arranged-STL export failed, we just skip it (footprint still shows).
+    iso = _render_plate_isometric(
+        arranged_stls, out_dir / f"plate_{plate_idx}_iso.png",
+        title=f"Plate {plate_idx} of {plate_count} — 3D view",
+        label_below=label_below)
+    if iso.get("ok"):
+        layout["iso_path"] = iso["path"]
     injection = {"ok": False, "sizes": [],
                  "error": "render failed; nothing to inject"}
     if layout.get("ok"):
@@ -1759,7 +1849,16 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         {"id": p["part_id"], "label": f"{p['filename']} ({p['footprint_mm'][0]:.0f}x{p['footprint_mm'][1]:.0f}mm)"}
         for p in kit["parts"]
     ]
-    return {
+    # Merged head/material: read the live tool map so the head screen carries
+    # each head's loaded filament + colour (and the separate Material screen is
+    # dropped). Empty when no tool map is present — then the schema falls back
+    # to generic T0–T3 + a Material screen (offline / tests).
+    try:
+        import u1_toolmap
+        heads = u1_toolmap.load_head_options()
+    except Exception:
+        heads = []
+    spec: dict[str, Any] = {
         "parts": parts,
         "tools": DEFAULT_TOOLS,
         "materials": DEFAULT_MATERIALS,
@@ -1769,6 +1868,61 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
         "_profiles_full": profiles_full,  # persisted at form-emit for index stability
     }
+    if heads:
+        spec["heads"] = heads
+        spec["tool_materials"] = {h["tool"]: h["material"] for h in heads}
+    return spec
+
+
+_GATE_PREGRACE_WAIT = 25  # seconds to catch a fast refusal before detaching
+
+
+_DOC_PREFIX_RE = re.compile(r"^doc_[0-9a-f]{8,}_")
+
+
+def _strip_doc_prefix(stem: str) -> str:
+    """Drop Hermes' document-cache prefix (``doc_<hash>_``) so the filename that
+    lands on the printer LEADS with the model name, not the hash. Otherwise
+    every plate shows as ``doc_55da642fda9e…`` in the printer's file list and the
+    operator can only tell them apart by the thumbnail (operator 2026-07-04). The
+    gcode hash is content-based (u1_request.compute_model_hash), so the rename
+    does not affect request tracking/recovery."""
+    stripped = _DOC_PREFIX_RE.sub("", str(stem))
+    return stripped or str(stem)
+
+
+def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
+    """Launch the Stage-2 gate DETACHED and return its result, or None if it's
+    still running (in the grace window).
+
+    Why detached: the gate blocks up to ~120s for the pre-start grace/cancel
+    window, but the agent's terminal tool call for --confirm-start times out at
+    ~60s and kills its process tree — which killed the gate mid-grace and the
+    print never started (live 2026-07-04). ``start_new_session=True`` puts the
+    gate in its own process group so it survives the tool call returning. We
+    wait a bounded ``_GATE_PREGRACE_WAIT`` to catch a fast pre-grace refusal
+    (bad token / blockers, which happen in a few seconds); if it's still running
+    after that it has passed the safety checks and is in the grace window, so we
+    leave it running and return None. The operator already has the grace DM (the
+    gate sent it) and reply-CANCEL still works out-of-band. Isolated so tests
+    monkeypatch it (never contact Moonraker / block)."""
+    from types import SimpleNamespace
+    log_path = Path(out_dir) / "stage2_gate.log"
+    logf = open(log_path, "w")
+    proc = subprocess.Popen(
+        [sys.executable, gate_py] + argv,
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        proc.wait(timeout=_GATE_PREGRACE_WAIT)
+    except subprocess.TimeoutExpired:
+        logf.close()
+        return None  # passed pre-grace checks; in the grace window, detached
+    logf.close()
+    try:
+        out = log_path.read_text(errors="replace")
+    except Exception:
+        out = ""
+    return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr="")
 
 
 def run_kit_workflow(args) -> dict[str, Any]:
@@ -1776,6 +1930,32 @@ def run_kit_workflow(args) -> dict[str, Any]:
     global _CLI_OPERATOR
     _CLI_OPERATOR = getattr(args, "operator", None) or None
     operator = _resolve_operator(args)
+
+    # --confirm-start <token>: the operator said "yes" at the bed-clear prompt.
+    # The model relays ONLY this short token (it mangled the old 200-char
+    # verbatim command). Resolve the request + pending nonce from persisted
+    # state, then fall through as a normal second-turn confirm (--action start
+    # --bed-clear-confirmed). Single-use: the token is consumed on resolve.
+    _confirm_token = getattr(args, "confirm_start", None)
+    if _confirm_token:
+        _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
+        _state = u1_request.read_request(_rid) if _rid else None
+        _pending = ((_state or {}).get("safety") or {}).get("pending_bed_clear_start") or {}
+        if not (_rid and _state and _pending.get("nonce")):
+            print(json.dumps({
+                "stage": "bed_clear_confirm_token_invalid",
+                "reason": ("confirm token is invalid, already used, or expired. "
+                           "Re-run --action start (no --bed-clear-confirmed) to "
+                           "get a fresh bed-clear prompt."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_token_invalid",
+                    "confirm_token": _confirm_token}
+        args.request_id = _rid
+        args.action = "start"
+        args.bed_clear_confirmed = True
+        args.pending_nonce = _pending.get("nonce")
+        _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
+               token_first6=str(_confirm_token)[:6])
     # Fence 1 companion: visible stderr banner whenever the workflow is
     # invoked under a test-prefixed operator. Same prefix list as
     # u1_print_start_gate.py's gate refusal. Prevents the "oh it looked
@@ -1950,10 +2130,18 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # ── LEGACY: one-liner power-user path (CLI tests + scripted runs) ──
     answers = getattr(args, "form_answers", None)
     answers_json = getattr(args, "form_answers_json", None)
-    if answers or answers_json:
+    answers_from = getattr(args, "form_answers_from", None)
+    if getattr(args, "redeem_pending_form", False) and not answers_from:
+        # The model relays NO form_id — it derives from the request, which
+        # persisted form_id at emit time. gemma4 mangled the random-hex form_id
+        # in the verbatim redeem command (live 2026-07-03: f7b273e3536 →
+        # f7b273e3504 → "form id mismatch"), the same failure mode the
+        # confirm-start short token fixed. Deriving it kills the manglable token.
+        answers_from = (u1_request.read_request(request_id) or {}).get("form_id")
+    if answers or answers_json or answers_from:
         return _run_legacy_form_answers(
             args, operator, archive, kit, request_id, out_dir, events_file,
-            json_events, answers, answers_json)
+            json_events, answers, answers_json, answers_from)
 
     # ── STAGED FLOW (Brent design 2026-06-30 late — text mode 6-turn) ──
     #
@@ -1969,6 +2157,125 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # trust_factor_pdf]] and postmortem §5e.5 for the roadmap).
 
     interaction_mode = _resolve_interaction_mode(args)
+
+    # ── FORM MODE (v2.2): one consolidated form instead of staged turns ──
+    # The form_schema is rendered by an adapter (buttons); the GATEWAY
+    # writes the collected answers to a file keyed by form_id and the
+    # agent redeems it by relaying next_command verbatim. No answer
+    # content ever passes through the model — same trust level as the
+    # --pending-nonce contract. Text fallback stays available.
+    if interaction_mode == "form" and not getattr(args, "action", None):
+        _existing = u1_request.read_request(request_id) or {}
+        spec = _build_form_spec(kit, nozzle,
+                                persisted_profiles=_existing.get("form_profiles"))
+        # Kit-of-1 (a lone STL routed through the unified flow): run the
+        # single-model orientation verdict so the orient button is data-driven —
+        # recommend the pose Orca actually prefers, with the reason. Proven to
+        # earn its cost (2026-07-03: catches floating regions as-authored →
+        # recommends auto). Cheap: one model, and orient_verdict only draft-
+        # slices the SECOND pose when the first has overhangs. Computed once and
+        # persisted so an idempotent re-emit reuses it. Skipped for true
+        # multi-part kits (draft-slicing every part is too expensive; they
+        # already auto-orient at slice time).
+        if len(kit.get("parts", [])) == 1:
+            _ov = _existing.get("orient_verdict")
+            if _ov is None:
+                _ov = {}
+                try:
+                    import u1_slice_workflow as _sw
+                    _pv = (spec.get("_prof_opts") or [{}])[0].get("value")
+                    if _pv:
+                        _od = (u1_request.ensure_request_dir(request_id)
+                               / "orient_analysis")
+                        _od.mkdir(parents=True, exist_ok=True)
+                        _res = _sw.orient_verdict(
+                            Path(kit["parts"][0]["path"]), _od,
+                            Path(_sw.profile_path(_pv)),
+                            _sw.filament_path(DEFAULT_MATERIALS[0], nozzle=nozzle))
+                        if _res.get("ok"):
+                            _ov = {"recommendation": _res["recommendation"],
+                                   "note": _res.get("note")}
+                except Exception:
+                    _ov = {}  # verdict is a nicety; never block the form on it
+                u1_request.write_request(request_id, orient_verdict=_ov)
+            if _ov:
+                spec["orient_recommendation"] = _ov.get("recommendation")
+                spec["orient_note"] = _ov.get("note")
+        if not spec["profiles"]:
+            _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
+                                "message": ("No profiles found. Run "
+                                            "tools/fetch_snapmaker_profiles.py.")},
+                  json_events)
+            return {"phase": "setup_required", "request_id": request_id,
+                    "out_dir": str(out_dir)}
+        # Re-invocation while a form is pending re-emits the SAME form_id —
+        # idempotent re-prompt, no orphaned answer files. (A successful
+        # commit clears form_id, so a stale one can't leak into a new run;
+        # the phase itself is unreliable here because the bare-reinvoke
+        # guard upstream resets it to kit_analysis by design.)
+        form_id = _existing.get("form_id") or u1_form.new_form_id()
+        u1_request.write_request(request_id, phase="awaiting_form",
+                                 form_id=form_id,
+                                 form_profiles=spec["_profiles_full"])
+        # Render the per-part STL thumbnail grid BEFORE the form so the
+        # operator can see each piece while picking parts — the staged flow
+        # does this at Turn 1; form mode was skipping it (operator feedback
+        # 2026-07-02: "I didn't get a photo of the models before selecting").
+        _thumb = _render_parts_thumbnail_grid(
+            kit, u1_request.ensure_request_dir(request_id) / "parts_thumbnails.png")
+        if _thumb.get("ok"):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "parts_thumbnail_grid",
+                                "image": _thumb["path"]}, json_events)
+        schema = u1_form.build_form_schema(
+            spec, submit={"mode": "file", "form_id": form_id})
+        # Carry the thumbnail path IN the schema so the form renderer sends it
+        # as a photo with the first screen — the operator sees the pieces
+        # while picking, without relying on the agent to surface the render
+        # (operator feedback 2026-07-02: picked parts with no photo).
+        if _thumb.get("ok"):
+            schema["header_image"] = _thumb["path"]
+        # Persist the schema to disk; the agent relays ONLY the flat form_id.
+        # A 26B local model (gemma4) could not reproduce the nested schema in
+        # a tool call — it emitted template-token soup as plain text
+        # (finish=stop, no tool_calls; Ollama #15539/#15798/#15943) and the
+        # flow stranded. Verified 2026-07-03: flat form_id call succeeds where
+        # the nested-schema call failed (19s vs 819s, temp-0.2 variant). The
+        # event is also kept SLIM (no schema/text_fallback) so the model
+        # never sees nested JSON it might try to echo.
+        u1_form.persist_schema(form_id, schema)
+        # Redeem WITHOUT relaying the form_id — the model mangled the random-hex
+        # id in the verbatim command (gemma4, live 2026-07-03). --redeem-pending-
+        # form makes the workflow read form_id off the request instead.
+        redeem_cmd = _build_next_command(
+            archive, request_id, nozzle=nozzle,
+            no_live_upload=no_live_upload,
+            no_live_material=no_live_material) + " --redeem-pending-form"
+        if not no_live_upload:
+            redeem_cmd += " --live-upload"
+        _emit(events_file, {
+            "stage": "need_input", "key": "kit_form",
+            "request_id": request_id,
+            "form_id": form_id,
+            "next_command": redeem_cmd,
+            "instruction": (
+                f"Your VERY NEXT action is a single tool call: "
+                f"form(form_id=\"{form_id}\"). Nothing else — no text first, "
+                "no image paths, no restated options (the form renderer "
+                "shows the parts thumbnail and every choice as buttons). "
+                "When the gateway confirms the answers file is written, "
+                "tool-call next_command VERBATIM — do not add, remove, or "
+                "restate any answer. If the form tool errors, is "
+                "unavailable, or times out: re-run THIS SAME kit command "
+                "with --interaction-mode text appended — that starts the "
+                "staged one-question-per-turn flow."),
+        }, json_events)
+        _emit(events_file, {"stage": "awaiting_input", "need": "kit_form",
+                            "request_id": request_id}, json_events)
+        _audit(request_id, "kit_form_emitted", operator, form_id=form_id,
+               mode="form")
+        return {"phase": "awaiting_form", "request_id": request_id,
+                "form_id": form_id}
 
     # Turn 1: parts (heavy: extract + build kit dict + render STL thumbnail grid)
     parts_answer = getattr(args, "parts", None)
@@ -2196,7 +2503,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
 
     # Upload each plate. Plate 1 is the gated one.
     live_upload = not no_live_upload
-    kit_stem = u1_kit._sanitize(archive.stem)
+    kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     # Plate filenames are deterministic ({kit_stem}_plateN.gcode), so an
     # adjust → re-confirm on the SAME request always collides with its own
     # earlier upload — rc=5 dead-ended the advertised adjust option. When
@@ -2249,8 +2556,16 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         })
         # ── NOW upload (gcode has thumbnail baked in) ──
         _oc = getattr(args, "on_collision", None)
-        if _oc is None and named.name in _own_prior_names:
-            _oc = "overwrite"
+        if _oc is None:
+            # Re-uploading THIS request's own prior name (adjust -> re-confirm)
+            # overwrites it. ANY OTHER collision -> rename with a timestamp
+            # suffix so the upload never fails and never clobbers a different
+            # job's file. This is the common case now that doc-hash filename
+            # prefixes are dropped (82a9681): re-printing a model a PRIOR
+            # request already uploaded = same base name. rename appends the
+            # timestamp ONLY on collision, so the first print keeps the clean
+            # name and the model name still leads (printer-list readability).
+            _oc = "overwrite" if named.name in _own_prior_names else "rename"
         up = (_real_upload(named,
                             on_collision=_oc,
                             material=material)
@@ -2306,6 +2621,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             "metadata": pl.get("metadata", {}),
             "arranged_stls": pl.get("arranged_stls") or [],
             "preview_path": layout.get("path"),
+            "iso_path": layout.get("iso_path"),
             "thumbnail_injection": injection,
         })
 
@@ -2448,6 +2764,41 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         printer_busy_reason=printer_state.get("reason"),
     )
 
+    # Pre-print review doc (v2.2): the operator's flight plan, generated
+    # from the sliced gcode's own config block. Strictly fail-soft — a doc
+    # problem must never block a print.
+    review_doc_path: str | None = None
+    try:
+        review_doc_path = str(u1_review_doc.generate(
+            request_id, out_dir, plates_state,
+            state=u1_request.read_request(request_id) or {},
+            decisions={"tool": tool_choice, "material": material,
+                       "profile": profile_slug, "orient": orient,
+                       "supports": supports,
+                       "parts": ", ".join(p["part_id"] for p in selected)},
+            overrides=([f"supports forced {'ON' if supports == 'supports' else 'OFF'} "
+                        f"by your answer (preset value overridden)"]
+                       if supports in ("supports", "no_supports") else None),
+            operator=operator,
+            reference=u1_review_doc.build_reference(
+                profile_slug, material, nozzle=nozzle, out_dir=out_dir),
+            envelope=u1_review_doc.build_material_envelope(
+                material, nozzle=nozzle, out_dir=out_dir),
+        ))
+        _emit(events_file, {
+            "stage": "review_doc", "request_id": request_id,
+            "path": review_doc_path,
+            "instruction": ("ATTACH this file (surface the bare path so Hermes "
+                            "sends it as a document) alongside the plan card — do "
+                            "NOT paste its contents inline; it is markdown with "
+                            "tables that render as a wall of pipes in a chat "
+                            "message. It is the human-readable review of exactly "
+                            "what will print."),
+        }, json_events)
+    except Exception as _rd_exc:
+        _audit(request_id, "review_doc_failed", operator,
+               error=f"{type(_rd_exc).__name__}: {_rd_exc}"[:200])
+
     # Readiness card carries the plan + captured photo/status. The raw
     # Stage 2 command and approval token are NOT surfaced here's
     # 2026-07-01 audit flagged that as a shortcut path any adapter could
@@ -2456,6 +2807,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
     # workflow's _action_start() can reach it.
     readiness = {
         "stage": "kit_readiness_card",
+        "review_doc_path": review_doc_path,
         "request_id": request_id,
         "part_count": kit["part_count"],
         "selected_parts": [p["part_id"] for p in selected],
@@ -2483,21 +2835,21 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         "printer_busy": printer_busy,
         "printer_busy_reason": printer_state.get("reason"),
         "gated_plate": plate1["printer_storage_filename"],
-        # NOT A START AUTHORIZATION. This is a Stage 1 command that
-        # captures a bed photo and writes an approval token; it does
-        # NOT command the printer. For kit requests the gate refuses
-        # any Stage 2 that arrives without a nonce
-        # (see u1_print_start_gate.py:is_kit_request refusal path), so
-        # this command CANNOT be chained into a print start on its
-        # own. Named the way it is for backward compat with older
-        # skills that grep this key for the photo-refresh flow.
-        "start_gate_stage1_command": stage1_cmd,
+        # start_gate_stage1_command is deliberately NOT surfaced here anymore.
+        # It's a runnable gate command, and a confused agent grabbed it and ran
+        # the gate directly — Stage 1 then a Stage 2 with no nonce, which the
+        # gate correctly refused, costing the operator a scary turn (live
+        # 2026-07-02, twice). The ONLY start path is the `start` option's
+        # next_command (--action start), which drives the bed-clear yes/no and
+        # emits the nonce-bound Stage 2 command itself. The command is still
+        # persisted in request state (write_request below) for _action_start's
+        # own no-token fallback.
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Plate 1 ({plate1['printer_storage_filename']}) is "
             f"start-gated. Plates 2..{len(plates_state)} are already uploaded; "
             "start them from the Snapmaker app after plate 1 finishes."
             if len(plates_state) > 1 else
-            "Single plate. `start` will ask for a fresh bed-clear yes/no before firing."
+            "Single plate. Slice & review, then a fresh bed-clear yes/no starts the print."
         ),
     }
     _emit(events_file, readiness, json_events)
@@ -2515,7 +2867,7 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         # is NOT surfaced here — that would be a
         # bypass path any adapter could grab.
         options.append({
-            "label": "Start — I'll ask you to confirm bed-clear before the print fires",
+            "label": "Slice & review — then a fresh bed-clear yes/no starts the print",
             "value": "start",
             "next_command": _build_next_command(
                 archive, request_id, parts=parts_answer, tool=tool_choice,
@@ -2588,6 +2940,10 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         _emit(events_file, {"stage": "render", "request_id": request_id,
                             "kind": "kit_plate_preview",
                             "image": preview_result["path"]}, json_events)
+        if preview_result.get("iso_path"):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_isometric",
+                                "image": preview_result["iso_path"]}, json_events)
     if bed_result["ok"]:
         _emit(events_file, {"stage": "render", "request_id": request_id,
                             "kind": "bed_snapshot",
@@ -2603,7 +2959,13 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
         "instruction": ("Surface BOTH render images bare in your reply (composite "
                         "plate preview + bed snapshot path) BEFORE the prompt text, "
                         "then surface the prompt verbatim, then wait for the "
-                        "operator's reply (`start` / `upload-only` / `adjust`)."),
+                        "operator's reply (`start` / `upload-only` / `adjust`). "
+                        "When the operator answers, tool-call the CHOSEN option's "
+                        "next_command VERBATIM. NEVER run u1_print_start_gate.py "
+                        "or start_gate_stage1_command yourself — the workflow drives "
+                        "the bed-clear yes/no turn and emits the Stage 2 command for "
+                        "you; running the gate directly skips the nonce and the gate "
+                        "will refuse."),
     }, json_events)
     _emit(events_file, {"stage": "awaiting_input", "need": "confirm",
                         "request_id": request_id}, json_events)
@@ -2872,12 +3234,18 @@ def _action_start(events_file: Path | None, request_id: str,
         # exact request revision + gcode hash. If either drifts before
         # the operator says yes, the second call will refuse.
         nonce = secrets.token_urlsafe(24)
+        # Short confirm token the model relays instead of the full command
+        # (gemma4 mangled the long verbatim relay — see u1_form confirm-token
+        # note). Maps to this request; single-use; the nonce still does the
+        # real auth.
+        confirm_token = u1_form.new_confirm_token()
         pending = {
             "issued_at": datetime.now(timezone.utc).isoformat(),
             "request_revision": request_revision,
             "gcode_hash": gcode_hash,
             "prompt_key": "bed_clear_start",
             "nonce": nonce,
+            "confirm_token": confirm_token,
         }
         # Persist the pending approval into safety block, preserving
         # existing safety fields (token/snapshot_path/etc).
@@ -2886,15 +3254,25 @@ def _action_start(events_file: Path | None, request_id: str,
         u1_request.write_request(request_id,
                                  phase="awaiting_bed_clear_start",
                                  safety=new_safety)
+        try:
+            u1_form.persist_confirm_token(confirm_token, request_id)
+        except Exception as _ct_exc:
+            _audit(request_id, "confirm_token_persist_failed", operator,
+                   error=f"{type(_ct_exc).__name__}: {_ct_exc}"[:160])
         # Reference the photo the operator already saw with the print
         # plan card (attached at the confirm turn). Do NOT say "the
         # attached photo" — no fresh attachment on this turn (Brent UX
         # 2026-07-01). Agents that resurface the photo at this turn get
         # dupes; agents that don't leave the operator wondering where
         # the photo went.
+        # ONE decision, made looking at the fresh bed photo. No request-id (noise
+        # for a single-user/single-printer setup), no double question — "bed's
+        # clear, print it?" IS the bed affirmation. NO = keep the gcode staged
+        # (it's already uploaded), not an abort.
         prompt = (
-            f"Review the bed photo I sent with the print plan above. "
-            f"Bed clear and you want to start request {request_id}? (yes/no)"
+            "Sliced plate, review doc, and a fresh bed photo are attached. "
+            "Bed clear and ready to print? Reply YES to start now, or NO to "
+            "keep the gcode uploaded without printing."
         )
         need = {
             "stage": "need_input",
@@ -2904,24 +3282,20 @@ def _action_start(events_file: Path | None, request_id: str,
             "requires_fresh_operator_bed_clear": True,
             "approval_prompt_key": "bed_clear_start",
             "prompt": prompt,
+            "instruction": ("FIRST surface the kit_plate_preview + bed_snapshot "
+                            "image paths BARE and attach the review_doc, THEN "
+                            "the prompt — the operator decides looking at the "
+                            "real bed. On NO: the gcode stays uploaded (staged), "
+                            "nothing prints; acknowledge and stop."),
             "expected_answers": ["yes", "no"],
-            # Yes-command carries full kit context (parts/tool/material/
-            # profile/orient/supports/nozzle) plus --bed-clear-confirmed.
-            # a hand-built version that omitted these
-            # caused the workflow to restart at Turn 1 (awaiting_parts)
-            # on the resume call.
-            # The pending nonce rides the yes-command: the second call must
-            # present it, so only the VERBATIM emitted command can confirm —
-            # a hand-assembled --bed-clear-confirmed call is refused.
-            "next_command_on_yes": (yes_command or (
-                # Legacy fallback (state-recovery path) — the workflow's
-                # self-heal on --request-id may fill in missing args, but
-                # this is a defense-in-depth path; callers should always
-                # pass yes_command.
+            # Short confirm token instead of a ~200-char verbatim command:
+            # the model relays ONE opaque token, the workflow resolves the
+            # request + nonce + full kit context from persisted state. This
+            # stopped gemma4 mangling the request_id mid-command. Single-use;
+            # the nonce still does the auth (revision + gcode binding).
+            "next_command_on_yes": (
                 f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                f"--request-id {request_id} --action start "
-                f"--bed-clear-confirmed"
-            )) + f" --pending-nonce {nonce}",
+                f"--confirm-start {confirm_token}"),
             "next_command_on_no": None,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
@@ -2990,29 +3364,84 @@ def _action_start(events_file: Path | None, request_id: str,
         u1_request.write_request(request_id,
                                  phase="awaiting_print_start",
                                  safety=new_safety)
-        stage2_cmd = (
-            f"python3 /opt/data/scripts/u1_print_start_gate.py "
-            f"{_shell_quote(plate_filename)} "
-            f"--intended-tool {extruder} --requested-material {_shell_quote(material)} "
-            f"--request-id {request_id} --bed-clear start "
-            f"--approval-token {token} "
-            f"--stage2-approval-nonce {stage2_nonce}"
-        )
+        # The workflow RUNS the gate itself — it does NOT hand the Stage-2
+        # command back to the model to retype. A 26B model (gemma4) appended
+        # garbage to the approval token when relaying this long token+nonce
+        # command (live 2026-07-03), and the gate correctly refused. The human
+        # already authorized via the bed-clear confirm; the workflow holds the
+        # token + nonce. The 120s grace CANCEL is model-free (gateway hook
+        # touches a marker the gate polls — docs/verify-cancel-hook.md), so
+        # blocking here does NOT break cancel: the operator still gets the live
+        # grace DM from the gate and can abort out-of-band.
+        gate_py = "/opt/data/scripts/u1_print_start_gate.py"
+        # Equals-form for the two random values: secrets.token_urlsafe can start
+        # with '-', and argparse would treat a leading-dash VALUE as a flag
+        # ("expected one argument"). This bug was latent in the old agent-relayed
+        # command too (~1.5% of nonces). `--flag=value` is dash-safe.
+        stage2_argv = [
+            plate_filename,
+            "--intended-tool", extruder,
+            "--requested-material", material,
+            "--request-id", request_id,
+            "--bed-clear", "start",
+            "--approval-token=" + token,
+            "--stage2-approval-nonce=" + stage2_nonce,
+        ]
         if operator:
-            stage2_cmd += f" --operator {_shell_quote(operator)}"
-        next_action = {
-            "stage": "next_action_required",
+            stage2_argv += ["--operator", operator]
+        stage2_cmd = "python3 " + gate_py + " " + " ".join(
+            _shell_quote(a) for a in stage2_argv)
+        _emit(events_file, {
+            "stage": "gate_invoked_by_workflow",
             "request_id": request_id,
-            "reason": ("Operator confirmed bed-clear at the fresh yes/no "
-                       "turn. Firing Stage 2 with single-use nonce "
-                       "(safety check + print start)."),
+            "reason": ("Operator confirmed bed-clear. Workflow runs the Stage 2 "
+                       "gate directly (single-use nonce) — the safety-critical "
+                       "command is never relayed by the model."),
             "command": stage2_cmd,
-        }
-        _emit(events_file, next_action, json_events)
-        u1_request.write_request(request_id,
-                                 next_action_required_event=next_action)
-        return {"phase": "awaiting_print_start", "request_id": request_id,
-                "command": stage2_cmd}
+        }, json_events)
+        _res = _invoke_stage2_gate(gate_py, stage2_argv,
+                                   u1_request.ensure_request_dir(request_id))
+        if _res is None:
+            # Gate passed its pre-grace safety checks and is in the grace window,
+            # running DETACHED. Blocking the agent's tool call through the full
+            # ~120s grace timed it out at 60s and killed the gate mid-grace
+            # (live 2026-07-04). The operator already has the grace DM from the
+            # gate and reply-CANCEL works out-of-band; nothing more for the agent.
+            _emit(events_file, {
+                "stage": "grace_in_progress", "request_id": request_id,
+                "reason": ("Print is in the pre-start grace window — reply CANCEL "
+                           "to abort, or ignore to let it start. The gate runs to "
+                           "completion on its own; do NOT re-run anything."),
+            }, json_events)
+            return {"phase": "grace_in_progress", "request_id": request_id,
+                    "started": None}
+        # Gate exited within the pre-grace wait (a fast refusal, or a fast
+        # outcome) — surface its events + outcome.
+        for _line in (_res.stdout or "").splitlines():
+            if _line.strip():
+                print(_line, flush=True)
+        if (_res.stderr or "").strip():
+            sys.stderr.write(_res.stderr)
+        # Parse the outcome from the last JSON object the gate emitted.
+        _outcome: dict[str, Any] = {}
+        for _line in reversed((_res.stdout or "").splitlines()):
+            _s = _line.strip()
+            if _s.startswith("{"):
+                try:
+                    _o = json.loads(_s)
+                except Exception:
+                    continue
+                if "started" in _o or "ok" in _o or _o.get("stage") in (
+                        "start_attempt", "print_started", "start_cancelled",
+                        "gate_refused_file_missing"):
+                    _outcome = _o
+                    break
+        _started = bool(_outcome.get("started"))
+        return {"phase": "print_started" if _started else "start_not_completed",
+                "request_id": request_id,
+                "gate_exit_code": _res.returncode,
+                "started": _started,
+                "gate_outcome": _outcome}
     # Fallback to legacy Stage 1 (no token persisted).
     stage1_cmd = state.get("start_gate_stage1_command")
     if not stage1_cmd:
@@ -3179,7 +3608,7 @@ def _action_refresh_bed_photo(args, events_file: Path | None, request_id: str,
             "Type `start` — I'll ask for a fresh bed-clear yes/no before firing."
         ),
         "options": [{
-            "label": "Start — I'll ask you to confirm bed-clear before the print fires",
+            "label": "Slice & review — then a fresh bed-clear yes/no starts the print",
             "value": "start",
             # Carry the FULL persisted answer set — a start command missing
             # orient/profile/supports would fall back into the staged Q&A
@@ -3660,9 +4089,12 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
                              out_dir: Path, events_file: Path | None,
                              json_events: bool,
                              answers: str | None,
-                             answers_json: str | None) -> dict[str, Any]:
-    """Power-user one-liner path: parse a single --form-answers line and
-    commit in a single CLI call. Bypasses the staged Q&A entirely."""
+                             answers_json: str | None,
+                             answers_from: str | None = None) -> dict[str, Any]:
+    """Single-call commit path. Three intakes, one validation core:
+    --form-answers (operator's one line), --form-answers-json (structured),
+    --form-answers-from <form_id> (v2.2 file handoff — the gateway wrote
+    the answers; the model never carried them)."""
     existing = u1_request.read_request(request_id) or {}
     spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"),
                             persisted_profiles=existing.get("form_profiles"))
@@ -3676,7 +4108,36 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     # Persist the form_profiles snapshot so `profile N` stays stable across calls.
     u1_request.write_request(request_id, form_profiles=spec["_profiles_full"])
 
-    if answers_json:
+    if answers_from:
+        # File redemption is nonce-like: the id must match the form this
+        # request emitted (when one was emitted), and the file is consumed
+        # on read — a replayed command redeems nothing.
+        persisted_form_id = existing.get("form_id")
+        if persisted_form_id and answers_from != persisted_form_id:
+            msg = ("form id mismatch — this request is awaiting a different "
+                   "form. Re-run the workflow to get a fresh form.")
+            _emit(events_file, {"stage": "form_rejected", "key": "kit_form",
+                                "request_id": request_id, "errors": [msg]},
+                  json_events)
+            _audit(request_id, "form_answers_rejected", operator,
+                   reason="form_id_mismatch", given=str(answers_from)[:32])
+            return {"phase": "form_rejected", "request_id": request_id,
+                    "errors": [msg]}
+        try:
+            obj = u1_form.read_and_consume_answers(answers_from)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            msg = f"could not redeem answers file: {exc}"
+            _emit(events_file, {"stage": "form_rejected", "key": "kit_form",
+                                "request_id": request_id, "errors": [msg]},
+                  json_events)
+            _audit(request_id, "form_answers_rejected", operator,
+                   reason="file_redeem_failed", error=str(exc)[:200])
+            return {"phase": "form_rejected", "request_id": request_id,
+                    "errors": [msg]}
+        _audit(request_id, "form_answers_file_redeemed", operator,
+               form_id=answers_from)
+        parsed = u1_form.parse_answers_json(obj, spec)
+    elif answers_json:
         try:
             obj = json.loads(answers_json) if isinstance(answers_json, str) else answers_json
         except (ValueError, TypeError) as exc:
@@ -3701,6 +4162,10 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     values = parsed["values"]
     _emit(events_file, {"stage": "form_accepted", "request_id": request_id,
                         "parsed": u1_form.echo_parse(values, spec)}, json_events)
+    if answers_from:
+        # The pending form is satisfied — clear the binding so a future
+        # form-mode run mints a fresh id instead of reusing a spent one.
+        u1_request.write_request(request_id, form_id=None)
     return _commit_kit_legacy(args, request_id, operator, out_dir,
                               events_file, archive, kit, spec, values)
 
@@ -3757,7 +4222,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
            parts=len(selected_paths), tool=tool, material=material, profile=profile_slug)
 
-    kit_stem = u1_kit._sanitize(archive.stem)
+    kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     live = bool(getattr(args, "live_upload", False))
     plates_state: list[dict[str, Any]] = []
     upload_failures: list[dict[str, Any]] = []
@@ -3788,8 +4253,16 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             source_stls=pl.get("source_stls"),
         )
         _oc = getattr(args, "on_collision", None)
-        if _oc is None and named.name in _own_prior_names:
-            _oc = "overwrite"
+        if _oc is None:
+            # Re-uploading THIS request's own prior name (adjust -> re-confirm)
+            # overwrites it. ANY OTHER collision -> rename with a timestamp
+            # suffix so the upload never fails and never clobbers a different
+            # job's file. This is the common case now that doc-hash filename
+            # prefixes are dropped (82a9681): re-printing a model a PRIOR
+            # request already uploaded = same base name. rename appends the
+            # timestamp ONLY on collision, so the first print keeps the clean
+            # name and the model name still leads (printer-list readability).
+            _oc = "overwrite" if named.name in _own_prior_names else "rename"
         up = _real_upload(named,
                           on_collision=_oc,
                           material=material) if live else {
@@ -3810,6 +4283,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                 })
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
+        _arranged = pl.get("arranged_stls") or []
         plates_state.append({
             "plate_idx": idx,
             "gcode_path": str(named),
@@ -3817,8 +4291,15 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             "printer_storage_filename": up.get("uploaded_filename") or named.name,
             "uploaded": up,
             "started": False,
-            "arranged_stls": pl.get("arranged_stls") or [],
+            # metadata (est time + filament) + partition_parts were missing on
+            # this (form-mode) path, so the review doc showed "—" and no parts
+            # row — unlike the staged path (operator feedback 2026-07-03).
+            "metadata": pl.get("metadata", {}),
+            "partition_parts": [re.sub(r"^obj_\d+_", "", os.path.basename(s))
+                                for s in _arranged],
+            "arranged_stls": _arranged,
             "preview_path": layout.get("path"),
+            "iso_path": layout.get("iso_path"),
             "thumbnail_injection": injection,
         })
     if upload_failures:
@@ -3842,6 +4323,34 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                         "plates": [p["printer_storage_filename"] for p in plates_state],
                         "live": live}, json_events)
 
+    # Surface the sliced-plate layout render(s) so the operator sees the
+    # arranged parts on the bed — the staged path does this; the form path was
+    # computing the preview but never emitting it (operator 2026-07-03: "I never
+    # got the photo of the sliced render").
+    for _ps in plates_state:
+        _pv = _ps.get("preview_path")
+        if _pv and os.path.isfile(_pv):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_preview",
+                                "plate_idx": _ps.get("plate_idx"),
+                                "image": _pv,
+                                "instruction": ("Surface this image path BARE (no "
+                                                "backticks) in your reply so the "
+                                                "operator sees the sliced plate "
+                                                "layout before the bed-clear prompt.")},
+                  json_events)
+        _iso = _ps.get("iso_path")
+        if _iso and os.path.isfile(_iso):
+            _emit(events_file, {"stage": "render", "request_id": request_id,
+                                "kind": "kit_plate_isometric",
+                                "plate_idx": _ps.get("plate_idx"),
+                                "image": _iso,
+                                "instruction": ("Surface this 3D view path BARE too "
+                                                "(alongside the top-down plate) — it "
+                                                "shows the operator the real print "
+                                                "pose to sanity-check before start.")},
+                  json_events)
+
     plate1 = plates_state[0]
     _tidx = _tool_to_index(tool)
     extruder = "extruder" if _tidx == 0 else f"extruder{_tidx}"
@@ -3851,8 +4360,47 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     )
 
     action = values.get("action", "start")
+
+    # Human-readable profile name + part filenames for the review doc, so it
+    # reads like the sample and not raw slugs/IDs (operator feedback
+    # 2026-07-03: "0_20_strength_gyroid" and "04_angle_90" looked generated).
+    _pf = (u1_request.read_request(request_id) or {}).get("form_profiles") or []
+    _profile_label = next((p.get("label") for p in _pf
+                           if p.get("value") == profile_slug), None) or profile_slug
+    _parts_display = ", ".join(p.get("filename", p["part_id"]) for p in selected)
+
+    # Pre-print review doc (v2.2) — same artifact as the staged path,
+    # same fail-soft contract.
+    review_doc_path: str | None = None
+    try:
+        review_doc_path = str(u1_review_doc.generate(
+            request_id, out_dir, plates_state,
+            state=u1_request.read_request(request_id) or {},
+            decisions={"tool": tool, "material": material,
+                       "profile": _profile_label,
+                       "orient": values.get("orient"),
+                       "supports": supports,
+                       "parts": _parts_display},
+            operator=operator,
+            reference=u1_review_doc.build_reference(
+                profile_slug, material, nozzle=nozzle, out_dir=out_dir),
+            envelope=u1_review_doc.build_material_envelope(
+                material, nozzle=nozzle, out_dir=out_dir),
+        ))
+        _emit(events_file, {
+            "stage": "review_doc", "request_id": request_id,
+            "path": review_doc_path,
+            "instruction": ("Attach this file to the operator alongside the "
+                            "readiness card — human-readable review of "
+                            "exactly what will print."),
+        }, json_events)
+    except Exception as _rd_exc:
+        _audit(request_id, "review_doc_failed", operator,
+               error=f"{type(_rd_exc).__name__}: {_rd_exc}"[:200])
+
     readiness = {
         "stage": "kit_readiness_card",
+        "review_doc_path": review_doc_path,
         "request_id": request_id,
         "part_count": kit["part_count"],
         "selected_parts": [p["part_id"] for p in selected],
@@ -3864,10 +4412,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         "orient": values.get("orient"), "supports": supports,
         "parsed_echo": u1_form.echo_parse(values, spec),
         "gated_plate": plate1["printer_storage_filename"],
-        # NOT A START AUTHORIZATION — Stage 1 photo-capture command
-        # only. Kit Stage 2 requires the staged bed_clear_start
-        # nonce (u1_print_start_gate.py refuses kit start without one).
-        "start_gate_stage1_command": stage1_cmd,
+        # start_gate_stage1_command is deliberately NOT surfaced here — a
+        # confused agent grabbed it and drove the gate directly (Stage 1 then a
+        # Stage 2 with no nonce → correctly refused, the scary "Stage 2 refused"
+        # the operator kept hitting on the FORM path). The ONLY start path is
+        # the `start` option's --action start command; the workflow drives the
+        # bed-clear yes/no and emits the nonce-bound Stage 2 itself. Still
+        # persisted in request state (write_request below) for the fallback.
         "operator_guidance": (
             f"{len(plates_state)} plate(s). Stage 1 gates ONLY plate 1 "
             f"({plate1['printer_storage_filename']}). After it prints, start plates "
@@ -3878,24 +4429,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     }
     _emit(events_file, readiness, json_events)
 
-    persist_phase = "awaiting_start_approval" if action == "start" else "complete"
-    next_action = None
-    if action == "start":
-        next_action = {
-            "stage": "next_action_required",
-            "reason": "Run Stage 1 to capture a real bed photo + approval token for plate 1.",
-            "command": stage1_cmd,
-        }
-        _emit(events_file, next_action, json_events)
-    else:
-        _emit(events_file, {"stage": "complete", "request_id": request_id,
-                            "reason": ("Upload-only: all plates on the printer; "
-                                       "start from the Snapmaker app."
-                                       if live else
-                                       "Upload-only DRY RUN: plates sliced "
-                                       "locally, nothing sent to the printer "
-                                       "(pass --live-upload to send).")}, json_events)
-
+    # Persist plate + plan state BEFORE any bed-clear routing so _action_start
+    # (below) reads plate_filename / gcode_hash / tool / material from state.
+    persist_phase = "awaiting_confirm" if action == "start" else "complete"
     u1_request.write_request(
         request_id,
         phase=persist_phase,
@@ -3907,18 +4443,72 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         printer_storage_filename=plate1["printer_storage_filename"],
         start_gate_stage1_command=stage1_cmd,
         readiness_card_event=readiness,
-        next_action_required_event=next_action,
     )
     _audit(request_id, "kit_readiness_card_emitted", operator,
            plate_count=len(plates_state), gated_plate=plate1["printer_storage_filename"],
-           gcode_hash=plate1["gcode_hash"], request_revision=(u1_request.read_request(request_id) or {}).get("request_revision", 1))
+           gcode_hash=plate1["gcode_hash"],
+           request_revision=(u1_request.read_request(request_id) or {}).get("request_revision", 1))
 
-    return {
-        "phase": persist_phase, "request_id": request_id, "out_dir": str(out_dir),
-        "plate_count": len(plates_state),
-        "gated_plate": plate1["printer_storage_filename"],
-        "start_gate_stage1_command": stage1_cmd,
-    }
+    if action != "start":
+        _emit(events_file, {"stage": "complete", "request_id": request_id,
+                            "reason": ("Upload-only: all plates on the printer; "
+                                       "start from the Snapmaker app."
+                                       if live else
+                                       "Upload-only DRY RUN: plates sliced "
+                                       "locally, nothing sent to the printer "
+                                       "(pass --live-upload to send).")}, json_events)
+        return {"phase": "complete", "request_id": request_id,
+                "out_dir": str(out_dir), "plate_count": len(plates_state),
+                "gated_plate": plate1["printer_storage_filename"]}
+
+    # action == "start": capture the bed photo + issue a token, then route into
+    # the SAME two-turn bed-clear gate as the staged path. _action_start emits
+    # the yes/no and mints the Stage-2 nonce on yes. The form path used to hand
+    # the agent the raw Stage-1 gate command with NO nonce path, so the kit gate
+    # refused EVERY start ("Stage 2 refused", operator 2026-07-03, every run).
+    _no_live_upload = not live
+    _no_live_material = bool(getattr(args, "no_live_material", False))
+    bed_result = _capture_bed_and_issue_token(out_dir)
+    if not bed_result["ok"]:
+        reason = str(bed_result.get("reason") or "camera unreachable")
+        _emit(events_file, {
+            "stage": "need_input", "key": "confirm", "request_id": request_id,
+            "prompt": (f"Bed photo could not be captured ({reason}). Can't offer a "
+                       "gated start. Reply `upload-only` to keep the sliced plates, "
+                       "or fix the camera and re-run the kit."),
+            "options": [{"label": "Upload only — keep plates, don't print",
+                         "value": "upload-only",
+                         "next_command": _build_next_command(
+                             archive, request_id, action="upload-only", nozzle=nozzle,
+                             no_live_upload=_no_live_upload,
+                             no_live_material=_no_live_material)}],
+        }, json_events)
+        return {"phase": "awaiting_confirm", "request_id": request_id,
+                "out_dir": str(out_dir), "bed_capture_failed": True}
+
+    _safety = dict((u1_request.read_request(request_id) or {}).get("safety") or {})
+    _safety.update({
+        "bed_clear_check_required": True,
+        "bed_clear_photo_captured": True,
+        "bed_clear_photo_path": bed_result["snapshot_path"],
+        "snapshot_path": bed_result["snapshot_path"],
+        "approval_token": bed_result["token"],
+    })
+    u1_request.write_request(request_id, safety=_safety)
+    _emit(events_file, {"stage": "render", "request_id": request_id,
+                        "kind": "bed_snapshot", "image": bed_result["snapshot_path"],
+                        "instruction": ("Surface this bed photo path BARE (no backticks) "
+                                        "in your reply BEFORE the bed-clear yes/no "
+                                        "prompt - the prompt refers to 'the bed photo I "
+                                        "sent', so it must actually be sent.")},
+          json_events)
+    yes_command = _build_next_command(
+        archive, request_id, action="start", nozzle=nozzle,
+        no_live_upload=_no_live_upload, no_live_material=_no_live_material
+    ) + " --bed-clear-confirmed"
+    return _action_start(events_file, request_id, json_events,
+                         yes_command=yes_command, bed_clear_confirmed=False,
+                         operator=operator)
 
 
 def main(argv=None) -> int:
@@ -3959,6 +4549,24 @@ def main(argv=None) -> int:
                     help=("Set ONLY after the operator answers 'yes' to the "
                           "fresh bed-clear-and-start prompt. Never set on the "
                           "initial confirm-turn 'start' pick."))
+    ap.add_argument("--form-answers-from", default=None, dest="form_answers_from",
+                    help=("v2.2 file handoff: redeem a gateway-written answers "
+                          "file by form_id (single-use, bound to the form this "
+                          "request emitted). The model relays this command "
+                          "verbatim; answer content never passes through it."))
+    ap.add_argument("--redeem-pending-form", action="store_true",
+                    dest="redeem_pending_form", default=False,
+                    help=("Redeem the pending form WITHOUT relaying its form_id — "
+                          "the workflow reads form_id off the request. Preferred "
+                          "over --form-answers-from for model-relayed redeems: a "
+                          "26B model mangled the random-hex id verbatim "
+                          "(live 2026-07-03)."))
+    ap.add_argument("--confirm-start", default=None, dest="confirm_start",
+                    help=("v2.2 bed-clear confirm: the operator answered 'yes' "
+                          "at the bed-clear prompt. The model relays ONLY this "
+                          "short token (it mangled the old long command); the "
+                          "workflow resolves the request + single-use nonce "
+                          "from persisted state. Never hand-assemble it."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "
@@ -3985,8 +4593,8 @@ def main(argv=None) -> int:
                           "6-turn Q&A (parts → orient → tool → preset → "
                           "supports → confirm), cheap intermediates, safe for "
                           "small local models. `form` = single kit_form event "
-                          "with form_schema (buttons UX, requires form_tool "
-                          "installed). Falls through to env U1_INTERACTION_MODE "
+                          "with form_schema (buttons UX, requires the u1-form "
+                          "Hermes plugin). Falls through to env U1_INTERACTION_MODE "
                           "then defaults to 'text'. Detection at Hermes "
                           "session start by the snapmaker_u1 plugin based on "
                           "model provider (web APIs = form, local = text)."))
