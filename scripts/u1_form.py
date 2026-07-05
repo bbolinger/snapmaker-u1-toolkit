@@ -569,19 +569,35 @@ def resolve_confirm_token(token: str, consume: bool = True):
     ``consume`` (default), delete the token file so it can't be replayed —
     single-use, like the nonce it fronts for. Strict pattern also blocks
     traversal."""
-    import json as _json
+    import json as _json, os
     if not _FORM_ID_RE.match(str(token or "")):
         return None
     p = confirm_tokens_dir() / f"{token}.json"
-    try:
-        rid = _json.loads(p.read_text()).get("request_id")
-    except Exception:
-        return None
-    if consume:
+    if not consume:
         try:
-            p.unlink()
+            return _json.loads(p.read_text()).get("request_id")
         except Exception:
-            pass
+            return None
+    # v2.2.1 #3: atomic single-use CLAIM. Rename the token file to a unique path
+    # BEFORE reading it. os.replace is atomic on one filesystem, so of N
+    # concurrent callers (double-click, gateway retry, duplicate Telegram
+    # delivery, two workers) exactly ONE wins the rename; the losers see the
+    # source already gone and return None. The old read-then-unlink let two
+    # callers both read the same token before either deleted it, and both
+    # returned the same request_id (and unlink failures were swallowed).
+    claimed = p.with_name(f".claim.{os.getpid()}.{token}.json")
+    try:
+        os.replace(p, claimed)
+    except OSError:
+        return None  # already claimed by another caller, or never existed
+    try:
+        rid = _json.loads(claimed.read_text()).get("request_id")
+    except Exception:
+        rid = None
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
     return rid
 
 
