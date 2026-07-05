@@ -38,7 +38,7 @@ from __future__ import annotations
 # _ensure_compat_python so the kit workflow is just as robust when invoked
 # via a `python3` that lacks deps (e.g. Hermes' /usr/bin/python3). Without
 # this, calling `python3 u1_kit_workflow.py ...` fails on the numpy import.
-import os, sys, subprocess
+import os, sys, subprocess, time
 from pathlib import Path
 
 
@@ -1899,30 +1899,62 @@ def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
     window, but the agent's terminal tool call for --confirm-start times out at
     ~60s and kills its process tree — which killed the gate mid-grace and the
     print never started (live 2026-07-04). ``start_new_session=True`` puts the
-    gate in its own process group so it survives the tool call returning. We
-    wait a bounded ``_GATE_PREGRACE_WAIT`` to catch a fast pre-grace refusal
-    (bad token / blockers, which happen in a few seconds); if it's still running
-    after that it has passed the safety checks and is in the grace window, so we
-    leave it running and return None. The operator already has the grace DM (the
-    gate sent it) and reply-CANCEL still works out-of-band. Isolated so tests
-    monkeypatch it (never contact Moonraker / block)."""
+    gate in its own process group so it survives the tool call returning.
+
+    v2.2.1 #2: resolve the outcome via the child's EXPLICIT state marker, not by
+    inferring 'still alive after 25s' == 'in the grace window'. Returns:
+      - a result namespace (returncode, stdout) if the child EXITED (fast
+        refusal / fast outcome),
+      - None if the child wrote a ``grace_started`` marker (the ~120s window
+        genuinely opened; leave it detached),
+      - a namespace with ``stalled=True`` if the wait elapsed with the child
+        still alive but NO grace marker (stuck in a pre-grace check / heading to
+        a late refusal) — the caller must NOT report that as a healthy grace.
+    Isolated so tests monkeypatch it (never contact Moonraker / block)."""
     from types import SimpleNamespace
-    log_path = Path(out_dir) / "stage2_gate.log"
+    out_dir = Path(out_dir)
+    # #4: per-invocation log so a retry can't truncate a live gate's diagnostics.
+    log_path = out_dir / f"stage2_gate_{os.getpid()}.log"
+    state_path = out_dir / "stage2_gate_state.json"
+    # Clear any stale marker from a prior invocation BEFORE launching, so we only
+    # ever observe THIS child's transitions.
+    try:
+        state_path.unlink()
+    except OSError:
+        pass
     logf = open(log_path, "w")
     proc = subprocess.Popen(
         [sys.executable, gate_py] + argv,
         stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
-    try:
-        proc.wait(timeout=_GATE_PREGRACE_WAIT)
-    except subprocess.TimeoutExpired:
+
+    def _finish(stalled=False):
         logf.close()
-        return None  # passed pre-grace checks; in the grace window, detached
-    logf.close()
-    try:
-        out = log_path.read_text(errors="replace")
-    except Exception:
-        out = ""
-    return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr="")
+        try:
+            out = log_path.read_text(errors="replace")
+        except Exception:
+            out = ""
+        if stalled:
+            return SimpleNamespace(stalled=True, returncode=None,
+                                   stdout=out, stderr="")
+        return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr="")
+
+    def _marker_state():
+        try:
+            return json.loads(state_path.read_text()).get("state")
+        except Exception:
+            return None
+
+    waited, step = 0.0, 0.5
+    while waited < _GATE_PREGRACE_WAIT:
+        if proc.poll() is not None:
+            return _finish()  # child exited -> real outcome in the log
+        if _marker_state() == "grace_started":
+            logf.close()
+            return None  # grace window genuinely opened; leave it detached
+        time.sleep(step)
+        waited += step
+    # Wait elapsed, child still alive, no grace marker: STALLED, not healthy.
+    return _finish(stalled=True)
 
 
 def run_kit_workflow(args) -> dict[str, Any]:
@@ -3401,6 +3433,29 @@ def _action_start(events_file: Path | None, request_id: str,
         }, json_events)
         _res = _invoke_stage2_gate(gate_py, stage2_argv,
                                    u1_request.ensure_request_dir(request_id))
+        if getattr(_res, "stalled", False):
+            # v2.2.1 #2: the gate is still running after the pre-grace wait but
+            # never wrote a grace_started marker — it is stalled in a pre-grace
+            # check (Moonraker query, camera, I/O) or heading to a late refusal.
+            # Do NOT report a healthy grace window we cannot confirm. Surface the
+            # honest unresolved state; the detached gate will finish on its own
+            # and its outcome is in the log + audit trail.
+            for _line in (_res.stdout or "").splitlines():
+                _line = _line.strip()
+                if _line.startswith("{"):
+                    try:
+                        _emit(events_file, json.loads(_line), json_events)
+                    except Exception:
+                        pass
+            _emit(events_file, {
+                "stage": "gate_state_unknown", "request_id": request_id,
+                "reason": ("The start gate is taking longer than expected and has "
+                           "not confirmed the grace window. It is running detached "
+                           "and will finish on its own — do NOT re-run it. Check "
+                           "the printer and the request audit log for the outcome."),
+            }, json_events)
+            return {"phase": "gate_state_unknown", "request_id": request_id,
+                    "started": None}
         if _res is None:
             # Gate passed its pre-grace safety checks and is in the grace window,
             # running DETACHED. Blocking the agent's tool call through the full
