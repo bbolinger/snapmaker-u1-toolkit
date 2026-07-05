@@ -654,7 +654,7 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
             "options": [{"id": p["id"], "label": _clean_label(p.get("label", p["id"]))} for p in parts],
             "default": "all", "required": False,
         })
-    # Setup screen (v2.2.1): print head + orientation + supports render TOGETHER
+    # Setup screen (form UX, shipped in v2.2.0): print head + orientation + supports render TOGETHER
     # on one screen (group="setup"). Head first, then the two toggles. When the
     # live tool map is available each head option carries its loaded material +
     # colour, so picking the head IS picking the filament and the separate
