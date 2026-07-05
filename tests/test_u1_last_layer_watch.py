@@ -110,3 +110,16 @@ def test_fallback_does_not_fire_across_different_jobs(monkeypatch, _fake_camera)
     assert len(_fake_camera) == 1
     state = w.load_state()
     assert state["last_layer_fired_job_key"] == "other.gcode|100"
+
+
+def test_fallback_does_not_fire_for_different_job_appearing_complete(monkeypatch, _fake_camera):
+    """Codex-review finding (2026-07-05): the fallback must fire only for the
+    SAME job. If job A was printing and next tick a DIFFERENT job B shows
+    complete (A finished + B auto-started+finished between two 1-min ticks —
+    realistic for multi-plate kits), capturing A's last-layer would photograph
+    B's bed and mislabel it. Guard on filename must reject the cross-job case."""
+    _run(monkeypatch, _status("printing", 35, 48, filename="plateA.gcode"))  # A never hit window
+    _run(monkeypatch, _status("complete", 20, 60, filename="plateB.gcode", is_active=False))  # different job
+    assert len(_fake_camera) == 0  # must NOT fire for A against B's bed
+    state = w.load_state()
+    assert state.get("last_layer_fired_job_key") != "plateA.gcode|48"
