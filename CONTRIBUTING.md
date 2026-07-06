@@ -77,6 +77,22 @@ Before submitting:
 - [ ] If you added PIL/numpy/etc. to a script in `scripts/`, move it to `tools/`
       and document the dep instead
 
+## Maintainer: promote a tag to a GitHub Release
+
+`git push origin vX.Y.Z` creates a Tag on GitHub but NOT a Release object — the Releases page won't see it until a Release is explicitly created. `tools/create_release_from_tag.py` closes that gap by reading the tag's commit message and publishing it as the Release notes.
+
+```
+# After tagging + pushing a new version:
+export GITHUB_TOKEN=<your PAT with `repo` scope>
+
+python3 tools/create_release_from_tag.py                # promote the latest tag
+python3 tools/create_release_from_tag.py v1.4.5         # promote a specific tag
+python3 tools/create_release_from_tag.py --all-missing  # backfill every tag without a Release
+python3 tools/create_release_from_tag.py v1.4.5 --update  # replace existing Release's notes
+```
+
+Idempotent: a tag that already has a Release is skipped unless `--update` is passed. Repo slug is auto-detected from `git remote get-url origin`. Token sources (first match wins): `--token`, `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`.
+
 ## Reporting bugs
 
 Open an issue with: U1 firmware version, OS + Python version, the script and
