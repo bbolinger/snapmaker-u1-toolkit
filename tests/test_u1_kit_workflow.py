@@ -703,18 +703,38 @@ def test_kit_setup_required_when_no_profiles(tmp_path, monkeypatch):
     assert res["phase"] == "setup_required"
 
 
-def test_plate_isometric_renders_from_stls(tmp_path):
-    """The isometric 3D plate view renders from arranged STLs — the confidence
-    companion to the top-down footprint (corroborating view from a different
-    data source, operator 2026-07-04). Single = blue; multi = distinct hues;
-    empty = graceful skip (footprint still shows), never a crash."""
-    a = _cube(tmp_path / "a.stl", 20)
-    b = _cube(tmp_path / "b.stl", 25)
-    r1 = kw._render_plate_isometric([str(a)], tmp_path / "iso1.png",
-                                    title="Plate 1 of 1 — 3D view",
-                                    label_below="1 part")
-    assert r1["ok"] and (tmp_path / "iso1.png").stat().st_size > 800
-    r2 = kw._render_plate_isometric([str(a), str(b)], tmp_path / "iso2.png")
-    assert r2["ok"] and r2["part_count"] == 2
-    r3 = kw._render_plate_isometric([], tmp_path / "iso3.png")
-    assert r3["ok"] is False
+def _make_m486_gcode(path, parts):
+    """Minimal Orca-shaped M486 gcode: a header declaring each object name, then
+    several Z layers of Outer wall extrusion per part. Mirrors the real format
+    (name via `M486 S<id>` + `M486 A<name>.stl_id_<n>_copy_0`)."""
+    lines = []
+    for i, (name, _) in enumerate(parts):
+        lines += [f"M486 S{i}", f"M486 A{name}.stl_id_{i}_copy_0", "M486 S-1"]
+    for z in (0.2, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0):
+        for i, (name, fp) in enumerate(parts):
+            lines += [f"M486 S{i}", f"G1 Z{z}", ";TYPE:Outer wall",
+                      f"G1 X{fp[0][0]} Y{fp[0][1]} E0"]
+            for (x, y) in list(fp[1:]) + [fp[0]]:
+                lines.append(f"G1 X{x} Y{y} E.5")
+            lines.append("M486 S-1")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
+def test_plate_isometric_from_gcode_renders(tmp_path):
+    """v2.2.1: the 3D view is built from the SAME sliced gcode as the top-down
+    footprint (M486 outer walls), so the two corroborate by construction (the old
+    arranged-STL version used Orca's buggy --export-stl packer and disagreed).
+    Two parts render; a gcode with no M486 markers skips gracefully."""
+    sq_a = [(20, 20), (60, 20), (60, 60), (20, 60)]
+    sq_b = [(120, 120), (160, 120), (160, 160), (120, 160)]
+    gp = tmp_path / "plate.gcode"
+    _make_m486_gcode(gp, [("square_a", sq_a), ("square_b", sq_b)])
+    r = kw._render_plate_isometric_from_gcode(
+        gp, tmp_path / "iso.png", bed_mm=(270, 270),
+        title="Plate 1 of 1  -  3D view", label_below="2 parts")
+    assert r["ok"] and r["part_count"] == 2
+    assert (tmp_path / "iso.png").stat().st_size > 800
+    # no M486 markers -> graceful skip (footprint still shows), never a crash
+    plain = tmp_path / "plain.gcode"
+    plain.write_text("G1 X10 Y10 E1\n")
+    assert kw._render_plate_isometric_from_gcode(plain, tmp_path / "iso2.png")["ok"] is False
