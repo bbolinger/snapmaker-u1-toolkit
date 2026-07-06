@@ -122,6 +122,27 @@ def test_tg_single_select_in_group_does_not_advance_but_ungrouped_does():
     assert form["current"] == tg.REVIEW_FIELD
 
 
+def test_tg_edit_from_review_returns_to_review():
+    """Trap fix (live 2026-07-06): editing a field FROM the Review screen and
+    then advancing must return to Review, not march the operator forward through
+    the remaining screens (or dead-end). Going back to re-edit the head used to
+    trap the operator with no way to confirm."""
+    schema = _schema()
+    form = tg.new_form(schema)
+    form["current"] = tg.REVIEW_FIELD  # finished the form
+    # edit a GROUPED field (tool, in the setup group)
+    tg.apply_callback(form, "e:%d" % _fi(schema, "tool"))
+    assert form["current"] == "tool" and form.get("_edit_return")
+    # the group's shared Next must return to Review, NOT advance to 'profile'
+    tg.apply_callback(form, "n:%d" % _fi(schema, "tool"))
+    assert form["current"] == tg.REVIEW_FIELD
+    assert not form.get("_edit_return")  # flag cleared
+    # and an UNGROUPED field (profile): edit + tap also returns to Review
+    tg.apply_callback(form, "e:%d" % _fi(schema, "profile"))
+    tg.apply_callback(form, "s:%d:0" % _fi(schema, "profile"))
+    assert form["current"] == tg.REVIEW_FIELD
+
+
 def test_tg_all_and_none_shortcuts():
     form = tg.new_form(_schema(n_parts=4))
     tg.apply_callback(form, "a:0")  # All
