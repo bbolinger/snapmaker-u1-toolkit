@@ -2102,6 +2102,17 @@ def run_kit_workflow(args) -> dict[str, Any]:
         args.pending_nonce = _pending.get("nonce")
         _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
                token_first6=str(_confirm_token)[:6])
+    # ── REPRINT (v2.3): both turns work with NO model positional ──
+    # Turn 1 (--reprint): list recent prints, one single-use pick token each.
+    # Turn 2 (--reprint-start <token>): seed a fresh request from the picked
+    # print and jump straight to the bed-clear boundary — no slicing at all.
+    if getattr(args, "reprint_start", None):
+        return _action_reprint_start(None, bool(getattr(args, "json_events", False)),
+                                     operator, args.reprint_start)
+    if getattr(args, "reprint", False):
+        return _action_reprint_list(None, bool(getattr(args, "json_events", False)),
+                                    operator)
+
     # Fence 1 companion: visible stderr banner whenever the workflow is
     # invoked under a test-prefixed operator. Same prefix list as
     # u1_print_start_gate.py's gate refusal. Prevents the "oh it looked
@@ -3359,6 +3370,232 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "approval_expires_at": expires_at,
             "captured_at_utc": captured_ts,
             "reason": None}
+
+
+def _printer_gcode_filenames() -> set[str] | None:
+    """Names in the printer's gcodes root, or None when Moonraker is
+    unreachable (callers treat None as unknown and fail closed at start)."""
+    import urllib.request
+    try:
+        from u1_config import get_u1_host, get_u1_port
+        url = (f"http://{get_u1_host()}:{get_u1_port()}"
+               "/server/files/list?root=gcodes")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            payload = json.loads(r.read().decode())
+        return {str(f.get("path", "")) for f in payload.get("result", [])}
+    except Exception:
+        return None
+
+
+def _reprint_candidates(limit: int = 6) -> list[dict[str, Any]]:
+    """Recent reprintable jobs: requests that uploaded a plate-1 gcode,
+    newest first, deduped by printer filename, enriched with the print-history
+    record (state/duration) and an on-printer check."""
+    from u1_config import get_data_dir
+    root = Path(get_data_dir()) / "requests"
+    if not root.is_dir():
+        return []
+    # History join: printer filename -> latest ledger record.
+    history: dict[str, dict[str, Any]] = {}
+    try:
+        hist = json.loads((Path(get_data_dir()) / "print_history.json").read_text())
+        for rec in hist.get("records", []):
+            if rec.get("filename"):
+                history[rec["filename"]] = rec
+    except Exception:
+        pass
+    on_printer = _printer_gcode_filenames()
+
+    dirs = sorted((d for d in root.iterdir() if d.is_dir()),
+                  key=lambda d: d.stat().st_mtime, reverse=True)[:60]
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for d in dirs:
+        try:
+            req = json.loads((d / "request.json").read_text())
+        except Exception:
+            continue
+        fname = req.get("printer_storage_filename")
+        plates = req.get("plates") or []
+        if not (fname and plates and plates[0].get("gcode_hash")):
+            continue  # never uploaded — nothing to reprint
+        if fname in seen:
+            continue
+        seen.add(fname)
+        rec = history.get(fname) or {}
+        est = rec.get("estimated_time_s")
+        dur = (f"{int(est // 3600)}h {int(est % 3600 // 60)}m" if est and est >= 3600
+               else f"{int(est // 60)}m" if est else None)
+        # Human name: strip the Hermes doc-cache prefix (doc_<hash>_), the
+        # same cleanup printer filenames get.
+        model = re.sub(r"^doc_[0-9a-f]{6,}_",
+                       "", Path(req.get("model_file") or fname).stem)
+        # Same model re-uploaded under a different cache hash reads as an
+        # identical option — keep only the newest per (model, tool, material).
+        model_key = f"{model}|{req.get('tool')}|{req.get('material')}"
+        if model_key in seen:
+            continue
+        seen.add(model_key)
+        out.append({
+            "request_id": req.get("request_id") or d.name,
+            "printer_storage_filename": fname,
+            "model": model,
+            "tool": req.get("tool"),
+            "material": req.get("material"),
+            "printed_state": rec.get("state"),
+            "duration": dur,
+            "last_seen_at": rec.get("last_seen_at"),
+            "on_printer": (None if on_printer is None else fname in on_printer),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _action_reprint_list(events_file: Path | None, json_events: bool,
+                         operator: str) -> dict[str, Any]:
+    """Turn 1: list recent prints, each with a single-use pick token. The
+    model relays ONE short token command verbatim — same mangle-proof shape
+    as --confirm-start."""
+    cands = _reprint_candidates()
+    if not cands:
+        _emit(events_file, {
+            "stage": "reprint_none_available",
+            "message": ("No reprintable jobs found — nothing in the request "
+                        "history has an uploaded plate. Send a model file to "
+                        "start a fresh print.")}, json_events)
+        return {"phase": "reprint_none_available"}
+    options = []
+    for i, c in enumerate(cands, 1):
+        tok = u1_form.new_confirm_token()
+        u1_form.persist_confirm_token(tok, c["request_id"])
+        bits = [c["model"]]
+        if c.get("material") or c.get("tool"):
+            bits.append(f"{c.get('material') or '?'} on {c.get('tool') or '?'}")
+        if c.get("printed_state") == "complete":
+            bits.append("printed" + (f", ~{c['duration']}" if c.get("duration") else ""))
+        elif c.get("printed_state"):
+            bits.append(str(c["printed_state"]))
+        else:
+            bits.append("uploaded, not printed")
+        label = " — ".join(bits)
+        if c.get("on_printer") is False:
+            label += " (no longer on printer)"
+        options.append({
+            "n": i, "label": label,
+            "next_command": (f"python3 /opt/data/scripts/u1_kit_workflow.py "
+                             f"--reprint-start {tok}"),
+        })
+    _emit(events_file, {
+        "stage": "need_input", "need": "reprint_pick", "key": "reprint_pick",
+        "prompt": "Which print do you want to run again?",
+        "options": options,
+        "instruction": ("Surface the options to the operator as a numbered "
+                        "list (labels only). Wait for their pick, then "
+                        "tool-call THAT option's next_command VERBATIM. Do "
+                        "not invent filenames or edit the token."),
+    }, json_events)
+    _emit(events_file, {"stage": "awaiting_input", "need": "reprint_pick"},
+          json_events)
+    return {"phase": "awaiting_reprint_pick", "options_count": len(options)}
+
+
+def _action_reprint_start(events_file: Path | None, json_events: bool,
+                          operator: str, token: str) -> dict[str, Any]:
+    """Turn 2: seed a fresh request from the picked print and enter the
+    standard bed-clear boundary. No slicing: the gcode is already in printer
+    storage; the gate still re-verifies material live, validates the file
+    exists before grace, and runs the full nonce/grace/cancel chain."""
+    old_rid = u1_form.resolve_confirm_token(token)  # single-use, atomic claim
+    old = u1_request.read_request(old_rid) if old_rid else None
+    if not (old_rid and old):
+        _emit(events_file, {
+            "stage": "reprint_token_invalid",
+            "reason": ("pick token is invalid, already used, or expired — "
+                       "run --reprint again for a fresh list.")}, json_events)
+        return {"phase": "reprint_token_invalid"}
+    plates = old.get("plates") or []
+    fname = old.get("printer_storage_filename") or (
+        plates[0].get("printer_storage_filename") if plates else None)
+    if not (fname and plates and plates[0].get("gcode_hash")):
+        _emit(events_file, {
+            "stage": "reprint_unavailable", "request_id": old_rid,
+            "reason": "that request never uploaded a plate — send the model "
+                      "file for a fresh slice instead."}, json_events)
+        return {"phase": "reprint_unavailable", "request_id": old_rid}
+
+    # Hard existence check now (better UX than failing at the gate; the gate
+    # still re-validates pre-grace as defense in depth).
+    names = _printer_gcode_filenames()
+    if names is None or fname not in names:
+        reason = ("printer unreachable — cannot verify the file is still on "
+                  "the printer" if names is None else
+                  f"'{fname}' is no longer in printer storage")
+        _emit(events_file, {
+            "stage": "reprint_file_missing", "request_id": old_rid,
+            "reason": reason,
+            "instruction": ("Tell the operator the reprint can't start and "
+                            "to re-send the original model file for a fresh "
+                            "slice.")}, json_events)
+        return {"phase": "reprint_file_missing", "request_id": old_rid}
+
+    new_rid = u1_request.generate_request_id()
+    new_dir = Path(u1_request.ensure_request_dir(new_rid))
+    bed = _capture_bed_and_issue_token(new_dir)
+    if not bed.get("ok"):
+        _emit(events_file, {
+            "stage": "reprint_bed_capture_failed", "request_id": new_rid,
+            "reason": bed.get("reason"),
+            "instruction": ("Bed photo failed — the reprint fails closed. "
+                            "Tell the operator why and stop.")}, json_events)
+        _audit(new_rid, "reprint_bed_capture_failed", operator,
+               reprint_of=old_rid, reason=str(bed.get("reason"))[:160])
+        return {"phase": "reprint_bed_capture_failed", "request_id": new_rid}
+
+    u1_request.write_request(
+        new_rid,
+        reprint_of=old_rid,
+        model_file=old.get("model_file"),
+        tool=old.get("tool", "T0"),
+        material=old.get("material", "PETG"),
+        request_revision=1,
+        printer_storage_filename=fname,
+        plates=[{"plate_idx": 1,
+                 "gcode_hash": plates[0].get("gcode_hash"),
+                 "gcode_path": plates[0].get("gcode_path"),
+                 "printer_storage_filename": fname,
+                 "uploaded": True}],
+        operator=operator,
+        safety={"approval_token": bed["token"],
+                "snapshot_path": bed.get("snapshot_path"),
+                "bed_clear_photo_captured": True},
+    )
+    _audit(new_rid, "reprint_initiated", operator, reprint_of=old_rid,
+           printer_filename=fname)
+
+    # Re-surface the ORIGINAL previews + review doc (they live in the old
+    # request dir), then the fresh bed photo — so the stock bed-clear prompt
+    # ("sliced plate, review doc, and a fresh bed photo are attached") stays
+    # literally true for a reprint.
+    for kind, path in (("kit_plate_preview", plates[0].get("preview_path")),
+                       ("kit_plate_isometric", plates[0].get("iso_path"))):
+        if path and Path(path).is_file():
+            _emit(events_file, {"stage": "render", "request_id": new_rid,
+                                "kind": kind, "image": path,
+                                "instruction": "Surface this image path BARE in your reply."},
+                  json_events)
+    _old_review = Path(old.get("out_dir") or "") / "review.md"
+    if _old_review.is_file():
+        _emit(events_file, {"stage": "review_doc", "request_id": new_rid,
+                            "path": str(_old_review)}, json_events)
+    if bed.get("snapshot_path"):
+        _emit(events_file, {"stage": "render", "request_id": new_rid,
+                            "kind": "bed_snapshot", "image": bed["snapshot_path"],
+                            "instruction": "Surface this fresh bed photo path BARE in your reply."},
+              json_events)
+
+    return _action_start(events_file, new_rid, json_events,
+                         bed_clear_confirmed=False, operator=operator)
 
 
 def _action_start(events_file: Path | None, request_id: str,
@@ -4745,6 +4982,12 @@ def main(argv=None) -> int:
                           "Optional ONLY when --request-id resolves a recoverable "
                           "model_path from request.json (resume case)."))
     ap.add_argument("--json-events", action="store_true")
+    ap.add_argument("--reprint", action="store_true",
+                    help="List recent prints to print again (no model file needed)")
+    ap.add_argument("--reprint-start", default=None, metavar="TOKEN",
+                    dest="reprint_start",
+                    help="Start the reprint the operator picked "
+                         "(single-use token minted by --reprint)")
 
     # Staged-flow flags (Phase 1) — each turn adds one.
     ap.add_argument("--parts", default=None,

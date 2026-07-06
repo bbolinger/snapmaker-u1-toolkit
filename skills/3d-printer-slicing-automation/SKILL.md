@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
-description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself."
-version: 2.2.0
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint / print a recent job again (no file needed): FIRST tool call MUST be 'python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events'."
+version: 2.3.0
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -26,6 +26,12 @@ This skill is a set of COMMANDS, not a description to summarize. If you catch yo
 python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
 (If the platform rejects raw `.stl` but accepts `.zip`, extract the STL first, then run this on the extracted path.) This one command is the entry for EVERYTHING — a single model or a multi-part kit zip alike; the workflow figures out which.
+
+**Reprint — the operator asks to print a recent job again (no file attached):**
+```bash
+python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events
+```
+It emits a `need_input` with numbered recent prints — surface the labels, wait for the pick, then tool-call that option's `next_command` verbatim (a short `--reprint-start <token>` command). No slicing happens; the flow goes straight to the normal bed-clear decision (Step 4). Never guess which print they meant and never skip the list turn.
 
 **Immediately after that first tool call**, your first TEXT reply (only once, not every turn) is:
 > "On it — running the Snapmaker U1 workflow. I'll surface every choice for you, show the plate preview and a fresh bed photo before anything prints, run only the commands the workflow gives me (never ones I invent), and nothing starts until you confirm at the bed-clear step."

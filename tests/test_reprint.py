@@ -1,0 +1,136 @@
+"""Reprint (v2.3): list recent prints, restart through the standard gate.
+
+No slicing happens on a reprint — the gcode is already in printer storage.
+The safety boundary is untouched: fresh bed photo, single-use confirm token,
+revision+hash-bound pending, live material re-check at the gate.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import u1_form
+import u1_request
+import u1_kit_workflow as kw
+
+
+def _seed_uploaded_request(model="widget", fname=None, tool="T1",
+                           material="PETG", ghash="sha256:abc123",
+                           doc_hash="a1b2c3d4e5f6"):
+    rid = u1_request.generate_request_id()
+    fname = fname or f"{model}_plate1.gcode"
+    d = Path(u1_request.ensure_request_dir(rid))
+    (d / "review.md").write_text("# review\n")
+    u1_request.write_request(
+        rid,
+        model_file=f"doc_{doc_hash}_{model}.zip",
+        tool=tool, material=material, request_revision=1,
+        printer_storage_filename=fname,
+        out_dir=str(d),
+        plates=[{"plate_idx": 1, "gcode_hash": ghash,
+                 "gcode_path": str(d / "plate_1.gcode"),
+                 "printer_storage_filename": fname, "uploaded": True}],
+    )
+    return rid, fname
+
+
+def _fake_bed_ok(out_dir):
+    p = Path(out_dir) / "bed_snapshot.jpg"
+    p.write_bytes(b"jpg")
+    return {"ok": True, "snapshot_path": str(p), "token": "tok123",
+            "approval_ttl_seconds": 1800, "approval_expires_at": None,
+            "captured_at_utc": "2026-07-06T00:00:00Z", "reason": None}
+
+
+def test_candidates_dedupe_and_strip_prefix(monkeypatch):
+    """Same model re-uploaded under a different doc hash collapses to the
+    newest; labels drop the doc_<hash>_ cache prefix."""
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: None)
+    _seed_uploaded_request(model="grip", fname="grip_old.gcode", doc_hash="aaaa11112222")
+    _seed_uploaded_request(model="grip", fname="grip_new.gcode", doc_hash="bbbb33334444")
+    cands = kw._reprint_candidates()
+    grips = [c for c in cands if c["model"] == "grip"]
+    assert len(grips) == 1
+    assert grips[0]["model"] == "grip"  # prefix stripped
+    assert not grips[0]["model"].startswith("doc_")
+
+
+def test_reprint_list_mints_resolvable_tokens(monkeypatch, capsys):
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: None)
+    rid, _ = _seed_uploaded_request()
+    res = kw._action_reprint_list(None, True, "test-op")
+    assert res["phase"] == "awaiting_reprint_pick"
+    out = capsys.readouterr().out
+    ev = next(json.loads(l) for l in out.splitlines()
+              if '"reprint_pick"' in l and '"need_input"' in l)
+    tok = ev["options"][0]["next_command"].split("--reprint-start ")[1].strip()
+    assert u1_form.resolve_confirm_token(tok) == rid  # resolves to old request
+
+
+def test_reprint_start_reaches_bed_clear(monkeypatch, capsys):
+    """Happy path: seeds a fresh request (reprint_of), copies the plate hash,
+    persists the Stage-1 token, and lands on the standard bed-clear prompt."""
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token()
+    u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "awaiting_bed_clear_start", res
+    new_rid = res["request_id"]
+    assert new_rid != old_rid
+    st = u1_request.read_request(new_rid)
+    assert st["reprint_of"] == old_rid
+    assert st["printer_storage_filename"] == fname
+    assert st["plates"][0]["gcode_hash"] == "sha256:abc123"
+    assert st["safety"]["approval_token"] == "tok123"
+    pending = st["safety"]["pending_bed_clear_start"]
+    assert pending["gcode_hash"] == "sha256:abc123" and pending["confirm_token"]
+    out = capsys.readouterr().out
+    assert "--confirm-start " + pending["confirm_token"] in out
+
+
+def test_reprint_refuses_when_file_gone(monkeypatch, capsys):
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {"other.gcode"})
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "reprint_file_missing"
+    assert "no longer in printer storage" in capsys.readouterr().out
+
+
+def test_reprint_fails_closed_when_printer_unreachable(monkeypatch, capsys):
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: None)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "reprint_file_missing"  # unknown = refuse
+
+
+def test_reprint_fails_closed_on_bed_capture_failure(monkeypatch, capsys):
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token",
+                        lambda d: {"ok": False, "snapshot_path": None,
+                                   "token": None, "reason": "camera dark"})
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "reprint_bed_capture_failed"
+    st = u1_request.read_request(res["request_id"]) or {}
+    assert not (st.get("safety") or {}).get("pending_bed_clear_start")
+
+
+def test_reprint_invalid_token_refused(capsys):
+    res = kw._action_reprint_start(None, True, "test-op", "c00000000000")
+    assert res["phase"] == "reprint_token_invalid"
+
+
+def test_reprint_pick_token_is_single_use(monkeypatch):
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    first = kw._action_reprint_start(None, True, "test-op", tok)
+    assert first["phase"] == "awaiting_bed_clear_start"
+    second = kw._action_reprint_start(None, True, "test-op", tok)  # replay
+    assert second["phase"] == "reprint_token_invalid"
