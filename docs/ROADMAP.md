@@ -143,6 +143,103 @@ Reference: Ollama/gemma4 tool-call bug + the fixes are documented in the README
 
 ---
 
+## v2.3 — Operator conveniences (planned 2026-07-06)
+
+Three features, ordered cheapest-to-richest. All three reuse proven machinery;
+none touches the safety boundary's shape.
+
+### 1. Reprint — recall recent prints, restart through the gate
+
+**Status:** 📋 QUEUED (first up)
+
+List recent prints from the `u1_print_history` ledger (filename, tool,
+material, when, duration) as a single-select form. Picking one skips slicing
+entirely: straight to Stage-1 bed photo → operator yes → Stage-2 start on the
+gcode already in printer storage.
+
+Why it's cheap: the ledger already records everything needed, and the start
+gate already (a) takes a printer-storage filename, (b) re-verifies material
+against what's physically loaded, and (c) validates the file exists on the
+printer before opening the grace window. If the file was deleted from the
+printer, re-upload from the request dir when it still exists; otherwise offer
+a fresh slice.
+
+### 2. Quantity — print N copies
+
+**Status:** 📋 QUEUED
+
+Orca 2.4.0 CLI natively supports `--repetitions count` (whole plate) and
+repeated positional STL paths (per-part control). Form gets a quantity
+selector — single-model (kit-of-one) runs first; per-part ×N for kits only if
+a real need appears. The instance-keyed 3D render already draws duplicate
+copies correctly, and multi-plate overflow is already handled by the extent
+guard + plate split.
+
+### 3. Advanced settings screen (infill, walls, brim, fuzzy skin)
+
+**Status:** 📋 QUEUED
+
+An optional "Advanced" button on the form's Review screen jumps to an extra
+group and returns to Review (the edit-return mechanism the re-edit fix added).
+Skipping it = today's behavior, so the default path costs nothing — and since
+the form schema rides on disk (the model only relays a `form_id`), extra
+fields cost a small local model zero tokens.
+
+Fields (button presets only — the renderer is single/multi-select, and preset
+lists beat free-typed numbers for reliability):
+
+- Infill density: 10 / 15 / 20 / 30 / 40 / 50 %
+- Infill pattern: grid / gyroid / honeycomb / triangles
+- Wall loops: 2 / 3 / 4
+- Brim: off / auto
+- Fuzzy skin: off / on
+
+Backend: generalize `apply_supports_override` into
+`apply_profile_overrides(dict)` — same flatten-profile → patch keys →
+self-contained temp JSON pattern (Orca has no CLI override flags; profile
+patching is the only reliable path). Keys: `sparse_infill_density`,
+`sparse_infill_pattern`, `wall_loops`, `brim_type`, `fuzzy_skin`. Every
+override must appear in `review.md` so what the operator approved is what
+prints. Text mode: optional prefixed tokens in the one-liner; staged mode
+skips advanced entirely.
+
+Scope fence: layer height and supports stay where they are (profile choice +
+the existing supports field). Seam, speeds, and temperatures stay out —
+that's profile territory, and every added option is another decision on the
+operator's screen.
+
+---
+
+## v2.4 — 3MF ingest (planned 2026-07-06)
+
+**Status:** 📋 QUEUED
+
+Accept a multi-object `.3mf` as a kit. Lean path: normalize to the proven STL
+pipeline by having Orca itself explode the file (`--export-stls <dir>`), then
+feed the extracted parts through the existing ingest → form → arrange → slice
+flow. No new geometry parsing. The packer divergence that bit the old 3D
+preview doesn't apply here — extraction only; our own arrange step re-packs
+everything. Embedded profiles and paint/multi-material data are ignored:
+geometry only. `--allow-newer-file` covers newer 3mf versions. Zip-of-STLs
+stays the primary kit shape.
+
+---
+
+## Model bench — 12B-class tool callers (standing)
+
+**Status:** 📋 QUEUED (independent of releases)
+
+Candidates to test against the skill, in order: Qwen3 14B (native tool
+template, ~9 GB), Llama-3-Groq-8B-Tool-Use (top small-class tool-calling
+benchmark; verify its context window fits the skill payload), Mistral Nemo
+12B, Granite4 small. Skip thinking-variant models (empty content in tool
+turns). Protocol per model: create a temp-0.2 variant, then the live
+gauntlet — does `form()` fire, does `next_command` relay verbatim, does it
+freelance on a bare zip. Three runs each; score = forms fired / verbatim
+relays / freelance incidents.
+
+---
+
 ## How to pick up this work cold
 
 1. Read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the immutable system contracts.
