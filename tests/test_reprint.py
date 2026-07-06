@@ -134,3 +134,37 @@ def test_reprint_pick_token_is_single_use(monkeypatch):
     assert first["phase"] == "awaiting_bed_clear_start"
     second = kw._action_reprint_start(None, True, "test-op", tok)  # replay
     assert second["phase"] == "reprint_token_invalid"
+def test_reprint_confirm_start_skips_ingest(monkeypatch, capsys):
+    """Live 2026-07-06: the operator's YES on a reprint died because the
+    confirm-token fall-through tried to recover + re-ingest the ORIGINAL
+    archive (long gone from the doc cache). A reprint confirm must route
+    straight to the gate turn — no archive, no ingest."""
+    from types import SimpleNamespace
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    new_rid = res["request_id"]
+    confirm = (u1_request.read_request(new_rid)["safety"]
+               ["pending_bed_clear_start"]["confirm_token"])
+
+    # The confirmed turn would invoke the real gate subprocess — stub it and
+    # capture that we actually REACHED it (the bug never got this far).
+    reached = {}
+    def _fake_gate(gate_py, argv, out_dir):
+        reached["argv"] = argv
+        return None  # None == grace window opened, gate detached
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake_gate)
+
+    args = SimpleNamespace(
+        model=None, confirm_start=confirm, reprint=False, reprint_start=None,
+        json_events=True, operator="test-op", events_file=None,
+        request_id=None, action=None, bed_clear_confirmed=False,
+        pending_nonce=None, nozzle="0.4",
+    )
+    out_res = kw.run_kit_workflow(args)
+    out = capsys.readouterr().out
+    assert reached, f"gate turn never reached; result={out_res} out={out[:400]}"
+    assert fname in " ".join(reached["argv"])          # gating the right file
+    assert "kit_ingested" not in out                    # NO re-ingest happened

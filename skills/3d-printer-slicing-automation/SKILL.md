@@ -47,6 +47,8 @@ It emits a `need_input` with numbered recent prints — surface the labels, wait
 
 **Never**: edit a command before relaying it, add or drop a flag, construct a command yourself from memory of an earlier turn, or invent a magic confirmation phrase. The workflow is the only source of truth for what runs next — if it didn't hand you the string this turn, you don't have it.
 
+**When a relayed command returns an error or refusal: surface its message verbatim and STOP.** Do not investigate with your own grep/ls/find commands, do not retry variants, do not re-slice, do not compose a recovery command. The operator decides what happens next.
+
 **Step 2 (staged text fallback) — for each `need_input` event (text fallback only; form mode is one screen).**
 
 Order: `parts` (skipped for a single model) → `orient` → `tool` → `preset` → `supports` → `confirm`. (Follow whatever order the workflow actually emits — this is just what to expect.)
@@ -71,6 +73,7 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 
 - If `bed_snapshot_path` is null, do **not** fabricate or re-capture a photo — ask the prompt as-is.
 - On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
+- If the operator replies **CANCEL** during the grace window: do NOTHING — a model-free gateway hook handles the cancel directly. Do not run any command, do not touch the gate, do not restart anything. Acknowledge only after the workflow reports the cancel.
 - On **no** / anything else: tool-call nothing, tell the operator it's cancelled or staged, stop.
 - **Never** construct a `--bed-clear start` / approval-token command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start command, fail closed and say so.
 

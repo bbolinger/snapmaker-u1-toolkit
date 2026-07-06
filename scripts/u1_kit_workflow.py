@@ -2102,6 +2102,19 @@ def run_kit_workflow(args) -> dict[str, Any]:
         args.pending_nonce = _pending.get("nonce")
         _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
                token_first6=str(_confirm_token)[:6])
+        if _state.get("reprint_of"):
+            # Reprint confirm (v2.3): there is NO archive to re-ingest — the
+            # gcode is already in printer storage and everything the confirmed
+            # turn validates (pending nonce, revision, plate hash, tool,
+            # material) is persisted on the request. Falling through would hit
+            # the model-positional recovery and die on the original upload's
+            # long-gone cache file (live 2026-07-06: the operator's YES
+            # errored, stranding the reprint at the finish line). Route
+            # straight to the gate turn.
+            return _action_start(None, _rid,
+                                 bool(getattr(args, "json_events", False)),
+                                 bed_clear_confirmed=True, operator=operator,
+                                 pending_nonce=_pending.get("nonce"))
     # ── REPRINT (v2.3): both turns work with NO model positional ──
     # Turn 1 (--reprint): list recent prints, one single-use pick token each.
     # Turn 2 (--reprint-start <token>): seed a fresh request from the picked
