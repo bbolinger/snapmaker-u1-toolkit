@@ -2277,6 +2277,51 @@ def run_kit_workflow(args) -> dict[str, Any]:
     answers = getattr(args, "form_answers", None)
     answers_json = getattr(args, "form_answers_json", None)
     answers_from = getattr(args, "form_answers_from", None)
+    # v2.2.2: idempotency for a DUPLICATE form-redeem. If the request already
+    # advanced to the bed-clear step (the first redeem sliced + uploaded and is
+    # awaiting the operator's yes), a second --redeem-pending-form must NOT
+    # re-render a fresh form — that stranded the operator in a form loop when a
+    # small model relayed the redeem command twice (live 2026-07-06). Re-surface
+    # the SAME bed-clear prompt (same still-valid confirm token) instead, so the
+    # duplicate relay is a harmless no-op.
+    if (getattr(args, "redeem_pending_form", False)
+            and not getattr(args, "action", None)):
+        # Detect the already-advanced state by the DURABLE pending object, NOT
+        # the phase: the looping re-form reset phase to awaiting_form while the
+        # pending_bed_clear_start (nonce + confirm token) survived in safety
+        # (confirmed on the live 2026-07-06 request).
+        _idem_safety = (u1_request.read_request(request_id) or {}).get("safety") or {}
+        _idem_pending = _idem_safety.get("pending_bed_clear_start") or {}
+        _idem_tok = _idem_pending.get("confirm_token")
+        if _idem_pending.get("nonce") and _idem_tok:
+            _idem_prompt = (
+                "You already submitted this plate — it's sliced, uploaded, and "
+                "waiting on your bed-clear yes. Reply YES to start now, or NO to "
+                "keep the gcode staged without printing.")
+            _emit(events_file, {
+                "stage": "need_input", "request_id": request_id,
+                "need": "bed_clear_start", "key": "bed_clear_start",
+                "requires_fresh_operator_bed_clear": True,
+                "approval_prompt_key": "bed_clear_start",
+                "prompt": _idem_prompt,
+                "instruction": ("The plate preview + bed photo were already sent "
+                                "on the previous turn — do NOT re-run the form. "
+                                "Re-surface the yes/no prompt and wait."),
+                "expected_answers": ["yes", "no"],
+                "next_command_on_yes": (
+                    f"python3 /opt/data/scripts/u1_kit_workflow.py "
+                    f"--confirm-start {_idem_tok}"),
+                "next_command_on_no": None,
+                "bed_snapshot_path": (_idem_safety.get("snapshot_path")
+                                      or _idem_safety.get("bed_snapshot_path")),
+            }, json_events)
+            _emit(events_file, {"stage": "awaiting_input",
+                                "need": "bed_clear_start",
+                                "request_id": request_id}, json_events)
+            _audit(request_id, "duplicate_redeem_reemitted_bed_clear", operator)
+            return {"phase": "awaiting_bed_clear_start",
+                    "request_id": request_id, "prompt": _idem_prompt}
+
     if getattr(args, "redeem_pending_form", False) and not answers_from:
         # The model relays NO form_id — it derives from the request, which
         # persisted form_id at emit time. gemma4 mangled the random-hex form_id

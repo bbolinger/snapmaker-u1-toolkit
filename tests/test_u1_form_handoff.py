@@ -198,6 +198,32 @@ def test_replayed_redemption_is_refused(tmp_path, hermetic_commit, capsys):
     assert any("redeem" in e for e in res2["errors"])
 
 
+def test_duplicate_redeem_reemits_bed_clear_not_form(tmp_path, hermetic_commit, capsys):
+    """v2.2.2: a SECOND --redeem-pending-form on a request that already sliced +
+    uploaded (a pending_bed_clear_start survives in safety) must re-surface the
+    SAME bed-clear prompt with the SAME confirm token, NOT render a fresh form. A
+    small model relaying the redeem twice stranded the operator in a form loop
+    (live 2026-07-06): the phase had been reset to awaiting_form but the pending
+    object survived, so the guard keys off that."""
+    zp = _kit_zip(tmp_path)
+    r1 = kw.run_kit_workflow(_args(zp, interaction_mode="form"))
+    rid = r1["request_id"]
+    tok = u1_form.new_confirm_token()
+    safety = dict((u1_request.read_request(rid) or {}).get("safety") or {})
+    safety["pending_bed_clear_start"] = {
+        "nonce": "n0", "confirm_token": tok, "prompt_key": "bed_clear_start"}
+    safety["snapshot_path"] = str(tmp_path / "bed.jpg")
+    u1_request.write_request(rid, safety=safety)
+    u1_form.persist_confirm_token(tok, rid)
+    capsys.readouterr()  # clear prior output
+    res = kw.run_kit_workflow(_args(zp, request_id=rid,
+                                    redeem_pending_form=True, live_upload=True))
+    assert res["phase"] == "awaiting_bed_clear_start", res
+    out = capsys.readouterr().out
+    assert "bed_clear_start" in out and tok in out   # same prompt + token re-surfaced
+    assert '"kit_form"' not in out                   # did NOT re-render a fresh form
+
+
 def test_mismatched_form_id_refused_and_file_preserved(tmp_path, hermetic_commit, capsys):
     zp = _kit_zip(tmp_path)
     r1 = kw.run_kit_workflow(_args(zp, interaction_mode="form"))
