@@ -22,18 +22,13 @@ backstop. Every safety claim is live-verified on real hardware. See the
 ## See it in action
 
 A single local model takes a zip of eight STLs all the way to a printing plate in
-about 75 seconds, entirely over Telegram and entirely on local hardware. It
+about 160 seconds (with local LLM), entirely over Telegram and entirely on local hardware. It
 measures each part, offers one button form for parts, tool, orientation, and
 supports, slices, shows a top-down footprint next to a 3D plate view, captures a
 fresh photo of the bed, and then waits. Nothing starts until a human replies
 "yes." Then the U1 begins the print.
 
-<!--
-  Screen recording: open this file in the GitHub web editor (the pencil icon) and
-  drag the .mp4 clip onto the line below this comment. GitHub stores it as an
-  attachment on its own CDN, so it renders as an inline player here but is NOT
-  committed to the repo and never bloats a clone. Drop it right here:
--->
+https://github.com/user-attachments/assets/f3acea60-4ebe-4059-8158-92abd207f4ec
 
 ---
 
