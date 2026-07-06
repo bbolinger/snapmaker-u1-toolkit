@@ -10,84 +10,66 @@
 
 This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
 
-**Single STLs and multi-part kits run one flow:** send a model or a zip of
-STLs, answer one button form, and the toolkit slices, previews the plate from two
-angles, and gates the print start behind a fresh bed photo and your explicit yes,
-with a pre-start grace period and a model-free Telegram cancel as the final
-backstop. Every safety claim is live-verified on real hardware. See the
-[CHANGELOG](CHANGELOG.md).
-
 ---
 
 ## See it in action
 
 A single local model takes a zip of eight STLs all the way to a printing plate in
-about 160 seconds (with local LLM), entirely over Telegram and entirely on local hardware. It
-measures each part, offers one button form for parts, tool, orientation, and
-supports, slices, shows a top-down footprint next to a 3D plate view, captures a
-fresh photo of the bed, and then waits. Nothing starts until a human replies
-"yes." Then the U1 begins the print.
+about 160 seconds (with local LLM), entirely over Telegram and entirely on local hardware.
+Nothing starts until a human replies "yes."
 
 https://github.com/user-attachments/assets/f3acea60-4ebe-4059-8158-92abd207f4ec
 
 ---
 
-## What This Is
+## The flow
 
-A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I have a zip of twelve STLs" — into an auditable, operator-gated print job. **A single STL and a multi-part kit run the same flow** (a lone model is just a kit of one). On a tool-capable model the plan is collected in **one native button form**; on a small local model it falls back to a typed one-liner — the *safety boundary is identical either way*:
+One flow handles everything. Send a single STL or a zip of twelve — **a lone
+model is just a kit of one**, auto-detected, same entrypoint, same safety
+boundary:
 
-1. **Triage** the model (dimensions, triangle count, mesh validity)
-2. **Orient** it — show both as-authored and Orca's auto-orient, with the real mesh-topology verdict (`floating cantilever` / `clean` / overhang layer fraction) so the operator picks based on Orca's actual call, not a face-angle approximation
-3. **Tool / filament / preset / supports** — surface live U1 state (what's actually loaded), recommend, never assume
-4. **Slice** through OrcaSlicer with the chosen profile, T0→T<chosen> rewriting, Snapmaker thumbnail injection, real Orca warnings surfaced
-5. **Preview — two corroborating views** derived from the *sliced gcode* (the real toolpath): a precise top-down footprint, and a 3D plate view of the same per-part geometry with height added. Same parts, same colors, same positions the printer will execute; plus footprint dimensions + real Orca warnings
-6. **Upload** to the U1's Moonraker storage with `print=false` (file lands; printer does NOT start)
-7. **Bed-clear photo** captured fresh by the U1's onboard camera, surfaced to the operator
-8. **One explicit bed-clear decision** — yes/no on the *fresh* bed photo (yes starts; no keeps the gcode staged, doesn't print)
-9. **Start** — only after approval, only via a token handed off from the photo step (30-min TTL)
-10. **Monitor** — first-layer photo (the earliest real tell a print is about to fail), last-layer check, completion — see [Always-on print monitoring](#always-on-print-monitoring--no-agent-required)
+1. **Send a model.** A `.stl`/`.3mf`, or a zip of STLs (the common Printables
+   shape). The workflow ingests every part: footprints measured, oversized
+   parts flagged, hostile archives refused with a clean error instead of a
+   crash.
+2. **Answer one decision form** — parts, print head, orientation, supports,
+   profile. On a tool-capable model it renders as **native buttons** (one
+   submit); on a small local model it falls back to a typed one-liner, or a
+   staged one-question-per-turn flow. The form surfaces live U1 state (which
+   filament is actually loaded on which head) and Orca's real mesh-topology
+   verdict (`floating cantilever` / `clean` / overhang fraction) so you pick
+   the pose Orca actually prefers. Either way **a script parses and validates
+   the answer; the model never interprets it** — only an opaque form id rides
+   through the model, and conflicting input fails loudly, never a silent guess.
+3. **Arrange + slice** through OrcaSlicer onto as many plates as the bed
+   needs — T0→T&lt;chosen&gt; rewriting, Snapmaker thumbnail injection, real
+   Orca warnings surfaced, and a gcode-extent guard that refuses any plate
+   whose extrusion would leave the bed (built from a real incident, not a
+   hypothetical).
+4. **Review two corroborating previews** derived from the *sliced gcode* (the
+   real toolpath): a precise top-down footprint and a 3D plate view of the same
+   per-part geometry with height added — same parts, same colors, same
+   positions the printer will execute. Plus a `review.md` flight plan generated
+   from the gcode's own config block: what will print, the ~12 settings that
+   matter, your decisions and overrides.
+5. **Upload** every plate to the U1's Moonraker storage with `print=false`
+   (files land; the printer does NOT start).
+6. **One bed-clear decision.** A fresh photo of the bed from the U1's onboard
+   camera arrives with the previews. Reply YES to start now, or NO to keep the
+   gcode uploaded without printing. The yes rides a single-use token bound to
+   the plan's revision + gcode hash — if anything changed since you looked, the
+   start refuses instead of printing stale state.
+7. **Gated start with a last exit.** The gate re-verifies material against
+   what's physically loaded, then opens a ~120s grace window with a model-free
+   Telegram CANCEL before any command reaches the printer. Plate 1 is the only
+   toolkit-started plate; plates 2..N start from the Snapmaker app — the
+   watchdog photographs every plate either way.
+8. **Monitoring takes over** — first-layer photo, last-layer check, completion
+   (see [Always-on print monitoring](#always-on-print-monitoring--no-agent-required)).
 
-Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
-
-### Multi-part kits + the unified flow
-Send a **zip of STLs** — the common Printables shape — and the kit workflow
-takes it from there:
-
-1. **Ingest** every part (footprints measured, oversized parts flagged, hostile
-   archives refused with a clean error instead of a crash)
-2. **One consolidated decision form** — parts, orientation, tool, material,
-   profile, supports. On a tool-capable model it renders as **native buttons**
-   (one submit); on a small model, a typed one-liner in any order. Either way
-   **a script parses and validates the answer; the model never interprets it**,
-   and the answer content never rides through the model — only an opaque form
-   id it can't corrupt. Conflicting or ambiguous input fails loudly, never a
-   silent guess. For a single model, Orca's real orientation verdict rides in
-   the form so you pick the pose Orca actually prefers.
-3. **Arrange + slice** onto as many plates as the bed needs, with a
-   gcode-extent guard that refuses any plate whose extrusion would leave the
-   bed (built from a real incident, not a hypothetical)
-4. **Upload all plates**, then run the same Stage 1/2 camera-gated start
-   boundary on plate 1. Plates 2..N start from the Snapmaker app after it —
-   the watchdog photographs every plate either way.
-
-The operator's confirm rides on a single-use nonce baked into the emitted
-command, so even the agent relaying your answers can't hand-assemble its way
-past the boundary. A single STL is just a kit of one — same entrypoint,
-auto-detected.
-
-## Always-on print monitoring — no agent required
-
-The start decision needs an LLM + your explicit approval. **Watching the print once it's running does not** — that part is three quiet cron jobs, no agent turn, no LLM in the loop at all.
-
-**Why first-layer specifically matters:** it's the earliest real tell a print is about to fail — bed adhesion problems, warping, a shifted part, wrong Z-offset all show up in the first few layers, long before you'd otherwise notice. A last-layer photo confirms it finished; a first-layer photo is the one that could actually save you hours of wasted filament and time if you catch it early.
-
-| Job | Cadence | What it does |
-|---|---|---|
-| `u1_last_layer_watch.py` | every 1 min | Snaps a photo at **first-layer** (layers 2–5, the bed-adhesion check), at **last-layer** (final ~6 layers), and after a **pause/resume** (an extra confidence check). Delivers each straight to Telegram. Auto-dims the cavity LED a few minutes after the job completes/errors/cancels. |
-| `u1_print_watchdog.py` | every 5 min | Silent health poll across *any* active U1 print, not just Hermes-started ones. Alerts once per distinct issue, with cooldown so it never spams. |
-| `u1_print_history.py` | every 5 min | Appends to a durable print ledger. |
-
-All three run in Hermes' `no_agent` cron mode — a plain script invocation with no persona and no model call, so there's nothing for a weak or a strong model to get wrong, and nothing that can fabricate a milestone that didn't happen (the photo either exists or the job says nothing). They watch *every* active print, whether it was started through this toolkit, the Snapmaker app, or anything else touching the same Moonraker.
+Steps 1–5 are useful as CLI utilities even if you never touch an AI agent.
+Steps 6–8 are where the operator gate makes the difference between "AI presses
+print" and "AI safely shows you the print so you can press it."
 
 ## What This Is Not
 
@@ -118,6 +100,32 @@ Actions that always require explicit operator confirmation:
 
 The workflow fails closed. If a check is unsure, it stops and asks rather than guessing. Bed-clear verdicts come from the operator looking at a real photo, not from the toolkit deciding the bed is "probably fine." Slicer profile mismatches abort BEFORE the slice. Upload that hits a filename collision asks before overwriting.
 
+### What the operator approves
+
+Every operator decision is concrete and tied to a specific artifact:
+
+| Decision | What the operator sees |
+|---|---|
+| Parts / orientation | Parts thumbnail grid + Orca's mesh-topology verdict for the recommended pose |
+| Tool / filament | Live U1 toolhead state ("T0: Generic white PETG (loaded)") |
+| Preset | Recommended profile based on model class + your print history |
+| Supports | Overhang verdict from a fast draft slice — Orca's real call, not face-angle |
+| Pre-print review | A `review.md` flight plan generated from the sliced gcode's own config block — bound to the plan's revision + hash so what you read is what prints |
+| **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. One yes/no. Default is no. |
+
+If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
+
+What the exchange actually looks like after the form is submitted:
+
+> **Bot:** *(plate preview, 3D view, review.md, and a fresh bed photo arrive)*
+> Sliced plate, review doc, and a fresh bed photo are attached. Bed clear and ready to print? Reply YES to start now, or NO to keep the gcode uploaded without printing.
+>
+> **You:** yes
+>
+> **Bot:** ⚠️ Snapmaker U1 print starting in 120s. Reply **CANCEL** to abort. Ignore this to let the print start.
+
+If a re-slice or plan change happened between the photo and the "yes," the start refuses and re-asks with the new revision instead of starting on stale state.
+
 The full per-action breakdown (the test-operator fence, the grace-period
 cancel chain, and every allowed-vs-gated command) lives in
 [docs/SAFETY.md](docs/SAFETY.md).
@@ -127,9 +135,24 @@ cancel chain is **live-verified on real hardware**, including a reproducible,
 no-printer-needed drill anyone can run:
 [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
 
+## Always-on print monitoring — no agent required
+
+The start decision needs an LLM + your explicit approval. **Watching the print once it's running does not** — that part is three quiet cron jobs, no agent turn, no LLM in the loop at all.
+
+**Why first-layer specifically matters:** it's the earliest real tell a print is about to fail — bed adhesion problems, warping, a shifted part, wrong Z-offset all show up in the first few layers, long before you'd otherwise notice. A last-layer photo confirms it finished; a first-layer photo is the one that could actually save you hours of wasted filament and time if you catch it early.
+
+| Job | Cadence | What it does |
+|---|---|---|
+| `u1_last_layer_watch.py` | every 1 min | Snaps a photo at **first-layer** (layers 2–5, the bed-adhesion check), at **last-layer** (final ~6 layers), and after a **pause/resume** (an extra confidence check). Delivers each straight to Telegram. Auto-dims the cavity LED a few minutes after the job completes/errors/cancels. |
+| `u1_print_watchdog.py` | every 5 min | Silent health poll across *any* active U1 print, not just Hermes-started ones. Alerts once per distinct issue, with cooldown so it never spams. |
+| `u1_print_history.py` | every 5 min | Appends to a durable print ledger. |
+
+All three run in Hermes' `no_agent` cron mode — a plain script invocation with no persona and no model call, so there's nothing for a weak or a strong model to get wrong, and nothing that can fabricate a milestone that didn't happen (the photo either exists or the job says nothing). They watch *every* active print, whether it was started through this toolkit, the Snapmaker app, or anything else touching the same Moonraker.
+
 ## The Three Layers
 
-The toolkit ships as three layers that build on each other.
+The toolkit ships as three layers that build on each other. Pick your mode,
+then install below.
 
 ### 1. CLI mode — useful without Hermes
 
@@ -153,78 +176,122 @@ This is the core product. It's what makes the toolkit feel like a responsible as
 
 A bundled Hermes skill (`3d-printer-slicing-automation`) that lets a Telegram-bridged Hermes agent drive the operator workflow on the user's behalf. The agent:
 
-- Surfaces the staged questions to the user verbatim
+- Surfaces the workflow's questions and previews to the user verbatim
 - Tool-calls the named scripts (never invents its own slicing path)
-- Surfaces every preview and bed photo for visual approval
 - Never decides bed-clear status on its own — the operator does, looking at a real photo
 
-The skill is designed to work on small local models (`gemma4-26b-64k` and below) via [Ollama](https://ollama.com/). See [Using with Hermes](#using-with-hermes--install-the-bundled-skill) for the full setup.
+The skill is designed to work on small local models (`gemma4-26b-64k` and below) via [Ollama](https://ollama.com/). See [Hermes integration](#hermes-integration) for the full setup.
 
-## What the Operator Approves
+## Install
 
-Every operator decision is concrete and tied to a specific artifact:
+One install path. Everything below assumes a U1 reachable on your LAN.
 
-| Decision | What the operator sees |
-|---|---|
-| Orientation | Source render + auto-oriented render + Orca's mesh-topology verdict |
-| Tool / filament | Live U1 toolhead state ("T0: Generic white PETG (loaded)") |
-| Preset | Recommended profile based on model class + your print history |
-| Supports | Overhang verdict from a fast draft slice — Orca's real call, not face-angle |
-| Upload | Three options: upload-only / upload+start gate / cancel |
-| Filename collision | Three options: timestamped rename / overwrite / cancel |
-| Kit decisions (v2.1.0) | One consolidated form (parts / orient / tool / material / profile / supports / action) — script-parsed, echoed back verbatim for confirmation before anything slices |
-| Pre-print review (v2.2) | A `review.md` flight plan generated from the sliced gcode's own config block: what will print, the ~12 settings that matter, your decisions and overrides — bound to the plan's revision + hash so what you read is what prints |
-| **Bed clear** | A **real, fresh photo** of the bed from the U1's onboard camera. The operator types yes/no. Default is no. |
-
-If anything is unknown — printer state, tool, material, slicer metadata, bed visibility — the workflow stops and asks. No silent assumptions.
-
-## What an approval looks like
-
-Operator-facing approvals are tied to a specific `request_id` — the toolkit-generated identifier for the print job (shape `u1_YYYY_MMDD_xxxxxx`). The agent is required (per [`HERMES.md`](HERMES.md) Rule 7 and the bundled [skill contract](skills/3d-printer-slicing-automation/SKILL.md)) to include the `request_id` in every approval question. This makes the operator's "yes" unambiguous — it routes to that specific request, not "whatever was most recent."
-
-A Telegram exchange after a `Stand.stl` was sent:
-
-> **Bot:** Slicing complete for request `u1_2026_0627_1b977b`. Estimated time 1h 14m, 18g PETG, T1, 0.20mm Strength. Uploaded as `Stand.gcode`. Stage 1 captures the bed photo next.
->
-> *(Stage 1 runs, photo arrives in chat)*
->
-> **Bot:** Bed photo: `/opt/data/snapmaker_u1/bed_snapshot.jpg`
-> Bed clear and you want to start request `u1_2026_0627_1b977b`? (yes/no)
->
-> **You:** yes
->
-> **Bot:** Started. Request `u1_2026_0627_1b977b` is now printing.
-
-If a re-slice or plan change happened between the photo and the "yes," `can_start()` would refuse and the bot would re-ask with the new revision instead of starting on stale state. That's the safety property [`HERMES.md`](HERMES.md) Rule 8 ("Approvals are revision+hash bound") encodes.
-
-## Quick Start
-
-If you have a U1 reachable on the LAN and want to try a slice:
+**Requirements:** Python 3.9+, `numpy` + `Pillow` (via `requirements.txt`), an
+[OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary
+(extracted AppImage is fine — full steps in
+[Headless slicing setup](#headless-slicing-setup-no-gui--scripted)), and network
+reachability to your U1's Moonraker port (default `7125`).
 
 ```bash
 git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
 cd snapmaker-u1-toolkit
 python3 -m pip install -r requirements.txt
 
-# Fetch Snapmaker's stock U1 profiles (~217 files)
-python3 tools/fetch_snapmaker_profiles.py
+# Point the toolkit at your printer (.env is auto-loaded on first config read)
+cp .env.example .env       # edit: set SNAPMAKER_U1_HOST to your U1's LAN IP
 
-# Slice a model — workflow asks for orient / tool / preset / supports / upload
-python3 scripts/u1_slice_workflow.py path/to/your_model.stl --json-events --no-live-material
+# Fetch Snapmaker's stock U1 profiles (~217 files) + extract your own history
+python3 tools/fetch_snapmaker_profiles.py
+python3 tools/extract_profiles_from_printer.py   # optional but recommended
+
+# Verify (argparse usage text = your environment is ready)
+python3 scripts/u1_slice_workflow.py --help
+
+# Read-only status probe (no risk)
+python3 scripts/snapmaker_u1_status.py
 ```
 
-For the full install (interpreter selection, Hermes skill install, U1 connection setup), see [Setup](#setup) below.
+On Windows (PowerShell) the same steps apply with `Copy-Item .env.example .env`
+and backslash paths; the data dir defaults to
+`C:\Users\<you>\.local\share\snapmaker-u1` (override with
+`$env:SNAPMAKER_U1_DATA_DIR`).
 
-For the design rationale, architecture, and acceptance criteria, see [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md). For the public event contract (every event the workflow + audit log emit, with payload shapes), see [`docs/events.md`](docs/events.md).
+**Choosing a Python interpreter.** The workflow needs `numpy` and `Pillow` on
+the Python that runs it and auto-detects a working interpreter (first that can
+`import numpy, PIL` wins): `$U1_TOOLKIT_PYTHON`, then
+`/opt/hermes/.venv/bin/python`, then a project-local `venv`/`.venv`, then the
+Homebrew paths. If none has the deps, it exits listing every path it tried and
+how to fix it. Cleanest isolated setup:
 
-## Setup
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+export U1_TOOLKIT_PYTHON=$PWD/venv/bin/python   # add to your shell rc to persist
+```
 
-### Requirements
+Connection, data-dir, and LED behavior are covered in
+[Configuration](#configuration). If something fails, check
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-- Python 3.9 or newer
-- `numpy` + `Pillow` — installed via `requirements.txt`
-- [OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary (extracted AppImage path is fine; full install steps in [Headless slicing setup](#headless-slicing-setup-no-gui--scripted))
-- Network reachability from your host to your U1's Moonraker port (default `7125`)
+## First slice
+
+![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
+
+The canonical entry point for a model or a kit zip (kit-of-one auto-detected):
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf
+```
+
+Agent/Telegram wrappers should consume the event stream instead of
+re-implementing the workflow:
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf --json-events
+```
+
+Safe headless proof run — decisions passed as flags, upload-only, no printer
+start (list your profile slugs with `python3 scripts/u1_profile_picker.py`):
+
+```bash
+python3 scripts/u1_slice_workflow.py model.3mf \
+  --tool T1 --material PETG --orient auto \
+  --profile 0_20_strength_snapmaker_u1_0_4_nozzle \
+  --supports auto --upload-only --yes
+```
+
+Without profiles the workflow exits with a `setup_required` event and points
+you back at the fetch/extract tools from [Install](#install).
+
+For the design rationale, architecture, and acceptance criteria, see
+[`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md). For the public event
+contract (every event the workflow + audit log emit, with payload shapes), see
+[`docs/events.md`](docs/events.md).
+
+## Hermes integration
+
+Hermes typically ships `numpy` + `Pillow` in its bundled venv (verify:
+`/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'` — the
+toolkit's interpreter auto-detection finds it). Then:
+
+```bash
+# 1. Install the bundled skill
+hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
+
+# 2. Deploy the workflow scripts to the runtime paths the skill calls into
+bash deploy_to_runtime.sh
+```
+
+The deploy script verifies the deployed workflow actually starts (`✓ workflow
+starts cleanly`); override target paths via `U1_DEPLOY_SCRIPTS` /
+`U1_DEPLOY_TOOLS` / `U1_DEPLOY_SKILL` / `U1_DEPLOY_PROFILES` if your layout
+differs from the Hermes default.
+
+![End-to-end example with Hermes — model preview, Telegram operator conversation, AI-derived slice settings, and the actual printed part in hand](docs/images/end-to-end-example.jpg)
+
+The skill tells Hermes to call `scripts/u1_slice_workflow.py`, follow the
+workflow's events, default to upload-only, and fail closed at the bed-clear
+start gate.
 
 ### Local model & serving requirements (form mode / button UX)
 
@@ -271,135 +338,6 @@ simple `terminal` calls that even small models handle reliably.
 > that drops `cuda_v12` would break it. Benign `driverInitFileInfo ... result=11`
 > lines at startup are that fallback, not a failure.
 
-### Install
-
-```bash
-git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
-cd snapmaker-u1-toolkit
-python3 -m pip install -r requirements.txt
-```
-
-### Verify
-
-```bash
-python3 scripts/u1_slice_workflow.py --help
-```
-
-If you see argparse usage text, your environment is ready. If you see `ERROR: u1_slice_workflow.py needs numpy + PIL`, the workflow tells you exactly which interpreters it tried and how to fix — see the next section.
-
-### Choosing a Python interpreter
-
-The workflow needs `numpy` and `Pillow` on the Python that runs it. It auto-detects a working interpreter in this priority order — the first one that can `import numpy, PIL` wins:
-
-1. `$U1_TOOLKIT_PYTHON` (your override; set to any path you like)
-2. `/opt/hermes/.venv/bin/python` (Hermes-bundled venv — common on agent hosts)
-3. `<repo>/venv/bin/python` (project-local venv — the recommended fresh install)
-4. `<repo>/.venv/bin/python` (uv-/poetry-style hidden venv)
-5. `/opt/homebrew/bin/python3` (macOS Homebrew on Apple Silicon — the M-series default)
-6. `/usr/local/bin/python3` (macOS Homebrew on Intel — legacy install path)
-
-If none has the deps, the workflow exits with a clear error listing each path it tried and concrete fix steps. You'll know exactly what to do next.
-
-### Recommended: isolated project venv
-
-Cleanest install for a fresh host, no clutter in your system Python:
-
-```bash
-cd snapmaker-u1-toolkit
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-export U1_TOOLKIT_PYTHON=$PWD/venv/bin/python
-```
-
-Add the `export U1_TOOLKIT_PYTHON=...` line to your shell rc (`~/.bashrc`, `~/.zshrc`) to make it permanent. The workflow respects this on every invocation.
-
-### For Hermes users
-
-Hermes typically ships with `numpy` + `Pillow` already in its bundled venv. Verify:
-
-```bash
-/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'
-```
-
-If that prints `ok`, the workflow's auto-detection finds it automatically — you don't need to set `U1_TOOLKIT_PYTHON`. The bundled Hermes skill is installable in one command:
-
-```bash
-hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
-```
-
-See [Using with Hermes](#using-with-hermes--install-the-bundled-skill) below for what the skill does and how Hermes drives the workflow.
-
-### Configure your U1
-
-Connection details (host, port, data dir) live in [Configuration](#configuration) below. The toolkit honors env vars, then a JSON config file, then sane defaults — set whichever fits your host best.
-
-### Deploy to runtime (Hermes users)
-
-If you're driving the toolkit through Hermes, the bundled skill expects the workflow scripts to live at the runtime paths Hermes calls into. Deploy them:
-
-```bash
-bash deploy_to_runtime.sh
-```
-
-After copying files, the deploy script invokes the deployed workflow's `--help` to confirm the Python at the runtime location can actually start the workflow. On success: `✓ workflow starts cleanly` + `✓ Deploy complete`. On env failure (no Python with `numpy`+`Pillow` reachable): files are deployed but the script exits non-zero with the workflow's own diagnostic output — fix what it tells you, re-run.
-
-Override target paths via env vars if your layout differs from the Hermes default:
-
-```bash
-U1_DEPLOY_SCRIPTS=/my/runtime/scripts \
-U1_DEPLOY_TOOLS=/my/runtime/tools \
-U1_DEPLOY_SKILL=/my/runtime/skill/.../3d-printer-slicing-automation \
-U1_DEPLOY_PROFILES=/my/runtime/profiles \
-bash deploy_to_runtime.sh
-```
-
-## End-to-end slice workflow
-![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
-
-**Before your first slice**, populate the profile picker (one-time setup, see [docs/PROFILES.md](docs/PROFILES.md)):
-
-```bash
-python3 tools/fetch_snapmaker_profiles.py            # Snapmaker U1 stock baseline
-python3 tools/extract_profiles_from_printer.py       # extract YOUR successful prints
-```
-
-Without either, the workflow exits with a `setup_required` event and points you back at these scripts. Hit something the docs didn't cover? Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
-
-Then the canonical STL/3MF → U1 path:
-
-```bash
-python3 scripts/u1_slice_workflow.py model.3mf
-```
-
-Agent/Telegram wrappers should use the event stream instead of re-implementing the workflow:
-
-```bash
-python3 scripts/u1_slice_workflow.py model.3mf --json-events
-```
-
-The workflow owns the full 10-step flow: triage, orientation choice, loaded filament/tool choice, preset choice, oriented render, support choice, slice, preview render, upload-only default, and optional camera-gated start. Render and slice both consume the same `oriented.stl`; Orca `--orient` only reports the best rotation, and this toolkit applies it.
-
-Safe headless proof run (pass `--profile` slugs your picker actually has — list with `python3 scripts/u1_profile_picker.py`):
-
-```bash
-python3 scripts/u1_slice_workflow.py model.3mf \
-  --tool T1 --material PETG --orient auto \
-  --profile 0_20_strength_snapmaker_u1_0_4_nozzle \
-  --supports auto --upload-only --yes
-```
-
-## Using with Hermes — install the bundled skill
-
-After release, Hermes users can install the workflow guidance directly from this repo:
-
-```bash
-hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
-```
-
-![End-to-end example with Hermes — model preview, Telegram operator conversation, AI-derived slice settings, and the actual printed part in hand](docs/images/end-to-end-example.jpg)
-
-That skill tells Hermes to call `scripts/u1_slice_workflow.py`, ask the 10 questions instead of guessing, default to upload-only, and fail closed at the bed-clear start gate.
-
 ### Gotcha for skill writers: Hermes attaches files via bare paths in text, not a tool parameter
 
 If you fork this skill or write your own, Hermes' platform gateways (Telegram, Discord, Signal, etc.) deliver media to the user by scanning the agent's reply text for **bare absolute file paths** ending in known media extensions and auto-attaching whatever exists on disk. There is **no** `files=[...]` tool parameter the agent needs to call. See `gateway/platforms/base.py:extract_local_files()` in Hermes 0.15.2 for the canonical implementation.
@@ -410,36 +348,7 @@ What this means for your skill prompt:
 - ❌ Do NOT tell the agent: *"attach the file via the reply tool's files parameter"*
 - ❌ Paths inside backticks or fenced code blocks are skipped — the agent must emit them as bare text
 
-This caught me out during the first v1.5.0 live test — the agent kept claiming it would "attach" renders but the gateway saw nothing to extract. See `TROUBLESHOOTING.md` for the full diagnosis if you hit the same.
-
-## Optional: notify me when OrcaSlicer has an update
-
-The toolkit ships a small checker that compares your installed `orca-slicer` version against the upstream latest release. **It does nothing unless you wire it into your scheduler.** Cloning the repo does not subscribe you to anything.
-
-To enable, add one line to cron (Linux/macOS):
-
-```
-0 7 * * * /usr/bin/python3 /path/to/snapmaker-u1-toolkit/tools/check_for_updates.py
-```
-
-Behavior:
-- **Silent when you're current.** No stdout → no cron email.
-- **Single-line stdout when an update is available** — cron mails it via your usual cron-email setup. Example: `OrcaSlicer 2.4.1 available (you have 2.4.0). Patch (bug fixes, likely safe). Release notes: https://github.com/OrcaSlicer/OrcaSlicer/releases/tag/v2.4.1`
-- **Refuses to query GitHub more than once per 24h** regardless of how often you invoke it (cache at `~/.cache/snapmaker-u1-toolkit/update-check.json`). `--force` overrides for one-off "tell me now" runs.
-- **Returns silently when GitHub is unreachable or the binary isn't present.** Never breaks your cron with stray stderr.
-
-Compatibility note: Snapmaker upstreamed the U1 vendor profile into OrcaSlicer 2.4.0, and `tools/fetch_snapmaker_profiles.py` pulls fresh stock profiles from that upstream — patch/minor upgrades should keep slicing U1 prints. Major-version bumps may change CLI flags or profile schema — re-run the EGO trimmer regression after upgrading. The notifier's risk label ("patch / minor / major") flags this in the alert text.
-
-If your `orca-slicer` binary lives anywhere other than `/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer` (Hermes-container default), pass the path explicitly OR set the `ORCA_SLICER_BIN` environment variable in your crontab, otherwise the script silently can't probe your installed version and you'll never see notifications.
-
-CLI:
-
-```
-python3 tools/check_for_updates.py                                    # daily-cached check
-python3 tools/check_for_updates.py --force                            # bypass cache, hit GitHub now
-python3 tools/check_for_updates.py --orca-bin /path/to/orca-slicer    # one-off
-ORCA_SLICER_BIN=/path/to/orca-slicer python3 tools/check_for_updates.py  # persistent env
-```
+This caught me out during the first live test — the agent kept claiming it would "attach" renders but the gateway saw nothing to extract. See `TROUBLESHOOTING.md` for the full diagnosis if you hit the same.
 
 ## What's in here
 
@@ -452,69 +361,17 @@ ORCA_SLICER_BIN=/path/to/orca-slicer python3 tools/check_for_updates.py  # persi
 | `u1_preflight.py` | Combined Moonraker state + camera freshness packet for "is it safe to start?" |
 | `u1_upload_gcode.py` | Upload-only (`print_started=false`) with gates: idle state + tool/material match |
 | `u1_slice_workflow.py` | Canonical end-to-end STL/3MF entry point: orient → render → slice → preview → upload-only/start gate |
+| `u1_kit_workflow.py` | The unified kit workflow behind it — ingest, one decision form, arrange, slice, previews, bed-clear gate |
 | `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and "last ~6 layers" milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
-| `u1_print_watchdog.py` | Quiet 20-min health watcher with cooldown to avoid notification spam |
+| `u1_print_watchdog.py` | Quiet cron-driven health watcher with per-issue cooldown to avoid notification spam |
 | `u1_print_history.py` | Append-only JSONL print ledger + canonical upserted JSON |
 | `snapmaker_u1_status.py` | Read-only status probe |
 | `snapmaker_u1_snapshot.py` | Websocket camera trigger helper |
 | `tools/extract_profile_from_gcode.py` | One-shot extractor — turn a successful G-code into Snapmaker Orca process + filament JSONs |
 | `tools/extract_profiles_from_printer.py` | Auto-pull recent G-codes off your U1 over Moonraker, run the extractor against each — one command, gets your real print history into `profiles/from-printer/` |
-| `tools/fetch_snapmaker_profiles.py` | Fetch Snapmaker's official U1 stock profiles (machine + process + filament) from the upstream `Snapmaker/OrcaSlicer` GitHub repo into `profiles/snapmaker-stock/` (v1.5.0) |
+| `tools/fetch_snapmaker_profiles.py` | Fetch Snapmaker's official U1 stock profiles (machine + process + filament) from the upstream `Snapmaker/OrcaSlicer` GitHub repo into `profiles/snapmaker-stock/` |
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
 | `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
-
-## Per-platform commands (Linux / macOS / Windows)
-
-The 30-second flavor is in [Quick Start](#quick-start) above. This section has the per-platform install + first-status-probe commands.
-
-### Linux / macOS
-
-```bash
-git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
-cd snapmaker-u1-toolkit
-cp .env.example .env
-# edit .env — set SNAPMAKER_U1_HOST to your U1's LAN IP
-
-# .env is auto-loaded the first time any script reads config — no
-# 'source .env' needed. Explicit env vars still win if set in the shell.
-
-# read-only status probe (no risk):
-python3 scripts/snapmaker_u1_status.py
-
-# combined preflight packet:
-python3 scripts/u1_preflight.py
-
-# upload a G-code file (does NOT start the print):
-# Material expectation is asserted at upload time; the intended tool is
-# auto-detected from the G-code's T0/T1/T2/T3 startup command.
-python3 scripts/u1_upload_gcode.py /path/to/file.gcode --material PETG
-
-# same upload, but inject a Snapmaker-app preview thumbnail from the source STL first:
-python3 scripts/u1_upload_gcode.py /path/to/file.gcode --material PETG \
-    --stl /path/to/model.stl   # fail-closed: if injection fails, upload is refused
-```
-
-### Windows (PowerShell)
-
-```powershell
-git clone https://github.com/bbolinger/snapmaker-u1-toolkit.git
-cd snapmaker-u1-toolkit
-Copy-Item .env.example .env
-# edit .env — set SNAPMAKER_U1_HOST to your U1's LAN IP
-
-# Same .env auto-load applies. If you'd rather set env vars explicitly:
-#   $env:SNAPMAKER_U1_HOST = "192.168.1.100"
-
-# read-only status probe (no risk):
-python scripts\snapmaker_u1_status.py
-
-# preflight + upload flows mirror the Linux examples above
-python scripts\u1_upload_gcode.py C:\path\to\file.gcode --material PETG
-```
-
-On Windows the data dir defaults to `C:\Users\<you>\.local\share\snapmaker-u1`
-(no `/opt/data` auto-detection). Override with `$env:SNAPMAKER_U1_DATA_DIR` if
-you'd rather keep state under `%APPDATA%` or another path.
 
 ## Configuration
 
@@ -569,6 +426,35 @@ so the operator doesn't have to think about it:
 the LED on to be useful, but leaving the cavity bright forever after a
 finished print is wasteful and surprising. The 5-minute grace gives you
 time to inspect the bed before it goes dark.
+
+## Optional: notify me when OrcaSlicer has an update
+
+The toolkit ships a small checker that compares your installed `orca-slicer` version against the upstream latest release. **It does nothing unless you wire it into your scheduler.** Cloning the repo does not subscribe you to anything.
+
+To enable, add one line to cron (Linux/macOS):
+
+```
+0 7 * * * /usr/bin/python3 /path/to/snapmaker-u1-toolkit/tools/check_for_updates.py
+```
+
+Behavior:
+- **Silent when you're current.** No stdout → no cron email.
+- **Single-line stdout when an update is available** — cron mails it via your usual cron-email setup. Example: `OrcaSlicer 2.4.1 available (you have 2.4.0). Patch (bug fixes, likely safe). Release notes: https://github.com/OrcaSlicer/OrcaSlicer/releases/tag/v2.4.1`
+- **Refuses to query GitHub more than once per 24h** regardless of how often you invoke it (cache at `~/.cache/snapmaker-u1-toolkit/update-check.json`). `--force` overrides for one-off "tell me now" runs.
+- **Returns silently when GitHub is unreachable or the binary isn't present.** Never breaks your cron with stray stderr.
+
+Compatibility note: Snapmaker upstreamed the U1 vendor profile into OrcaSlicer 2.4.0, and `tools/fetch_snapmaker_profiles.py` pulls fresh stock profiles from that upstream — patch/minor upgrades should keep slicing U1 prints. Major-version bumps may change CLI flags or profile schema — re-run the EGO trimmer regression after upgrading. The notifier's risk label ("patch / minor / major") flags this in the alert text.
+
+If your `orca-slicer` binary lives anywhere other than `/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer` (Hermes-container default), pass the path explicitly OR set the `ORCA_SLICER_BIN` environment variable in your crontab, otherwise the script silently can't probe your installed version and you'll never see notifications.
+
+CLI:
+
+```
+python3 tools/check_for_updates.py                                    # daily-cached check
+python3 tools/check_for_updates.py --force                            # bypass cache, hit GitHub now
+python3 tools/check_for_updates.py --orca-bin /path/to/orca-slicer    # one-off
+ORCA_SLICER_BIN=/path/to/orca-slicer python3 tools/check_for_updates.py  # persistent env
+```
 
 ## Reference docs
 
