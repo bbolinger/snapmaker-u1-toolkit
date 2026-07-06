@@ -2290,10 +2290,22 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # the phase: the looping re-form reset phase to awaiting_form while the
         # pending_bed_clear_start (nonce + confirm token) survived in safety
         # (confirmed on the live 2026-07-06 request).
-        _idem_safety = (u1_request.read_request(request_id) or {}).get("safety") or {}
+        _idem_req = u1_request.read_request(request_id) or {}
+        _idem_safety = _idem_req.get("safety") or {}
         _idem_pending = _idem_safety.get("pending_bed_clear_start") or {}
         _idem_tok = _idem_pending.get("confirm_token")
-        if _idem_pending.get("nonce") and _idem_tok:
+        # Fire ONLY for a genuine DUPLICATE redeem — the current form's answers
+        # are already consumed. A FIRST redeem still has its answers file and must
+        # proceed normally (slice + overwrite any stale pending); otherwise a
+        # request carrying a stale pending from a PRIOR run (request ids are
+        # content-derived, so re-uploads reuse the request) would wrongly
+        # re-surface the OLD plate instead of slicing the fresh answers.
+        _idem_fid = _idem_req.get("form_id")
+        try:
+            _answers_gone = not (_idem_fid and u1_form._answers_path(_idem_fid).exists())
+        except Exception:
+            _answers_gone = True
+        if _idem_pending.get("nonce") and _idem_tok and _answers_gone:
             _idem_prompt = (
                 "You already submitted this plate — it's sliced, uploaded, and "
                 "waiting on your bed-clear yes. Reply YES to start now, or NO to "
