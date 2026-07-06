@@ -1,0 +1,8 @@
+name: snapmaker_u1
+version: 0.1.0
+description: Auto-trigger the Snapmaker U1 slicing skill on STL/3MF/ZIP attachments.
+provides_hooks:
+  - pre_gateway_dispatch
+  - transform_tool_result
+provides_skills:
+  - 3d-printer-slicing-automation

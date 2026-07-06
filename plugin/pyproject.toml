@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapmaker-u1-toolkit-plugin"
+version = "0.1.0"
+description = "Hermes plugin: auto-trigger the snapmaker U1 3D-printer-slicing skill on STL/3MF/ZIP attachments. Wraps the existing snapmaker-u1-toolkit skill + scripts."
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [{name = "Brent Bolinger"}]
+keywords = ["hermes-agent", "snapmaker", "3d-printing", "klipper", "moonraker", "plugin"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = []
+
+[project.entry-points."hermes_agent.plugins"]
+snapmaker_u1 = "snapmaker_u1"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+snapmaker_u1 = ["*.md", "skills/**/*.md"]

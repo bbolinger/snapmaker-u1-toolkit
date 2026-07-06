@@ -48,3 +48,4 @@ tests/experiments/v16-results.tsv
 docs/FORM-PROTOCOL.md
 docs/v2.1.0-multipart-kits-plan.md
 docs/2026-*-*.md
+*.egg-info/
