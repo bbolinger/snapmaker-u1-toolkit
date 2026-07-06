@@ -49,3 +49,22 @@ def test_stage2_nonce_single_consume_under_concurrency():
         results = _race(lambda: g._consume_stage2_nonce(rid, nonce))
         winners = [r for r in results if r is True]
         assert len(winners) == 1, f"expected exactly one nonce consumer, got {sum(1 for r in results if r)}"
+
+
+def test_form_answers_single_redeem_under_concurrency():
+    """v2.2.2 #5: the form-answer file is CLAIMED (renamed) before it is read, so
+    concurrent redeems (double delivery / retry) cannot both process it. Exactly
+    one caller gets the answers; the rest see it already consumed."""
+    for _ in range(25):
+        fid = u1_form.new_form_id()
+        u1_form.write_answers_file(fid, {"tool": "T0", "material": "PLA"})
+
+        def _redeem():
+            try:
+                return u1_form.read_and_consume_answers(fid)
+            except FileNotFoundError:
+                return None
+
+        results = _race(_redeem)
+        winners = [r for r in results if isinstance(r, dict)]
+        assert len(winners) == 1, f"expected exactly one answer redeemer, got {len(winners)}"

@@ -614,17 +614,30 @@ def write_answers_file(form_id: str, obj: dict) -> "Path":
 
 
 def read_and_consume_answers(form_id: str) -> dict:
-    """Read an answer file and consume it (single-use — renamed on read so
-    a replayed --form-answers-from redeems nothing). Raises FileNotFoundError
-    when absent/already consumed and ValueError on a bad id or bad JSON."""
+    """Read an answer file and consume it (single-use). Raises FileNotFoundError
+    when absent/already consumed and ValueError on a bad id or bad JSON.
+
+    v2.2.2: CLAIM-before-read. The file is atomically renamed to a pid-unique
+    path BEFORE it is read, so two concurrent redeems (double delivery / retry)
+    cannot both read the same file and both act on it (the old read-then-rename
+    let both in). Only the process whose ``os.replace`` wins owns the answers;
+    the loser sees the source gone and raises FileNotFoundError."""
     import json as _json
     import os
     p = _answers_path(form_id)
-    if not p.is_file():
+    claimed = p.with_suffix(f".claimed.{os.getpid()}")
+    try:
+        os.replace(p, claimed)
+    except OSError:
         raise FileNotFoundError(
             f"no pending answers for form {form_id!r} (missing or already used)")
-    text = p.read_text()
-    os.replace(p, p.with_suffix(".json.consumed"))
+    try:
+        text = claimed.read_text()
+    finally:
+        try:
+            os.replace(claimed, p.with_suffix(".json.consumed"))
+        except OSError:
+            pass
     obj = _json.loads(text)
     if not isinstance(obj, dict):
         raise ValueError("answers file must contain a JSON object")

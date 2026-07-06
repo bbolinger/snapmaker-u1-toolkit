@@ -1068,6 +1068,7 @@ def _render_plate_isometric_from_gcode(
     id_to_name: dict[int, str] = {}
     layers: dict[str, dict[float, list]] = defaultdict(lambda: defaultdict(list))
     heights: dict[str, float] = defaultdict(float)
+    base_of: dict[str, str] = {}  # v2.2.2: instance name -> base model name (shared color)
     cid = None; cbase = None; ctype = None; prevx = prevy = None; cz = 0.0
     poly: list[tuple[float, float]] = []
 
@@ -1087,7 +1088,16 @@ def _render_plate_isometric_from_gcode(
         if ms:
             flush(); nid = int(ms.group(1)); cid = None if nid < 0 else nid; cbase = None
             if cid is not None:
-                nm = id_to_name.get(cid, ""); cbase = re.sub(r"_id_\d+_copy_\d+$", "", nm) or None
+                nm = id_to_name.get(cid, "")
+                # v2.2.2: key geometry by the FULL M486 instance name so two
+                # copies of one model (same base, distinct _id_/_copy_) each keep
+                # their own polygons and position. Keying by the stripped base
+                # collapsed copies into one part in the 3D view (the largest-loop
+                # pick below) while the top-down drew both, so the two review
+                # images disagreed. Base name is kept only for a shared color.
+                cbase = nm or None
+                if cbase is not None:
+                    base_of[cbase] = re.sub(r"_id_\d+_copy_\d+$", "", nm) or cbase
             continue
         zm = Z_RE.search(ln)
         if zm:
@@ -1177,13 +1187,18 @@ def _render_plate_isometric_from_gcode(
         "from the real sliced gcode (matches the footprint)"
     d.text((pad, 52), sub, fill=(140, 150, 160), font=small_font)
     n = len(parts)
+    # v2.2.2: colour by base model, not by instance, so copies of one model
+    # share a hue (and distinct models stay distinct) even though each instance
+    # is now drawn separately.
+    _bases = sorted({base_of.get(p, p) for p in parts})
+    _base_idx = {b: k for k, b in enumerate(_bases)}
+    _nb = len(_bases)
 
     def _depth(p):  # draw parts further back (higher y) first
         lp = rep[p]; return -sum(b for _, b in lp) / len(lp)
 
     for p in sorted(parts, key=_depth):
-        i = parts.index(p)
-        r, g, b = colorsys.hsv_to_rgb(i / max(n, 1), 0.55, 0.9)  # match top-down
+        r, g, b = colorsys.hsv_to_rgb(_base_idx[base_of.get(p, p)] / max(_nb, 1), 0.55, 0.9)
         bright = (int(r * 255), int(g * 255), int(b * 255))
         dim = tuple(int(c * 0.5) for c in bright)
         h = max(heights[p], 1.0); lp = rep[p]
@@ -2013,19 +2028,18 @@ def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
     Isolated so tests monkeypatch it (never contact Moonraker / block)."""
     from types import SimpleNamespace
     out_dir = Path(out_dir)
-    # #4: per-invocation log so a retry can't truncate a live gate's diagnostics.
-    log_path = out_dir / f"stage2_gate_{os.getpid()}.log"
-    state_path = out_dir / "stage2_gate_state.json"
-    # Clear any stale marker from a prior invocation BEFORE launching, so we only
-    # ever observe THIS child's transitions.
-    try:
-        state_path.unlink()
-    except OSError:
-        pass
+    # v2.2.2 #4: a unique id per launch so overlapping detached invocations for
+    # the same request can't cross-talk on a shared marker. The child inherits it
+    # via env and writes a run-scoped state file + log; the parent only ever polls
+    # THIS run's marker (no stale-marker unlink needed — the path is unique).
+    gate_run_id = os.urandom(5).hex()
+    log_path = out_dir / f"stage2_gate_{gate_run_id}.log"
+    state_path = out_dir / f"stage2_gate_state_{gate_run_id}.json"
+    child_env = dict(os.environ, U1_GATE_RUN_ID=gate_run_id)
     logf = open(log_path, "w")
     proc = subprocess.Popen(
         [sys.executable, gate_py] + argv,
-        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=child_env)
 
     def _finish(stalled=False):
         logf.close()
