@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.2.1] — 2026-07-06
+
+A safety-hardening and preview-fidelity patch on top of v2.2.0, driven by an
+external cold audit plus a live-caught render bug. Verified end to end on real
+hardware (gemma4-26b over Telegram): a full kit sliced, showed the corrected 3D
+view, passed the gate, and printed, with the new hardening engaged underneath.
+
+### Safety
+
+- **Material-mismatch override is no longer forgeable by an agent.** The
+  `--accept-material-mismatch` override claimed to require an operator phrase but
+  silently defaulted the provenance, so an agent holding a valid bed-clear nonce
+  could bypass the material gate and the audit row would call it an operator
+  override with no mechanical proof. The override is now refused unless invoked
+  from a real interactive terminal (an agent-mediated / workflow-subprocess start
+  has no TTY and cannot fake one) **and** `--operator-text` is supplied;
+  provenance is never defaulted. It is now a deliberate CLI-only escape hatch for
+  an operator physically at the machine.
+- **Detached start gate reports the real state, not an inference.** The gate runs
+  detached to survive the tool-call timeout; previously the parent inferred "grace
+  window started" purely from the child still being alive after 25s, so a child
+  stalled in a pre-grace check (Moonraker query, camera, I/O) or heading to a late
+  refusal was reported as a healthy grace. The child now writes an explicit
+  `stage2_gate_state.json` marker (`grace_started` / `started`) which the parent
+  polls; an unresolved stall surfaces as an honest `gate_state_unknown` event
+  instead of a false grace.
+- **Single-use token and Stage-2 nonce consumption are now concurrency-safe.** A
+  double-tap "yes", gateway retry, or duplicate delivery could previously consume
+  the same confirm-token or Stage-2 nonce twice (read-then-unlink / read-validate-
+  write with no lock). The confirm-token is now claimed by atomic rename before
+  reading, and the nonce is consumed under a per-request file lock with a re-check
+  inside the lock. Exactly one start proceeds.
+
+### Fixed
+
+- **3D plate view is built from the real sliced gcode, not a divergent packer.**
+  The isometric companion view was parsed from Orca's `--export-stl` output, which
+  uses a different (buggy) packer than `--slice`, so it rendered a garbled,
+  overlapping layout that flatly disagreed with the (correct) top-down footprint.
+  It is now built from the **same** sliced-gcode M486 outer walls as the
+  footprint (each part's mid-body boundary extruded to its real height, drawn with
+  an elevated top-down projection that preserves the footprint's orientation), so
+  the two views corroborate by construction: same parts, same colors, same
+  positions, with height added. Verified live against the real arrangement.
+- **Detached gate logs are per-invocation** (`stage2_gate_<pid>.log`), so a retry
+  can't truncate a live gate's diagnostics.
+
+### Changed
+
+- Removed the dead arranged-STL isometric renderer (superseded by the gcode one)
+  and pointed its test at the live path. Corrected a `v2.2.1`-labeled comment that
+  actually described v2.2.0 behavior. Added adversarial + concurrency tests for
+  all of the above.
+
+---
+
 ## [2.2.0] — 2026-07-05
 
 Every safety-critical claim below was verified **live on hardware** (gemma4-26b

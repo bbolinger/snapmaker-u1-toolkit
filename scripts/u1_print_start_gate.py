@@ -401,6 +401,63 @@ def _write_approval_token(out_dir: Path, snapshot: dict[str, Any]) -> str:
     return token
 
 
+def _gate_state_path(out_dir) -> Path:
+    return Path(out_dir) / 'stage2_gate_state.json'
+
+
+def _write_gate_state(out_dir, state: str, **extra) -> None:
+    """v2.2.1 #2: persist an explicit Stage-2 lifecycle marker (grace_started /
+    started / refused) so the DETACHED parent can distinguish 'the grace window
+    genuinely opened' from 'child still alive but stalled or heading to a late
+    refusal'. Previously the parent inferred grace purely from the child still
+    being alive after 25s, which reported a stall as a healthy grace window.
+    Best-effort: a marker write never blocks the gate."""
+    try:
+        p = _gate_state_path(out_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + '.tmp')
+        tmp.write_text(json.dumps({'state': state, **extra}))
+        tmp.replace(p)  # atomic
+    except Exception:
+        pass
+
+
+def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
+    """v2.2.1 #3: atomically consume the single-use Stage-2 nonce under a
+    per-request file lock. Re-reads the nonce INSIDE the lock and consumes it
+    only if it is still present and still equals expected, so two concurrent
+    gate processes (double-click / retry / duplicate delivery that got past the
+    confirm-token claim, or a direct-gate race) cannot both validate and consume
+    the same nonce. Returns True if THIS call consumed it, False if it was
+    already consumed/changed (the caller must then refuse the start)."""
+    import u1_request
+    try:
+        import fcntl
+        req_dir = Path(u1_request.ensure_request_dir(request_id))
+        with open(req_dir / '.stage2_nonce.lock', 'w') as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
+            if fresh_safety.get('stage2_approval_nonce') != expected_nonce:
+                return False  # already consumed / changed by a concurrent start
+            for k in ('stage2_approval_nonce', 'stage2_approval_issued_at',
+                      'stage2_approval_binds'):
+                fresh_safety.pop(k, None)
+            u1_request.write_request(request_id, safety=fresh_safety)
+            return True
+    except Exception:
+        # Locking unavailable (non-Unix / fs quirk): best-effort consume. The
+        # confirm-token atomic claim already serialises the realistic triggers.
+        try:
+            fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
+            for k in ('stage2_approval_nonce', 'stage2_approval_issued_at',
+                      'stage2_approval_binds'):
+                fresh_safety.pop(k, None)
+            u1_request.write_request(request_id, safety=fresh_safety)
+        except Exception:
+            pass
+        return True
+
+
 def _approval_token_valid(stored: dict[str, Any], offered: str) -> tuple[bool, str]:
     """Verify operator's offered token matches stored, within TTL."""
     if not stored:
@@ -815,13 +872,18 @@ def run_gate(filename: str,
                          host=host, port=port,
                          gcode_path=_gcode_path,
                          accept_material_mismatch=accept_material_mismatch)
-    # Layer 3 override: when --accept-material-mismatch
-    # is set, preflight tags the material-mismatch line with [OVERRIDE:...].
-    # Filter those out of the active blocker list + audit the override so it's
-    # visible forensically. The hardware safety isn't bypassed — just the
-    # mismatch refusal. Tool/material-temp damage is on the operator.
+    # Layer 3 override: when --accept-material-mismatch is set, preflight tags
+    # the material-mismatch line with [OVERRIDE:...]. The override is honored
+    # ONLY when a real operator authorizing phrase is supplied (v2.2.1 #1). The
+    # provenance is NEVER defaulted: without operator_text the override does not
+    # apply and the material blocker stands (a rogue agent cannot mint
+    # authorization it did not receive). main() additionally refuses the flag
+    # unless invoked from an interactive terminal, so an agent-mediated /
+    # subprocess start can never reach this branch with the override honored.
+    # The hardware safety isn't bypassed even then — just the mismatch refusal.
     overrides_used: list[dict[str, Any]] = []
-    if accept_material_mismatch:
+    _override_ok = bool(accept_material_mismatch and operator_text)
+    if _override_ok:
         kept: list[str] = []
         for line in blockers:
             if line.startswith("[OVERRIDE:material_mismatch] "):
@@ -836,13 +898,26 @@ def run_gate(filename: str,
             _audit_gate(request_id, "operator_override", resolved_operator,
                         override_kind="material_mismatch",
                         reason="loaded_material_does_not_match_requested",
-                        verification_method=(verification_method
-                                             or "unspecified_manual"),
-                        operator_text=(operator_text
-                                       or "accept-material-mismatch"),
+                        verification_method=verification_method,
+                        operator_text=operator_text,
                         expected_tool=intended_tool,
                         expected_material=requested_material,
                         blocker_text=overrides_used[0].get("blocker_text"))
+    elif accept_material_mismatch and not operator_text:
+        # Override requested with no operator authorization: refuse. Un-tag the
+        # [OVERRIDE:...] marker back to a clean hard blocker so the refusal reads
+        # normally, and audit the rejected attempt for forensics.
+        blockers = [
+            (l[len("[OVERRIDE:material_mismatch] "):]
+             if l.startswith("[OVERRIDE:material_mismatch] ") else l)
+            for l in blockers
+        ]
+        if request_id:
+            _audit_gate(request_id, "operator_override_rejected", resolved_operator,
+                        override_kind="material_mismatch",
+                        reason="override_missing_operator_text",
+                        expected_tool=intended_tool,
+                        expected_material=requested_material)
 
     if bed_clear != 'start':
         # Stage 1 — capture real photo, write token, return readiness.
@@ -1003,16 +1078,22 @@ def run_gate(filename: str,
                     'reason': ("Stage 2 nonce rejected: "
                                + "; ".join(problems)),
                 }
-            # Consume the nonce (single-use). Wipe binds too so a replay
-            # attempt can't re-use them.
-            try:
-                new_safety = dict(safety_for_nonce)
-                new_safety.pop('stage2_approval_nonce', None)
-                new_safety.pop('stage2_approval_issued_at', None)
-                new_safety.pop('stage2_approval_binds', None)
-                u1_request.write_request(request_id, safety=new_safety)
-            except Exception:
-                pass
+            # Consume the nonce (single-use, ATOMIC under a per-request lock).
+            # Wipes binds too so a replay can't re-use them. If a concurrent
+            # start already consumed it, refuse — exactly one start proceeds.
+            if not _consume_stage2_nonce(request_id, expected_nonce):
+                _audit_gate(request_id, 'stage2_nonce_double_consume_refused',
+                            resolved_operator)
+                return {
+                    'stage': 'start_attempt',
+                    'filename': printer_filename,
+                    'blockers': blockers,
+                    'snapshot': None,
+                    'ok': False, 'started': False,
+                    'reason': ("Stage 2 nonce was already consumed by a "
+                               "concurrent start (double-click / retry). Exactly "
+                               "one start proceeds; this one is refused."),
+                }
             _audit_gate(request_id, 'stage2_nonce_verified',
                         resolved_operator,
                         nonce_prefix=stage2_approval_nonce[:8] + '...')
@@ -1233,6 +1314,11 @@ def run_gate(filename: str,
         }
 
     if _resolved_grace > 0:
+        # v2.2.1 #2: mark grace as genuinely started BEFORE the blocking wait,
+        # so the detached parent polling this marker knows the ~120s window
+        # actually opened (vs. the child stalling in a pre-grace check).
+        _write_gate_state(out_dir, 'grace_started', request_id=request_id,
+                          grace_seconds=_resolved_grace)
         if not _wait_pre_start_grace_period(
                 cancel_marker, _resolved_grace, request_id,
                 resolved_operator,
@@ -1266,6 +1352,7 @@ def run_gate(filename: str,
                 printer_storage_filename=printer_filename,
                 request_revision=(req or {}).get('request_revision'),
                 gcode_hash=(req or {}).get('gcode_hash'))
+    _write_gate_state(out_dir, 'started', request_id=request_id)
     return {
         'stage': 'start_attempt',
         'filename': printer_filename,
@@ -1306,17 +1393,19 @@ def main(argv=None):
                     help='v2.0 Phase 3a: operator identity for audit + approval rows '
                          '(e.g. "telegram:brent"). Falls back to env U1_OPERATOR, '
                          'then "unknown:gate".')
-    # Layer 3 override flags. The material-mismatch
-    # blocker is loud-by-default; the operator can take explicit responsibility
-    # by passing --accept-material-mismatch. The forensic-control guarantee
-    # comes from the audit row capturing --operator-text verbatim. The agent
-    # CAN fabricate this text (no software gate prevents it); session-log
-    # review is the post-hoc check.
+    # Layer 3 override flags. The material-mismatch blocker is loud-by-default.
+    # v2.2.1 #1: the override is now MECHANICALLY constrained, not merely
+    # forensic. It is refused unless invoked from an interactive terminal (an
+    # agent-mediated / workflow-subprocess start has no TTY) AND --operator-text
+    # is supplied. Provenance is never defaulted, so an agent cannot mint an
+    # override it did not receive. This is a deliberate CLI-only escape hatch
+    # for an operator physically at the machine.
     ap.add_argument('--accept-material-mismatch', action='store_true',
-                    help=('Layer 3 override: operator explicitly accepts a '
-                          'material-mismatch (loaded filament does not match '
-                          'requested material). Audited. Requires '
-                          '--operator-text capturing the operator phrase.'))
+                    help=('Layer 3 override (INTERACTIVE TERMINAL ONLY): operator '
+                          'physically at the CLI accepts a material mismatch '
+                          '(loaded filament does not match requested material). '
+                          'REQUIRES --operator-text and a real TTY; refused for '
+                          'agent-mediated / subprocess starts. Audited.'))
     ap.add_argument('--operator-text', default=None,
                     help=('Layer 3 override: verbatim operator phrase '
                           'authorizing the override. Audited.'))
@@ -1346,6 +1435,28 @@ def main(argv=None):
                           "$U1_CANCEL_MARKER to abort.\"'. Overrides env "
                           'U1_GRACE_NOTIFY_CMD.'))
     a = ap.parse_args(argv)
+    # v2.2.1 #1: the material-mismatch override must be a deliberate operator
+    # action, never something an agent can forge. Refuse the flag unless it comes
+    # from a real interactive terminal (an agent-mediated / workflow-subprocess
+    # start has no TTY and cannot fake one) AND the operator's authorizing phrase
+    # is actually supplied. Provenance is not defaulted.
+    if a.accept_material_mismatch:
+        if not (sys.stdin and sys.stdin.isatty()):
+            print(json.dumps({
+                "phase": "refused",
+                "reason": ("material-mismatch override refused: it requires an "
+                           "interactive terminal. Agent-mediated or workflow "
+                           "starts cannot override a material mismatch. Load the "
+                           "correct material, or run this gate directly from a "
+                           "terminal.")}, indent=2))
+            return 3
+        if not a.operator_text:
+            print(json.dumps({
+                "phase": "refused",
+                "reason": ("material-mismatch override refused: --operator-text "
+                           "is required (the phrase authorizing this override). "
+                           "It is never defaulted.")}, indent=2))
+            return 3
     res = run_gate(a.filename, a.bed_clear,
                    intended_tool=a.intended_tool,
                    requested_material=a.requested_material,

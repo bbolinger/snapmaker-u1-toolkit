@@ -384,3 +384,76 @@ def test_grace_notify_loop_guard_caps_repeats():
     assert results[g.GRACE_NOTIFY_CAP:] == [False, False]
     # No request_id → always allowed (nothing to track).
     assert g._grace_notify_allowed(None) is True
+
+
+# ── v2.2.1 #1: material override must be unforgeable by an agent ──────────────
+import types as _types
+
+
+def test_material_override_refused_when_not_interactive_tty(monkeypatch, capsys):
+    """PRIMARY defense: --accept-material-mismatch is refused for agent-mediated
+    / subprocess starts (no TTY). An agent cannot fake a terminal, so it cannot
+    reach the override at all."""
+    monkeypatch.setattr(g.sys, 'stdin', _types.SimpleNamespace(isatty=lambda: False))
+    called = {'run_gate': False}
+    monkeypatch.setattr(g, 'run_gate',
+                        lambda *a, **k: called.__setitem__('run_gate', True) or {})
+    rc = g.main(['x.gcode', '--bed-clear', 'start', '--accept-material-mismatch',
+                 '--operator-text', 'I accept PLA', '--requested-material', 'PETG',
+                 '--intended-tool', 'extruder'])
+    assert rc == 3
+    assert called['run_gate'] is False  # refused BEFORE the gate ran
+    assert 'interactive terminal' in capsys.readouterr().out
+
+
+def test_material_override_refused_without_operator_text(monkeypatch, capsys):
+    """Even from a real TTY, the override refuses when --operator-text is missing.
+    Provenance is never defaulted."""
+    monkeypatch.setattr(g.sys, 'stdin', _types.SimpleNamespace(isatty=lambda: True))
+    called = {'run_gate': False}
+    monkeypatch.setattr(g, 'run_gate',
+                        lambda *a, **k: called.__setitem__('run_gate', True) or {})
+    rc = g.main(['x.gcode', '--bed-clear', 'start', '--accept-material-mismatch',
+                 '--requested-material', 'PETG', '--intended-tool', 'extruder'])
+    assert rc == 3
+    assert called['run_gate'] is False
+    assert '--operator-text is required' in capsys.readouterr().out
+
+
+def _seed_stage1_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'query_state', lambda h, p: idle())
+    monkeypatch.setattr(g, 'capture_real_bed_photo', _fake_capture(success=True))
+    # force a live material mismatch so preflight produces the material blocker
+    monkeypatch.setattr(g, 'run_tool_gate',
+                        lambda h, p, m, t: (False, 'requested material PETG does not '
+                                            'match extruder detected material PLA'))
+    rid = _seed_can_start_passing_request()
+    res1 = g.run_gate('x.gcode', bed_clear='cancel', host='h', port=1,
+                      intended_tool='extruder', requested_material='PETG',
+                      out_dir=tmp_path, request_id=rid)
+    return rid, res1['approval_token']
+
+
+def test_run_gate_override_refused_without_operator_text(monkeypatch, tmp_path):
+    """Defense in depth: even at the run_gate layer, accept_material_mismatch
+    without operator_text does NOT filter the material blocker; the start refuses."""
+    rid, token = _seed_stage1_token(monkeypatch, tmp_path)
+    res = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                     intended_tool='extruder', requested_material='PETG',
+                     approval_token=token, request_id=rid,
+                     accept_material_mismatch=True, operator_text=None,
+                     out_dir=tmp_path, start_func=lambda *a: {'result': 'ok'})
+    assert res['started'] is False
+
+
+def test_run_gate_override_applies_with_operator_text(monkeypatch, tmp_path):
+    """With a genuine operator_text, the material override applies and the start
+    proceeds (the escape hatch still works for a real operator at the CLI)."""
+    rid, token = _seed_stage1_token(monkeypatch, tmp_path)
+    res = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                     intended_tool='extruder', requested_material='PETG',
+                     approval_token=token, request_id=rid,
+                     accept_material_mismatch=True,
+                     operator_text='I accept PLA loaded at PETG temp',
+                     out_dir=tmp_path, start_func=lambda *a: {'result': 'ok'})
+    assert res['started'] is True
