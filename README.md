@@ -40,7 +40,7 @@ A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I ha
 2. **Orient** it — show both as-authored and Orca's auto-orient, with the real mesh-topology verdict (`floating cantilever` / `clean` / overhang layer fraction) so the operator picks based on Orca's actual call, not a face-angle approximation
 3. **Tool / filament / preset / supports** — surface live U1 state (what's actually loaded), recommend, never assume
 4. **Slice** through OrcaSlicer with the chosen profile, T0→T<chosen> rewriting, Snapmaker thumbnail injection, real Orca warnings surfaced
-5. **Preview — two corroborating views**: a top-down footprint traced from the *sliced gcode* (the real toolpath) and an isometric 3D render of the *actual arranged, oriented parts*. Built from different sources, so if they agree you're seeing the truth; plus footprint dimensions + real Orca warnings
+5. **Preview — two corroborating views** derived from the *sliced gcode* (the real toolpath): a precise top-down footprint, and a 3D plate view of the same per-part geometry with height added. Same parts, same colors, same positions the printer will execute; plus footprint dimensions + real Orca warnings
 6. **Upload** to the U1's Moonraker storage with `print=false` (file lands; printer does NOT start)
 7. **Bed-clear photo** captured fresh by the U1's onboard camera, surfaced to the operator
 8. **One explicit bed-clear decision** — yes/no on the *fresh* bed photo (yes starts; no keeps the gcode staged, doesn't print)
@@ -91,7 +91,7 @@ All three run in Hermes' `no_agent` cron mode — a plain script invocation with
 
 ## What This Is Not
 
-- **It is not an autonomous printer driver.** No agent in this stack can start a print without an operator yes/no on a real bed photo captured in-the-moment.
+- **It is not an autonomous printer driver.** No agent in this stack can start a print without an explicit operator yes/no. Normal starts are approved against a fresh U1 camera photo captured in-the-moment; if the camera is unavailable, the only alternative is an explicit, audited manual bed-verification path (never a silent skip).
 - **It is not a generic slicer wrapper.** Specific profile resolution, T0→T<n> rewriting, Snapmaker thumbnail injection, and Moonraker storage discipline are baked in for the U1.
 - **It is not a multi-printer abstraction yet.** The safety model and event contract are portable in principle. The implementation is U1-specific by design until the U1 experience is solid.
 - **It is not a Hermes-only project.** Hermes is the convenient remote-control layer. Every workflow step has a CLI form and JSON event stream — wrap it with whatever you want.
@@ -118,7 +118,11 @@ Actions that always require explicit operator confirmation:
 
 The workflow fails closed. If a check is unsure, it stops and asks rather than guessing. Bed-clear verdicts come from the operator looking at a real photo, not from the toolkit deciding the bed is "probably fine." Slicer profile mismatches abort BEFORE the slice. Upload that hits a filename collision asks before overwriting.
 
-None of this is aspirational: 703 tests run in CI on every change, and the
+The full per-action breakdown (the test-operator fence, the grace-period
+cancel chain, and every allowed-vs-gated command) lives in
+[docs/SAFETY.md](docs/SAFETY.md).
+
+None of this is aspirational: 710 tests run in CI on every change, and the
 cancel chain is **live-verified on real hardware**, including a reproducible,
 no-printer-needed drill anyone can run:
 [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
@@ -352,7 +356,7 @@ bash deploy_to_runtime.sh
 ## End-to-end slice workflow
 ![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
 
-**Before your first slice**, populate the profile picker (one-time setup — see [Profile sources (v1.5.0)](#profile-sources-v150) below):
+**Before your first slice**, populate the profile picker (one-time setup, see [docs/PROFILES.md](docs/PROFILES.md)):
 
 ```bash
 python3 tools/fetch_snapmaker_profiles.py            # Snapmaker U1 stock baseline
@@ -437,22 +441,6 @@ python3 tools/check_for_updates.py --orca-bin /path/to/orca-slicer    # one-off
 ORCA_SLICER_BIN=/path/to/orca-slicer python3 tools/check_for_updates.py  # persistent env
 ```
 
-## Maintainer helper: promote a tag to a GitHub Release
-
-`git push origin vX.Y.Z` creates a Tag on GitHub but NOT a Release object — the Releases page won't see it until a Release is explicitly created. `tools/create_release_from_tag.py` closes that gap by reading the tag's commit message and publishing it as the Release notes.
-
-```
-# After tagging + pushing a new version:
-export GITHUB_TOKEN=<your PAT with `repo` scope>
-
-python3 tools/create_release_from_tag.py                # promote the latest tag
-python3 tools/create_release_from_tag.py v1.4.5         # promote a specific tag
-python3 tools/create_release_from_tag.py --all-missing  # backfill every tag without a Release
-python3 tools/create_release_from_tag.py v1.4.5 --update  # replace existing Release's notes
-```
-
-Idempotent: a tag that already has a Release is skipped unless `--update` is passed. Repo slug is auto-detected from `git remote get-url origin`. Token sources (first match wins): `--token`, `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`.
-
 ## What's in here
 
 | Script | What it does |
@@ -463,7 +451,7 @@ Idempotent: a tag that already has a Release is skipped unless `--update` is pas
 | `u1_toolmap.py` | Multi-tool material gate — declared vs detected material check |
 | `u1_preflight.py` | Combined Moonraker state + camera freshness packet for "is it safe to start?" |
 | `u1_upload_gcode.py` | Upload-only (`print_started=false`) with gates: idle state + tool/material match |
-| `u1_slice_workflow.py` | Canonical v1.4.0 end-to-end STL/3MF workflow: orient → render → slice → preview → upload-only/start gate |
+| `u1_slice_workflow.py` | Canonical end-to-end STL/3MF entry point: orient → render → slice → preview → upload-only/start gate |
 | `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and "last ~6 layers" milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
 | `u1_print_watchdog.py` | Quiet 20-min health watcher with cooldown to avoid notification spam |
 | `u1_print_history.py` | Append-only JSONL print ledger + canonical upserted JSON |
@@ -475,127 +463,7 @@ Idempotent: a tag that already has a Release is skipped unless `--update` is pas
 | `tools/gcode_inject_thumbnail.py` | Add Snapmaker-app preview thumbnails to headless-sliced G-code (PIL renderer + base64 splice) |
 | `tools/render_stl_orientation.py` | Pre-print orientation review — 4-view PNG (isometric, front, side, top) with overhang faces highlighted in orange |
 
-## Safety model — concrete details
-
-The high-level model is in [Safety Model](#safety-model) above. This is the per-action breakdown.
-
-```
-read → slice → upload (print=false) → operator-approved start → quiet monitor
-```
-
-**Allowed automatically**:
-- Read printer state through Moonraker/Klipper endpoints
-- Read toolhead/extruder/material/feed sensor state
-- Read G-code metadata
-- Upload/stage G-code with `print=false`
-- Trigger fresh camera snapshots
-- Send operator alerts for milestones or issues
-- Record local print history
-
-**Requires explicit operator approval**:
-- Start a print
-- Resume a paused print
-- Cancel/stop a print
-- Any movement/heating command
-
-### Test-operator fence
-`u1_print_start_gate.py` refuses Stage 2 (real printer start) BEFORE any Moonraker
-call if the `--operator` argument starts with an unambiguously test-flavored
-prefix: `smoke:`, `test:`, `dry:`, `mock:`, or `fixture:` (case-insensitive).
-
-The gate returns a `gate_refused_test_operator` payload and audits the refusal.
-No HTTP call reaches the printer, no photo is taken, no preflight runs. This
-closes the "smoke-test accidentally runs a real print" failure that motivated
-the fence.
-
-`u1_kit_workflow.py` also prints a highly visible TEST MODE banner to stderr
-at the top of every invocation under a test-flavored operator, so the tester
-sees the gate will refuse before any command runs.
-
-If you hit the fence for a legitimate print — e.g. you set `U1_OPERATOR=test:homelab`
-in your environment because that's your naming convention — change the operator
-string to something without a test prefix (`homelab`, `human:homelab`, etc.).
-The fence is deliberately narrow: identity strings starting with `dev:`, `ci:`,
-`telegram:`, `discord:`, `human:`, or bare names all proceed normally.
-
-Two sharp edges, decided deliberately (rc2):
-
-- An explicit `--operator` now rides **every** command the kit workflow
-  emits, so a `smoke:*` identity can't silently drop back to your
-  production `U1_OPERATOR` mid-chain. Env-resolved identity is never baked
-  into commands (replay-safe).
-- An **unset** operator (`unknown:gate`) passes the fence — refusing every
-  bare CLI run would tax legitimate local use — but leaves a loud
-  `gate_operator_unknown` audit row. If your smoke tests might run with no
-  operator set, set one (`smoke:whatever`) so the fence can catch them.
-
-### Pre-start grace period + Telegram cancel button
-After every safety check passes and before the gate HTTPs the printer's
-`/printer/print/start`, there's a **grace window** (default 120s, configurable
-via `U1_GRACE_PERIOD_SECONDS` env var or `--grace-seconds N`). During the
-window the gate:
-
-1. Fires an operator notification via `$U1_GRACE_NOTIFY_CMD` (a shell
-   command you configure). Env vars `U1_REQUEST_ID`, `U1_FILENAME`,
-   `U1_GRACE_SECONDS`, `U1_CANCEL_MARKER`, `U1_OPERATOR` are exported so
-   your command can templatize them.
-2. Polls a per-request marker file at `<out_dir>/pre_start_cancel.marker`
-   once per second.
-3. If the marker appears → refuses the print, no HTTP call, audit
-   `pre_start_grace_cancelled`.
-4. If it doesn't appear before the window expires → proceeds, audit
-   `pre_start_grace_period_expired`.
-
-**Hermes users get a one-tap cancel button:** ship a Telegram notification
-via `hermes send` and a Gateway hook that touches the marker when you reply
-`cancel <code>` in the DM. Zero LLM, zero agent-loop — the hook runs directly
-in the Hermes gateway process.
-
-Install:
-
-```bash
-# One-time — installs the hook into Hermes' actual HOOKS_DIR + restarts gateway
-bash tools/install_hermes_cancel_hook.sh
-
-# Per environment — point the gate at the notify script
-export U1_GRACE_NOTIFY_CMD=/absolute/path/to/tools/u1_grace_notify_hermes.sh
-
-# REQUIRED for Hermes users: the gate spawns the notify script in a
-# stripped subprocess env where `hermes` is usually NOT on PATH. Without
-# this, the notify fails (audited as pre_start_grace_notify_failed — the
-# wait still runs fail-open, but no Telegram warning is sent).
-export HERMES_BIN=/opt/hermes/.venv/bin/hermes
-```
-
-The notify script sends a Telegram DM. Reply `CANCEL` (or `STOP` or
-`ABORT`, case-insensitive) within the window and the print aborts before
-any HTTP call — a bare keyword cancels **every** active grace window;
-`cancel <code>` (the code is the last 6 chars of the request id, shown in
-the DM) cancels **only** that request, and a code that matches nothing
-cancels nothing. Trailing punctuation is fine — `CANCEL!!!` fires (urgency
-isn't ambiguity) — but extra words never match: "cancel that plan" is safe
-from unintended cancels. Multi-request setups (two concurrent grace windows)
-each write their own pending-state file so they don't race each other.
-
-Honesty guard: the DM only promises reply-to-cancel when the installer's
-receipt file shows the hook actually loaded — otherwise it gives the SSH
-`touch <marker>` fallback instead of a reply that would silently do
-nothing.
-
-Cancelled by mistake, or the bed was actually fine? The refusal payload
-carries a `recovery.stage1_command`: the slice and upload are still
-valid, so restarting costs one fresh bed photo + one fresh yes — not a
-workflow re-run.
-
-Verify the whole chain (including a zero-risk drill that needs no
-printer): [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
-
-Opt-out for power users at the printer: `U1_GRACE_PERIOD_SECONDS=0`
-disables the window. `U1_GRACE_NOTIFY_CMD` unset disables the
-notification but the wait still runs (in that case an SSH `touch
-<marker>` cancels).
-
-## Quick start — per-platform commands
+## Per-platform commands (Linux / macOS / Windows)
 
 The 30-second flavor is in [Quick Start](#quick-start) above. This section has the per-platform install + first-status-probe commands.
 
@@ -719,167 +587,14 @@ Real reverse-engineering notes from getting these scripts working — the kind o
 | `references/snapmaker-u1-research.md` | First-pass research summary |
 
 ## Profile sources
-**The toolkit no longer ships default profiles.** A fresh install has an empty picker. Profiles come from one of three sources you populate yourself, scanned in priority order:
 
-| Source dir | Populated by | Purpose | Priority |
-|---|---|---|---|
-| `profiles/from-printer/` | `python3 tools/extract_profiles_from_printer.py` | Profiles extracted from your printer's recent G-code history. Physics-validated — every setting produced a successful print. | Highest |
-| `profiles/user/` | The operator, manually | Hand-tuned overrides + custom variants you want to keep stable across stock refreshes | Middle |
-| `profiles/snapmaker-stock/` | `python3 tools/fetch_snapmaker_profiles.py` | Snapmaker's official U1 profiles, pulled fresh from the Snapmaker/OrcaSlicer upstream repo (~217 files: every nozzle size + layer height + Snapmaker-tuned filament) | Lowest (universal baseline) |
-
-All three are listed in `.gitignore` — they're per-user, not redistributed.
-
-### First-run setup
-
-```bash
-# Pull Snapmaker's official U1 baseline (~217 files, one-time):
-python3 tools/fetch_snapmaker_profiles.py
-
-# Extract whatever you've actually printed successfully so far:
-python3 tools/extract_profiles_from_printer.py
-```
-
-Both are idempotent — re-run anytime to pick up Snapmaker upstream updates or fresh prints from your printer's history. Snapmaker stock gives you the universal U1 baseline; extracted profiles reflect what you've validated on your hardware.
-
-Without either, the workflow fails closed at analysis time with a clear `setup_required` event pointing you back here. Hermes agents surface that error verbatim.
-
-### Why ship empty
-Earlier versions shipped 13 personal community profiles in `profiles/` as defaults. They were tuned for one bed surface (Textured PEI), one bed temp, specific filament brands (SUNLU PETG, HF White PETG), specific tool assignments. Running them silently on another U1 with different filaments or a different bed surface could ruin prints — and the toolkit had no way to warn the user that the profile underneath didn't match their setup.
-
-v1.5.0 moves those personal templates to `examples/profiles/` and points the picker at three honest sources: Snapmaker upstream (universal baseline), your printer's history (physics-validated on your hardware), and your own hand-tuned profiles. The agent's *Preset?* prompt now annotates each option with `source`, `has_supports` (read from the JSON's `enable_support` field), and `supports_status` (does picking "Add supports" auto-promote to a `_supports` sibling, already encode supports, or fail with a `no_supports_variant` warning).
-
-### Supports auto-detection
-Profiles are JSON-typed for supports — the picker reads each profile's `enable_support` field and annotates the option with `has_supports: true/false`. The agent's *Preset?* prompt also carries a `supports_status` that pre-warns the user before the *Supports?* question:
-
-- `"self"` → preset already encodes supports; "Add supports" is a no-op for them
-- `"<variant_name>"` → if user picks "Add supports", workflow auto-promotes to this same-source sibling and emits a `preset_promoted` event
-- `null` → no same-source supports sibling exists (or multiple ambiguous candidates). Workflow emits a `warning` event with `kind:no_supports_variant` and slices without supports — agent surfaces it before the user trusts the preview
-
-Why "same-source exactly one"? Snapmaker stock has multiple Support flavors at the same layer height (`0.20 Support`, `0.20 Support W`, `0.20 Bambu Support W`) — auto-promote can't pick one; the user has to.
-
-### Why build your own (vs. just importing the examples)
-
-Profile-as-data-from-real-prints means every setting is *physics-validated* — it produced a completed print on actual hardware. But the validation is environment-specific:
-
-- Different bed surface (smooth PEI, garolite, glass) → different first-layer temp / bed temp / Z-offset
-- Different filament brand → different optimal nozzle temp (PETG ranges 230–260°C across brands)
-- Different tool assignment → e.g. your PLA is in extruder0, mine in extruder2
-- Different exhaust/enclosure → affects warping defaults
-
-Importing someone else's profiles is fine as a starting point; running them as gospel on a different setup will give you mediocre prints.
-
-### Build per-extruder, per-filament profiles from your own print history
-
-This is the recipe used to bootstrap the included community profiles. It
-only takes one good print per filament-type-per-extruder slot.
-
-**The fastest path — one command:**
-
-```bash
-python3 tools/extract_profiles_from_printer.py
-```
-
-That connects to your U1 (via `SNAPMAKER_U1_HOST` / `.env`), pulls the 5
-most recent G-codes, runs the extractor against each, and drops process +
-filament JSONs into `profiles/from-printer/` — with multi-tool metadata
-sliced down to the actual tool each print used (so the filament profile
-for a T1 PETG print isn't polluted by T0/T2/T3 settings).
-
-Tweaks: `--list` to see what's on the printer first, `--file "<exact gcode>"`
-to pick a specific one, `--limit N` to grab more, `--vendor SUNLU` to
-override the often-generic vendor field, `--output-dir <path>` to write
-elsewhere.
-
-**The longhand recipe** — same outcome, manual steps:
-
-1. **Print once with Snapmaker's defaults** — get a clean part, no warping/stringing/under-extrusion, on your bed surface and filament. Just enough to call it "good enough to use as a baseline."
-2. **List successful prints via Moonraker**:
-   ```
-   curl http://YOUR_U1:7125/server/files/list?root=gcodes
-   ```
-3. **Download the G-code** and parse the `; key = value` metadata block at the top. The key ones:
-   ```
-   ; filament_type, filament_settings_id
-   ; print_settings_id
-   ; layer_height, first_layer_height
-   ; nozzle_temperature, first_layer_temperature
-   ; bed_temperature, first_layer_bed_temperature
-   ; curr_bed_type
-   ; sparse_infill_density, wall_loops
-   ; nozzle_diameter
-   ```
-4. **Build a flattened process JSON** (see `examples/profiles/community_merged_*.json` for shape) and a matching filament JSON (see `examples/profiles/community_generic_petg_*.json`). Name them with the extruder + filament so you don't confuse yourself: e.g. `myprinter_extruder1_sunlu_black_petg.json`.
-
-   **Or run the included extractor** to do steps 3-4 in one go:
-   ```bash
-   python3 tools/extract_profile_from_gcode.py my_good_print.gcode \
-       --process-out  profiles/myprinter_extruder1_petg_process.json \
-       --filament-out profiles/myprinter_extruder1_sunlu_black_petg_filament.json \
-       --process-name  "My 0.20 PETG Extruder1" \
-       --filament-name "My PETG Extruder1" \
-       --vendor SUNLU --brand-label "SUNLU Black"
-   ```
-   It parses the slicer's `; key = value` metadata block, emits a flat process JSON + a list-shaped filament JSON in Snapmaker Orca's expected shape, and lets you override `filament_vendor` (G-code often says "Generic"). Pass `--metadata-only` to inspect the raw parsed keys without writing files.
-5. **Track per-extruder mapping in `u1_tool_material_map.json`** so the toolmap gate enforces correct slot assignment:
-   ```json
-   {
-     "tools": {
-       "extruder":  { "material": "PLA",   "label": "Polymaker PolyLite Black" },
-       "extruder1": { "material": "PETG",  "label": "SUNLU Black PETG" },
-       "extruder2": { "material": "PETG",  "label": "HF White PETG" },
-       "extruder3": { "material": "PLA",   "label": "Polymaker PolyLite Grey" }
-     }
-   }
-   ```
-
-The toolmap gate (`u1_toolmap.py`) then prevents you from accidentally slicing a job for PETG and uploading it against the slot loaded with PLA.
-
-### Reference: example community profiles in `examples/profiles/`
-
-The 13 profiles used during development live in `examples/profiles/` as a shape reference. They're MIT-licensed and show what a working community-tuned profile looks like for the U1. **Do not use them as defaults** — they assume Textured PEI + specific filament brands. If you happen to share that setup, copy them into `profiles/user/` and they'll appear in the picker.
-
-The naming convention so you can see the pattern:
-
-| Pattern | Meaning |
-|---|---|
-| `community_016_optimal_*` | 0.16mm layer, optimal preset, process profile |
-| `community_020_strength_*` | 0.20mm layer, strength preset (6 walls, 25% infill) |
-| `community_*_supports` | + tree/auto supports enabled |
-| `community_*_gyroid` | + gyroid infill pattern |
-| `community_*_fuzzy_external` | + fuzzy skin on outer walls |
-| `community_generic_petg_*` | Filament profile for PETG |
-| `community_*_sunlu_black_*` | SUNLU brand-specific (240°C first layer) |
-| `community_*_hf_white_*` | High-flow white PETG variant |
-| `community_merged_*` | **Flattened** — works for headless CLI slicing |
-| `community_*_override` | Inherits from official — GUI only |
-
-Diff against the official Snapmaker preset chain is ~93% identical; deltas are tuning choices that came from real prints (lower prime-tower waste, arachne walls, brand-specific PETG temps).
-
-Use them as **templates** to copy + modify for your own setup. Don't blindly import.
-
-| File | Type | Use case |
-|---|---|---|
-| `community_merged_016_optimal_u1_textured_pei.json` | process | **Start here.** Flattened 0.16 Optimal, no inheritance — works headless |
-| `community_016_optimal_u1_textured_pei.json` | process | Standalone 0.16 Optimal |
-| `community_016_optimal_u1_textured_pei_override.json` | process | Inherits-from-official override |
-| `community_016_optimal_*_fuzzy_external*.json` | process | Fuzzy/staggered seam variants |
-| `community_020_strength_u1_textured_pei.json` | process | 0.20 Strength preset |
-| `community_020_strength_supports_*.json` | process | Strength + supports |
-| `community_020_strength_gyroid*.json` | process | Strength with gyroid infill |
-| `community_generic_petg_u1_textured_pei.json` | filament | Generic PETG (255°C first layer) |
-| `community_generic_petg_sunlu_black_*.json` | filament | SUNLU Black PETG (240°C first layer) |
-| `community_generic_petg_hf_white_*.json` | filament | High-flow White PETG |
-
-Diff against official ≈ 93% identical; deltas are documented tuning choices, not regressions.
-
-### Importing profiles into OrcaSlicer (GUI)
-
-1. Open OrcaSlicer → top-right gear → "Configuration / Profiles"
-2. Drag-and-drop the desired `.json` file into the profiles panel, OR copy to the system config directory for your slicer:
-   - **Upstream OrcaSlicer** (recommended): `~/.config/OrcaSlicer/system/Snapmaker/process/` (or `filament/`) on Linux/macOS; `%APPDATA%\OrcaSlicer\system\Snapmaker\process\` on Windows
-   - **Snapmaker fork** (if you're using `snapmaker-orca` instead): `~/.config/SnapmakerOrca/system/Snapmaker/process/` / `%APPDATA%\Snapmaker_Orca\system\Snapmaker\process\`
-3. Restart OrcaSlicer
-4. Select the Community profile from the dropdown when slicing
+Your profiles should be *yours*: extracted from your own successful prints,
+mapped to your own extruders. The toolkit ships with an empty `profiles/` dir on
+purpose and gives you three honest sources: Snapmaker's stock profiles
+(`tools/fetch_snapmaker_profiles.py`), profiles extracted from prints that
+already succeeded on your printer, and your own hand-tuned files. The full
+guide (first-run setup, supports auto-detection, and building per-extruder
+profiles from print history) is in [docs/PROFILES.md](docs/PROFILES.md).
 
 ## Headless slicing setup (no GUI / scripted)
 
@@ -1053,7 +768,7 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-703 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+710 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
@@ -1074,31 +789,16 @@ to omit if you only want to run the safety-script tests.
 
 ## Release validation
 
-Each tagged release is install-validated end-to-end before publish — clone,
-test suite, script-help smoke, and the active-print upload-gate safety
-check (the latter against a mocked Moonraker so no live printer is
-touched). The validation surfaces install/docs gaps a fresh-clone user
-would hit.
-
-| Tag | Tooling | Platform |
-|---|---|---|
-| v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
-| v1.0.1 | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
-| v1.1.0 | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
-| v1.1.1 | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
-| v1.1.2 | Cold-pass doc fixes + new regenerate_machine_profile.py helper (135 tests) | Linux (Hermes container) |
-| v1.2.0 | New printer-side extractor with multi-tool slice; live-tested against the U1 (extracted from "Dazzling Uusam_PETG_25m58s.gcode") | Linux (Hermes container) + real U1 |
-| v1.3.0 | Cavity LED auto-on for camera captures + 5-minute auto-dim after print finish (`u1_led.photo_wrap()`); 151 pytest tests | Linux (Hermes container) |
-| **v1.4.2** | End-to-end slice workflow (`u1_slice_workflow.py`) with 10-step staged Q&A flow + bundled Hermes skill installable via `hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation`. Render-equals-slice rotation fix verified by Kabsch alignment on the EGO String Trimmer holder. Wrong-extruder G-code rewrite closes a safety bug surfaced by the camera-gated start gate during live test (T0 → T&lt;chosen&gt; in start/end blocks while preserving multi-tool cooling commands). 172 pytest tests | Linux (Hermes container) + real U1 |
-
-Findings from the v1.0.1 validation drove every change in that release —
-see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
-for the per-finding breakdown.
+Each tagged release is validated before publish: the full test suite in CI on
+Python 3.11 and 3.12, a fresh-clone install and script-help smoke test, the
+active-print upload-gate safety check against a mocked Moonraker, and, for
+releases that touch the safety boundary or the operator flow, a live run on a
+real U1. Per-release evidence lives in the [CHANGELOG](CHANGELOG.md).
 
 ## Known limitations / design notes
 
 1. **Single-printer scope**: scripts assume one U1. Multi-printer would need namespacing in the config + per-printer state dirs.
-2. **Cron / always-on cadence**: the watchdog, last-layer, and history scripts are written to be cron-driven (typically every 1/5/20 min). They keep state on disk and are idempotent across runs, but they're not daemonized — your scheduler (cron, systemd timer, Hermes' cron, etc.) owns the cadence.
+2. **Cron / always-on cadence**: the watchdog, last-layer, and history scripts are written to be cron-driven (the table above shows the defaults; the intervals are yours to set). They keep state on disk and are idempotent across runs, but they're not daemonized; your scheduler (cron, systemd timer, Hermes' cron, etc.) owns the cadence.
 3. **U1 firmware coupling**: tested against Snapmaker U1 firmware on the version that ships Moonraker on port 7125. Other Snapmaker models, or future firmware revisions that change the `print_task_config` / `filament_detect` object shape, may surface field gaps. The `references/` docs capture what the current firmware does emit — start there if you're debugging a field-shape mismatch.
 
 ## License

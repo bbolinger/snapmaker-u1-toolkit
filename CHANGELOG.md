@@ -669,3 +669,31 @@ See [README.md → Upgrading from v1.x](README.md#upgrading-from-v1x).
 - `HERMES.md` stable-tier procedural rules (Rules 1-5).
 
 For earlier releases, see `git log`.
+
+---
+
+## Appendix: release validation history (v1.x era)
+
+Preserved from the README. Since v2.x, per-release validation evidence is
+documented in each release entry above.
+
+Each tagged release is install-validated end-to-end before publish — clone,
+test suite, script-help smoke, and the active-print upload-gate safety
+check (the latter against a mocked Moonraker so no live printer is
+touched). The validation surfaces install/docs gaps a fresh-clone user
+would hit.
+
+| Tag | Tooling | Platform |
+|---|---|---|
+| v1.0.0 (initial) | manual + 94 pytest tests | Linux (Hermes container) |
+| v1.0.1 | Hermes (local agent) running Qwopus3.6-27B-Coder-GGUF:Q4_K_M on Ollama | Windows (Git Bash + Python 3.11) |
+| v1.1.0 | 126 pytest tests + visual review against the orbital-sander STL | Linux (Hermes container) |
+| v1.1.1 | Hermes cold-style live run on Windows; full headless slice + thumbnail inject against shoehorn.stl via upstream OrcaSlicer v2.4.0 | Windows (Python 3.11 + native CLI) |
+| v1.1.2 | Cold-pass doc fixes + new regenerate_machine_profile.py helper (135 tests) | Linux (Hermes container) |
+| v1.2.0 | New printer-side extractor with multi-tool slice; live-tested against the U1 (extracted from "Dazzling Uusam_PETG_25m58s.gcode") | Linux (Hermes container) + real U1 |
+| v1.3.0 | Cavity LED auto-on for camera captures + 5-minute auto-dim after print finish (`u1_led.photo_wrap()`); 151 pytest tests | Linux (Hermes container) |
+| **v1.4.2** | End-to-end slice workflow (`u1_slice_workflow.py`) with 10-step staged Q&A flow + bundled Hermes skill installable via `hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation`. Render-equals-slice rotation fix verified by Kabsch alignment on the EGO String Trimmer holder. Wrong-extruder G-code rewrite closes a safety bug surfaced by the camera-gated start gate during live test (T0 → T&lt;chosen&gt; in start/end blocks while preserving multi-tool cooling commands). 172 pytest tests | Linux (Hermes container) + real U1 |
+
+Findings from the v1.0.1 validation drove every change in that release —
+see the [v1.0.1 commit](https://github.com/bbolinger/snapmaker-u1-toolkit/commit/ccdeaef)
+for the per-finding breakdown.
