@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -446,9 +447,16 @@ def test_run_gate_override_refused_without_operator_text(monkeypatch, tmp_path):
     assert res['started'] is False
 
 
+class _FakeTTY:
+    def isatty(self):
+        return True
+
+
 def test_run_gate_override_applies_with_operator_text(monkeypatch, tmp_path):
-    """With a genuine operator_text, the material override applies and the start
-    proceeds (the escape hatch still works for a real operator at the CLI)."""
+    """With a genuine operator_text AND an interactive terminal, the material
+    override applies and the start proceeds (the escape hatch still works for a
+    real operator at the CLI)."""
+    monkeypatch.setattr(g.sys, "stdin", _FakeTTY())  # v2.2.2: override needs a TTY
     rid, token = _seed_stage1_token(monkeypatch, tmp_path)
     res = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
                      intended_tool='extruder', requested_material='PETG',
@@ -457,3 +465,29 @@ def test_run_gate_override_applies_with_operator_text(monkeypatch, tmp_path):
                      operator_text='I accept PLA loaded at PETG temp',
                      out_dir=tmp_path, start_func=lambda *a: {'result': 'ok'})
     assert res['started'] is True
+
+
+def test_run_gate_override_refused_without_tty(monkeypatch, tmp_path):
+    """v2.2.2 #1: the override is enforced at the apply-point, not only in
+    main(). A direct run_gate() caller WITHOUT an interactive terminal (an
+    agent/subprocess) cannot honor the override even with operator_text — the
+    material mismatch still blocks the start."""
+    monkeypatch.setattr(g.sys, "stdin", io.StringIO())  # isatty() -> False
+    rid, token = _seed_stage1_token(monkeypatch, tmp_path)
+    res = g.run_gate('x.gcode', bed_clear='start', host='h', port=1,
+                     intended_tool='extruder', requested_material='PETG',
+                     approval_token=token, request_id=rid,
+                     accept_material_mismatch=True,
+                     operator_text='I accept PLA loaded at PETG temp',
+                     out_dir=tmp_path, start_func=lambda *a: {'result': 'ok'})
+    assert res['started'] is not True
+
+
+def test_consume_stage2_nonce_fails_closed_on_exception(monkeypatch, tmp_path):
+    """v2.2.2 #2: if consuming the Stage-2 nonce raises (lock/read/write failure,
+    missing fcntl), the gate must REFUSE (return False), never authorize. The old
+    best-effort fallback returned True on error, which is fail-open."""
+    def _boom(*a, **k):
+        raise OSError("simulated fs failure under the lock")
+    monkeypatch.setattr(u1_request, "ensure_request_dir", _boom)
+    assert g._consume_stage2_nonce("u1_2026_0101_abcdef", "some-nonce") is False

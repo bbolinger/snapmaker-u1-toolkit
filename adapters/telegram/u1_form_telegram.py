@@ -417,6 +417,10 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
     fid = field["id"]
 
     if kind == "e":
+        # Edit-from-review: remember to return to Review after this field, so a
+        # tweak doesn't march the operator forward through the remaining screens
+        # (or dead-end). Cleared when the edited screen advances.
+        form["_edit_return"] = True
         form["current"] = fid
         return {"kind": "rerender"}
 
@@ -442,8 +446,10 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         return {"kind": "rerender"}
 
     if kind == "n":
-        # Done on a multi field → advance to next
-        form["current"] = _next_field(form)
+        # Done on a multi field (or a group's shared Next) → advance. If we got
+        # here via Edit-from-review, go straight back to Review instead of
+        # marching forward through the remaining screens.
+        form["current"] = REVIEW_FIELD if form.pop("_edit_return", None) else _next_field(form)
         return {"kind": "rerender"}
 
     if kind == "s":
@@ -455,7 +461,7 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         # A single-select on its own screen advances on tap; one inside a
         # group is a radio — it only marks, the shared Next advances.
         if not field.get("group"):
-            form["current"] = _next_field(form)
+            form["current"] = REVIEW_FIELD if form.pop("_edit_return", None) else _next_field(form)
         return {"kind": "rerender"}
 
     raise ValueError(f"bad callback_data: {data!r}")

@@ -1068,6 +1068,7 @@ def _render_plate_isometric_from_gcode(
     id_to_name: dict[int, str] = {}
     layers: dict[str, dict[float, list]] = defaultdict(lambda: defaultdict(list))
     heights: dict[str, float] = defaultdict(float)
+    base_of: dict[str, str] = {}  # v2.2.2: instance name -> base model name (shared color)
     cid = None; cbase = None; ctype = None; prevx = prevy = None; cz = 0.0
     poly: list[tuple[float, float]] = []
 
@@ -1087,7 +1088,16 @@ def _render_plate_isometric_from_gcode(
         if ms:
             flush(); nid = int(ms.group(1)); cid = None if nid < 0 else nid; cbase = None
             if cid is not None:
-                nm = id_to_name.get(cid, ""); cbase = re.sub(r"_id_\d+_copy_\d+$", "", nm) or None
+                nm = id_to_name.get(cid, "")
+                # v2.2.2: key geometry by the FULL M486 instance name so two
+                # copies of one model (same base, distinct _id_/_copy_) each keep
+                # their own polygons and position. Keying by the stripped base
+                # collapsed copies into one part in the 3D view (the largest-loop
+                # pick below) while the top-down drew both, so the two review
+                # images disagreed. Base name is kept only for a shared color.
+                cbase = nm or None
+                if cbase is not None:
+                    base_of[cbase] = re.sub(r"_id_\d+_copy_\d+$", "", nm) or cbase
             continue
         zm = Z_RE.search(ln)
         if zm:
@@ -1177,13 +1187,18 @@ def _render_plate_isometric_from_gcode(
         "from the real sliced gcode (matches the footprint)"
     d.text((pad, 52), sub, fill=(140, 150, 160), font=small_font)
     n = len(parts)
+    # v2.2.2: colour by base model, not by instance, so copies of one model
+    # share a hue (and distinct models stay distinct) even though each instance
+    # is now drawn separately.
+    _bases = sorted({base_of.get(p, p) for p in parts})
+    _base_idx = {b: k for k, b in enumerate(_bases)}
+    _nb = len(_bases)
 
     def _depth(p):  # draw parts further back (higher y) first
         lp = rep[p]; return -sum(b for _, b in lp) / len(lp)
 
     for p in sorted(parts, key=_depth):
-        i = parts.index(p)
-        r, g, b = colorsys.hsv_to_rgb(i / max(n, 1), 0.55, 0.9)  # match top-down
+        r, g, b = colorsys.hsv_to_rgb(_base_idx[base_of.get(p, p)] / max(_nb, 1), 0.55, 0.9)
         bright = (int(r * 255), int(g * 255), int(b * 255))
         dim = tuple(int(c * 0.5) for c in bright)
         h = max(heights[p], 1.0); lp = rep[p]
@@ -2013,19 +2028,18 @@ def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
     Isolated so tests monkeypatch it (never contact Moonraker / block)."""
     from types import SimpleNamespace
     out_dir = Path(out_dir)
-    # #4: per-invocation log so a retry can't truncate a live gate's diagnostics.
-    log_path = out_dir / f"stage2_gate_{os.getpid()}.log"
-    state_path = out_dir / "stage2_gate_state.json"
-    # Clear any stale marker from a prior invocation BEFORE launching, so we only
-    # ever observe THIS child's transitions.
-    try:
-        state_path.unlink()
-    except OSError:
-        pass
+    # v2.2.2 #4: a unique id per launch so overlapping detached invocations for
+    # the same request can't cross-talk on a shared marker. The child inherits it
+    # via env and writes a run-scoped state file + log; the parent only ever polls
+    # THIS run's marker (no stale-marker unlink needed — the path is unique).
+    gate_run_id = os.urandom(5).hex()
+    log_path = out_dir / f"stage2_gate_{gate_run_id}.log"
+    state_path = out_dir / f"stage2_gate_state_{gate_run_id}.json"
+    child_env = dict(os.environ, U1_GATE_RUN_ID=gate_run_id)
     logf = open(log_path, "w")
     proc = subprocess.Popen(
         [sys.executable, gate_py] + argv,
-        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=child_env)
 
     def _finish(stalled=False):
         logf.close()
@@ -2263,6 +2277,63 @@ def run_kit_workflow(args) -> dict[str, Any]:
     answers = getattr(args, "form_answers", None)
     answers_json = getattr(args, "form_answers_json", None)
     answers_from = getattr(args, "form_answers_from", None)
+    # v2.2.2: idempotency for a DUPLICATE form-redeem. If the request already
+    # advanced to the bed-clear step (the first redeem sliced + uploaded and is
+    # awaiting the operator's yes), a second --redeem-pending-form must NOT
+    # re-render a fresh form — that stranded the operator in a form loop when a
+    # small model relayed the redeem command twice (live 2026-07-06). Re-surface
+    # the SAME bed-clear prompt (same still-valid confirm token) instead, so the
+    # duplicate relay is a harmless no-op.
+    if (getattr(args, "redeem_pending_form", False)
+            and not getattr(args, "action", None)):
+        # Detect the already-advanced state by the DURABLE pending object, NOT
+        # the phase: the looping re-form reset phase to awaiting_form while the
+        # pending_bed_clear_start (nonce + confirm token) survived in safety
+        # (confirmed on the live 2026-07-06 request).
+        _idem_req = u1_request.read_request(request_id) or {}
+        _idem_safety = _idem_req.get("safety") or {}
+        _idem_pending = _idem_safety.get("pending_bed_clear_start") or {}
+        _idem_tok = _idem_pending.get("confirm_token")
+        # Fire ONLY for a genuine DUPLICATE redeem — the current form's answers
+        # are already consumed. A FIRST redeem still has its answers file and must
+        # proceed normally (slice + overwrite any stale pending); otherwise a
+        # request carrying a stale pending from a PRIOR run (request ids are
+        # content-derived, so re-uploads reuse the request) would wrongly
+        # re-surface the OLD plate instead of slicing the fresh answers.
+        _idem_fid = _idem_req.get("form_id")
+        try:
+            _answers_gone = not (_idem_fid and u1_form._answers_path(_idem_fid).exists())
+        except Exception:
+            _answers_gone = True
+        if _idem_pending.get("nonce") and _idem_tok and _answers_gone:
+            _idem_prompt = (
+                "You already submitted this plate — it's sliced, uploaded, and "
+                "waiting on your bed-clear yes. Reply YES to start now, or NO to "
+                "keep the gcode staged without printing.")
+            _emit(events_file, {
+                "stage": "need_input", "request_id": request_id,
+                "need": "bed_clear_start", "key": "bed_clear_start",
+                "requires_fresh_operator_bed_clear": True,
+                "approval_prompt_key": "bed_clear_start",
+                "prompt": _idem_prompt,
+                "instruction": ("The plate preview + bed photo were already sent "
+                                "on the previous turn — do NOT re-run the form. "
+                                "Re-surface the yes/no prompt and wait."),
+                "expected_answers": ["yes", "no"],
+                "next_command_on_yes": (
+                    f"python3 /opt/data/scripts/u1_kit_workflow.py "
+                    f"--confirm-start {_idem_tok}"),
+                "next_command_on_no": None,
+                "bed_snapshot_path": (_idem_safety.get("snapshot_path")
+                                      or _idem_safety.get("bed_snapshot_path")),
+            }, json_events)
+            _emit(events_file, {"stage": "awaiting_input",
+                                "need": "bed_clear_start",
+                                "request_id": request_id}, json_events)
+            _audit(request_id, "duplicate_redeem_reemitted_bed_clear", operator)
+            return {"phase": "awaiting_bed_clear_start",
+                    "request_id": request_id, "prompt": _idem_prompt}
+
     if getattr(args, "redeem_pending_form", False) and not answers_from:
         # The model relays NO form_id — it derives from the request, which
         # persisted form_id at emit time. gemma4 mangled the random-hex form_id

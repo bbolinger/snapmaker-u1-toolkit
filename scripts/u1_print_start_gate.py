@@ -402,7 +402,14 @@ def _write_approval_token(out_dir: Path, snapshot: dict[str, Any]) -> str:
 
 
 def _gate_state_path(out_dir) -> Path:
-    return Path(out_dir) / 'stage2_gate_state.json'
+    # v2.2.2 #4: run-scoped marker so overlapping detached invocations for one
+    # request never cross-talk. The parent passes a unique id via U1_GATE_RUN_ID
+    # and polls this exact path. Falls back to the shared name if unset (direct
+    # CLI use).
+    import os
+    run_id = os.environ.get('U1_GATE_RUN_ID', '')
+    name = f'stage2_gate_state_{run_id}.json' if run_id else 'stage2_gate_state.json'
+    return Path(out_dir) / name
 
 
 def _write_gate_state(out_dir, state: str, **extra) -> None:
@@ -413,10 +420,13 @@ def _write_gate_state(out_dir, state: str, **extra) -> None:
     being alive after 25s, which reported a stall as a healthy grace window.
     Best-effort: a marker write never blocks the gate."""
     try:
+        import os
         p = _gate_state_path(out_dir)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + '.tmp')
-        tmp.write_text(json.dumps({'state': state, **extra}))
+        payload = {'state': state,
+                   'gate_run_id': os.environ.get('U1_GATE_RUN_ID', ''), **extra}
+        tmp.write_text(json.dumps(payload))
         tmp.replace(p)  # atomic
     except Exception:
         pass
@@ -444,18 +454,19 @@ def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
                 fresh_safety.pop(k, None)
             u1_request.write_request(request_id, safety=fresh_safety)
             return True
-    except Exception:
-        # Locking unavailable (non-Unix / fs quirk): best-effort consume. The
-        # confirm-token atomic claim already serialises the realistic triggers.
+    except Exception as exc:
+        # Fail CLOSED (v2.2.2): if we cannot prove the nonce was valid AND
+        # durably consumed under the lock, REFUSE the start. Authorizing on a
+        # lock/read/write error (or a missing fcntl) is exactly backwards for a
+        # safety gate — the old best-effort fallback turned any such failure into
+        # an authorization. The target runtime is Linux, where fcntl is always
+        # present, so no permissive path is needed.
         try:
-            fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
-            for k in ('stage2_approval_nonce', 'stage2_approval_issued_at',
-                      'stage2_approval_binds'):
-                fresh_safety.pop(k, None)
-            u1_request.write_request(request_id, safety=fresh_safety)
+            _audit_gate(request_id, 'stage2_nonce_consume_failed', 'gate',
+                        error=f"{type(exc).__name__}: {exc}"[:200])
         except Exception:
             pass
-        return True
+        return False
 
 
 def _approval_token_valid(stored: dict[str, Any], offered: str) -> tuple[bool, str]:
@@ -882,7 +893,14 @@ def run_gate(filename: str,
     # subprocess start can never reach this branch with the override honored.
     # The hardware safety isn't bypassed even then — just the mismatch refusal.
     overrides_used: list[dict[str, Any]] = []
-    _override_ok = bool(accept_material_mismatch and operator_text)
+    # v2.2.2: enforce the interactive-terminal requirement HERE, where the
+    # override is actually applied, not only in main(). A direct caller of
+    # run_gate() (bypassing the CLI) therefore cannot honor the override without
+    # an interactive TTY either. (A pty can still spoof isatty; that is treated
+    # as UX friction, not authentication — a single-operator homelab tool does
+    # not add a sudo/second-user ceremony for it.)
+    _tty_ok = bool(sys.stdin is not None and sys.stdin.isatty())
+    _override_ok = bool(accept_material_mismatch and operator_text and _tty_ok)
     if _override_ok:
         kept: list[str] = []
         for line in blockers:
@@ -903,10 +921,11 @@ def run_gate(filename: str,
                         expected_tool=intended_tool,
                         expected_material=requested_material,
                         blocker_text=overrides_used[0].get("blocker_text"))
-    elif accept_material_mismatch and not operator_text:
-        # Override requested with no operator authorization: refuse. Un-tag the
-        # [OVERRIDE:...] marker back to a clean hard blocker so the refusal reads
-        # normally, and audit the rejected attempt for forensics.
+    elif accept_material_mismatch and not _override_ok:
+        # Override requested but not authorized (missing operator text, or not
+        # from an interactive terminal): refuse. Un-tag the [OVERRIDE:...] marker
+        # back to a clean hard blocker so the refusal reads normally, and audit
+        # the rejected attempt for forensics.
         blockers = [
             (l[len("[OVERRIDE:material_mismatch] "):]
              if l.startswith("[OVERRIDE:material_mismatch] ") else l)
@@ -915,7 +934,8 @@ def run_gate(filename: str,
         if request_id:
             _audit_gate(request_id, "operator_override_rejected", resolved_operator,
                         override_kind="material_mismatch",
-                        reason="override_missing_operator_text",
+                        reason=("override_missing_operator_text" if not operator_text
+                                else "override_requires_interactive_terminal"),
                         expected_tool=intended_tool,
                         expected_material=requested_material)
 

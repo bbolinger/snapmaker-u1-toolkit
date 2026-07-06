@@ -738,3 +738,21 @@ def test_plate_isometric_from_gcode_renders(tmp_path):
     plain = tmp_path / "plain.gcode"
     plain.write_text("G1 X10 Y10 E1\n")
     assert kw._render_plate_isometric_from_gcode(plain, tmp_path / "iso2.png")["ok"] is False
+
+
+def test_plate_isometric_keeps_duplicate_copies(tmp_path):
+    """v2.2.2 #3: two copies of the SAME model (same base name, distinct M486
+    instance ids) at different XY must BOTH render in the 3D view. Keying by the
+    stripped base name collapsed them into one part (the largest-loop pick) while
+    the top-down drew both, so the two review images disagreed. Geometry is now
+    keyed by instance."""
+    unit = [(0, 0), (40, 0), (40, 40), (0, 40)]
+    copy_a = [(20 + x, 20 + y) for (x, y) in unit]
+    copy_b = [(150 + x, 150 + y) for (x, y) in unit]  # a second copy, far away
+    gp = tmp_path / "plate.gcode"
+    # same base "widget" for both -> the helper still gives them distinct
+    # _id_<n>_copy_0 instance ids, i.e. two copies of one model.
+    _make_m486_gcode(gp, [("widget", copy_a), ("widget", copy_b)])
+    r = kw._render_plate_isometric_from_gcode(
+        gp, tmp_path / "iso_dup.png", bed_mm=(270, 270), title="Plate 1 of 1")
+    assert r["ok"] and r["part_count"] == 2  # both copies kept, not collapsed to 1

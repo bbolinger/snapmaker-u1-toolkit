@@ -28,11 +28,14 @@ def test_fast_exit_returns_result(tmp_path):
 
 
 def test_grace_marker_returns_none(tmp_path):
-    """Child writes a grace_started marker: the window genuinely opened -> None."""
+    """Child writes a grace_started marker: the window genuinely opened -> None.
+    v2.2.2 #4: the marker is run-scoped; the child reads its id from U1_GATE_RUN_ID
+    (injected by the parent) and the parent polls that exact path."""
     gate = _fake_gate(tmp_path,
-        "import json,sys,time,pathlib\n"
+        "import json,sys,time,pathlib,os\n"
         "d=pathlib.Path(sys.argv[1])\n"
-        "(d/'stage2_gate_state.json').write_text(json.dumps({'state':'grace_started'}))\n"
+        "rid=os.environ.get('U1_GATE_RUN_ID','')\n"
+        "(d/f'stage2_gate_state_{rid}.json').write_text(json.dumps({'state':'grace_started'}))\n"
         "time.sleep(2)\n")
     res = kw._invoke_stage2_gate(gate, [str(tmp_path)], tmp_path)
     assert res is None
