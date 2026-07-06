@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [2.2.1] — 2026-07-06
 
-A safety-hardening and preview-fidelity patch on top of v2.2.0, driven by an
-external cold audit plus a live-caught render bug. Verified end to end on real
+A safety-hardening and preview-fidelity patch on top of v2.2.0, closing several
+integrity gaps in the approval boundary plus a live-caught render bug. Verified end to end on real
 hardware (gemma4-26b over Telegram): a full kit sliced, showed the corrected 3D
 view, passed the gate, and printed, with the new hardening engaged underneath.
 
@@ -67,8 +67,7 @@ view, passed the gate, and printed, with the new hardening engaged underneath.
 Every safety-critical claim below was verified **live on hardware** (gemma4-26b
 over Telegram), not only in tests — including a single session that both
 **refused** a real material mismatch and then ran a **full matching-material
-print to completion**, followed by a cold, adversarial pre-ship regression audit
-of the whole v2.1.0 → v2.2 change surface (0 HIGH, 0 MED findings).
+print to completion**.
 
 ### Safety
 
@@ -297,8 +296,8 @@ of the whole v2.1.0 → v2.2 change surface (0 HIGH, 0 MED findings).
 
 **Multi-part kit support, the pre-start grace period with model-free
 Telegram cancel, and a hardened safety boundary** — the rc1 feature set
-(see rc1/rc2 entries below) shipped after two external review rounds and
-full live verification on real hardware.
+(see rc1/rc2 entries below) shipped after extensive hardening and full live
+verification on real hardware.
 
 ### Added since rc2
 
@@ -345,10 +344,10 @@ receipt) and set `HERMES_BIN` + `U1_GRACE_NOTIFY_CMD` in your env (see
 
 ## [2.1.0-rc2] — 2026-07-02
 
-Review-driven hardening of rc1. An external deep review (4 parallel passes:
-kit workflow, safety gate + grace-cancel, form/arrange/kit scripts, adapters)
-found bugs that contradicted rc1's own safety claims; all release blockers
-are fixed here. No schema changes.
+Hardening of rc1. A deep pass across the kit workflow, the safety gate and
+grace-cancel, the form/arrange/kit scripts, and the adapters found bugs that
+contradicted rc1's own safety claims; all release blockers are fixed here. No
+schema changes.
 
 ### Fixed — safety
 
@@ -556,7 +555,7 @@ Two safety-gate hotfixes. Both are the **same bug class**: v2.0 single-flow assu
 
 ## [2.0.1] — 2026-06-28
 
-Doc-only patch from an external review of the v2.0.0 release notes. No runtime or schema changes; no test additions; safe to apply by `git pull` alone.
+Doc-only patch cleaning up the v2.0.0 release notes. No runtime or schema changes; no test additions; safe to apply by `git pull` alone.
 
 ### Fixed
 
