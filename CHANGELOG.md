@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.2.2] — 2026-07-06
+
+Safety hardening plus two operator-reported UX bugs, verified live on real
+hardware (gemma4-26b over Telegram): a full kit ran form → slice → previews →
+bed-clear → grace window → operator cancel, with every fix engaged.
+
+### Safety
+
+- **Stage-2 nonce consumption fails CLOSED.** Any failure while consuming the
+  single-use start nonce (lock, read, or write error) now refuses the start
+  instead of authorizing it. The previous best-effort fallback returned success
+  on error, which is exactly backwards for a safety gate.
+- **The material-mismatch override enforces its interactive-terminal requirement
+  at the point the override is applied**, not only in the CLI entrypoint, so a
+  direct programmatic caller cannot honor the override without a TTY either.
+- **Each detached start-gate launch gets a unique run id** for its state marker
+  and log, so overlapping invocations for one request can never cross-talk or
+  misattribute a grace window.
+- **Form answers are claimed before they are read** (atomic rename first), so
+  concurrent redeems of one submission cannot both act on it.
+
+### Fixed
+
+- **Duplicate copies of one model now all render in the 3D plate view.** The
+  renderer keyed geometry by base model name, which collapsed copies into one
+  part while the top-down drew both; geometry is now keyed by the full per-part
+  instance id, with copies sharing a color.
+- **Re-editing a completed form no longer traps the operator.** Editing a field
+  from the Review screen and advancing used to march forward through the
+  remaining screens (or dead-end with no way to confirm); it now returns
+  straight to Review.
+- **A duplicated redeem command re-surfaces the bed-clear prompt** (same
+  still-valid confirm token) instead of re-rendering a fresh form — a relayed
+  duplicate is now a harmless no-op.
+
+### Changed
+
+- **The `snapmaker_u1` gateway plugin is now tracked in-repo** (`plugin/`,
+  installed with `pip install -e ./plugin/`). It auto-loads the slicing skill
+  when a 3D-model attachment arrives and wraps `next_action_required` output in
+  a hard directive so a small model tool-calls the command verbatim. It was
+  previously an untracked local directory — runtime-critical but invisible to
+  version control, which let it silently disappear and take the whole
+  attachment-to-skill flow with it.
+
+---
+
 ## [2.2.1] — 2026-07-06
 
 A safety-hardening and preview-fidelity patch on top of v2.2.0, closing several
