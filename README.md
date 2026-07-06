@@ -10,10 +10,30 @@
 
 This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
 
-**New in v2.1.0:** multi-part kits (send a zip, print a project), a pre-start
-grace period with a model-free Telegram cancel button, and a safety boundary
-hardened by two external review rounds — every claim live-verified on real
-hardware. See the [CHANGELOG](CHANGELOG.md).
+**Single STLs and multi-part kits run one flow:** send a model or a zip of
+STLs, answer one button form, and the toolkit slices, previews the plate from two
+angles, and gates the print start behind a fresh bed photo and your explicit yes,
+with a pre-start grace period and a model-free Telegram cancel as the final
+backstop. Every safety claim is live-verified on real hardware. See the
+[CHANGELOG](CHANGELOG.md).
+
+---
+
+## See it in action
+
+A single local model takes a zip of eight STLs all the way to a printing plate in
+about 75 seconds, entirely over Telegram and entirely on local hardware. It
+measures each part, offers one button form for parts, tool, orientation, and
+supports, slices, shows a top-down footprint next to a 3D plate view, captures a
+fresh photo of the bed, and then waits. Nothing starts until a human replies
+"yes." Then the U1 begins the print.
+
+<!--
+  Screen recording: open this file in the GitHub web editor (the pencil icon) and
+  drag the .mp4 clip onto the line below this comment. GitHub stores it as an
+  attachment on its own CDN, so it renders as an inline player here but is NOT
+  committed to the repo and never bloats a clone. Drop it right here:
+-->
 
 ---
 
@@ -34,8 +54,7 @@ A toolkit + workflow that turns "I have an STL, slice it for my U1" — or "I ha
 
 Steps 1–6 are useful as CLI utilities even if you never touch an AI agent. Steps 7–10 are where the "operator workflow" wrapping makes the difference between "AI presses print" and "AI safely shows you the print so you can press it."
 
-### Multi-part kits + the unified flow (v2.2)
-
+### Multi-part kits + the unified flow
 Send a **zip of STLs** — the common Printables shape — and the kit workflow
 takes it from there:
 
@@ -104,11 +123,9 @@ Actions that always require explicit operator confirmation:
 
 The workflow fails closed. If a check is unsure, it stops and asks rather than guessing. Bed-clear verdicts come from the operator looking at a real photo, not from the toolkit deciding the bed is "probably fine." Slicer profile mismatches abort BEFORE the slice. Upload that hits a filename collision asks before overwriting.
 
-None of this is aspirational: the safety boundary went through two external
-deep-review rounds (the findings and fixes are documented in the
-[CHANGELOG](CHANGELOG.md)), 614 tests run in CI on every change, and the
-cancel chain is **live-verified on real hardware** — including a
-reproducible, no-printer-needed drill anyone can run:
+None of this is aspirational: 703 tests run in CI on every change, and the
+cancel chain is **live-verified on real hardware**, including a reproducible,
+no-printer-needed drill anyone can run:
 [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
 
 ## The Three Layers
@@ -200,52 +217,6 @@ python3 scripts/u1_slice_workflow.py path/to/your_model.stl --json-events --no-l
 For the full install (interpreter selection, Hermes skill install, U1 connection setup), see [Setup](#setup) below.
 
 For the design rationale, architecture, and acceptance criteria, see [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md). For the public event contract (every event the workflow + audit log emit, with payload shapes), see [`docs/events.md`](docs/events.md).
-
-## Roadmap
-
-Where the toolkit is going:
-
-- ✅ **v1.5–v1.6** (shipped) — Agent-driven staged workflow with the `next_command` pattern, pre-slice Orca mesh-topology analysis, stable-tier procedural rules ([HERMES.md](HERMES.md))
-- ✅ **v2.0 — Safe AI Print Operator** (shipped) — a 9-phase reframe that turns this from "Hermes slicer for the U1" into a staged, auditable, request-driven print-operator toolkit. The full plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md). Headline pieces:
-  - **Print Request Objects** — every job gets a stable `request_id` + a durable `requests/<id>/request.json` record. Approval becomes "approve start `u1_2026_0626_abc123`," not vague "yes."
-  - **Per-request `audit.jsonl`** — who requested, what was selected, what checks passed, who approved, what actually happened.
-  - **Capability modes** — `read_only` / `upload_only` / `operator_start`. Pick the security posture per deployment. *(Deferred — only `operator_start` is currently used; will land when a second deployment posture appears. See [`CHANGELOG.md`](CHANGELOG.md) → Deferred.)*
-  - **Sandbox mode** — full workflow without hardware, for CI and demos. *(Deferred — existing `--no-live-material` flag + dry-run upload already cover the meaningful workflow steps without a U1. See [`CHANGELOG.md`](CHANGELOG.md) → Deferred.)*
-  - **JSON event contract** — formalize the event stream so any frontend (Telegram, web UI, MCP server) can wrap it without re-implementing.
-  - v2.0 shipped as a single release after acceptance-testing end-to-end on `gemma4-26b-64k`. Full release notes in [`CHANGELOG.md`](CHANGELOG.md). Public event contract in [`docs/events.md`](docs/events.md).
-
-- ✅ **v2.1 — Multi-part / multi-plate kits** (shipped) — send a zip of STLs (the common Printables shape) and the toolkit arranges them onto the bed, slices every plate Orca needs, uploads them all, and gates the start of plate 1. The operator answers one consolidated form (parts / orient / tool / material / profile / supports), which the **script** parses — the AI just relays it. Plates 2–N are uploaded for you to start from the Snapmaker app. See [`CHANGELOG.md`](CHANGELOG.md).
-
-The Snapmaker U1 is the first implementation. The safety model is portable — multi-printer support comes only after the U1 experience is solid, and only along seams that the U1 implementation has already proven.
-
----
-
-## Upgrading from v1.x
-
-v2.0 is additive on disk — existing v1 deployments keep working — but new prints land in the Print Request Object world (`requests/<id>/`) instead of bare temp dirs. To finish a v1-style in-flight print after upgrading, run the one-shot migrator (idempotent, safe to re-run):
-
-```bash
-# 1. Pull the v2.0 code
-git pull origin main
-
-# 2. Migrate any in-flight pre-v2.0 state to the new request layout
-python3 scripts/migrate_v0_to_v1.py
-
-# 3. Redeploy to your runtime container (Hermes agent, etc.)
-./scripts/deploy_to_runtime.sh
-
-# 4. Restart Hermes so it picks up the new SKILL.md (version 2.0.0)
-docker restart hermes-agent-stack
-
-# 5. Re-approve any in-flight prints — the migrator preserves the
-#    request payload but does NOT carry forward approval tokens.
-#    Re-run the workflow with --request-id <id> to get a fresh photo +
-#    approval question, then dispatch Stage 2 as normal.
-```
-
-Operator-facing change: every approval question now includes the `request_id` verbatim (e.g. "Bed clear and you want to start request `u1_2026_0626_abc123`? (yes/no)"). The agent should not approve a "yes" that doesn't reference a known request. Full operator contract in [`docs/DESIGN-CONTRACT.md`](docs/DESIGN-CONTRACT.md); public event stream in [`docs/events.md`](docs/events.md).
-
----
 
 ## Setup
 
@@ -383,8 +354,7 @@ U1_DEPLOY_PROFILES=/my/runtime/profiles \
 bash deploy_to_runtime.sh
 ```
 
-## End-to-end slice workflow (v1.4.0, picker rework v1.5.0)
-
+## End-to-end slice workflow
 ![Workflow preview render — auto-oriented mounting plate flat on bed, U-cradle upright; first-layer footprint parsed from real Orca G-code](docs/images/workflow-preview-corrected-orientation.jpg)
 
 **Before your first slice**, populate the profile picker (one-time setup — see [Profile sources (v1.5.0)](#profile-sources-v150) below):
@@ -533,8 +503,7 @@ read → slice → upload (print=false) → operator-approved start → quiet mo
 - Cancel/stop a print
 - Any movement/heating command
 
-### Test-operator fence (v2.1.0)
-
+### Test-operator fence
 `u1_print_start_gate.py` refuses Stage 2 (real printer start) BEFORE any Moonraker
 call if the `--operator` argument starts with an unambiguously test-flavored
 prefix: `smoke:`, `test:`, `dry:`, `mock:`, or `fixture:` (case-insensitive).
@@ -565,8 +534,7 @@ Two sharp edges, decided deliberately (rc2):
   `gate_operator_unknown` audit row. If your smoke tests might run with no
   operator set, set one (`smoke:whatever`) so the fence can catch them.
 
-### Pre-start grace period + Telegram cancel button (v2.1.0)
-
+### Pre-start grace period + Telegram cancel button
 After every safety check passes and before the gate HTTPs the printer's
 `/printer/print/start`, there's a **grace window** (default 120s, configurable
 via `U1_GRACE_PERIOD_SECONDS` env var or `--grace-seconds N`). During the
@@ -706,8 +674,7 @@ you actually run a command without any configuration.
 
 See `.env.example` for a starting template.
 
-### Cavity LED auto-control (new in v1.3.0)
-
+### Cavity LED auto-control
 The U1's `cavity_led` is white-only — Snapmaker's shipped `printer.cfg`
 defines it as `[led cavity_led] / white_pin: PA10`, no R/G/B. Klipper's
 `[led]` interface exposes all four channels regardless, but only the W
@@ -756,8 +723,7 @@ Real reverse-engineering notes from getting these scripts working — the kind o
 | `references/snapmaker-u1-orca-moonraker.md` | OrcaSlicer + Moonraker integration |
 | `references/snapmaker-u1-research.md` | First-pass research summary |
 
-## Profile sources (v1.5.0)
-
+## Profile sources
 **The toolkit no longer ships default profiles.** A fresh install has an empty picker. Profiles come from one of three sources you populate yourself, scanned in priority order:
 
 | Source dir | Populated by | Purpose | Priority |
@@ -782,14 +748,12 @@ Both are idempotent — re-run anytime to pick up Snapmaker upstream updates or 
 
 Without either, the workflow fails closed at analysis time with a clear `setup_required` event pointing you back here. Hermes agents surface that error verbatim.
 
-### Why ship empty (v1.4.x → v1.5.0)
-
+### Why ship empty
 Earlier versions shipped 13 personal community profiles in `profiles/` as defaults. They were tuned for one bed surface (Textured PEI), one bed temp, specific filament brands (SUNLU PETG, HF White PETG), specific tool assignments. Running them silently on another U1 with different filaments or a different bed surface could ruin prints — and the toolkit had no way to warn the user that the profile underneath didn't match their setup.
 
 v1.5.0 moves those personal templates to `examples/profiles/` and points the picker at three honest sources: Snapmaker upstream (universal baseline), your printer's history (physics-validated on your hardware), and your own hand-tuned profiles. The agent's *Preset?* prompt now annotates each option with `source`, `has_supports` (read from the JSON's `enable_support` field), and `supports_status` (does picking "Add supports" auto-promote to a `_supports` sibling, already encode supports, or fail with a `no_supports_variant` warning).
 
-### Supports auto-detection (v1.5.0)
-
+### Supports auto-detection
 Profiles are JSON-typed for supports — the picker reads each profile's `enable_support` field and annotates the option with `has_supports: true/false`. The agent's *Preset?* prompt also carries a `supports_status` that pre-warns the user before the *Supports?* question:
 
 - `"self"` → preset already encodes supports; "Add supports" is a no-op for them
@@ -1094,7 +1058,7 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-151 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+703 tests covering: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
