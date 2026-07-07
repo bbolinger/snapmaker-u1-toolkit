@@ -60,7 +60,7 @@ def test_apply_profile_overrides_noop_returns_original(tmp_path):
 def test_schema_offers_advanced_fields_flagged():
     schema = u1_form.build_form_schema(_spec())
     adv = [f for f in schema["fields"] if f.get("advanced")]
-    assert [f["id"] for f in adv] == ["infill", "infill_pattern", "walls", "brim", "fuzzy"]
+    assert [f["id"] for f in adv] == ["infill", "infill_pattern", "walls", "brim", "fuzzy", "support_style"]
     assert all(f["group"] == "advanced" and f["default"] == "default" for f in adv)
     # not offered -> absent entirely
     schema2 = u1_form.build_form_schema(_spec(offer=False))
@@ -172,7 +172,7 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
     # and each label identifies its field (no bare values)
     for f in tg._advanced_fields(form):
         key = {"infill": "Infill", "infill_pattern": "Pattern", "walls": "Walls",
-               "brim": "Brim", "fuzzy": "Fuzzy"}[f["id"]]
+               "brim": "Brim", "fuzzy": "Fuzzy", "support_style": "Support"}[f["id"]]
         assert all(key in tg._opt_label(o) for o in f["options"]), f["id"]
     # Review: exactly ONE advanced-related button (the jump), no Edit rows
     form["current"] = tg.REVIEW_FIELD
@@ -188,3 +188,27 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
     assert sum(1 for t in edit_targets if t in adv_ids) == 1  # the one jump button
     assert not any(f"Infill" in b["text"] and "Advanced" not in b["text"]
                    for row in review["keyboard"] for b in row)
+
+
+
+def test_support_style_tree_vs_grid():
+    """v2.3: tree vs grid support style rides the advanced-override rail."""
+    res = u1_form.parse_answers_json(
+        {"tool": "T0", "material": "PLA", "profile": 1, "supports": "supports",
+         "support_style": "tree"}, _spec())
+    assert res["ok"], res["errors"]
+    assert res["values"]["overrides"]["support_type"] == "tree(auto)"
+    # text mode: "tree supports" sets BOTH supports on and the style
+    res2 = u1_form.parse_answers("T0 | PLA | profile 1 | tree supports", _spec())
+    assert res2["ok"], res2["errors"]
+    assert res2["values"]["supports"] == "supports"
+    assert res2["values"]["overrides"]["support_type"] == "tree(auto)"
+    # bare "grid" is still the INFILL pattern, not support style
+    res3 = u1_form.parse_answers("T0 | PLA | profile 1 | grid", _spec())
+    assert res3["ok"]
+    assert res3["values"]["overrides"] == {"sparse_infill_pattern": "grid"}
+    # "grid supports" is the explicit support-style form
+    res4 = u1_form.parse_answers("T0 | PLA | profile 1 | grid supports", _spec())
+    assert res4["ok"], res4["errors"]
+    assert res4["values"]["overrides"]["support_type"] == "normal(auto)"
+    assert res4["values"]["supports"] == "supports"

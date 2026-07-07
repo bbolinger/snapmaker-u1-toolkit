@@ -114,6 +114,13 @@ ADVANCED_FIELDS = (
      [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
       ("on", "Fuzzy skin: on (outer walls)")],
      "fuzzy_skin", {"off": "none", "on": "external"}),
+    # Only takes effect when Supports is ON (the setup-screen toggle);
+    # Orca ignores support_type when enable_support is 0.
+    ("support_style", "Support style",
+     [("default", "Support style: profile default"),
+      ("tree", "Support style: tree"),
+      ("grid", "Support style: grid")],
+     "support_type", {"tree": "tree(auto)", "grid": "normal(auto)"}),
 )
 
 _ADVANCED_BY_ID = {fid: (orca_key, mapping)
@@ -130,7 +137,10 @@ _ADV_INFILL_RE = re.compile(r"^infill\s*(\d{1,3})\s*%?$", re.IGNORECASE)
 _ADV_WALLS_RE = re.compile(r"^walls?\s*(\d)$", re.IGNORECASE)
 _ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on)$", re.IGNORECASE)
 _ADV_FUZZY_RE = re.compile(r"^fuzzy(?:[\s-]*skin)?(?:\s+(on|off))?$", re.IGNORECASE)
+# NOTE: bare "grid" stays an infill-pattern token (pre-existing grammar);
+# support style needs the word: "tree supports" / "grid supports" / "tree".
 _ADV_PATTERN_IDS = {"grid", "gyroid", "honeycomb", "triangles", "cubic"}
+_ADV_SUPSTYLE_RE = re.compile(r"^(tree|grid)[\s-]+supports?$|^tree$", re.IGNORECASE)
 _INT_RE = re.compile(r"^\d+$")
 _INT_LIST_RE = re.compile(r"^\d+(?:\s*[,\s-]\s*\d+)*$")  # 1,3,5 or 1-4 or "1 3 5"
 
@@ -311,6 +321,15 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             if m:
                 _adv_set("fuzzy", "off" if (m.group(1) or "on").lower() == "off"
                          else "on")
+                continue
+            m = _ADV_SUPSTYLE_RE.match(tok)
+            if m:
+                style = (m.group(1) or "tree").lower()
+                _adv_set("support_style", style)
+                # "tree supports" means supports ON too — don't make the
+                # operator say it twice.
+                if "support" in low:
+                    _set(values, "supports", "supports", errors, tok)
                 continue
 
         # explicit profile prefix: "profile 2" / "preset slug"

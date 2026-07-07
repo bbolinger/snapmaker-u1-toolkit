@@ -818,7 +818,7 @@ def apply_supports_override(process_path: Path, enable_support: bool, out_dir: P
 # the reliable path is a flattened, self-contained temp process JSON.
 ADVANCED_OVERRIDE_KEYS = (
     'sparse_infill_density', 'sparse_infill_pattern', 'wall_loops',
-    'brim_type', 'fuzzy_skin',
+    'brim_type', 'fuzzy_skin', 'support_type',
 )
 
 
