@@ -54,6 +54,24 @@ _OMIT = object()
 
 
 @pytest.fixture(autouse=True)
+def _no_real_watchdogs(monkeypatch):
+    """Arm calls spawn a detached expiry watchdog; tests must not."""
+    monkeypatch.setattr(kw, "_spawn_confirm_expiry_watchdog",
+                        lambda rid, fn: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_refusal_dms(monkeypatch):
+    """Hook refusals DM the bound operator; tests capture instead."""
+    sent = []
+    monkeypatch.setattr(hook, "_notify_operator",
+                        lambda text: sent.append(text))
+    hook._test_refusal_dms = sent
+    yield
+    hook._test_refusal_dms = None
+
+
+@pytest.fixture(autouse=True)
 def _stable_printer_metadata(monkeypatch):
     """Reprint-style seeds bind printer-side size+modified; hermetic
     default keeps them stable so identity checks pass unless a test
@@ -694,6 +712,54 @@ def test_arm_marker_carries_chat_binding(pending_dir, tmp_path, monkeypatch):
                         lambda rid: tmp_path / "req" / rid)
     monkeypatch.setattr(kw.u1_config, "get_operator_binding",
                         lambda: ("telegram", "8131922235"))
-    kw._arm_pending_confirm("u1_2026_0707_chat01", "tokx", "p.gcode", "brent")
+    kw._arm_pending_confirm("u1_2026_0707_chat01", "p.gcode", "brent")
     m = _json.loads((pending_dir / "u1_2026_0707_chat01.json").read_text())
     assert m["operator_chat_id"] == "8131922235"
+
+
+
+# ---------- silence is not an outcome (operator feedback 2026-07-07) ----------
+
+def test_wrong_user_refusal_notifies_bound_operator(pending_dir, monkeypatch):
+    _marker(pending_dir)
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: pytest.fail("must not spawn"))
+    asyncio.run(hook.handle("agent:start", _ctx(user_id="42")))
+    assert hook._test_refusal_dms and "refused" in hook._test_refusal_dms[0]
+    assert "Nothing was started" in hook._test_refusal_dms[0]
+
+
+def test_wrong_chat_refusal_notifies_with_guidance(pending_dir, monkeypatch):
+    _marker(pending_dir)
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: pytest.fail("must not spawn"))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_id="999999")))
+    assert any("wrong conversation" in t for t in hook._test_refusal_dms)
+
+
+def test_group_chat_refusal_notifies(pending_dir, monkeypatch):
+    _marker(pending_dir)
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: pytest.fail("must not spawn"))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_type="group")))
+    assert any("private DM" in t for t in hook._test_refusal_dms)
+
+
+def test_no_yes_no_dm(pending_dir, monkeypatch):
+    """A non-YES message near an armed window stays silent — the refusal
+    DMs exist for refused YESes, not for ambient chatter."""
+    _marker(pending_dir)
+    asyncio.run(hook.handle("agent:start", _ctx(text="how long will it take?")))
+    assert hook._test_refusal_dms == []
+
+
+def test_arm_spawns_expiry_watchdog(pending_dir, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(kw, "_spawn_confirm_expiry_watchdog",
+                        lambda rid, fn: calls.append((rid, fn)))
+    monkeypatch.setattr(kw.u1_request, "request_dir",
+                        lambda rid: tmp_path / "req" / rid)
+    monkeypatch.setattr(kw.u1_config, "get_operator_binding",
+                        lambda: ("telegram", "8131922235"))
+    kw._arm_pending_confirm("u1_2026_0707_wd0001", "p.gcode", "brent")
+    assert calls == [("u1_2026_0707_wd0001", "p.gcode")]

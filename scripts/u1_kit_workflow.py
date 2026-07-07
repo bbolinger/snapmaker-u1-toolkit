@@ -3503,6 +3503,35 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
     tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
     tmp.write_text(json.dumps(entry, indent=2))
     tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+    _spawn_confirm_expiry_watchdog(request_id, filename)
+
+
+def _spawn_confirm_expiry_watchdog(request_id: str,
+                                   filename: str | None) -> None:
+    """Silence is not an allowed outcome (operator feedback 2026-07-07):
+    a window that expires unredeemed must say so. A tiny detached process
+    sleeps out the TTL and, ONLY IF the marker still exists, removes it and
+    DMs the operator. Redeemed/cancelled windows have no marker left, so
+    the watchdog exits without a peep. Best-effort: a watchdog failure
+    changes nothing about safety, only about feedback."""
+    code = (
+        "import time, os, sys; time.sleep({ttl}); p={p!r}\n"
+        "if os.path.exists(p):\n"
+        "    os.unlink(p)\n"
+        "    import subprocess\n"
+        "    subprocess.run([\"python3\", \"/opt/data/scripts/u1_notify.py\","
+        " \"\\u23f3 The bed-clear window for {fn} expired with no YES."
+        " Nothing was printed. Re-run the flow when ready.\"], timeout=30)\n"
+    ).format(ttl=_PENDING_CONFIRM_TTL_S,
+             p=str(_PENDING_CONFIRM_DIR / f"{request_id}.json"),
+             fn=str(filename or "the pending print").replace('"', ""))
+    try:
+        import subprocess as _sp
+        _sp.Popen(["python3", "-c", code],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                  stdin=_sp.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
 
 
 def _disarm_pending_confirm(request_id: str) -> None:

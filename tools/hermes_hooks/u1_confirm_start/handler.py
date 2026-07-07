@@ -92,6 +92,23 @@ _YES_RE = re.compile(
 )
 
 
+def _notify_operator(text: str) -> None:
+    """DM the BOUND operator (never the sender) via the toolkit notifier.
+    Live 2026-07-07: a false-negative identity refusal left the legitimate
+    operator staring at four minutes of silence. Any refusal now reports to
+    the operator the window was armed for — a stranger triggering one gets
+    nothing in their own chat, but the operator always learns their machine
+    declined something and why. Best-effort; failures only log."""
+    try:
+        import subprocess as _sp
+        _sp.Popen(["python3", "/opt/data/scripts/u1_notify.py", text],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                  stdin=_sp.DEVNULL, start_new_session=True)
+    except Exception as exc:
+        _log({"event": "refusal_notify_failed",
+              "error": f"{type(exc).__name__}: {exc}"})
+
+
 def _log(entry: dict) -> None:
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +244,10 @@ def _operator_binding_ok(state: dict, context: dict) -> bool:
               "request_id": rid,
               "platform": context.get("platform"),
               "user_id": context.get("user_id")})
+        _notify_operator(f"\u26a0\ufe0f A YES for {state.get('filename')} "
+                         "was refused: this window has no operator binding "
+                         "(set U1_OPERATOR_BINDING or TELEGRAM_ALLOWED_USERS "
+                         "and re-run). Nothing was started.")
         return False
     got_platform = str(context.get("platform") or "").strip().lower()
     got_user = str(context.get("user_id") or "").strip()
@@ -237,6 +258,9 @@ def _operator_binding_ok(state: dict, context: dict) -> bool:
               "expected_platform": want_platform,
               "platform": context.get("platform"),
               "user_id": context.get("user_id")})
+        _notify_operator(f"\u26a0\ufe0f A YES for {state.get('filename')} "
+                         "was refused: it did not come from the bound "
+                         "operator account. Nothing was started.")
         return False
     # Conversation binding (final release review): the YES must come from
     # the private DM the window was armed for, not merely from the right
@@ -253,17 +277,29 @@ def _operator_binding_ok(state: dict, context: dict) -> bool:
         _log({"event": "confirm_refused_not_private_chat",
               "request_id": rid, "chat_type": chat_type,
               "user_id": context.get("user_id")})
+        _notify_operator(f"\u26a0\ufe0f A YES for {state.get('filename')} "
+                         "was refused: it came from a group or channel, and "
+                         "print confirmation only works in your private DM. "
+                         "Nothing was started.")
         return False
     want_chat = state.get("operator_chat_id")
     if not want_chat:
         _log({"event": "confirm_refused_marker_missing_chat_binding",
               "request_id": rid})
+        _notify_operator(f"\u26a0\ufe0f A YES for {state.get('filename')} "
+                         "was refused: stale confirmation window from an "
+                         "older version. Re-run the flow for a fresh "
+                         "bed-clear prompt. Nothing was started.")
         return False
     got_chat = str(context.get("chat_id") or "").strip()
     if got_chat != str(want_chat).strip():
         _log({"event": "confirm_refused_chat_mismatch",
               "request_id": rid,
               "chat_id": context.get("chat_id")})
+        _notify_operator(f"\u26a0\ufe0f A YES for {state.get('filename')} "
+                         "was refused: wrong conversation. Reply YES in the "
+                         "private DM where the bed-clear prompt arrived. "
+                         "Nothing was started.")
         return False
     return True
 
