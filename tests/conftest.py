@@ -231,3 +231,21 @@ def mock_http(monkeypatch, moonraker_responses):
         except (ImportError, AttributeError):
             pass
     return _fake
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_start_marker_dirs(tmp_path, monkeypatch):
+    """No test may touch the LIVE pending-confirm/-cancel dirs. Several test
+    files exercise _action_start and the confirm hook; any of them running
+    without a per-file sandbox was arming real /tmp windows (found live
+    2026-07-07: 22 phantom markers, fail-closed but filthy). One autouse
+    guard beats per-file discipline."""
+    confirm_dir = tmp_path / "u1_pending_confirm"
+    cancel_dir = tmp_path / "u1_pending_cancel"
+    monkeypatch.setenv("U1_PENDING_CONFIRM_DIR", str(confirm_dir))
+    monkeypatch.setenv("U1_PENDING_CANCEL_DIR", str(cancel_dir))
+    try:
+        import u1_kit_workflow as _kw
+        monkeypatch.setattr(_kw, "_PENDING_CONFIRM_DIR", confirm_dir)
+    except Exception:
+        pass
