@@ -141,7 +141,7 @@ def test_renderer_advanced_hidden_from_linear_flow_but_reachable():
     tg.apply_callback(form, f"n:{tg._field_index(form, 'infill')}")
     assert form["current"] == tg.REVIEW_FIELD
     review = tg.render_screen(form)
-    assert "Gyroid" in review["text"]
+    assert "Pattern: gyroid" in review["text"]
     assert any("(1 set)" in b["text"] for row in review["keyboard"] for b in row)
 
 
@@ -155,3 +155,36 @@ def test_renderer_answer_json_carries_advanced_ids():
     out = tg.answer_json(form)
     assert out["walls"] == "3"
     assert out["infill"] == "default"  # untouched advanced fields submit their default
+
+
+
+def test_advanced_buttons_self_describing_and_review_not_duplicated():
+    """Live UX feedback 2026-07-06: five bare "Profile default" buttons and
+    naked numbers made the advanced screen unreadable ("you feel blind"), and
+    Review listed an Edit row per advanced field on top of the one button.
+    Every advanced option label must carry its field identity, and Review must
+    expose advanced ONLY via the single Advanced button + summary line."""
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    # every advanced option label is unique across the whole group screen
+    labels = [tg._opt_label(o) for f in tg._advanced_fields(form) for o in f["options"]]
+    assert len(labels) == len(set(labels)), "duplicate/blind button labels"
+    # and each label identifies its field (no bare values)
+    for f in tg._advanced_fields(form):
+        key = {"infill": "Infill", "infill_pattern": "Pattern", "walls": "Walls",
+               "brim": "Brim", "fuzzy": "Fuzzy"}[f["id"]]
+        assert all(key in tg._opt_label(o) for o in f["options"]), f["id"]
+    # Review: exactly ONE advanced-related button (the jump), no Edit rows
+    form["current"] = tg.REVIEW_FIELD
+    review = tg.render_screen(form)
+    adv_ids = {f["id"] for f in tg._advanced_fields(form)}
+    edit_targets = []
+    for row in review["keyboard"]:
+        for b in row:
+            cd = b.get("callback_data", "")
+            if cd.startswith("e:"):
+                fi = int(cd.split(":")[1])
+                edit_targets.append(form["schema"]["fields"][fi]["id"])
+    assert sum(1 for t in edit_targets if t in adv_ids) == 1  # the one jump button
+    assert not any(f"Infill" in b["text"] and "Advanced" not in b["text"]
+                   for row in review["keyboard"] for b in row)

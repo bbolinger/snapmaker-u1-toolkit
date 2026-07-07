@@ -334,6 +334,8 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
     for fi, field in enumerate(form["schema"]["fields"]):
         if not _is_screen_field(field):
             continue  # submit_choice (Action) is the verb row below, not a line
+        if field.get("advanced"):
+            continue  # advanced fields get ONE summary line + the ⚙ button below
         echo = _selection_label_for(form, field)
         # Message text is ParseMode.HTML \u2192 escape schema-derived strings.
         # Button text is NOT parsed as HTML \u2192 leave the Edit label raw.
@@ -349,8 +351,8 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         for f in adv:
             sel = form["selections"].get(f["id"])
             if sel is not None and _opt_id(f["options"][sel]) != "default":
-                changed.append(f"{f.get('label', f['id'])}: "
-                               f"{_opt_label(f['options'][sel])}")
+                # option labels are self-describing ("Infill 30%") — no prefix
+                changed.append(_opt_label(f["options"][sel]))
         if changed:
             lines.append("\u2022 <b>Advanced</b>: " + _esc(", ".join(changed)))
         rows.append([{

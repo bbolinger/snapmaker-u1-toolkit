@@ -84,29 +84,35 @@ _ACTIONS = {
 # the form's Review screen via the Advanced button. "default" = no override
 # (the picked profile's own value stands). Each entry: (field_id, label,
 # [(option_id, option_label), ...], orca_key, {option_id: orca_value}).
+# Option labels are SELF-DESCRIBING on purpose: the five fields render on ONE
+# shared screen, so a bare "2" or "Profile default" button is unreadable
+# (operator feedback, live 2026-07-06 — "you feel blind").
 ADVANCED_FIELDS = (
     ("infill", "Infill density",
-     [("default", "Profile default"), ("10", "10%"), ("15", "15%"),
-      ("20", "20%"), ("30", "30%"), ("40", "40%"), ("50", "50%")],
+     [("default", "Infill: profile default"), ("10", "Infill 10%"),
+      ("15", "Infill 15%"), ("20", "Infill 20%"), ("30", "Infill 30%"),
+      ("40", "Infill 40%"), ("50", "Infill 50%")],
      "sparse_infill_density",
      {"10": "10%", "15": "15%", "20": "20%", "30": "30%",
       "40": "40%", "50": "50%"}),
     ("infill_pattern", "Infill pattern",
-     [("default", "Profile default"), ("grid", "Grid"), ("gyroid", "Gyroid"),
-      ("honeycomb", "Honeycomb"), ("triangles", "Triangles"),
-      ("cubic", "Cubic")],
+     [("default", "Pattern: profile default"), ("grid", "Pattern: grid"),
+      ("gyroid", "Pattern: gyroid"), ("honeycomb", "Pattern: honeycomb"),
+      ("triangles", "Pattern: triangles"), ("cubic", "Pattern: cubic")],
      "sparse_infill_pattern",
      {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
       "triangles": "triangles", "cubic": "cubic"}),
     ("walls", "Wall loops",
-     [("default", "Profile default"), ("2", "2"), ("3", "3"), ("4", "4")],
+     [("default", "Walls: profile default"), ("2", "Walls: 2"),
+      ("3", "Walls: 3"), ("4", "Walls: 4")],
      "wall_loops", {"2": "2", "3": "3", "4": "4"}),
     ("brim", "Brim",
-     [("default", "Profile default"), ("off", "Off"), ("auto", "Auto")],
+     [("default", "Brim: profile default"), ("off", "Brim: off"),
+      ("auto", "Brim: auto")],
      "brim_type", {"off": "no_brim", "auto": "auto_brim"}),
     ("fuzzy", "Fuzzy skin",
-     [("default", "Profile default"), ("off", "Off"),
-      ("on", "On (outer walls)")],
+     [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
+      ("on", "Fuzzy skin: on (outer walls)")],
      "fuzzy_skin", {"off": "none", "on": "external"}),
 )
 
