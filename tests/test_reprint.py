@@ -93,12 +93,15 @@ def test_reprint_start_reaches_bed_clear(monkeypatch, capsys):
     pending = st["safety"]["pending_bed_clear_start"]
     assert pending["gcode_hash"] == "sha256:abc123" and pending["confirm_token"]
     out = capsys.readouterr().out
-    # Model-free YES: the token is armed on disk for the gateway hook, and
-    # never emitted where the model could fire it.
+    # Model-free YES: the token stays server-side, never emitted where the
+    # model could fire it — and the armed marker is opaque (the hook builds
+    # its own --confirm-start-for argv), so the token isn't in /tmp either.
     assert pending["confirm_token"] not in out
     marker = kw._PENDING_CONFIRM_DIR / f"{new_rid}.json"
     assert marker.exists()
-    assert pending["confirm_token"] in marker.read_text()
+    marker_text = marker.read_text()
+    assert pending["confirm_token"] not in marker_text
+    assert "confirm_cmd" not in marker_text
 
 
 def test_reprint_refuses_when_file_gone(monkeypatch, capsys):

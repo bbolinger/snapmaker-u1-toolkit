@@ -19,19 +19,39 @@ Contract with u1_kit_workflow.py:
   * When the workflow reaches the bed-clear prompt it writes
     /tmp/u1_pending_confirm/<request_id>.json:
       {
-        "request_id":  "u1_2026_0707_abc123",
-        "confirm_cmd": ["python3", ".../u1_kit_workflow.py",
-                         "--confirm-start", "<token>", "--json-events"],
-        "log_path":    ".../requests/<rid>/confirm_via_hook.log",
-        "filename":    "plate1.gcode",
-        "expires_at":  "<ISO timestamp>"
+        "request_id":       "u1_2026_0707_abc123",
+        "filename":         "plate1.gcode",
+        "platform":         "telegram",
+        "operator_user_id": "8131922235",
+        "created_at":       "<ISO timestamp>",
+        "expires_at":       "<ISO timestamp>"
       }
-  * The confirm command redeems the same single-use token + nonce chain
-    as before — every downstream safety check (revision, gcode hash,
-    material, grace window, cancel hook) is unchanged.
-  * The workflow deletes the marker when the token is redeemed; this hook
-    deletes it BEFORE spawning (single-fire: a double YES can't double-
-    spawn) and ignores expired entries.
+  * The marker is OPAQUE: display + binding data only. It never carries a
+    command, a token, or a path. This hook builds its own argv from the
+    constants below — a marker is a claim that a window exists, not
+    instructions to run (review finding: the old confirm_cmd field made
+    anything that could write /tmp a command author, gated only by the
+    word "yes"). The spawned command is exactly
+      python3 /opt/data/scripts/u1_kit_workflow.py \
+          --confirm-start-for <request_id> --json-events
+    with request_id validated against ^u1_[a-z0-9_]+$ first. The workflow
+    resolves the persisted single-use confirm token server-side and then
+    runs the SAME redemption path as a relayed --confirm-start — nonce,
+    revision, gcode hash, phase checks all unchanged. A request id with no
+    valid pending confirmation redeems nothing.
+  * YES is bound to the operator: the marker's platform/operator_user_id
+    (written at arm time from config) must equal the message context's
+    platform/user_id. Mismatch refuses. A marker WITHOUT binding fields
+    also refuses — fail closed; the workflow warns at arm time when the
+    binding config is missing, so this shows up before the YES, not at it.
+  * Claim-then-spawn: the marker is atomically renamed to
+    <rid>.claimed.<pid>.json BEFORE spawning (of N concurrent YESes exactly
+    one wins the rename; the rest find nothing). Spawn success deletes the
+    claimed file; spawn failure renames it back while unexpired, so the
+    operator's next YES retries instead of the window dying silently.
+  * Expiry fails closed: expires_at missing -> marker deleted; unparseable
+    or more than 24h out -> quarantined to <name>.bad (kept for
+    inspection); expired -> deleted. All logged.
 
 START NEVER GUESSES: with multiple active windows, a bare `yes` refuses
 and logs — the operator must say `yes <code>`. (The cancel hook does the
@@ -52,6 +72,15 @@ import subprocess
 PENDING_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
                                   "/tmp/u1_pending_confirm"))
 LOG_FILE = Path(__file__).parent / "hook.log"
+
+# The ONLY thing this hook ever executes. Marker content contributes one
+# argv element — a request id that must match _REQUEST_ID_RE.
+WORKFLOW_PY = "/opt/data/scripts/u1_kit_workflow.py"
+_REQUEST_ID_RE = re.compile(r"^u1_[a-z0-9_]+$")
+
+# A marker claiming to be valid for more than a day is not a window
+# anyone armed on purpose — the workflow TTL is 15 minutes.
+_MAX_EXPIRY_AHEAD_S = 24 * 60 * 60
 
 # `yes` / `yes abc123`. The code is the request_id tail the bed-clear DM
 # shows — those tails are hex; requiring hex keeps natural replies like
@@ -100,72 +129,201 @@ def _parse_yes_message(text: str) -> tuple[bool, str | None]:
     return False, None
 
 
+def _quarantine_marker(p: Path, event: str, **details) -> None:
+    """Rename a bad marker to <name>.bad — out of the pending set but kept
+    on disk, because a marker that LIES about its expiry (or its request
+    id) is evidence, not litter."""
+    try:
+        os.replace(p, p.with_name(p.name + ".bad"))
+        _log({"event": event, "marker": p.name, **details})
+    except Exception as exc:
+        _log({"event": f"{event}_rename_failed", "marker": p.name,
+              "error": f"{type(exc).__name__}: {exc}", **details})
+
+
+def _delete_marker(p: Path, event: str, **details) -> None:
+    try:
+        p.unlink()
+        _log({"event": event, "marker": p.name, **details})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        _log({"event": f"{event}_unlink_failed", "marker": p.name,
+              "error": f"{type(exc).__name__}: {exc}", **details})
+
+
 def _load_pending_windows() -> list[dict]:
-    """Read every json file in PENDING_DIR, drop expired or malformed
-    entries. Returns a list of active pending-confirm state dicts."""
+    """Read every marker in PENDING_DIR and enforce marker hygiene.
+    Returns the list of live pending-confirm state dicts.
+
+    Fail-closed rules (review findings — expiry used to be advisory):
+      * unreadable / non-object JSON        -> quarantine to <name>.bad
+      * request_id not ^u1_[a-z0-9_]+$      -> quarantine
+      * expires_at missing                  -> delete
+      * expires_at unparseable or tz-naive  -> quarantine
+      * expires_at more than 24h out        -> quarantine
+      * expired                             -> delete
+    `.claimed.` files are in-flight spawns, not windows — skipped."""
     if not PENDING_DIR.exists():
         return []
     now = datetime.now(timezone.utc)
     out = []
     for p in sorted(PENDING_DIR.iterdir()):
-        if not p.is_file() or p.suffix != ".json":
+        if not p.is_file() or p.suffix != ".json" or ".claimed." in p.name:
             continue
         try:
             state = json.loads(p.read_text())
-            cmd = state.get("confirm_cmd")
-            if not (isinstance(cmd, list) and cmd):
-                continue
-            expires_at = state.get("expires_at")
-            if expires_at:
-                try:
-                    exp = datetime.fromisoformat(
-                        expires_at.replace("Z", "+00:00"))
-                    if now > exp:
-                        continue  # expired; the token TTL is the real gate
-                except ValueError:
-                    pass
-            state["_source_file"] = str(p)
-            out.append(state)
-        except Exception:
+            if not isinstance(state, dict):
+                raise ValueError("marker is not a JSON object")
+        except Exception as exc:
+            _quarantine_marker(p, "confirm_marker_unreadable_quarantined",
+                               error=f"{type(exc).__name__}: {exc}")
             continue
+        rid = str(state.get("request_id") or "")
+        if not _REQUEST_ID_RE.match(rid):
+            _quarantine_marker(p, "confirm_marker_bad_request_id_quarantined",
+                               request_id=rid[:60])
+            continue
+        raw_exp = state.get("expires_at")
+        if not raw_exp:
+            _delete_marker(p, "confirm_marker_missing_expiry_deleted",
+                           request_id=rid)
+            continue
+        try:
+            exp = datetime.fromisoformat(str(raw_exp).replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                raise ValueError("naive expiry timestamp")
+        except Exception:
+            _quarantine_marker(p, "confirm_marker_bad_expiry_quarantined",
+                               request_id=rid, expires_at=str(raw_exp)[:60])
+            continue
+        if (exp - now).total_seconds() > _MAX_EXPIRY_AHEAD_S:
+            _quarantine_marker(p, "confirm_marker_expiry_too_far_quarantined",
+                               request_id=rid, expires_at=str(raw_exp)[:60])
+            continue
+        if now > exp:
+            _delete_marker(p, "confirm_marker_expired_deleted",
+                           request_id=rid)
+            continue
+        state["_source_file"] = str(p)
+        state["_expires"] = exp
+        out.append(state)
     return out
 
 
+def _operator_binding_ok(state: dict, context: dict) -> bool:
+    """The YES must come from the operator the window was armed for:
+    context platform + user_id must equal the marker's binding fields.
+    A marker WITHOUT binding fields (legacy shape, or binding config unset
+    at arm time) refuses — fail closed; the workflow already warned at arm
+    time, this log entry is the enforcement half. user_id is compared as a
+    string on both sides — gateways deliver it as int or str depending on
+    platform."""
+    rid = state.get("request_id")
+    want_platform = state.get("platform")
+    want_user = state.get("operator_user_id")
+    if not want_platform or not want_user:
+        _log({"event": "confirm_refused_marker_missing_binding",
+              "request_id": rid,
+              "platform": context.get("platform"),
+              "user_id": context.get("user_id")})
+        return False
+    got_platform = str(context.get("platform") or "").strip().lower()
+    got_user = str(context.get("user_id") or "").strip()
+    if (got_platform != str(want_platform).strip().lower()
+            or got_user != str(want_user).strip()):
+        _log({"event": "confirm_refused_operator_mismatch",
+              "request_id": rid,
+              "expected_platform": want_platform,
+              "platform": context.get("platform"),
+              "user_id": context.get("user_id")})
+        return False
+    return True
+
+
 def _spawn_confirm(state: dict) -> bool:
-    """Single-fire: remove the marker FIRST (a second YES finds nothing),
-    then spawn the confirm command detached with output captured to the
-    request's own log. Returns True when the spawn was issued."""
+    """Claim-then-spawn. The command is built HERE from constants — the
+    marker's only contribution is a request id that already matched
+    _REQUEST_ID_RE in the loader (checked again for direct callers).
+
+    Claim = atomic rename to <rid>.claimed.<pid>.json: of N concurrent
+    YESes exactly one wins; the losers see FileNotFoundError and stand
+    down. Spawn success deletes the claimed file. Spawn failure renames it
+    back (while unexpired) so the next YES retries — the old unlink-then-
+    spawn burned the window when Popen failed. Returns True when the spawn
+    was issued."""
+    rid = str(state.get("request_id") or "")
     src = state.get("_source_file")
+    if not src or not _REQUEST_ID_RE.match(rid):
+        return False
+    src_path = Path(src)
+    claimed = src_path.with_name(f"{rid}.claimed.{os.getpid()}.json")
     try:
-        if src:
-            Path(src).unlink()
+        os.rename(src_path, claimed)
     except FileNotFoundError:
         return False  # another YES beat us to it — single-fire held
     except Exception as exc:
-        _log({"event": "confirm_marker_unlink_failed",
-              "request_id": state.get("request_id"),
+        _log({"event": "confirm_marker_claim_failed", "request_id": rid,
               "error": f"{type(exc).__name__}: {exc}"})
         return False
-    log_path = state.get("log_path")
+    cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid, "--json-events"]
+    # Log path is DERIVED, never read from the marker.
+    log_path = Path(f"/tmp/u1_confirm_start_{rid}.log")
+    out = None
+    spawn_ok = False
     try:
-        if log_path:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
             out = open(log_path, "ab")
-        else:
-            out = subprocess.DEVNULL
+        except Exception:
+            out = None  # losing the log is acceptable; losing the start isn't
         subprocess.Popen(
-            state["confirm_cmd"],
-            stdout=out, stderr=subprocess.STDOUT if log_path else out,
+            cmd,
+            stdout=out if out is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
         )
-        return True
+        spawn_ok = True
     except Exception as exc:
-        _log({"event": "confirm_spawn_failed",
-              "request_id": state.get("request_id"),
+        _log({"event": "confirm_spawn_failed", "request_id": rid,
               "error": f"{type(exc).__name__}: {exc}"})
-        return False
+    finally:
+        if out is not None:
+            try:
+                out.close()
+            except Exception:
+                pass
+    if spawn_ok:
+        try:
+            claimed.unlink()
+        except Exception as exc:
+            _log({"event": "confirm_claimed_cleanup_failed", "request_id": rid,
+                  "error": f"{type(exc).__name__}: {exc}"})
+        return True
+    # Spawn failed — put the marker back while the window is still live so
+    # the operator's next YES can retry.
+    exp = state.get("_expires")
+    if exp is None:
+        try:
+            exp = datetime.fromisoformat(
+                str(state.get("expires_at")).replace("Z", "+00:00"))
+        except Exception:
+            exp = None
+    try:
+        if exp is not None and datetime.now(timezone.utc) <= exp:
+            os.rename(claimed, src_path)
+            _log({"event": "confirm_spawn_failed_marker_restored",
+                  "request_id": rid})
+        else:
+            claimed.unlink()
+            _log({"event": "confirm_spawn_failed_marker_expired",
+                  "request_id": rid})
+    except Exception as exc:
+        _log({"event": "confirm_spawn_failed_restore_failed",
+              "request_id": rid,
+              "error": f"{type(exc).__name__}: {exc}"})
+    return False
 
 
 async def handle(event_type: str, context: dict) -> None:
@@ -196,6 +354,8 @@ async def handle(event_type: str, context: dict) -> None:
               "user_id": context.get("user_id")})
         return
     state = pending[0]
+    if not _operator_binding_ok(state, context):
+        return
     ok = _spawn_confirm(state)
     _log({"event": "confirm_spawned" if ok else "confirm_not_spawned",
           "request_id": state.get("request_id"),

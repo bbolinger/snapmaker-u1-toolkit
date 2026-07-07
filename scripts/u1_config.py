@@ -178,3 +178,49 @@ def get_u1_port(default: int = FALLBACK_PORT) -> int:
 
 def get_u1_base_url(host: str | None = None, port: int | None = None) -> str:
     return f"http://{host or get_u1_host()}:{port or get_u1_port()}"
+
+
+def get_operator_binding() -> tuple[str, str] | None:
+    """Resolve the (platform, user_id) pair the confirm-start hook binds
+    the operator's YES to — e.g. ("telegram", "8131922235"). Returns None
+    when unconfigured: the hook then refuses every YES (fail closed) and
+    the workflow warns at arm time.
+
+    Priority:
+      1. U1_OPERATOR_BINDING env — "platform:user_id". A non-empty value
+         that doesn't parse returns None rather than falling through: an
+         explicit override that's malformed should surface as missing, not
+         silently bind to whatever the fallbacks say.
+      2. u1_config.json key "operator_binding" — same format, same rule.
+      3. TELEGRAM_ALLOWED_USERS env (the gateway allowlist of sender ids) —
+         used only when it holds exactly ONE id; several ids can't name
+         THE operator.
+      4. TELEGRAM_HOME_CHANNEL env — the chat the bed-clear DM is delivered
+         to; in a single-operator DM setup the chat id IS the operator's
+         user id.
+
+    U1_OPERATOR is a display identity ("telegram:brent"), not the gateway's
+    numeric user id, so it is deliberately NOT a source here — the hook
+    compares against the message context's user_id, which is numeric.
+    """
+    _load_dotenv_if_present()
+    raw = os.environ.get("U1_OPERATOR_BINDING", "").strip()
+    if not raw:
+        file_val = _load_file().get("operator_binding")
+        raw = str(file_val).strip() if file_val is not None else ""
+    if raw:
+        platform, sep, user_id = raw.partition(":")
+        platform = platform.strip().lower()
+        user_id = user_id.strip()
+        if sep and platform and user_id:
+            return platform, user_id
+        return None
+    allowed = [u.strip() for u in
+               os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+               if u.strip()]
+    if len(allowed) == 1:
+        return "telegram", allowed[0]
+    home = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    if home:
+        return "telegram", home
+    return None

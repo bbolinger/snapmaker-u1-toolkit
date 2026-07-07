@@ -115,6 +115,7 @@ from typing import Any
 import u1_kit
 import u1_form
 import u1_arrange
+import u1_config
 import u1_request
 import u1_review_doc
 from u1_print_start_gate import build_stage1_command
@@ -2093,7 +2094,39 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # verbatim command). Resolve the request + pending nonce from persisted
     # state, then fall through as a normal second-turn confirm (--action start
     # --bed-clear-confirmed). Single-use: the token is consumed on resolve.
+    #
+    # --confirm-start-for <request_id>: the gateway-hook shape of the same
+    # confirm. The pending marker the hook redeems is display-only — no
+    # command, no token (review finding: a same-UID /tmp writer could
+    # otherwise feed the hook arbitrary argv) — so the hook relays only the
+    # request id and the workflow looks up the persisted single-use confirm
+    # token here, server-side. From that point on this IS the --confirm-start
+    # path: same atomic token claim, nonce, revision, hash, and phase checks.
     _confirm_token = getattr(args, "confirm_start", None)
+    _confirm_for = getattr(args, "confirm_start_for", None)
+    if _confirm_for and not _confirm_token:
+        if not u1_request.is_request_id(str(_confirm_for)):
+            print(json.dumps({
+                "stage": "bed_clear_confirm_bad_request_id",
+                "reason": ("request id is not a valid u1 request id; "
+                           "nothing was started."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_bad_request_id"}
+        _for_pending = (((u1_request.read_request(_confirm_for) or {})
+                         .get("safety") or {})
+                        .get("pending_bed_clear_start") or {})
+        _confirm_token = _for_pending.get("confirm_token")
+        if not _confirm_token:
+            print(json.dumps({
+                "stage": "bed_clear_confirm_no_pending",
+                "request_id": _confirm_for,
+                "reason": ("no pending bed-clear confirmation exists for "
+                           "this request — nothing was started. Re-run "
+                           "--action start (no --bed-clear-confirmed) to "
+                           "get a fresh bed-clear prompt."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_no_pending",
+                    "request_id": _confirm_for}
     if _confirm_token:
         _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
         _state = u1_request.read_request(_rid) if _rid else None
@@ -2365,9 +2398,9 @@ def run_kit_workflow(args) -> dict[str, Any]:
                 "bed_snapshot_path": (_idem_safety.get("snapshot_path")
                                       or _idem_safety.get("bed_snapshot_path")),
             }, json_events)
-            _arm_pending_confirm(request_id, _idem_tok,
+            _arm_pending_confirm(request_id,
                                  _idem_req.get("printer_storage_filename"),
-                                 operator)
+                                 operator, events_file, json_events)
             _emit(events_file, {"stage": "awaiting_input",
                                 "need": "bed_clear_start",
                                 "request_id": request_id}, json_events)
@@ -3413,25 +3446,52 @@ _PENDING_CONFIRM_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
 _PENDING_CONFIRM_TTL_S = 15 * 60
 
 
-def _arm_pending_confirm(request_id: str, confirm_token: str,
-                         filename: str | None, operator: str | None) -> None:
+def _arm_pending_confirm(request_id: str, filename: str | None,
+                         operator: str | None,
+                         events_file: Path | None = None,
+                         json_events: bool = False) -> None:
     """Write the per-request marker the u1_confirm_start hook redeems.
-    Overwrites any previous marker for this request (re-prompt re-arms)."""
+    Overwrites any previous marker for this request (re-prompt re-arms).
+
+    The marker is deliberately OPAQUE: request id, display filename,
+    operator binding, timestamps. No command, no token, no paths — the
+    hook builds its own argv (`--confirm-start-for <request_id>`) and the
+    workflow resolves the persisted single-use token server-side. Review
+    finding: the old confirm_cmd field let any same-UID writer of /tmp
+    hand the gateway an arbitrary command to run on the next YES.
+
+    Operator binding comes from u1_config.get_operator_binding(). When
+    that's unconfigured we STILL arm — the print mid-flow shouldn't brick
+    on a config gap — but the hook will refuse the YES (fail closed), so
+    say so HERE, loudly, where the operator can act on it before typing a
+    YES that goes nowhere."""
     from datetime import datetime, timedelta, timezone
-    req_dir = u1_request.request_dir(request_id)
-    cmd = ["python3", "/opt/data/scripts/u1_kit_workflow.py",
-           "--confirm-start", confirm_token, "--json-events"]
-    if operator:
-        cmd += ["--operator", operator]
+    now = datetime.now(timezone.utc)
     entry = {
         "request_id": request_id,
-        "confirm_cmd": cmd,
-        "log_path": str(req_dir / "confirm_via_hook.log"),
         "filename": filename,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": (datetime.now(timezone.utc)
-                       + timedelta(seconds=_PENDING_CONFIRM_TTL_S)).isoformat(),
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(
+            seconds=_PENDING_CONFIRM_TTL_S)).isoformat(),
     }
+    try:
+        binding = u1_config.get_operator_binding()
+    except Exception:
+        binding = None
+    if binding:
+        entry["platform"], entry["operator_user_id"] = binding
+    else:
+        _audit(request_id, "confirm_binding_unconfigured", operator or "")
+        _emit(events_file, {
+            "stage": "confirm_binding_unconfigured",
+            "request_id": request_id,
+            "message": ("Operator binding for the YES hook is not "
+                        "configured — set U1_OPERATOR_BINDING="
+                        "telegram:<numeric user id> (or TELEGRAM_HOME_"
+                        "CHANNEL / TELEGRAM_ALLOWED_USERS). The bed-clear "
+                        "prompt is armed, but the gateway hook will REFUSE "
+                        "the YES until it can verify who is answering."),
+        }, json_events)
     _PENDING_CONFIRM_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
     tmp.write_text(json.dumps(entry, indent=2))
@@ -3906,8 +3966,9 @@ def _action_start(events_file: Path | None, request_id: str,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
         }
-        _arm_pending_confirm(request_id, confirm_token,
-                             state.get("printer_storage_filename"), operator)
+        _arm_pending_confirm(request_id,
+                             state.get("printer_storage_filename"), operator,
+                             events_file, json_events)
         _emit(events_file, need, json_events)
         _emit(events_file, {"stage": "awaiting_input",
                             "need": "bed_clear_start",
@@ -5233,6 +5294,16 @@ def main(argv=None) -> int:
                           "short token (it mangled the old long command); the "
                           "workflow resolves the request + single-use nonce "
                           "from persisted state. Never hand-assemble it."))
+    ap.add_argument("--confirm-start-for", default=None,
+                    dest="confirm_start_for",
+                    help=("Gateway-hook bed-clear confirm: redeem the pending "
+                          "confirmation for this request id. The persisted "
+                          "single-use confirm token is resolved server-side "
+                          "and then this follows the exact --confirm-start "
+                          "path (same nonce/revision/hash checks). Written "
+                          "for the u1_confirm_start hook, which builds this "
+                          "command from its own constants — the pending "
+                          "marker carries no command and no token."))
     ap.add_argument("--grace-cancel", action="store_true", dest="grace_cancel",
                     help=("Cancel every active pre-start grace window (touches "
                           "the same markers the gateway cancel hook does). The "
