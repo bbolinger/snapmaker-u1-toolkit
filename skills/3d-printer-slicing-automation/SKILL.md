@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
-description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself."
-version: 2.2.0
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint a recent job (no file attached) — follow the Reprint section."
+version: 2.3.1
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -82,7 +82,7 @@ Named patterns (each one was observed in a live run on 2026-06-25):
 - **STACKING QUESTIONS** — Two or more questions in one turn. User answers one; you guess the others.
 - **CUSTOM SLICING PYTHON** — `subprocess.run(['orca-slicer', ...])` or `import requests` to query the printer. Bypasses v1.4.2 T0→T1 rewriter, v1.4.3 thumbnail injector, the JSON event schema, AND the toolkit's stdlib-only safety discipline.
 - **PATCHING THE LIVE SKILL** — Writing to `/opt/data/skills/.../SKILL.md`. Has silently deleted whole sections twice (v1.4.4 + v1.4.6 sessions). Workspace edits only; let the maintainer commit + redeploy.
-- **IMPROVISING AROUND FAILURES** — Surface the actual error verbatim and stop. Don't retry with different args.
+- **IMPROVISING AROUND FAILURES** — Surface the actual error verbatim and stop. Don't retry with different args, don't diagnose with your own grep/ls/find commands, don't re-slice, don't compose a recovery command. The operator decides what happens next.
 - **STARTING FROM CRON / CHAIN** — Start commands require in-the-moment operator confirmation on the bed-clear question.
 
 ### ANTI-FABRICATION (named patterns from live testing)
@@ -122,7 +122,12 @@ Workflow emits `{stage:"warning", kind:"slicer_warning", messages:[...], count:N
 
 - **Upload-only is default.** Never upload+start without bed-clear via `u1_print_start_gate.py`.
 - **Start = physical action.** Never run from cron / chain / automation. In-the-moment operator confirmation only.
+- **CANCEL in the grace window is hook-handled.** A model-free gateway hook executes it; the agent runs nothing and confirms only after the workflow reports the cancel.
 - **If anything is unknown** — printer state, tool, material, slicer metadata, bed visibility — fail closed.
+
+## Reprint — printing a recent job again
+
+The operator asks to reprint (no file attached): your first tool call is `python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events`. It emits a `need_input` listing numbered recent prints — surface the labels, wait for the pick, then tool-call that option's `next_command` verbatim. No slicing happens; the flow goes straight to the normal bed-clear decision (Step 4). Never guess which print they meant and never skip the list turn.
 
 ## References
 
