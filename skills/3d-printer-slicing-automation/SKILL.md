@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
 description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint a recent job (no file attached) — follow the Reprint section."
-version: 2.3.1
+version: 2.3.2
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -64,7 +64,7 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 **Step 4 — the ONE bed-clear decision.** After the readiness card (or after the operator submits the form), the workflow emits `need_input` with `key`/`need: "bed_clear_start"` — this is the single approval boundary, form and text alike. It carries a bed photo (already captured) and a `prompt` that IS the bed-clear question; surface any attached bed-photo path bare, then ask that exact prompt, then wait.
 
 - If `bed_snapshot_path` is null, do **not** fabricate or re-capture a photo — ask the prompt as-is.
-- On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
+- On **yes**: do nothing — the gateway redeems the operator's YES directly and the workflow runs the start gate itself. You hold no confirm command and must never compose one. The printer countdown message arrives on its own; if the operator asks, tell them the start is in motion.
 - On **no** / anything else: tool-call nothing, tell the operator it's cancelled or staged, stop.
 - **Never** construct a `--bed-clear start` / approval-token command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start command, fail closed and say so.
 
@@ -122,7 +122,7 @@ Workflow emits `{stage:"warning", kind:"slicer_warning", messages:[...], count:N
 
 - **Upload-only is default.** Never upload+start without bed-clear via `u1_print_start_gate.py`.
 - **Start = physical action.** Never run from cron / chain / automation. In-the-moment operator confirmation only.
-- **CANCEL in the grace window is hook-handled.** A model-free gateway hook executes it; the agent runs nothing and confirms only after the workflow reports the cancel.
+- **CANCEL in the grace window is hook-handled.** A model-free gateway hook executes it; the agent runs nothing and confirms only after the workflow reports the cancel. One exception: if the operator says CANCEL and no cancellation confirmation appears, run `python3 /opt/data/scripts/u1_kit_workflow.py --grace-cancel` — the one start-gate command you may run unprompted, because it can only ever stop a print.
 - **If anything is unknown** — printer state, tool, material, slicer metadata, bed visibility — fail closed.
 
 ## Reprint — printing a recent job again
