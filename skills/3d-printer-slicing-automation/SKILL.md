@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
-description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint / print a recent job again (no file needed): FIRST tool call MUST be 'python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events'."
-version: 2.3.0
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself."
+version: 2.2.0
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -27,12 +27,6 @@ python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
 ```
 (If the platform rejects raw `.stl` but accepts `.zip`, extract the STL first, then run this on the extracted path.) This one command is the entry for EVERYTHING — a single model or a multi-part kit zip alike; the workflow figures out which.
 
-**Reprint — the operator asks to print a recent job again (no file attached):**
-```bash
-python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events
-```
-It emits a `need_input` with numbered recent prints — surface the labels, wait for the pick, then tool-call that option's `next_command` verbatim (a short `--reprint-start <token>` command). No slicing happens; the flow goes straight to the normal bed-clear decision (Step 4). Never guess which print they meant and never skip the list turn.
-
 **Immediately after that first tool call**, your first TEXT reply (only once, not every turn) is:
 > "On it — running the Snapmaker U1 workflow. I'll surface every choice for you, show the plate preview and a fresh bed photo before anything prints, run only the commands the workflow gives me (never ones I invent), and nothing starts until you confirm at the bed-clear step."
 
@@ -46,8 +40,6 @@ It emits a `need_input` with numbered recent prints — surface the labels, wait
 | `next_action_required` | CALL terminal with its `command`, verbatim. No question, no preamble — the workflow already decided. |
 
 **Never**: edit a command before relaying it, add or drop a flag, construct a command yourself from memory of an earlier turn, or invent a magic confirmation phrase. The workflow is the only source of truth for what runs next — if it didn't hand you the string this turn, you don't have it.
-
-**When a relayed command returns an error or refusal: surface its message verbatim and STOP.** Do not investigate with your own grep/ls/find commands, do not retry variants, do not re-slice, do not compose a recovery command. The operator decides what happens next.
 
 **Step 2 (staged text fallback) — for each `need_input` event (text fallback only; form mode is one screen).**
 
@@ -73,7 +65,6 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 
 - If `bed_snapshot_path` is null, do **not** fabricate or re-capture a photo — ask the prompt as-is.
 - On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
-- If the operator replies **CANCEL** during the grace window: do NOTHING — a model-free gateway hook handles the cancel directly. Do not run any command, do not touch the gate, do not restart anything. Acknowledge only after the workflow reports the cancel.
 - On **no** / anything else: tool-call nothing, tell the operator it's cancelled or staged, stop.
 - **Never** construct a `--bed-clear start` / approval-token command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start command, fail closed and say so.
 
