@@ -20,6 +20,13 @@ def _sandbox_confirm_markers(tmp_path, monkeypatch):
     monkeypatch.setattr(kw, "_PENDING_CONFIRM_DIR", tmp_path / "pending_confirm")
 
 
+@pytest.fixture(autouse=True)
+def _stable_printer_metadata(monkeypatch):
+    """Reprint binds printer-side size+modified; hermetic default = stable."""
+    monkeypatch.setattr(kw, "_printer_file_metadata",
+                        lambda fname: {"size": 4242, "modified": 1751900000.0})
+
+
 def _seed_uploaded_request(model="widget", fname=None, tool="T1",
                            material="PETG", ghash="sha256:abc123",
                            doc_hash="a1b2c3d4e5f6"):
@@ -241,3 +248,81 @@ def test_reprint_of_reprint_resurfaces_original_artifacts(monkeypatch, capsys, t
     st2 = u1_request.read_request(r2["request_id"])
     assert st2["plates"][0]["preview_path"] == str(prev)
     assert st2["review_path"] == str(rev)
+
+
+
+def test_reprint_refuses_when_printer_metadata_unavailable(monkeypatch, capsys):
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    monkeypatch.setattr(kw, "_printer_file_metadata", lambda fname: None)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "reprint_refused"
+    assert res["reason"] == "printer_metadata_unavailable"
+
+
+def test_reprint_refuses_when_printer_file_changed(monkeypatch, capsys):
+    """Same filename, different bytes (review finding): stored size+modified
+    from upload time must match the CURRENT printer file or the reprint
+    refuses — filename existence is not content identity."""
+    old_rid, fname = _seed_uploaded_request()
+    st = u1_request.read_request(old_rid)
+    plates = st["plates"]
+    plates[0]["printer_file_size"] = 1000
+    plates[0]["printer_file_modified"] = 1751000000.0
+    u1_request.write_request(old_rid, plates=plates)
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    monkeypatch.setattr(kw, "_printer_file_metadata",
+                        lambda fname: {"size": 9999, "modified": 1751999999.0})
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "reprint_refused"
+    assert res["reason"] == "printer_file_changed"
+
+
+def test_reprint_legacy_record_binds_current_metadata(monkeypatch, capsys):
+    """Records from before metadata binding have no stored size/modified:
+    the seed binds the CURRENT values so the pick-to-start window is
+    covered from now on."""
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    st = u1_request.read_request(res["request_id"])
+    assert st["plates"][0]["printer_file_size"] == 4242
+    assert st["plates"][0]["printer_file_modified"] == 1751900000.0
+
+
+def test_confirm_turn_refuses_on_printer_file_drift(monkeypatch, capsys):
+    """The last check before Stage 2: file drifts between the bed-clear
+    prompt and the confirmed yes -> structured refusal, no gate launch."""
+    from types import SimpleNamespace
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    new_rid = res["request_id"]
+    confirm = (u1_request.read_request(new_rid)["safety"]
+               ["pending_bed_clear_start"]["confirm_token"])
+    reached = {}
+    monkeypatch.setattr(kw, "_invoke_stage2_gate",
+                        lambda *a, **k: reached.setdefault("gate", True))
+    # drift AFTER the prompt: current metadata no longer matches the seed
+    monkeypatch.setattr(kw, "_printer_file_metadata",
+                        lambda fname: {"size": 7777, "modified": 1751911111.0})
+    args = SimpleNamespace(
+        model=None, confirm_start=confirm, confirm_start_for=None,
+        reprint=False, reprint_start=None, grace_cancel=False,
+        json_events=True, operator="test-op", events_file=None,
+        request_id=None, action=None, bed_clear_confirmed=False,
+        pending_nonce=None, nozzle="0.4",
+    )
+    out_res = kw.run_kit_workflow(args)
+    out = capsys.readouterr().out
+    assert "gate" not in reached, "gate must not launch on drifted bytes"
+    assert out_res["phase"] == "bed_clear_approval_rejected"
+    assert "changed since upload" in out

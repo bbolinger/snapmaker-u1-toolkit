@@ -3561,6 +3561,36 @@ def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, A
     return {"phase": "grace_cancel", "cancelled": touched}
 
 
+def _moonraker_host_port() -> tuple[str, int]:
+    from u1_config import get_u1_host, get_u1_port
+    return get_u1_host(), get_u1_port()
+
+
+def _printer_file_metadata(fname: str) -> dict[str, Any] | None:
+    """(size, modified) of a printer-side gcode via Moonraker metadata.
+    None on any failure — callers decide whether that fails closed. Review
+    finding 2026-07-07: reprint verified the FILENAME still existed but not
+    that the bytes were still the reviewed ones; size+modified binding
+    catches an overwrite between the pick and the start. (Weaker than a
+    content hash — Moonraker doesn't serve one — and documented as such.)"""
+    try:
+        import urllib.request as _rq
+        from urllib.parse import quote as _q
+        host, port = _moonraker_host_port()
+        url = (f"http://{host}:{port}/server/files/metadata"
+               f"?filename={_q(fname)}")
+        with _rq.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        res = data.get("result") or {}
+        size = res.get("size")
+        modified = res.get("modified")
+        if size is None or modified is None:
+            return None
+        return {"size": int(size), "modified": float(modified)}
+    except Exception:
+        return None
+
+
 def _printer_gcode_filenames() -> set[str] | None:
     """Names in the printer's gcodes root, or None when Moonraker is
     unreachable (callers treat None as unknown and fail closed at start)."""
@@ -3771,6 +3801,39 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
         return {"phase": "reprint_bed_capture_failed", "request_id": new_rid}
 
     _art_preview, _art_iso, _art_review = _resolve_reprint_artifacts(old)
+    # Printer-side identity check (review finding): filename existence is not
+    # content identity. If the source recorded size+modified at upload,
+    # compare against the CURRENT printer file and refuse on drift; legacy
+    # records bind the current values so the pick-to-start window is covered
+    # either way.
+    _cur_meta = _printer_file_metadata(fname)
+    if _cur_meta is None:
+        _emit(events_file, {
+            "stage": "reprint_refused", "reason": "printer_metadata_unavailable",
+            "message": ("Could not verify the printer-side file before "
+                        "reprint. Try again when the printer is reachable."),
+        }, json_events)
+        _audit(old_rid, "reprint_refused_metadata_unavailable", operator,
+               printer_filename=fname)
+        return {"phase": "reprint_refused",
+                "reason": "printer_metadata_unavailable"}
+    _stored_size = plates[0].get("printer_file_size")
+    _stored_mod = plates[0].get("printer_file_modified")
+    if _stored_size is not None and _stored_mod is not None:
+        if (_cur_meta["size"] != _stored_size
+                or _cur_meta["modified"] != _stored_mod):
+            _emit(events_file, {
+                "stage": "reprint_refused", "reason": "printer_file_changed",
+                "message": ("The printer-side file changed since it was "
+                            "reviewed and uploaded (size or timestamp "
+                            "drifted). Refusing to reprint it — re-slice "
+                            "from the model instead."),
+            }, json_events)
+            _audit(old_rid, "reprint_refused_printer_file_changed", operator,
+                   printer_filename=fname,
+                   stored_size=_stored_size, current_size=_cur_meta["size"])
+            return {"phase": "reprint_refused",
+                    "reason": "printer_file_changed"}
     u1_request.write_request(
         new_rid,
         reprint_of=old_rid,
@@ -3786,6 +3849,8 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                  "gcode_hash": plates[0].get("gcode_hash"),
                  "gcode_path": plates[0].get("gcode_path"),
                  "printer_storage_filename": fname,
+                 "printer_file_size": _cur_meta["size"],
+                 "printer_file_modified": _cur_meta["modified"],
                  "preview_path": _art_preview,
                  "iso_path": _art_iso,
                  "uploaded": True}],
@@ -4004,6 +4069,26 @@ def _action_start(events_file: Path | None, request_id: str,
             if pending.get("gcode_hash") != gcode_hash:
                 problems.append("gcode_hash mismatch (plan changed since "
                                 "bed-clear prompt was issued)")
+        # Printer-side identity re-check at the last gate before Stage 2
+        # (review finding): when upload recorded size+modified, the CURRENT
+        # printer file must still match — a same-name overwrite between the
+        # review and the confirmed yes refuses here. Metadata unavailable
+        # also refuses: this close to a start, unverifiable means no.
+        _p0 = (state.get("plates") or [{}])[0]
+        _psize = _p0.get("printer_file_size")
+        _pmod = _p0.get("printer_file_modified")
+        if _psize is not None and _pmod is not None and not problems:
+            _now_meta = _printer_file_metadata(
+                _p0.get("printer_storage_filename") or "")
+            if _now_meta is None:
+                problems.append("printer-side file metadata unavailable — "
+                                "cannot verify the file is still the "
+                                "reviewed one")
+            elif (_now_meta["size"] != _psize
+                  or _now_meta["modified"] != _pmod):
+                problems.append("printer-side file changed since upload "
+                                "(size/timestamp drift) — refusing to start "
+                                "unreviewed bytes")
         if problems:
             err = {
                 "stage": "bed_clear_approval_rejected",
@@ -5000,11 +5085,18 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
         _arranged = pl.get("arranged_stls") or []
+        _pf_meta = (_printer_file_metadata(
+            up.get("uploaded_filename") or named.name)
+            if idx == 1 and up.get("moonraker_upload_ok") else None)
         plates_state.append({
             "plate_idx": idx,
             "gcode_path": str(named),
             "gcode_hash": post_inject_hash,
             "printer_storage_filename": up.get("uploaded_filename") or named.name,
+            # Printer-side identity captured at upload: the start path
+            # re-checks these so a same-name overwrite can't ride a review.
+            "printer_file_size": (_pf_meta or {}).get("size"),
+            "printer_file_modified": (_pf_meta or {}).get("modified"),
             "uploaded": up,
             "started": False,
             # metadata (est time + filament) + partition_parts were missing on
