@@ -25,7 +25,8 @@ operator answers a `need_input` prompt:
 
 This applies to: `orient`, `tool`, `preset`, `supports`, `upload`, AND
 `filename_collision`. The workflow tracks state via CLI flags it pre-wrote
-into each `next_command`. There are no exceptions.
+into each `next_command`. ONE exception by design: the bed-clear start
+question carries no command at all — see Rule 8.
 
 ## Rule 2 — `next_action_required` events ALWAYS trigger a tool call
 
@@ -48,27 +49,22 @@ After a collision answer, you tool-call the matching option's
 `next_command` and wait for the workflow's next emitted events
 (`slice_reused`, `readiness_card`, then `next_action_required`).
 
-## Rule 4 — Stage 1 only after `readiness_card`
+## Rule 4 — You never invoke the print-start gate. Ever.
 
-You may not issue a `u1_print_start_gate.py` tool call until a
-`readiness_card` event has been received in the current turn's captured
-output AND a `next_action_required` event has named the Stage 1 command.
+`u1_print_start_gate.py` is not yours to run, compose, or recover. The
+workflow launches it internally after the operator's confirmed yes. If any
+turn seems to require a gate invocation from you, that turn is wrong —
+surface what the workflow said and wait. If you have lost this turn's
+events, re-run the workflow with `--request-id <request_id>` to recover
+them from disk; never reconstruct commands from chat memory.
 
-If you have no `readiness_card` in this turn, re-run the workflow with
-`--request-id <request_id>` (preferred, v2.0+) or `--out-dir <prior_out_dir>`
-(legacy) to recover its events from disk. Never compose a Stage-1
-invocation from chat memory — the printer storage filename, intended
-tool, and material flags must come from the workflow's emitted
-`start_gate_stage1_command`, not from anywhere else.
+## Rule 5 — Bed-clear is its own decision, made on a fresh photo
 
-## Rule 5 — Bed-clear is a SEPARATE turn from Stage 1's photo capture
-
-Stage 1 (`u1_print_start_gate.py`) captures a real bed photo and writes
-an approval token. Surface the photo path bare in your reply, then ask
-the operator: "Bed clear and you want to start? (yes/no)".
-
-That is a NEW question, with NEW operator approval, separate from the
-collision answer two turns earlier. Do not collapse them.
+The workflow captures a real bed photo at decision time. Surface the photo
+path bare (with the plate preview and review doc when emitted), then ask
+the operator the exact yes/no question from the event. That is a NEW
+question with NEW operator approval — never collapsed into any earlier
+answer, never assumed from context.
 
 ## Rule 6 — On resume, re-run the workflow on the SAME STL path; never re-extract
 
@@ -78,9 +74,17 @@ If you've lost context mid-flow, re-run `u1_slice_workflow.py <stl-path> --json-
 
 Workflow events carry `request_id`. Include it verbatim in every approval ask: "Bed clear and start request `u1_2026_...`? (yes/no)". Operator's "yes" then routes to that specific request, not to a guess.
 
-## Rule 8 — Stage 2 dispatch uses the workflow's emitted command
+## Rule 8 — The start transition is model-free. You hold no start command.
 
-Use `start_gate_stage1_command` from the `readiness_card` event as your Stage 2 base; append `--bed-clear start --approval-token <token>`. If the gate refuses, surface its `reason` field verbatim and re-run `u1_slice_workflow.py <stl> --request-id <id>` to recover. Never assemble print-start commands from memory; never call Moonraker directly.
+At `bed_clear_start`, surface the artifacts and the exact question, then
+wait. On the operator's YES you issue NO tool call — the gateway redeems
+the YES directly and the printer countdown message arrives on its own. If
+no countdown appears, say the start was not initiated; do not retry or
+compose anything. On any error or refusal from a relayed command: surface
+its message verbatim and stop. The one command you may run unprompted is
+`u1_kit_workflow.py --grace-cancel` when the operator's CANCEL goes
+unacknowledged — it can only ever stop a print. Never call Moonraker
+directly.
 
 ## Rule 9 — Multi-part kits: follow `kit_detected`, relay the form verbatim
 
