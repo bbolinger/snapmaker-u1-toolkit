@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.3.0] — 2026-07-07
+
+Three operator-requested features, all behind the same safety boundary:
+recalling a recent job for a reprint, an optional advanced-settings screen,
+and printing multiple copies in one run. Nothing about the start path
+changed — every route still ends at the fresh bed photo, the explicit yes,
+and the cancellable grace window.
+
+### Added
+
+- **Reprint.** Say "reprint" (no file needed) and the workflow lists your
+  recent successful uploads with their model, head, and material. Pick one
+  and the flow goes straight to the bed-clear decision: no re-slicing, the
+  gcode already on the printer is reused, the original previews and review
+  document are re-surfaced alongside a fresh bed photo, and the start gate
+  runs with the same drift checks as a new job (the reviewed revision and
+  gcode hash must still match). Each listed option carries a single-use
+  pick token, so a stale or replayed message cannot start anything.
+- **Advanced settings screen.** The form's Review screen gains one
+  `Advanced settings` button opening a single optional screen: infill
+  density (10-50%), infill pattern (grid / gyroid / honeycomb / triangles /
+  cubic), wall loops (2-4), brim (off / auto), fuzzy skin, and support
+  style (tree vs grid, when supports are on). Every field defaults to the
+  profile's own value, so skipping the screen is exactly the old behavior.
+  Overrides are applied as a flattened temp process profile (the same
+  mechanism supports already used), persisted on the request, audited, and
+  flagged in the review document's settings sweep before you confirm.
+  Text mode accepts the same choices (`infill 30%`, `gyroid`, `walls 3`,
+  `brim off`, `fuzzy`, `tree supports`).
+- **Quantity.** Single-part jobs gain a Quantity choice on the setup screen
+  (1-9 copies). Copies are packed onto the plate by the normal arranger, so
+  the plate previews show every instance and jobs too large for one bed
+  split into multiple plates exactly like a kit. Text mode: `x3`, `qty 3`,
+  or `3 copies`.
+
+### Fixed
+
+- **Reprint confirm no longer re-ingests the original archive.** The YES
+  turn on a reprint routes directly to the start gate; previously it tried
+  to recover the original upload (long since cleaned from the cache) and
+  failed at the finish line.
+- **Reprint records its review moment.** The reprint turn re-surfaces the
+  plan previews and review document with a fresh bed photo, and now writes
+  the same revision-and-hash-bound readiness record a new job gets, so the
+  start gate's drift check passes for honest reprints and still refuses if
+  anything changed underneath.
+- **Advanced screen readability.** Option buttons are self-describing
+  ("Infill 30%", "Walls: 3") instead of bare values, and Review exposes
+  the screen through a single button plus a summary of non-default picks.
+
+### Changed
+
+- **Skill guidance hardened from live incidents:** on any relayed command
+  error or refusal the agent surfaces the message verbatim and stops (no
+  self-directed diagnosis or recovery), and a CANCEL during the grace
+  window is executed by a model-free gateway hook — the agent runs nothing.
+
+---
+
 ## [2.2.2] — 2026-07-06
 
 Safety hardening plus two operator-reported UX bugs, verified live on real
