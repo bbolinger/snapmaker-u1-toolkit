@@ -79,6 +79,7 @@ def _marker(pending_dir, rid="u1_2026_0707_aaa111", expired=False, **over):
         "filename": "plate1.gcode",
         "platform": _OP_PLATFORM,
         "operator_user_id": _OP_USER,
+        "operator_chat_id": _OP_USER,   # private-DM assumption: chat == user
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": (datetime.now(timezone.utc)
                        + timedelta(minutes=-5 if expired else 10)).isoformat(),
@@ -90,8 +91,10 @@ def _marker(pending_dir, rid="u1_2026_0707_aaa111", expired=False, **over):
     return entry
 
 
-def _ctx(text="yes", platform=_OP_PLATFORM, user_id=_OP_USER):
-    return {"message": text, "platform": platform, "user_id": user_id}
+def _ctx(text="yes", platform=_OP_PLATFORM, user_id=_OP_USER,
+         chat_id=_OP_USER, chat_type="private"):
+    return {"message": text, "platform": platform, "user_id": user_id,
+            "chat_id": chat_id, "chat_type": chat_type}
 
 
 def _run(context):
@@ -404,7 +407,7 @@ def test_far_future_expiry_is_quarantined(pending_dir, monkeypatch, tmp_path):
 def test_arm_writes_opaque_marker_and_disarm_removes(pending_dir):
     kw._arm_pending_confirm("u1_2026_0707_ccc333", "p.gcode", "telegram:brent")
     m = json.loads((pending_dir / "u1_2026_0707_ccc333.json").read_text())
-    assert set(m) == {"request_id", "filename", "platform",
+    assert set(m) == {"request_id", "filename", "platform", "operator_chat_id",
                       "operator_user_id", "created_at", "expires_at"}
     assert m["platform"] == _OP_PLATFORM
     assert m["operator_user_id"] == _OP_USER
@@ -618,3 +621,66 @@ def test_grace_cancel_with_nothing_pending_is_calm(tmp_path, monkeypatch, capsys
     res = kw._action_grace_cancel(True, "brent")
     assert res["cancelled"] == []
     assert "No active grace window" in capsys.readouterr().out
+
+
+
+# ---------- conversation binding (final release review) ----------
+
+def test_yes_from_wrong_chat_refuses(pending_dir, monkeypatch):
+    """Same operator, different conversation: refuses. The YES belongs to
+    the private DM the window was armed for."""
+    _marker(pending_dir)
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_id="999999")))
+    assert spawned == []
+    assert len(list(pending_dir.glob("*.json"))) == 1
+
+
+def test_yes_from_group_chat_refuses(pending_dir, monkeypatch):
+    """Model-free start is a private-DM feature: any non-private chat_type
+    refuses outright, even from the right operator in the right chat id."""
+    _marker(pending_dir)
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_type="group")))
+    assert spawned == []
+
+
+def test_marker_without_chat_binding_refuses(pending_dir, monkeypatch):
+    """Legacy marker shape (no operator_chat_id) fails closed."""
+    entry = _marker(pending_dir)
+    import json as _json
+    raw = _json.loads((pending_dir / f"{entry['request_id']}.json").read_text())
+    raw.pop("operator_chat_id")
+    (pending_dir / f"{entry['request_id']}.json").write_text(_json.dumps(raw))
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd))
+    asyncio.run(hook.handle("agent:start", _ctx()))
+    assert spawned == []
+
+
+def test_empty_chat_type_with_right_chat_id_succeeds(pending_dir, monkeypatch):
+    """Some gateway paths omit chat_type; the chat_id equality still
+    gates. Absence of evidence about the chat KIND is tolerated only when
+    the conversation identity itself matches."""
+    _marker(pending_dir)
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_type="")))
+    assert len(spawned) == 1
+
+
+def test_arm_marker_carries_chat_binding(pending_dir, tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setattr(kw.u1_request, "request_dir",
+                        lambda rid: tmp_path / "req" / rid)
+    monkeypatch.setattr(kw.u1_config, "get_operator_binding",
+                        lambda: ("telegram", "8131922235"))
+    kw._arm_pending_confirm("u1_2026_0707_chat01", "tokx", "p.gcode", "brent")
+    m = _json.loads((pending_dir / "u1_2026_0707_chat01.json").read_text())
+    assert m["operator_chat_id"] == "8131922235"

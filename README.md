@@ -130,7 +130,8 @@ The full per-action breakdown (the test-operator fence, the grace-period
 cancel chain, and every allowed-vs-gated command) lives in
 [docs/SAFETY.md](docs/SAFETY.md).
 
-None of this is aspirational: 710 tests run in CI on every change, and the
+None of this is aspirational: the full test suite runs in CI on Python 3.11
+and 3.12 for every change, and the
 cancel chain is **live-verified on real hardware**, including a reproducible,
 no-printer-needed drill anyone can run:
 [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
@@ -280,7 +281,25 @@ hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-a
 
 # 2. Deploy the workflow scripts to the runtime paths the skill calls into
 bash deploy_to_runtime.sh
+
+# 3. Install BOTH gateway hooks (the operator YES that starts a print and
+#    the reply/tap CANCEL that stops one), restart the gateway, verify
+bash tools/install_hermes_u1_hooks.sh
+hermes gateway restart
+bash tools/install_hermes_u1_hooks.sh --verify
 ```
+
+The YES/CANCEL hooks bind to one operator in one private Telegram DM. With a
+single user id in `TELEGRAM_ALLOWED_USERS` the binding resolves itself;
+otherwise set it explicitly in the runtime `.env`:
+
+```bash
+U1_OPERATOR_BINDING=telegram:<your-numeric-telegram-user-id>
+```
+
+Without the hooks installed, a YES at the bed-clear prompt does nothing
+(fail-safe: the printer never starts) — `--verify` and the deploy script
+both tell you loudly.
 
 The deploy script verifies the deployed workflow actually starts (`✓ workflow
 starts cleanly`); override target paths via `U1_DEPLOY_SCRIPTS` /
@@ -499,7 +518,8 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-710 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+The suite (840+ and counting; CI runs it on Python 3.11 and 3.12 for every
+pull request) covers: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on

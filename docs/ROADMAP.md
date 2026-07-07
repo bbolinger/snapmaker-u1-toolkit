@@ -212,6 +212,18 @@ operator's screen.
 
 ## v2.4 — 3MF ingest (planned 2026-07-06)
 
+### Hardened deployment: caller-bound start redemption
+
+Today the gateway hook that redeems the operator's YES and the workflow CLI
+run as the same Unix user, so the redemption path is operator-bound but not
+caller-bound — a deliberately malicious agent with terminal access could
+invoke it directly (contained by the audited gate, the operator countdown,
+and one-tap cancel, but not prevented). The v2.4 hardening moves redemption
+behind a boundary the agent worker cannot reach: the gateway (or a small
+broker) runs under a separate user or host, owns the confirmation secret,
+and exposes redemption only over a peer-credentialed channel. A request id
+alone stops being authorization.
+
 **Status:** 📋 QUEUED
 
 Accept a multi-object `.3mf` as a kit. Lean path: normalize to the proven STL

@@ -18,8 +18,13 @@ start trigger now lives where model behavior cannot reach it.
 - **The operator's YES is model-free.** The bed-clear prompt no longer
   hands the agent any confirm command — the workflow arms an on-disk
   marker and a gateway hook redeems the operator's literal YES message by
-  running the confirm itself. The model has nothing it could fire, so a
-  misbehaving (or prompt-injected) agent cannot start a print at all. The
+  running the confirm itself. The model is handed nothing it could fire:
+  accidental or instruction-following command relay — the failure that
+  happened live — is structurally gone. (In the default same-user
+  deployment this is not a boundary against a deliberately malicious agent
+  with terminal access; every start still runs the audited gate, the
+  operator countdown, and the one-tap cancel, and SAFETY.md describes the
+  user-separation that makes it a hard boundary.) The
   single-use token, nonce, and revision/hash binding underneath are
   unchanged. With multiple pending starts, a bare YES refuses and asks
   for `yes <code>`: a print start never guesses.
@@ -27,7 +32,7 @@ start trigger now lives where model behavior cannot reach it.
   mid-turn interrupt bypasses gateway hooks (how the incident's CANCEL
   was lost), so the agent may now relay `--grace-cancel` — a command that
   can only ever stop a pending start. Capability is asymmetric by design:
-  the model can help cancel, and cannot help start.
+  the model can help cancel, and is never handed a way to help start.
 - **Review hardening on the same boundary.** The armed YES window is
   opaque (no command, no token — the hook builds its own fixed invocation
   and never executes anything read from a file) and bound to the

@@ -238,6 +238,29 @@ def _operator_binding_ok(state: dict, context: dict) -> bool:
               "platform": context.get("platform"),
               "user_id": context.get("user_id")})
         return False
+    # Conversation binding (final release review): the YES must come from
+    # the private DM the window was armed for, not merely from the right
+    # human somewhere on the platform. Model-free start is a private-DM
+    # feature by design — a group chat refuses outright, and a chat_id
+    # mismatch (same operator, different conversation) refuses too. A
+    # marker without the chat field (legacy shape) refuses, fail closed.
+    chat_type = str(context.get("chat_type") or "").strip().lower()
+    if chat_type and chat_type != "private":
+        _log({"event": "confirm_refused_not_private_chat",
+              "request_id": rid, "chat_type": chat_type,
+              "user_id": context.get("user_id")})
+        return False
+    want_chat = state.get("operator_chat_id")
+    if not want_chat:
+        _log({"event": "confirm_refused_marker_missing_chat_binding",
+              "request_id": rid})
+        return False
+    got_chat = str(context.get("chat_id") or "").strip()
+    if got_chat != str(want_chat).strip():
+        _log({"event": "confirm_refused_chat_mismatch",
+              "request_id": rid,
+              "chat_id": context.get("chat_id")})
+        return False
     return True
 
 

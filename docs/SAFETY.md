@@ -162,9 +162,14 @@ installs it together with the cancel hook (there is no separate installer),
 nothing": in the default single-container deployment the gateway and the
 agent's terminal tool run as the same Unix user, so a sufficiently
 deliberate agent could read the toolkit's own state files and reconstruct
-a confirm invocation — the same way it could touch the printer's API
-directly. What this design removes is the failure that actually happened
-in live testing: an agent firing a start command it was *given*. Removing
+a confirm invocation (concretely: `--confirm-start-for <request_id>`, the
+same request-id redemption the gateway hook uses) — the same way it could
+touch the printer's API directly. What this design removes is the failure
+that actually happened in live testing: an agent firing a start command it
+was *given*. What contains the deliberate case is everything downstream:
+the invocation is audited with its operator identity, the full gate still
+runs, the countdown DM with the one-tap CANCEL still goes to the operator,
+and nothing moves for 120 seconds. Removing
 the capability domain itself requires running the gateway under a separate
 user (or host) from the agent worker so the state files and hook are
 simply out of reach — recommended for any deployment that is not a

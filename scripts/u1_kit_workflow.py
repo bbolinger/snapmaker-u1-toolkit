@@ -3480,6 +3480,13 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
         binding = None
     if binding:
         entry["platform"], entry["operator_user_id"] = binding
+        # Private-DM assumption, stated where it lives: on Telegram the DM
+        # chat id equals the operator's user id. Model-free start is a
+        # private-DM feature; the hook refuses group chats and any other
+        # conversation outright. Override via U1_OPERATOR_CHAT_ID if a
+        # deployment ever separates them.
+        entry["operator_chat_id"] = os.environ.get(
+            "U1_OPERATOR_CHAT_ID", binding[1])
     else:
         _audit(request_id, "confirm_binding_unconfigured", operator or "")
         _emit(events_file, {
