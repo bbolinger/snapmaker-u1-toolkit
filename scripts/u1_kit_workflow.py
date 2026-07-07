@@ -2111,6 +2111,7 @@ def run_kit_workflow(args) -> dict[str, Any]:
         args.action = "start"
         args.bed_clear_confirmed = True
         args.pending_nonce = _pending.get("nonce")
+        _disarm_pending_confirm(_rid)
         _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
                token_first6=str(_confirm_token)[:6])
         if _state.get("reprint_of"):
@@ -2130,6 +2131,9 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # Turn 1 (--reprint): list recent prints, one single-use pick token each.
     # Turn 2 (--reprint-start <token>): seed a fresh request from the picked
     # print and jump straight to the bed-clear boundary — no slicing at all.
+    if getattr(args, "grace_cancel", False):
+        return _action_grace_cancel(bool(getattr(args, "json_events", False)),
+                                    operator)
     if getattr(args, "reprint_start", None):
         return _action_reprint_start(None, bool(getattr(args, "json_events", False)),
                                      operator, args.reprint_start)
@@ -2353,15 +2357,17 @@ def run_kit_workflow(args) -> dict[str, Any]:
                 "prompt": _idem_prompt,
                 "instruction": ("The plate preview + bed photo were already sent "
                                 "on the previous turn — do NOT re-run the form. "
-                                "Re-surface the yes/no prompt and wait."),
+                                "Re-surface the yes/no prompt and wait. The "
+                                "operator's YES is handled by the gateway; you "
+                                "hold no start command."),
                 "expected_answers": ["yes", "no"],
-                "next_command_on_yes": (
-                    f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                    f"--confirm-start {_idem_tok}"),
                 "next_command_on_no": None,
                 "bed_snapshot_path": (_idem_safety.get("snapshot_path")
                                       or _idem_safety.get("bed_snapshot_path")),
             }, json_events)
+            _arm_pending_confirm(request_id, _idem_tok,
+                                 _idem_req.get("printer_storage_filename"),
+                                 operator)
             _emit(events_file, {"stage": "awaiting_input",
                                 "need": "bed_clear_start",
                                 "request_id": request_id}, json_events)
@@ -3396,6 +3402,105 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "reason": None}
 
 
+# Model-free YES (post-incident 2026-07-07): the agent model fired the
+# emitted confirm command itself — no operator YES ever happened. Guidance
+# cannot bound an agentic model, so bed_clear_start events no longer carry
+# any confirm command. The workflow arms a marker file instead; the
+# u1_confirm_start gateway hook redeems the operator's actual YES message
+# by spawning the confirm command directly. The model has nothing to fire.
+_PENDING_CONFIRM_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
+                                           "/tmp/u1_pending_confirm"))
+_PENDING_CONFIRM_TTL_S = 15 * 60
+
+
+def _arm_pending_confirm(request_id: str, confirm_token: str,
+                         filename: str | None, operator: str | None) -> None:
+    """Write the per-request marker the u1_confirm_start hook redeems.
+    Overwrites any previous marker for this request (re-prompt re-arms)."""
+    from datetime import datetime, timedelta, timezone
+    req_dir = u1_request.request_dir(request_id)
+    cmd = ["python3", "/opt/data/scripts/u1_kit_workflow.py",
+           "--confirm-start", confirm_token, "--json-events"]
+    if operator:
+        cmd += ["--operator", operator]
+    entry = {
+        "request_id": request_id,
+        "confirm_cmd": cmd,
+        "log_path": str(req_dir / "confirm_via_hook.log"),
+        "filename": filename,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc)
+                       + timedelta(seconds=_PENDING_CONFIRM_TTL_S)).isoformat(),
+    }
+    _PENDING_CONFIRM_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
+    tmp.write_text(json.dumps(entry, indent=2))
+    tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+
+
+def _disarm_pending_confirm(request_id: str) -> None:
+    try:
+        (_PENDING_CONFIRM_DIR / f"{request_id}.json").unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+_MODEL_FREE_YES_INSTRUCTION = (
+    "FIRST surface the kit_plate_preview + bed_snapshot image paths BARE "
+    "and attach the review_doc, THEN the prompt — the operator decides "
+    "looking at the real bed. The operator's YES and CANCEL are both "
+    "handled by the gateway directly; you hold NO start command and must "
+    "not compose one. After the operator replies YES the printer countdown "
+    "message arrives on its own. On NO: the gcode stays uploaded (staged), "
+    "nothing prints; acknowledge and stop.")
+
+
+def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, Any]:
+    """Model-relayable SAFE-direction fallback: touch every active grace
+    cancel marker (same contract as the u1_grace_cancel hook). Exists
+    because an operator message that arrives as a mid-turn interrupt
+    bypasses gateway hooks (live 2026-07-07) — the model can then still
+    relay a cancel. It can only ever stop a print with this; there is no
+    start analogue by design."""
+    from datetime import datetime, timezone
+    pending_dir = Path(os.environ.get("U1_PENDING_CANCEL_DIR",
+                                      "/tmp/u1_pending_cancel"))
+    touched: list[str] = []
+    now = datetime.now(timezone.utc)
+    if pending_dir.exists():
+        for f in sorted(pending_dir.iterdir()):
+            if not f.is_file() or f.suffix != ".json":
+                continue
+            try:
+                st = json.loads(f.read_text())
+                marker = st.get("cancel_marker")
+                exp = st.get("expires_at")
+                if exp:
+                    try:
+                        if now > datetime.fromisoformat(exp.replace("Z", "+00:00")):
+                            continue
+                    except ValueError:
+                        pass
+                if marker:
+                    Path(marker).parent.mkdir(parents=True, exist_ok=True)
+                    Path(marker).write_text("cancel via workflow --grace-cancel")
+                    touched.append(st.get("request_id", "unknown"))
+            except Exception:
+                continue
+    for rid in touched:
+        _audit(rid, "grace_cancel_via_workflow", operator)
+    _emit(None, {"stage": "grace_cancel",
+                 "cancelled_request_ids": touched,
+                 "message": (f"Cancelled {len(touched)} pending start(s)."
+                             if touched else
+                             "No active grace window to cancel."),
+                 "instruction": "Tell the operator this outcome verbatim."},
+          json_events)
+    return {"phase": "grace_cancel", "cancelled": touched}
+
+
 def _printer_gcode_filenames() -> set[str] | None:
     """Names in the printer's gcodes root, or None when Moonraker is
     unreachable (callers treat None as unknown and fail closed at start)."""
@@ -3758,24 +3863,19 @@ def _action_start(events_file: Path | None, request_id: str,
             "requires_fresh_operator_bed_clear": True,
             "approval_prompt_key": "bed_clear_start",
             "prompt": prompt,
-            "instruction": ("FIRST surface the kit_plate_preview + bed_snapshot "
-                            "image paths BARE and attach the review_doc, THEN "
-                            "the prompt — the operator decides looking at the "
-                            "real bed. On NO: the gcode stays uploaded (staged), "
-                            "nothing prints; acknowledge and stop."),
+            "instruction": _MODEL_FREE_YES_INSTRUCTION,
             "expected_answers": ["yes", "no"],
-            # Short confirm token instead of a ~200-char verbatim command:
-            # the model relays ONE opaque token, the workflow resolves the
-            # request + nonce + full kit context from persisted state. This
-            # stopped gemma4 mangling the request_id mid-command. Single-use;
-            # the nonce still does the auth (revision + gcode binding).
-            "next_command_on_yes": (
-                f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                f"--confirm-start {confirm_token}"),
+            # Model-free YES (2026-07-07 incident): no confirm command is
+            # emitted to the model AT ALL — it fired one itself once. The
+            # marker below arms the u1_confirm_start gateway hook, which
+            # redeems the operator's literal YES message. Same single-use
+            # token + nonce chain underneath; only the trigger moved.
             "next_command_on_no": None,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
         }
+        _arm_pending_confirm(request_id, confirm_token,
+                             state.get("printer_storage_filename"), operator)
         _emit(events_file, need, json_events)
         _emit(events_file, {"stage": "awaiting_input",
                             "need": "bed_clear_start",
@@ -5101,6 +5201,11 @@ def main(argv=None) -> int:
                           "short token (it mangled the old long command); the "
                           "workflow resolves the request + single-use nonce "
                           "from persisted state. Never hand-assemble it."))
+    ap.add_argument("--grace-cancel", action="store_true", dest="grace_cancel",
+                    help=("Cancel every active pre-start grace window (touches "
+                          "the same markers the gateway cancel hook does). The "
+                          "ONLY start-gate command the agent may run on its own "
+                          "initiative — it can only ever STOP a print."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "

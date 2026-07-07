@@ -1,0 +1,15 @@
+name: u1_confirm_start
+description: |
+  Snapmaker U1 model-free print-start confirmation.
+  The workflow arms /tmp/u1_pending_confirm/<request_id>.json at the
+  bed-clear prompt (the emitted event carries NO confirm command — the
+  agent model holds nothing it could fire). This hook watches operator
+  messages: a bare YES reply redeems the single pending window by
+  spawning the confirm command detached from the gateway process;
+  `yes <code>` scopes to one window when several exist. With multiple
+  windows and a bare yes it refuses and logs — a print start never
+  guesses. Every downstream safety layer (single-use token, nonce,
+  revision + gcode binding, grace window, cancel hook) is unchanged.
+  NO AI in the loop; the gateway calls this handler directly.
+events:
+  - agent:start

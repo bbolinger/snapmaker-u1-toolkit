@@ -9,9 +9,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import u1_form
 import u1_request
 import u1_kit_workflow as kw
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_confirm_markers(tmp_path, monkeypatch):
+    monkeypatch.setattr(kw, "_PENDING_CONFIRM_DIR", tmp_path / "pending_confirm")
 
 
 def _seed_uploaded_request(model="widget", fname=None, tool="T1",
@@ -87,7 +93,12 @@ def test_reprint_start_reaches_bed_clear(monkeypatch, capsys):
     pending = st["safety"]["pending_bed_clear_start"]
     assert pending["gcode_hash"] == "sha256:abc123" and pending["confirm_token"]
     out = capsys.readouterr().out
-    assert "--confirm-start " + pending["confirm_token"] in out
+    # Model-free YES: the token is armed on disk for the gateway hook, and
+    # never emitted where the model could fire it.
+    assert pending["confirm_token"] not in out
+    marker = kw._PENDING_CONFIRM_DIR / f"{new_rid}.json"
+    assert marker.exists()
+    assert pending["confirm_token"] in marker.read_text()
 
 
 def test_reprint_refuses_when_file_gone(monkeypatch, capsys):

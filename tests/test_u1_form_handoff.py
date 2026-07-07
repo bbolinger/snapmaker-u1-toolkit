@@ -220,7 +220,8 @@ def test_duplicate_redeem_reemits_bed_clear_not_form(tmp_path, hermetic_commit, 
                                     redeem_pending_form=True, live_upload=True))
     assert res["phase"] == "awaiting_bed_clear_start", res
     out = capsys.readouterr().out
-    assert "bed_clear_start" in out and tok in out   # same prompt + token re-surfaced
+    assert "bed_clear_start" in out
+    assert tok not in out   # model-free YES: the token re-arms on disk, not in the event
     assert '"kit_form"' not in out                   # did NOT re-render a fresh form
 
 
