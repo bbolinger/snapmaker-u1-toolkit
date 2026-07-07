@@ -53,6 +53,15 @@ _OP_USER = "555000111"
 _OMIT = object()
 
 
+@pytest.fixture(autouse=True)
+def _stable_printer_metadata(monkeypatch):
+    """Reprint-style seeds bind printer-side size+modified; hermetic
+    default keeps them stable so identity checks pass unless a test
+    drifts them on purpose."""
+    monkeypatch.setattr(kw, "_printer_file_metadata",
+                        lambda fname: {"size": 4242, "modified": 1751900000.0})
+
+
 @pytest.fixture()
 def pending_dir(tmp_path, monkeypatch):
     d = tmp_path / "pending_confirm"
