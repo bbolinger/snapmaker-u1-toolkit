@@ -244,8 +244,12 @@ def _operator_binding_ok(state: dict, context: dict) -> bool:
     # feature by design — a group chat refuses outright, and a chat_id
     # mismatch (same operator, different conversation) refuses too. A
     # marker without the chat field (legacy shape) refuses, fail closed.
+    # Gateways name the one-on-one chat differently: Telegram's Bot API
+    # says "private", Hermes normalizes to "dm" (live 2026-07-07: the
+    # operator's own DM was refused for not being called "private").
+    _PRIVATE_CHAT_TYPES = {"private", "dm", "direct", "im"}
     chat_type = str(context.get("chat_type") or "").strip().lower()
-    if chat_type and chat_type != "private":
+    if chat_type and chat_type not in _PRIVATE_CHAT_TYPES:
         _log({"event": "confirm_refused_not_private_chat",
               "request_id": rid, "chat_type": chat_type,
               "user_id": context.get("user_id")})

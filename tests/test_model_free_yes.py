@@ -663,6 +663,19 @@ def test_marker_without_chat_binding_refuses(pending_dir, monkeypatch):
     assert spawned == []
 
 
+@pytest.mark.parametrize("ctype", ["private", "dm", "direct", "im"])
+def test_private_dm_chat_type_synonyms_succeed(pending_dir, monkeypatch, ctype):
+    """Hermes says "dm" where Telegram says "private" (live 2026-07-07:
+    the operator's own DM was refused). Every one-on-one synonym passes;
+    anything else still refuses."""
+    _marker(pending_dir)
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+    asyncio.run(hook.handle("agent:start", _ctx(chat_type=ctype)))
+    assert len(spawned) == 1
+
+
 def test_empty_chat_type_with_right_chat_id_succeeds(pending_dir, monkeypatch):
     """Some gateway paths omit chat_type; the chat_id equality still
     gates. Absence of evidence about the chat KIND is tolerated only when
