@@ -28,6 +28,21 @@ start trigger now lives where model behavior cannot reach it.
   was lost), so the agent may now relay `--grace-cancel` — a command that
   can only ever stop a pending start. Capability is asymmetric by design:
   the model can help cancel, and cannot help start.
+- **Review hardening on the same boundary.** The armed YES window is
+  opaque (no command, no token — the hook builds its own fixed invocation
+  and never executes anything read from a file) and bound to the
+  operator's identity, refusing a YES from anyone else or when identity
+  can't be resolved. The stable-tier agent rules were rewritten to match
+  (they still taught the old command-relay flow — the strongest prompt
+  layer contradicting the boundary), with a repo test that fails if any
+  legacy start phrase reappears in a model-facing file. Reprint now binds
+  the printer-side file's size and timestamp at upload and re-checks them
+  at the confirmed yes, so a same-name overwrite can't ride a review
+  through the gate. One installer ships both gateway hooks with receipts
+  and a `--verify` mode, and an end-to-end test proves every advanced
+  override lands in the sliced gcode. SAFETY.md states the boundary
+  honestly: the agent is handed nothing it could fire, and full capability
+  separation calls for running the gateway under a separate user.
 
 ### Added
 

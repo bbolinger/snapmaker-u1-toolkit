@@ -137,13 +137,18 @@ notification but the wait still runs (in that case an SSH `touch
 Starting a print is the same trick in the other direction. At the
 bed-clear prompt the workflow arms a per-request window at
 `/tmp/u1_pending_confirm/<request_id>.json` and emits NO start command —
-the agent model holds nothing it could fire. The `u1_confirm_start`
+the agent model is handed nothing it could fire. The `u1_confirm_start`
 gateway hook redeems the operator's actual YES reply (bare `yes` when one
 window is armed; `yes <code>` when several are — a bare yes with several
 armed refuses and logs, because a start never guesses) by spawning the
 confirm command directly from the gateway process. Every downstream check
 (single-use token, nonce, revision + gcode binding, grace window, cancel
 hook) is unchanged. Zero LLM in the loop.
+
+The YES is also **bound to the operator**: the armed window records the
+operator's platform + user id (auto-resolved from the gateway config), and
+the hook refuses a YES from any other sender — or from anyone, when the
+binding can't be resolved. Missing identity refuses; a start never guesses.
 
 The failure mode is deliberately boring: **with the hook missing, YES does
 nothing — by design.** The window is armed, nothing redeems it, the token
@@ -152,6 +157,18 @@ install the hook and restart the gateway. `tools/install_hermes_u1_hooks.sh`
 installs it together with the cancel hook (there is no separate installer),
 `--verify` reports whether both are actually in place, and
 `deploy_to_runtime.sh` prints a loud warning when the receipts are absent.
+
+**An honest boundary statement.** "Handed nothing" is not "can reach
+nothing": in the default single-container deployment the gateway and the
+agent's terminal tool run as the same Unix user, so a sufficiently
+deliberate agent could read the toolkit's own state files and reconstruct
+a confirm invocation — the same way it could touch the printer's API
+directly. What this design removes is the failure that actually happened
+in live testing: an agent firing a start command it was *given*. Removing
+the capability domain itself requires running the gateway under a separate
+user (or host) from the agent worker so the state files and hook are
+simply out of reach — recommended for any deployment that is not a
+single-operator home printer, and a good idea even then.
 
 
 ---

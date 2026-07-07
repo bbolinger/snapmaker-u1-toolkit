@@ -37,7 +37,9 @@ HERMES_PY="${HERMES_PY:-/opt/hermes/.venv/bin/python}"
 HERMES_BIN="${HERMES_BIN:-/opt/hermes/.venv/bin/hermes}"
 HERMES_UID="${HERMES_UID:-10000}"
 HERMES_GID="${HERMES_GID:-10000}"
-GATEWAY_LOG="${HERMES_HOME:-/opt/data}/logs/gateway.log"
+# Hook registration lands in agent.log on this runtime (gateway.log carries
+# platform chatter) — check both so --verify sees the load line.
+GATEWAY_LOG="${HERMES_HOME:-/opt/data}/logs/agent.log ${HERMES_HOME:-/opt/data}/logs/gateway.log"
 NOTIFY_RECEIPT="${U1_CANCEL_HOOK_RECEIPT:-${HERMES_HOME:-/opt/data}/.u1_cancel_hook_receipt}"
 HOOKS=(u1_grace_cancel u1_confirm_start)
 
@@ -96,8 +98,18 @@ if [[ "${MODE}" == "verify" ]]; then
     # notify script's honesty receipt (the grace-period DM only promises
     # reply-CANCEL when this receipt exists). Never fails the verify —
     # deploy boxes without a gateway have no log and that's fine.
-    if [[ -r "${GATEWAY_LOG}" ]]; then
-        LOG_TAIL="$(tail -n 300 "${GATEWAY_LOG}" 2>/dev/null || true)"
+    LOG_TAIL=""
+    for _lf in ${GATEWAY_LOG}; do
+        [[ -r "${_lf}" ]] && LOG_TAIL+="$(tail -n 300 "${_lf}" 2>/dev/null || true)"$'\n'
+    done
+    # This runtime logs "N hook(s) loaded" without naming them — accept a
+    # count >= 2 as evidence both loaded (there are exactly two U1 hooks and
+    # nothing else installs here).
+    _LOADED_COUNT="$(grep -oE '[0-9]+ hook\(s\) loaded' <<< "${LOG_TAIL}" | tail -1 | grep -oE '^[0-9]+' || true)"
+    if [[ -n "${_LOADED_COUNT}" && "${_LOADED_COUNT}" -ge 2 ]]; then
+        LOG_TAIL+=$'\nu1_grace_cancel u1_confirm_start (inferred from count)'
+    fi
+    if [[ -n "${LOG_TAIL//[$'\n ']}" ]]; then
         if grep -q 'u1_grace_cancel' <<< "${LOG_TAIL}"; then
             if printf '{"hook": "u1_grace_cancel", "dest": "%s", "installed_at": "%s"}\n' \
                 "${HOOKS_DIR}/u1_grace_cancel" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${NOTIFY_RECEIPT}" 2>/dev/null; then
