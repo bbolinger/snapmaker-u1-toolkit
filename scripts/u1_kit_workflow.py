@@ -2201,6 +2201,16 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # fired, but don't refuse the call when the recovery succeeds.
     model_arg = getattr(args, "model", None)
     self_healed = False
+    _mangled_arg = None
+    if (model_arg and getattr(args, "request_id", None)
+            and not Path(model_arg).exists()):
+        # Anti-pattern #4b (live 2026-07-07): the agent RETYPED the verbatim
+        # next_command and corrupted the path mid-string (doc_ad25_ad25bc...),
+        # so the positional is present but points nowhere. Same recovery as
+        # the dropped-positional case: the request already persisted the real
+        # path at ingest; trust disk, not the relay.
+        _mangled_arg = model_arg
+        model_arg = None
     if not model_arg and getattr(args, "request_id", None):
         try:
             existing = u1_request.read_request(args.request_id) or {}
@@ -2210,6 +2220,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         if recovered and Path(recovered).exists():
             model_arg = recovered
             self_healed = True
+    if not model_arg and _mangled_arg:
+        model_arg = _mangled_arg  # nothing recoverable — fail on the original
     if not model_arg:
         raise SystemExit(
             "u1_kit_workflow: missing model positional and no recoverable "
@@ -2221,7 +2233,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # so the underlying agent-paraphrasing pattern is detectable later.
         _audit(args.request_id, "kit_workflow_self_healed_model_arg",
                getattr(args, "operator", None) or "unknown",
-               recovered_path=model_arg)
+               recovered_path=model_arg,
+               mangled_arg=(_mangled_arg or "")[:120] or None)
     json_events = bool(getattr(args, "json_events", False))
     nozzle = getattr(args, "nozzle", "0.4")
     no_live_material = bool(getattr(args, "no_live_material", False))
