@@ -1988,6 +1988,12 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         # default path never sees it.
         "offer_advanced": True,
     }
+    # v2.3: quantity (print N copies) — offered ONLY for single-part jobs.
+    # Multi-part kits keep per-part quantities out of scope; the operator
+    # picks parts instead. The commit path duplicates the lone path N times
+    # so the arranger + overflow split treat it exactly like a kit of N.
+    if len(parts) <= 1:
+        spec["offer_quantity"] = True
     if heads:
         spec["heads"] = heads
         spec["tool_materials"] = {h["tool"]: h["material"] for h in heads}
@@ -4677,6 +4683,15 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     selected = [kit["parts"][i - 1] for i in sel_idx]
     selected_paths = [p["path"] for p in selected]
 
+    # Quantity (v2.3): N copies of a single-part job. Duplicating the lone
+    # path N times reuses the whole kit pipeline untouched — the arranger
+    # packs N instances, the instance-keyed previews draw every copy, and
+    # the plate-overflow split absorbs an N that can't fit one bed. Only
+    # single-part specs offer/parse the field, so real kits never hit this.
+    quantity = int(values.get("quantity") or 1)
+    if quantity > 1 and len(selected_paths) == 1:
+        selected_paths = selected_paths * quantity
+
     tool = values["tool"]
     material = values["material"]
     auto_orient = values.get("orient") == "auto"
@@ -4722,8 +4737,11 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         return {"phase": "slice_failed", "request_id": request_id, "error": str(exc)[:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
+    # quantity only appears in the audit trail when it changed the plan —
+    # default single-copy rows stay identical to every pre-quantity run.
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
-           parts=len(selected_paths), tool=tool, material=material, profile=profile_slug)
+           parts=len(selected), tool=tool, material=material, profile=profile_slug,
+           **({"quantity": quantity} if quantity > 1 else {}))
 
     kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     live = bool(getattr(args, "live_upload", False))
@@ -4749,7 +4767,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         layout, injection = _render_and_inject_plate_preview(
             named, idx, len(arr["plates"]), out_dir,
             arranged_stls=(pl.get("arranged_stls") or []),
-            selected_count=len(selected),
+            # instance count, not distinct parts — a 3-copy plate labels "3
+            # parts", matching what the operator sees on the bed render
+            selected_count=len(selected_paths),
             tool_choice=tool, material=material,
             bed_mm=u1_kit.DEFAULT_BED_MM,
             arrange_3mf=pl.get("arrange_3mf"),
@@ -4883,7 +4903,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                        "profile": _profile_label,
                        "orient": values.get("orient"),
                        "supports": supports,
-                       "parts": _parts_display},
+                       "parts": _parts_display,
+                       **({"quantity": quantity} if quantity > 1 else {})},
             operator=operator,
             reference=u1_review_doc.build_reference(
                 profile_slug, material, nozzle=nozzle, out_dir=out_dir),
@@ -4947,6 +4968,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         printer_storage_filename=plate1["printer_storage_filename"],
         start_gate_stage1_command=stage1_cmd,
         readiness_card_event=readiness,
+        # persisted only when the plan actually asked for copies — default
+        # runs keep request.json identical to every pre-quantity request
+        **({"quantity": quantity} if quantity > 1 else {}),
     )
     _audit(request_id, "kit_readiness_card_emitted", operator,
            plate_count=len(plates_state), gated_plate=plate1["printer_storage_filename"],

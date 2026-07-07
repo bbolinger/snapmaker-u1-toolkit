@@ -436,7 +436,8 @@ def generate(
     L += _sep("YOUR DECISIONS")
     label_map = [("tool", "Toolhead"), ("material", "Material"),
                  ("profile", "Profile"), ("orient", "Orientation"),
-                 ("supports", "Supports"), ("parts", "Parts")]
+                 ("supports", "Supports"), ("parts", "Parts"),
+                 ("quantity", "Copies")]
     decs = []
     for key, label in label_map:
         v = decisions.get(key) if key in decisions else state.get(key)

@@ -27,6 +27,10 @@ Field grammar (all order-independent, ``|`` / ``;`` / newline separated):
                ``overhangs`` is recognized but rejected as not-offered —
                enable_support is binary in the profile patch; a distinct
                overhangs-only mode is not implemented (do not offer it).
+  - quantity : ``x3`` | ``3x`` | ``qty 3`` | ``quantity 3`` (default: 1).
+               Only when the spec offers it (single-part jobs). A bare
+               integer keeps its existing meaning (profile index / loud
+               kit ambiguity) — quantity is always an explicit form.
   - action   : ``start`` | ``upload-only``             (default: start; nothing
                physically starts without the separate Stage-1 photo + yes)
 
@@ -126,6 +130,18 @@ ADVANCED_FIELDS = (
 _ADVANCED_BY_ID = {fid: (orca_key, mapping)
                    for fid, _lbl, _opts, orca_key, mapping in ADVANCED_FIELDS}
 
+# Quantity (v2.3): print N copies of a SINGLE-part job. The workflow sets
+# spec["offer_quantity"] only when the kit has one part — per-part quantities
+# on multi-part kits are out of scope (the operator picks parts instead). The
+# commit path duplicates the lone part path N times, so the arranger packs N
+# instances and the existing plate-overflow split absorbs a count that does
+# not fit one bed. Labels are self-describing (shared setup screen).
+QUANTITY_OPTIONS = (
+    ("1", "1 copy"), ("2", "2 copies"), ("3", "3 copies"),
+    ("4", "4 copies"), ("6", "6 copies"), ("9", "9 copies"),
+)
+_QUANTITY_IDS = {qid for qid, _ in QUANTITY_OPTIONS}
+
 
 _TOOL_RE = re.compile(r"^t([0-9])$", re.IGNORECASE)
 _PARTS_PREFIX_RE = re.compile(r"^(?:parts?|p)\s+(.+)$", re.IGNORECASE)
@@ -141,6 +157,15 @@ _ADV_FUZZY_RE = re.compile(r"^fuzzy(?:[\s-]*skin)?(?:\s+(on|off))?$", re.IGNOREC
 # support style needs the word: "tree supports" / "grid supports" / "tree".
 _ADV_PATTERN_IDS = {"grid", "gyroid", "honeycomb", "triangles", "cubic"}
 _ADV_SUPSTYLE_RE = re.compile(r"^(tree|grid)[\s-]+supports?$|^tree$", re.IGNORECASE)
+# Quantity tokens (v2.3), text mode: "qty 3" / "quantity 3" / "x3" / "3x" /
+# "3 copies". Anchored, explicit forms ONLY — a bare integer keeps its
+# existing meaning (profile index on a partless spec, loud ambiguity error
+# on a kit) and numeric lists stay part selections.
+_QTY_RE = re.compile(
+    r"^(?:qty|quantity|copies)\s*[:=]?\s*(\d{1,2})$"
+    r"|^x\s*(\d{1,2})$"
+    r"|^(\d{1,2})\s*(?:x|cop(?:y|ies))$",
+    re.IGNORECASE)
 _INT_RE = re.compile(r"^\d+$")
 _INT_LIST_RE = re.compile(r"^\d+(?:\s*[,\s-]\s*\d+)*$")  # 1,3,5 or 1-4 or "1 3 5"
 
@@ -281,6 +306,22 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
                     _set(values, "parts", idxs, errors, tok)
             continue
 
+        # quantity (v2.3) — only when the spec offers it (single-part jobs).
+        # Explicit forms only; validated against the offered counts so both
+        # intakes accept the same values. A conflicting repeat fails loudly
+        # via _set like every other field.
+        if spec.get("offer_quantity"):
+            m = _QTY_RE.match(tok)
+            if m:
+                q = int(next(g for g in m.groups() if g))
+                if str(q) not in _QUANTITY_IDS:
+                    errors.append(
+                        f"quantity {q} not offered "
+                        f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
+                else:
+                    _set(values, "quantity", q, errors, tok)
+                continue
+
         # Advanced overrides (v2.3), only when the spec offers them. Each maps
         # an operator token to the Orca profile key/value; a conflicting
         # repeat fails loudly like every other field.
@@ -408,6 +449,10 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
                       else (supports_offered[0] if supports_offered else "no-supports"))
     values.setdefault("action", "start" if "start" in actions_allowed
                       else (actions_offered[0] if actions_offered else "start"))
+    # Quantity defaults to 1 ONLY when offered — specs that never offered it
+    # (multi-part kits, pre-v2.3 flows) keep their decision set unchanged.
+    if spec.get("offer_quantity"):
+        values.setdefault("quantity", 1)
 
     # Merged head/material: when the head carries its loaded filament (live
     # tool map), picking the head sets the material — no Material screen. Derive
@@ -549,6 +594,10 @@ def build_form(spec: dict[str, Any]) -> str:
         for p in profiles:
             lines.append(f"  {p.get('idx')}. {_clean_label(p.get('label'))}")
     lines.append("SUPPORTS: " + " | ".join(spec.get("supports", ["no-supports"])))
+    if spec.get("offer_quantity"):
+        lines.append("QUANTITY (copies): "
+                     + " | ".join(i for i, _ in QUANTITY_OPTIONS)
+                     + " — e.g. `x3` (default 1)")
     lines.append("ACTION: " + " | ".join(spec.get("actions", ["start", "upload-only"])))
     lines.append("")
     ex_parts = "parts 1,3 | " if parts else ""
@@ -829,6 +878,14 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                    "group": _GROUP, "compact": True,
                    "options": [{"id": s, "label": _sup_lbl.get(s, s)} for s in _sup_ordered],
                    "default": "no-supports"})
+    # Quantity (v2.3): copies of the lone part — only when the workflow
+    # offered it (single-part jobs). Rides the setup group so it doesn't add
+    # a screen; compact packs the six options two per row.
+    if spec.get("offer_quantity"):
+        fields.append({"id": "quantity", "type": "single_select",
+                       "label": "Quantity", "group": _GROUP, "compact": True,
+                       "options": [{"id": i, "label": l} for i, l in QUANTITY_OPTIONS],
+                       "default": "1", "required": False})
     profiles = spec.get("profiles", [])
     if profiles:
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
@@ -951,6 +1008,18 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
         else:
             errors.append(f"unknown action {obj['action']!r}")
 
+    # quantity (v2.3) — honored only when the spec offered it (single-part
+    # jobs). Option ids are strings ("1".."9"); a widget can only send an
+    # offered id, so anything else fails loudly.
+    if spec.get("offer_quantity") and obj.get("quantity") not in (None, ""):
+        q = str(obj["quantity"]).strip()
+        if q in _QUANTITY_IDS:
+            values["quantity"] = int(q)
+        else:
+            errors.append(
+                f"quantity {obj['quantity']!r} not offered "
+                f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
+
     # Advanced overrides (v2.3) — honored only when the spec offered them.
     # "default" (or absent) = no override; anything else must be an offered
     # option id, mapped here to the Orca profile key/value.
@@ -979,6 +1048,10 @@ def echo_parse(values: dict[str, Any], spec: dict[str, Any]) -> str:
         else:
             labels = [parts[i - 1].get("id", str(i)) for i in sel]
             bits.append("parts=" + ",".join(labels))
+    # Quantity only earns a slot when it changes the plan — the default single
+    # copy would just be noise on every readiness card.
+    if values.get("quantity", 1) != 1:
+        bits.append(f"quantity={values['quantity']}")
     bits.append(f"orient={values.get('orient')}")
     if "tool" in values:
         bits.append(f"tool={values['tool']}")
