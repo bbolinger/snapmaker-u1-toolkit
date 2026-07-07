@@ -199,3 +199,42 @@ def test_reprint_satisfies_can_start(monkeypatch):
     req2 = dict(req); req2["gcode_hash"] = "sha256:tampered"
     allowed2, reason2 = u1_safety.can_start(req2)
     assert not allowed2 and "gcode regenerated" in reason2
+
+def test_reprint_of_reprint_resurfaces_original_artifacts(monkeypatch, capsys, tmp_path):
+    """Live 2026-07-07: reprinting a reprint showed the operator a bed photo
+    and nothing else — the seeded request carried no preview/iso/review
+    pointers, so the review moment was visually empty while the prompt
+    claimed everything was attached. The resolver must walk reprint_of back
+    to whoever has the artifacts, emit them, and persist the pointers on the
+    new seed (chains stay one hop deep)."""
+    import json as _json
+    old_rid, fname = _seed_uploaded_request()
+    # give the ORIGINAL request real artifact files + pointers
+    art_dir = tmp_path / "orig"; art_dir.mkdir()
+    prev = art_dir / "plate_1_preview.png"; prev.write_bytes(b"png")
+    iso = art_dir / "plate_1_iso.png"; iso.write_bytes(b"png")
+    rev = art_dir / "review.md"; rev.write_text("# review")
+    st = u1_request.read_request(old_rid)
+    plates = st["plates"]; plates[0]["preview_path"] = str(prev); plates[0]["iso_path"] = str(iso)
+    u1_request.write_request(old_rid, plates=plates, out_dir=str(art_dir))
+
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+
+    # hop 1: reprint the original
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    r1 = kw._action_reprint_start(None, True, "test-op", tok)
+    mid_rid = r1["request_id"]
+    capsys.readouterr()
+
+    # hop 2: reprint the REPRINT (the live failure case)
+    tok2 = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok2, mid_rid)
+    r2 = kw._action_reprint_start(None, True, "test-op", tok2)
+    out = capsys.readouterr().out
+    assert str(prev) in out, "original preview not re-surfaced on 2nd-gen reprint"
+    assert str(iso) in out
+    assert str(rev) in out, "original review.md not re-surfaced on 2nd-gen reprint"
+    # and the new seed carries the pointers forward
+    st2 = u1_request.read_request(r2["request_id"])
+    assert st2["plates"][0]["preview_path"] == str(prev)
+    assert st2["review_path"] == str(rev)

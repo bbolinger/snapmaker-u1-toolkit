@@ -3581,6 +3581,35 @@ def _reprint_candidates(limit: int = 6) -> list[dict[str, Any]]:
     return out
 
 
+def _resolve_reprint_artifacts(old: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """(preview_path, iso_path, review_path) for a reprint source, walking
+    the reprint_of chain when needed. A reprint-seeded request carries gcode
+    pointers but (before this existed) not the render artifacts — live
+    2026-07-07: reprinting a reprint showed the operator a bed photo and
+    nothing else. The chain is short and cycle-guarded; first hop that has a
+    real preview on disk wins."""
+    seen: set[str] = set()
+    cur: dict[str, Any] | None = old
+    for _ in range(6):
+        if not cur:
+            break
+        p0 = (cur.get("plates") or [{}])[0]
+        prev = p0.get("preview_path")
+        if prev and Path(prev).is_file():
+            iso = p0.get("iso_path")
+            rev = cur.get("review_path") or str(
+                Path(cur.get("out_dir") or "") / "review.md")
+            return (prev,
+                    iso if iso and Path(iso).is_file() else None,
+                    rev if rev and Path(rev).is_file() else None)
+        nxt = cur.get("reprint_of")
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        cur = u1_request.read_request(nxt)
+    return None, None, None
+
+
 def _action_reprint_list(events_file: Path | None, json_events: bool,
                          operator: str) -> dict[str, Any]:
     """Turn 1: list recent prints, each with a single-use pick token. The
@@ -3681,6 +3710,7 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                reprint_of=old_rid, reason=str(bed.get("reason"))[:160])
         return {"phase": "reprint_bed_capture_failed", "request_id": new_rid}
 
+    _art_preview, _art_iso, _art_review = _resolve_reprint_artifacts(old)
     u1_request.write_request(
         new_rid,
         reprint_of=old_rid,
@@ -3696,7 +3726,10 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                  "gcode_hash": plates[0].get("gcode_hash"),
                  "gcode_path": plates[0].get("gcode_path"),
                  "printer_storage_filename": fname,
+                 "preview_path": _art_preview,
+                 "iso_path": _art_iso,
                  "uploaded": True}],
+        review_path=_art_review,
         operator=operator,
         safety={"approval_token": bed["token"],
                 "snapshot_path": bed.get("snapshot_path"),
@@ -3710,17 +3743,16 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
     # request dir), then the fresh bed photo — so the stock bed-clear prompt
     # ("sliced plate, review doc, and a fresh bed photo are attached") stays
     # literally true for a reprint.
-    for kind, path in (("kit_plate_preview", plates[0].get("preview_path")),
-                       ("kit_plate_isometric", plates[0].get("iso_path"))):
+    for kind, path in (("kit_plate_preview", _art_preview),
+                       ("kit_plate_isometric", _art_iso)):
         if path and Path(path).is_file():
             _emit(events_file, {"stage": "render", "request_id": new_rid,
                                 "kind": kind, "image": path,
                                 "instruction": "Surface this image path BARE in your reply."},
                   json_events)
-    _old_review = Path(old.get("out_dir") or "") / "review.md"
-    if _old_review.is_file():
+    if _art_review and Path(_art_review).is_file():
         _emit(events_file, {"stage": "review_doc", "request_id": new_rid,
-                            "path": str(_old_review)}, json_events)
+                            "path": _art_review}, json_events)
     if bed.get("snapshot_path"):
         _emit(events_file, {"stage": "render", "request_id": new_rid,
                             "kind": "bed_snapshot", "image": bed["snapshot_path"],
