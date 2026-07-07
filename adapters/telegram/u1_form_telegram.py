@@ -111,7 +111,10 @@ def _screens(form: dict[str, Any]) -> list[list[dict[str, Any]]]:
     screen-fields sharing a non-empty ``group`` (e.g. head + orient + supports
     render together), or a single ungrouped field. submit_choice fields have no
     screen."""
-    fields = [f for f in form["schema"]["fields"] if _is_screen_field(f)]
+    # Advanced fields (v2.3) are excluded from the linear flow — they are
+    # only reachable from the Review screen's Advanced button.
+    fields = [f for f in form["schema"]["fields"]
+              if _is_screen_field(f) and not f.get("advanced")]
     screens: list[list[dict[str, Any]]] = []
     i = 0
     while i < len(fields):
@@ -128,11 +131,20 @@ def _screens(form: dict[str, Any]) -> list[list[dict[str, Any]]]:
     return screens
 
 
+def _advanced_fields(form: dict[str, Any]) -> list[dict[str, Any]]:
+    """The advanced-override fields (one shared screen), possibly empty."""
+    return [f for f in form["schema"]["fields"]
+            if _is_screen_field(f) and f.get("advanced")]
+
+
 def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
     """The screen (list of fields) that renders together with ``fid``."""
     for screen in _screens(form):
         if any(f["id"] == fid for f in screen):
             return screen
+    adv = _advanced_fields(form)
+    if any(f["id"] == fid for f in adv):
+        return adv
     return [_field(form, fid)]
 
 
@@ -195,14 +207,18 @@ def _join_human(items: list[str]) -> str:
 
 def _screen_pos(form: dict[str, Any], fid: str) -> str:
     screens = _screens(form)
-    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), 0)
+    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), None)
+    if pos is None:
+        return "Optional"  # advanced screen sits outside the numbered flow
     return f"Step {pos + 1} of {len(screens)}"
 
 
 def _step_suffix(form: dict[str, Any], fid: str) -> str:
     """"Step N of M" over SCREENS (a group counts as one screen)."""
     screens = _screens(form)
-    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), 0)
+    pos = next((i for i, sc in enumerate(screens) if any(f["id"] == fid for f in sc)), None)
+    if pos is None:
+        return "\n<i>Optional — Advanced</i>"
     return f"\n<i>Step {pos + 1} of {len(screens)}</i>"
 
 
@@ -324,6 +340,25 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         lines.append(f"\u2022 <b>{_esc(field.get('label', field['id']))}</b>: {_esc(echo)}")
         rows.append([{"text": f"\u270e Edit {field.get('label', field['id'])}",
                       "callback_data": f"e:{fi}"}])
+    # Advanced overrides (v2.3): one summary line when anything is
+    # non-default, and a jump button. The button reuses the Edit-from-review
+    # jump (e:<fi>), so the group's Next returns straight here.
+    adv = _advanced_fields(form)
+    if adv:
+        changed = []
+        for f in adv:
+            sel = form["selections"].get(f["id"])
+            if sel is not None and _opt_id(f["options"][sel]) != "default":
+                changed.append(f"{f.get('label', f['id'])}: "
+                               f"{_opt_label(f['options'][sel])}")
+        if changed:
+            lines.append("\u2022 <b>Advanced</b>: " + _esc(", ".join(changed)))
+        rows.append([{
+            "text": ("\u2699 Advanced settings"
+                     + (f" ({len(changed)} set)" if changed else "")),
+            "callback_data": f"e:{_field_index(form, adv[0]['id'])}",
+        }])
+
     # Action becomes the submit verbs: each option submits with that action.
     submit_field = next((f for f in form["schema"]["fields"] if f.get("submit_choice")), None)
     if submit_field:

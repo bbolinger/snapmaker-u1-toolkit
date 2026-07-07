@@ -80,9 +80,51 @@ _ACTIONS = {
     "upload": "upload-only",
 }
 
+# Advanced settings (v2.3): optional per-run slicer overrides, reached from
+# the form's Review screen via the Advanced button. "default" = no override
+# (the picked profile's own value stands). Each entry: (field_id, label,
+# [(option_id, option_label), ...], orca_key, {option_id: orca_value}).
+ADVANCED_FIELDS = (
+    ("infill", "Infill density",
+     [("default", "Profile default"), ("10", "10%"), ("15", "15%"),
+      ("20", "20%"), ("30", "30%"), ("40", "40%"), ("50", "50%")],
+     "sparse_infill_density",
+     {"10": "10%", "15": "15%", "20": "20%", "30": "30%",
+      "40": "40%", "50": "50%"}),
+    ("infill_pattern", "Infill pattern",
+     [("default", "Profile default"), ("grid", "Grid"), ("gyroid", "Gyroid"),
+      ("honeycomb", "Honeycomb"), ("triangles", "Triangles"),
+      ("cubic", "Cubic")],
+     "sparse_infill_pattern",
+     {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
+      "triangles": "triangles", "cubic": "cubic"}),
+    ("walls", "Wall loops",
+     [("default", "Profile default"), ("2", "2"), ("3", "3"), ("4", "4")],
+     "wall_loops", {"2": "2", "3": "3", "4": "4"}),
+    ("brim", "Brim",
+     [("default", "Profile default"), ("off", "Off"), ("auto", "Auto")],
+     "brim_type", {"off": "no_brim", "auto": "auto_brim"}),
+    ("fuzzy", "Fuzzy skin",
+     [("default", "Profile default"), ("off", "Off"),
+      ("on", "On (outer walls)")],
+     "fuzzy_skin", {"off": "none", "on": "external"}),
+)
+
+_ADVANCED_BY_ID = {fid: (orca_key, mapping)
+                   for fid, _lbl, _opts, orca_key, mapping in ADVANCED_FIELDS}
+
+
 _TOOL_RE = re.compile(r"^t([0-9])$", re.IGNORECASE)
 _PARTS_PREFIX_RE = re.compile(r"^(?:parts?|p)\s+(.+)$", re.IGNORECASE)
 _PROFILE_PREFIX_RE = re.compile(r"^(?:profile|preset)\s+(.+)$", re.IGNORECASE)
+# Advanced-override tokens (v2.3), text mode: "infill 30%", "gyroid",
+# "walls 3", "brim off", "fuzzy". Prefixed or uniquely-named so they can't
+# collide with parts/profile numbers.
+_ADV_INFILL_RE = re.compile(r"^infill\s*(\d{1,3})\s*%?$", re.IGNORECASE)
+_ADV_WALLS_RE = re.compile(r"^walls?\s*(\d)$", re.IGNORECASE)
+_ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on)$", re.IGNORECASE)
+_ADV_FUZZY_RE = re.compile(r"^fuzzy(?:[\s-]*skin)?(?:\s+(on|off))?$", re.IGNORECASE)
+_ADV_PATTERN_IDS = {"grid", "gyroid", "honeycomb", "triangles", "cubic"}
 _INT_RE = re.compile(r"^\d+$")
 _INT_LIST_RE = re.compile(r"^\d+(?:\s*[,\s-]\s*\d+)*$")  # 1,3,5 or 1-4 or "1 3 5"
 
@@ -222,6 +264,48 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
                 else:
                     _set(values, "parts", idxs, errors, tok)
             continue
+
+        # Advanced overrides (v2.3), only when the spec offers them. Each maps
+        # an operator token to the Orca profile key/value; a conflicting
+        # repeat fails loudly like every other field.
+        if spec.get("offer_advanced"):
+            def _adv_set(field_id: str, option_id: str) -> bool:
+                orca_key, mapping = _ADVANCED_BY_ID[field_id]
+                mapped = mapping.get(option_id)
+                if mapped is None:
+                    errors.append(
+                        f"{field_id} option {option_id!r} not offered "
+                        f"(have {', '.join(sorted(mapping))})")
+                    return True
+                ov = values.setdefault("overrides", {})
+                if orca_key in ov and ov[orca_key] != mapped:
+                    errors.append(
+                        f"{field_id} given twice with different values — "
+                        f"send one value per field")
+                    return True
+                ov[orca_key] = mapped
+                return True
+            m = _ADV_INFILL_RE.match(tok)
+            if m:
+                _adv_set("infill", m.group(1))
+                continue
+            if low in _ADV_PATTERN_IDS:
+                _adv_set("infill_pattern", low)
+                continue
+            m = _ADV_WALLS_RE.match(tok)
+            if m:
+                _adv_set("walls", m.group(1))
+                continue
+            m = _ADV_BRIM_RE.match(tok)
+            if m:
+                _adv_set("brim", "auto" if m.group(1).lower() == "on"
+                         else m.group(1).lower())
+                continue
+            m = _ADV_FUZZY_RE.match(tok)
+            if m:
+                _adv_set("fuzzy", "off" if (m.group(1) or "on").lower() == "off"
+                         else "on")
+                continue
 
         # explicit profile prefix: "profile 2" / "preset slug"
         mpr = _PROFILE_PREFIX_RE.match(tok)
@@ -725,6 +809,18 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
                        "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
                        "required": True})
+    # Advanced overrides (v2.3): optional, EXCLUDED from the main screen flow —
+    # the renderer only reaches them via the Review screen's Advanced button.
+    # "default" = no override; skipping the screen is today's behavior.
+    if spec.get("offer_advanced"):
+        for _fid, _lbl, _opts, _orca_key, _mapping in ADVANCED_FIELDS:
+            fields.append({
+                "id": _fid, "type": "single_select", "label": _lbl,
+                "options": [{"id": oid, "label": olbl} for oid, olbl in _opts],
+                "default": "default", "required": False,
+                "advanced": True, "group": "advanced",
+                "group_label": "Advanced settings",
+            })
     # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
     # The single print/keep-staged decision happens AFTER slice + a FRESH bed
     # photo (you decide with the real bed in view) — not up front, before the
@@ -829,6 +925,20 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
             values["action"] = a
         else:
             errors.append(f"unknown action {obj['action']!r}")
+
+    # Advanced overrides (v2.3) — honored only when the spec offered them.
+    # "default" (or absent) = no override; anything else must be an offered
+    # option id, mapped here to the Orca profile key/value.
+    if spec.get("offer_advanced"):
+        for _fid, (_orca_key, _mapping) in _ADVANCED_BY_ID.items():
+            raw = obj.get(_fid)
+            if raw in (None, "", "default"):
+                continue
+            mapped = _mapping.get(str(raw))
+            if mapped is None:
+                errors.append(f"unknown {_fid} option {raw!r}")
+            else:
+                values.setdefault("overrides", {})[_orca_key] = mapped
 
     return _finalize(values, spec, errors)
 

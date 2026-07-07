@@ -125,6 +125,7 @@ from u1_slice_workflow import (
     list_profiles,
     profile_path,
     apply_supports_override,
+    apply_profile_overrides,
     _tool_to_index,
 )
 
@@ -1982,6 +1983,10 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "actions": ["start", "upload-only"],
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
         "_profiles_full": profiles_full,  # persisted at form-emit for index stability
+        # v2.3: offer the optional Advanced screen (infill/pattern/walls/brim/
+        # fuzzy skin) — reachable only from the form's Review button; the
+        # default path never sees it.
+        "offer_advanced": True,
     }
     if heads:
         spec["heads"] = heads
@@ -4687,6 +4692,16 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     if override in ("supports", "no_supports"):
         process = apply_supports_override(process, override == "supports", out_dir)
 
+    # v2.3 advanced overrides (from the form's Advanced screen). Applied on top
+    # of the supports patch — each pass flattens, so the temp stays
+    # self-contained. The review doc's full-config sweep marks every override
+    # as DIFFERS automatically, so the operator sees them before the yes.
+    adv_overrides = values.get("overrides") or {}
+    if adv_overrides:
+        process = apply_profile_overrides(process, adv_overrides, out_dir)
+        _audit(request_id, "advanced_overrides_applied", operator,
+               **{k: str(v) for k, v in adv_overrides.items()})
+
     slice_out = out_dir / "slice"
     _emit(events_file, {"stage": "kit_slicing", "request_id": request_id,
                         "parts": len(selected_paths), "auto_orient": auto_orient}, json_events)
@@ -4927,6 +4942,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
              "selected": [p["part_id"] for p in selected], "orient_mode": values.get("orient")},
         plates=plates_state,
         tool=tool, material=material, profile=profile_slug, supports=override,
+        overrides=values.get("overrides") or {},
         gcode_hash=plate1["gcode_hash"],
         printer_storage_filename=plate1["printer_storage_filename"],
         start_gate_stage1_command=stage1_cmd,
