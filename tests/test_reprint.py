@@ -168,3 +168,23 @@ def test_reprint_confirm_start_skips_ingest(monkeypatch, capsys):
     assert reached, f"gate turn never reached; result={out_res} out={out[:400]}"
     assert fname in " ".join(reached["argv"])          # gating the right file
     assert "kit_ingested" not in out                    # NO re-ingest happened
+
+def test_reprint_satisfies_can_start(monkeypatch):
+    """Live-caught: the gate refused the reprint with 'no readiness_card
+    emitted yet'. The reprint turn IS the review moment (original previews +
+    review doc + fresh bed photo), so it must record the audited readiness
+    row with the same revision+hash binding — and can_start() must pass."""
+    import u1_safety
+    old_rid, fname = _seed_uploaded_request()
+    monkeypatch.setattr(kw, "_printer_gcode_filenames", lambda: {fname})
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", _fake_bed_ok)
+    tok = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok, old_rid)
+    res = kw._action_reprint_start(None, True, "test-op", tok)
+    assert res["phase"] == "awaiting_bed_clear_start"
+    req = u1_request.read_request(res["request_id"])
+    allowed, reason = u1_safety.can_start(req)
+    assert allowed, f"can_start refused a seeded reprint: {reason}"
+    # And the drift check still bites: change the hash, must refuse.
+    req2 = dict(req); req2["gcode_hash"] = "sha256:tampered"
+    allowed2, reason2 = u1_safety.can_start(req2)
+    assert not allowed2 and "gcode regenerated" in reason2

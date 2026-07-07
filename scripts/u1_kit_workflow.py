@@ -3573,6 +3573,9 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
         material=old.get("material", "PETG"),
         request_revision=1,
         printer_storage_filename=fname,
+        # Top-level gcode_hash is what can_start() drift-checks against the
+        # audited readiness row.
+        gcode_hash=plates[0].get("gcode_hash"),
         plates=[{"plate_idx": 1,
                  "gcode_hash": plates[0].get("gcode_hash"),
                  "gcode_path": plates[0].get("gcode_path"),
@@ -3581,7 +3584,8 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
         operator=operator,
         safety={"approval_token": bed["token"],
                 "snapshot_path": bed.get("snapshot_path"),
-                "bed_clear_photo_captured": True},
+                "bed_clear_photo_captured": True,
+                "bed_clear_check_required": True},
     )
     _audit(new_rid, "reprint_initiated", operator, reprint_of=old_rid,
            printer_filename=fname)
@@ -3606,6 +3610,14 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                             "kind": "bed_snapshot", "image": bed["snapshot_path"],
                             "instruction": "Surface this fresh bed photo path BARE in your reply."},
               json_events)
+
+    # This turn IS the operator's review moment (original previews + review
+    # doc + fresh bed photo, above). Record it with the same revision+hash
+    # binding a kit readiness card carries — can_start() drift-checks the
+    # start against exactly this row.
+    _audit(new_rid, "reprint_readiness_card_emitted", operator,
+           request_revision=1, gcode_hash=plates[0].get("gcode_hash"),
+           reprint_of=old_rid, printer_filename=fname)
 
     return _action_start(events_file, new_rid, json_events,
                          bed_clear_confirmed=False, operator=operator)

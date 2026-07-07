@@ -31,6 +31,10 @@ _RESUMED_OR_EMITTED = (
     # workflow must be added here or can_start() will refuse Stage 2 with
     # "no readiness_card emitted yet".
     'kit_readiness_card_emitted',
+    # v2.3 reprint: the review moment is the reprint turn itself — the
+    # original plate previews + review doc are re-surfaced alongside a fresh
+    # bed photo before the operator's yes. Same revision+hash binding rules.
+    'reprint_readiness_card_emitted',
 )
 
 
