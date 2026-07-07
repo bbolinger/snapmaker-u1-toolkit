@@ -46,6 +46,7 @@ def test_send_operator_builds_button_payload(monkeypatch):
 def test_send_operator_falls_back_to_hermes_send(monkeypatch):
     calls = []
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok123")
+    monkeypatch.setenv("HERMES_BIN", "hermes")  # conftest pins /bin/true suite-wide
     monkeypatch.setattr(u1_notify, "_chat_id", lambda: "8131922235")
     monkeypatch.setattr(u1_notify.urllib.request, "urlopen",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("down")))

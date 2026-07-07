@@ -249,3 +249,31 @@ def _sandbox_start_marker_dirs(tmp_path, monkeypatch):
         monkeypatch.setattr(_kw, "_PENDING_CONFIRM_DIR", confirm_dir)
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _no_real_operator_notifications(monkeypatch, tmp_path):
+    """The suite must never message the real operator. Live 2026-07-07: the
+    per-file watchdog/notify stubs only covered one test file, so every
+    OTHER file's arming tests spawned real 15-minute expiry watchdogs
+    against pytest tmp dirs (which pytest keeps) — twelve phantom-expiry
+    DMs hit the operator's phone in a burst. Suite-wide guards:
+      * the expiry watchdog spawn is a no-op,
+      * any lazy `import u1_notify` resolves to a capture-only fake,
+      * the notifier env can't reach a real bot token.
+    Tests that WANT to observe notifications monkeypatch their own fakes
+    on top (last-in wins), same as before."""
+    import sys
+    from types import SimpleNamespace
+    try:
+        import u1_kit_workflow as _kw
+        monkeypatch.setattr(_kw, "_spawn_confirm_expiry_watchdog",
+                            lambda rid, fn: None, raising=False)
+    except Exception:
+        pass
+    sent = []
+    fake = SimpleNamespace(send_operator=lambda text, **k: sent.append(text) or True,
+                           _suite_captured=sent)
+    monkeypatch.setitem(sys.modules, "u1_notify", fake)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("HERMES_BIN", "/bin/true")
