@@ -8,11 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [2.3.0] — 2026-07-07
 
-Three operator-requested features, all behind the same safety boundary:
-recalling a recent job for a reprint, an optional advanced-settings screen,
-and printing multiple copies in one run. Nothing about the start path
-changed — every route still ends at the fresh bed photo, the explicit yes,
-and the cancellable grace window.
+Three operator-requested features plus one structural safety change born
+from a live incident during release testing: the agent model fired the
+emitted confirm command itself, starting a print no operator approved. The
+start trigger now lives where model behavior cannot reach it.
+
+### Safety
+
+- **The operator's YES is model-free.** The bed-clear prompt no longer
+  hands the agent any confirm command — the workflow arms an on-disk
+  marker and a gateway hook redeems the operator's literal YES message by
+  running the confirm itself. The model has nothing it could fire, so a
+  misbehaving (or prompt-injected) agent cannot start a print at all. The
+  single-use token, nonce, and revision/hash binding underneath are
+  unchanged. With multiple pending starts, a bare YES refuses and asks
+  for `yes <code>`: a print start never guesses.
+- **Cancel gained a second route.** An operator message that arrives as a
+  mid-turn interrupt bypasses gateway hooks (how the incident's CANCEL
+  was lost), so the agent may now relay `--grace-cancel` — a command that
+  can only ever stop a pending start. Capability is asymmetric by design:
+  the model can help cancel, and cannot help start.
 
 ### Added
 
