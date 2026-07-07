@@ -5459,6 +5459,23 @@ def main(argv=None) -> int:
     ap.add_argument("--on-collision", choices=["rename", "overwrite", "cancel"], default=None)
     a = ap.parse_args(argv)
     res = run_kit_workflow(a)
+    # Hook-run confirms (--confirm-start-for) execute detached from any chat:
+    # their output lands in a log file nobody reads live. Any outcome short
+    # of the grace window must reach the operator as a model-free DM, or the
+    # silence gets narrated by an agent that saw nothing (live 2026-07-07:
+    # "start signal sent" about a preflight refusal).
+    if getattr(a, "confirm_start_for", None):
+        _phase = (res or {}).get("phase")
+        if _phase != "grace_in_progress":
+            _reason = ((res or {}).get("reason")
+                       or "; ".join((res or {}).get("reasons") or [])
+                       or _phase or "unknown refusal")
+            try:
+                import u1_notify
+                u1_notify.send_operator(
+                    "\U0001f6ab Print NOT started — " + str(_reason)[:300])
+            except Exception:
+                pass
     if not a.json_events:
         print(json.dumps(res, indent=2, default=str))
     return 0

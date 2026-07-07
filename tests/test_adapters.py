@@ -620,7 +620,11 @@ def test_cb_handler_registered_on_live_app_not_class(monkeypatch, tmp_path):
     pytest.importorskip("telegram")
     import re
     mod = _load_plugin_pkg(monkeypatch, tmp_path)
-    tp = sys.modules["hermes_plugins.u1_form.telegram_patch"]
+    # Import explicitly instead of fishing sys.modules: the package loads
+    # telegram_patch lazily (inside dispatch), so the sys.modules entry only
+    # existed here when an earlier test happened to seed it — an ordering
+    # dependency that finally bit.
+    tp = importlib.import_module("hermes_plugins.u1_form.telegram_patch")
     cls = _fake_adapter_cls()
 
     class _P:
@@ -643,12 +647,14 @@ def test_cb_handler_registered_on_live_app_not_class(monkeypatch, tmp_path):
     inst = cls()
     inst._app = _FakeApp()
     inst._u1_ensure_cb_handler()
-    assert len(added) == 1 and added[0][1] == -11
-    inst._u1_ensure_cb_handler()  # same app: no duplicate
-    assert len(added) == 1
+    # Two pattern-scoped handlers per app since the grace-cancel button:
+    # the form vocabulary and u1c:<request_id>.
+    assert len(added) == 2 and all(g == -11 for _h, g in added)
+    inst._u1_ensure_cb_handler()  # same app: no duplicates
+    assert len(added) == 2
     inst._app = _FakeApp()        # reconnect: fresh app object
     inst._u1_ensure_cb_handler()
-    assert len(added) == 2
+    assert len(added) == 4
 
     # pattern owns the ENTIRE renderer vocabulary and nothing native
     pat = re.compile(tp.FORM_CB_PATTERN)

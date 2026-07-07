@@ -50,9 +50,9 @@ EXPIRES_AT="$(python3 -c "from datetime import datetime, timezone, timedelta; im
 CODE="${U1_REQUEST_ID: -6}"
 
 if [[ -f "${HOOK_RECEIPT}" ]]; then
-    CANCEL_LINE="Reply **CANCEL** to abort. Ignore this to let the print start."
+    CANCEL_LINE="Tap 🛑 CANCEL below, or reply CANCEL. Ignore this to let the print start."
 else
-    CANCEL_LINE="⚠️ Reply-to-cancel hook NOT detected on this host (run tools/install_hermes_cancel_hook.sh). To abort, SSH: touch '${U1_CANCEL_MARKER}'"
+    CANCEL_LINE="Tap 🛑 CANCEL below to abort. (Reply-to-cancel hook not detected — run tools/install_hermes_u1_hooks.sh. SSH fallback: touch '${U1_CANCEL_MARKER}')"
 fi
 
 read -r -d '' MSG <<EOF || true
@@ -63,9 +63,14 @@ File:     ${U1_FILENAME}
 ${CANCEL_LINE}
 EOF
 
-# Send FIRST. Only persist state on send success.
-if ! "${HERMES_BIN}" send --to "${DEST}" "${MSG}"; then
-    echo "grace-notify: hermes send failed, skipping pending state write" >&2
+# Send FIRST. Only persist state on send success. u1_notify sends via the
+# Bot API with an inline 🛑 CANCEL button (the button callback is handled at
+# the gateway adapter layer, immune to the mid-turn-interrupt loss that ate
+# typed CANCELs twice on 2026-07-07); it falls back to plain `hermes send`
+# internally when the token/API is unavailable.
+NOTIFY_PY="${U1_NOTIFY_PY:-/opt/data/scripts/u1_notify.py}"
+if ! python3 "${NOTIFY_PY}" "${MSG}" --cancel-button "${U1_REQUEST_ID}"; then
+    echo "grace-notify: operator send failed on all channels, skipping pending state write" >&2
     exit 1
 fi
 
