@@ -104,6 +104,8 @@ The same entrypoint and the same bed-clear gate handle three more moves:
 
 Hermes — and any other AI agent layered on top — can recommend, explain, and prepare a print, but the U1 toolkit owns the final safety checks and will not perform printer-affecting actions without an explicit operator approval tied to a specific request ID.
 
+**The model is never given a way to start a print.** The workflow hands the agent no start command at all — when you reply YES at the bed-clear prompt, the gateway itself redeems it and runs the start gate; the agent runs nothing. That YES is single-use and bound to your operator identity in your private chat, so a wrong sender, a wrong conversation, or a stale plan all refuse. The agent's only unattended power over the printer is in the safe direction: it can help you *cancel* a pending start, never begin one. This boundary was not designed on paper — it was forced by a live incident where an earlier build let the model fire a start it had been handed, then hardened across several rounds of adversarial review. In the default single-host deployment a deliberately hostile agent is *contained* (every start is audited, gated, and cancellable) rather than cryptographically *prevented*; the separate-user boundary that would make it prevention is on the roadmap. The full boundary, and that honest limit, are documented in [docs/SAFETY.md](docs/SAFETY.md).
+
 The default lifecycle:
 
 ```text
@@ -152,11 +154,10 @@ The full per-action breakdown (the test-operator fence, the grace-period
 cancel chain, and every allowed-vs-gated command) lives in
 [docs/SAFETY.md](docs/SAFETY.md).
 
-None of this is aspirational: the full test suite runs in CI on Python 3.11
-and 3.12 for every change, and the
-cancel chain is **live-verified on real hardware**, including a reproducible,
-no-printer-needed drill anyone can run:
-[docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
+None of this is aspirational: the full test suite runs in CI on every change
+(the deployed runtime is Python 3.13), and the cancel chain is
+**live-verified on real hardware**, including a reproducible, no-printer-needed
+drill anyone can run: [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
 
 ## Always-on print monitoring — no agent required
 
@@ -540,8 +541,8 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-The suite (840+ and counting; CI runs it on Python 3.11 and 3.12 for every
-pull request) covers: config resolution (incl. 3-tier data-dir, `.env`
+The suite (CI runs it on every pull request; the deployed runtime is Python
+3.13) covers: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
@@ -562,8 +563,8 @@ to omit if you only want to run the safety-script tests.
 
 ## Release validation
 
-Each tagged release is validated before publish: the full test suite in CI on
-Python 3.11 and 3.12, a fresh-clone install and script-help smoke test, the
+Each tagged release is validated before publish: the full test suite in CI (on
+the deployed Python 3.13 runtime), a fresh-clone install and script-help smoke test, the
 active-print upload-gate safety check against a mocked Moonraker, and, for
 releases that touch the safety boundary or the operator flow, a live run on a
 real U1. Per-release evidence lives in the [CHANGELOG](CHANGELOG.md).
