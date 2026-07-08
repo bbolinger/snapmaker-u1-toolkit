@@ -2127,6 +2127,10 @@ def run_kit_workflow(args) -> dict[str, Any]:
             }), flush=True)
             return {"phase": "bed_clear_confirm_no_pending",
                     "request_id": _confirm_for}
+        # Child-ack commitment point: we have a token and are about to consume
+        # it. Release our claim now — a crash before here is recoverable by
+        # the hook reaper; a crash after here spent the token either way.
+        _release_confirm_claim(_confirm_for)
     if _confirm_token:
         _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
         _state = u1_request.read_request(_rid) if _rid else None
@@ -3544,6 +3548,22 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
                    str(_PENDING_CONFIRM_TTL_S), generation],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _release_confirm_claim(request_id: str) -> None:
+    """Child-ack (Q3, 2026-07-08): remove the confirm hook's claim marker(s)
+    for this request. Called by the confirmed turn RIGHT BEFORE it consumes
+    the single-use token — the point of commitment. A child that crashes
+    before here leaves the claim for the hook's reaper to restore, so the
+    operator's YES is not spent by a child that never redeemed it."""
+    try:
+        for c in _PENDING_CONFIRM_DIR.glob(f"{request_id}.claimed.*.json"):
+            try:
+                c.unlink()
+            except FileNotFoundError:
+                pass
     except Exception:
         pass
 

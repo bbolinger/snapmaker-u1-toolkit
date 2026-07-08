@@ -169,6 +169,70 @@ def _delete_marker(p: Path, event: str, **details) -> None:
               "error": f"{type(exc).__name__}: {exc}", **details})
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else — treat as alive
+    except Exception:
+        return True          # unknown — do not reap on uncertainty
+
+
+def _reap_orphaned_claims() -> None:
+    """Restore a claim whose child died BEFORE releasing it (Q3, 2026-07-08).
+
+    A `<rid>.claimed.<pid>.json` still on disk with a DEAD pid means the child
+    crashed before it reached the token-consume point (where it removes its
+    own claim), so the operator's YES was never actually spent. Rename it back
+    to `<rid>.json` if the window is still live, else delete it. A live pid is
+    a confirm in flight — left alone."""
+    if not PENDING_DIR.exists():
+        return
+    now = datetime.now(timezone.utc)
+    for p in list(PENDING_DIR.iterdir()):
+        if not p.is_file() or ".claimed." not in p.name:
+            continue
+        # filename: <rid>.claimed.<pid>.json
+        try:
+            pid = int(p.name.rsplit(".claimed.", 1)[1].split(".")[0])
+        except Exception:
+            continue
+        if _pid_alive(pid):
+            continue
+        try:
+            st = json.loads(p.read_text())
+            rid = str(st.get("request_id") or "")
+            exp = st.get("expires_at")
+            live = True
+            if exp:
+                try:
+                    live = now <= datetime.fromisoformat(
+                        str(exp).replace("Z", "+00:00"))
+                except Exception:
+                    live = True
+        except Exception:
+            live, rid = False, ""
+        if not rid or not _REQUEST_ID_RE.match(rid):
+            _delete_marker(p, "confirm_claim_orphan_bad_dropped")
+            continue
+        target = PENDING_DIR / f"{rid}.json"
+        if live and not target.exists():
+            try:
+                os.replace(p, target)
+                _log({"event": "confirm_claim_orphan_restored",
+                      "request_id": rid, "dead_pid": pid})
+            except Exception as exc:
+                _log({"event": "confirm_claim_orphan_restore_failed",
+                      "request_id": rid,
+                      "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            _delete_marker(p, "confirm_claim_orphan_expired_dropped",
+                           request_id=rid)
+
+
 def _load_pending_windows() -> list[dict]:
     """Read every marker in PENDING_DIR and enforce marker hygiene.
     Returns the list of live pending-confirm state dicts.
@@ -183,6 +247,7 @@ def _load_pending_windows() -> list[dict]:
     `.claimed.` files are in-flight spawns, not windows — skipped."""
     if not PENDING_DIR.exists():
         return []
+    _reap_orphaned_claims()
     now = datetime.now(timezone.utc)
     out = []
     for p in sorted(PENDING_DIR.iterdir()):
@@ -358,11 +423,14 @@ def _spawn_confirm(state: dict) -> bool:
             except Exception:
                 pass
     if spawn_ok:
-        try:
-            claimed.unlink()
-        except Exception as exc:
-            _log({"event": "confirm_claimed_cleanup_failed", "request_id": rid,
-                  "error": f"{type(exc).__name__}: {exc}"})
+        # Q3 (child-ack, 2026-07-08): do NOT delete the claim here. The old
+        # code consumed the operator's YES the instant Popen succeeded — a
+        # child that then crashed during bootstrap/import/request-load
+        # stranded a valid YES with nothing started. The claim now stays
+        # until the CHILD releases it right before consuming the token; a
+        # child that dies before that point leaves the claim for the reaper
+        # to restore, so the operator's next YES retries. Single-fire still
+        # holds: a concurrent YES skips `.claimed.` markers.
         return True
     # Spawn failed — put the marker back while the window is still live so
     # the operator's next YES can retry.

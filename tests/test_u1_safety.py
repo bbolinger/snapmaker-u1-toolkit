@@ -10,6 +10,15 @@ import pytest
 
 import u1_audit
 import u1_print_start_gate as g
+
+
+@pytest.fixture(autouse=True)
+def _gate_file_exists_by_default(monkeypatch):
+    """Q1 (2026-07-08): the gate FAILS CLOSED when it can't confirm the gcode
+    exists on the printer. These safety-path tests assume the file is present
+    so they exercise the approval/audit logic, not the existence check."""
+    monkeypatch.setattr(g, "gcode_exists_on_printer", lambda *a, **k: True)
+
 import u1_request
 import u1_safety
 

@@ -164,8 +164,10 @@ def test_single_window_yes_spawns_and_single_fires(pending_dir, monkeypatch):
     _run(_ctx("Yes!"))
     assert spawned == [_expected_cmd(entry["request_id"])]
     assert not (pending_dir / f"{entry['request_id']}.json").exists()
-    assert list(pending_dir.iterdir()) == []  # no claimed leftovers either
-    # a second YES finds nothing — no double spawn
+    # Q3: the claim is RETAINED for the child (not deleted on spawn); its pid
+    # is this live test process, so the reaper leaves it and a second YES
+    # still finds no armed window (claimed files are never windows).
+    assert len(list(pending_dir.glob(f"{entry['request_id']}.claimed.*.json"))) == 1
     _run(_ctx())
     assert len(spawned) == 1
 
@@ -329,7 +331,8 @@ def test_spawn_failure_restores_marker(pending_dir, monkeypatch, tmp_path):
                         lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
     _run(_ctx())
     assert spawned == [_expected_cmd(entry["request_id"])]
-    assert list(pending_dir.iterdir()) == []
+    # Q3: successful retry retains the claim for the child
+    assert len(list(pending_dir.glob("*.claimed.*.json"))) == 1
 
 
 def test_second_yes_mid_claim_finds_nothing(pending_dir, monkeypatch):
@@ -353,9 +356,12 @@ def test_stale_claimed_file_is_not_a_window(pending_dir, monkeypatch):
     """A .claimed. file (in-flight or crashed spawn) never counts as an
     armed window."""
     pending_dir.mkdir(parents=True, exist_ok=True)
+    import os as _os
     entry = _marker(pending_dir)
     src = pending_dir / f"{entry['request_id']}.json"
-    src.rename(pending_dir / f"{entry['request_id']}.claimed.4242.json")
+    # a LIVE pid = confirm genuinely in flight -> never a window (the reaper
+    # only restores claims whose pid is dead).
+    src.rename(pending_dir / f"{entry['request_id']}.claimed.{_os.getpid()}.json")
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
                         lambda cmd, **kw_: spawned.append(cmd))
@@ -763,3 +769,75 @@ def test_arm_spawns_expiry_watchdog(pending_dir, tmp_path, monkeypatch):
                         lambda: ("telegram", "8131922235"))
     kw._arm_pending_confirm("u1_2026_0707_wd0001", "p.gcode", "brent")
     assert calls == [("u1_2026_0707_wd0001", "p.gcode")]
+
+
+
+# ---------- Q3: child-ack + orphan claim reaper (2026-07-08) ----------
+
+def _dead_pid():
+    import subprocess as _sp
+    d = _sp.Popen(["true"]); d.wait()
+    return d.pid           # reliably dead now
+
+
+def test_spawn_leaves_claim_for_child(pending_dir, monkeypatch):
+    """Q3: the hook no longer deletes the claim on spawn — the child owns it.
+    Previously the YES was consumed the instant Popen returned."""
+    entry = _marker(pending_dir)
+    spawned = []
+    monkeypatch.setattr(hook.subprocess, "Popen",
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+    asyncio.run(hook.handle("agent:start", _ctx()))
+    assert spawned, "should have spawned"
+    rid = entry["request_id"]
+    assert not (pending_dir / f"{rid}.json").exists()          # renamed to claim
+    claims = list(pending_dir.glob(f"{rid}.claimed.*.json"))
+    assert len(claims) == 1, "claim must be RETAINED, not deleted on spawn"
+
+
+def test_reaper_restores_orphaned_claim(pending_dir):
+    """A claim with a dead pid + live window = child crashed before consuming
+    -> restore so the operator's next YES retries."""
+    rid = "u1_2026_0708_cafe01"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    claim = pending_dir / f"{rid}.claimed.{_dead_pid()}.json"
+    claim.write_text(json.dumps({"request_id": rid,
+        "expires_at": (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()}))
+    hook._reap_orphaned_claims()
+    assert not claim.exists()
+    assert (pending_dir / f"{rid}.json").exists(), "orphan must be restored"
+
+
+def test_reaper_leaves_live_claim_alone(pending_dir, monkeypatch):
+    """A claim with a LIVE pid = confirm in flight -> untouched."""
+    rid = "u1_2026_0708_cafe02"
+    monkeypatch.setattr(hook, "_pid_alive", lambda pid: True)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    claim = pending_dir / f"{rid}.claimed.4242.json"
+    claim.write_text(json.dumps({"request_id": rid,
+        "expires_at": (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()}))
+    hook._reap_orphaned_claims()
+    assert claim.exists()
+    assert not (pending_dir / f"{rid}.json").exists()
+
+
+def test_reaper_drops_expired_orphan_without_restoring(pending_dir):
+    """Dead pid but the window already expired -> drop, do NOT restore a
+    dead window."""
+    rid = "u1_2026_0708_cafe03"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    claim = pending_dir / f"{rid}.claimed.{_dead_pid()}.json"
+    claim.write_text(json.dumps({"request_id": rid,
+        "expires_at": (datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()}))
+    hook._reap_orphaned_claims()
+    assert not claim.exists()
+    assert not (pending_dir / f"{rid}.json").exists()
+
+
+def test_release_confirm_claim_removes_the_claim(pending_dir):
+    """The child releases its own claim at the commitment point."""
+    rid = "u1_2026_0708_cafe04"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    (pending_dir / f"{rid}.claimed.111.json").write_text("{}")
+    kw._release_confirm_claim(rid)
+    assert not list(pending_dir.glob(f"{rid}.claimed.*.json"))

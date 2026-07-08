@@ -17,6 +17,17 @@ from types import SimpleNamespace
 
 import u1_kit_workflow as kw
 import u1_request
+import u1_print_start_gate as _gate_mod
+
+
+@pytest.fixture(autouse=True)
+def _gate_file_exists_by_default(monkeypatch):
+    """Q1 (2026-07-08): the gate FAILS CLOSED when it can't confirm the gcode
+    exists on the printer. Gate tests not about existence assume it's present
+    so they isolate their own logic; existence tests override in-body."""
+    monkeypatch.setattr(_gate_mod, "gcode_exists_on_printer",
+                        lambda *a, **k: True)
+
 
 
 @pytest.fixture(autouse=True)
@@ -1313,9 +1324,9 @@ def test_grace_notify_cmd_fired_when_window_opens(sandbox_requests, monkeypatch)
 
 
 def test_grace_notify_failure_does_not_block_start(sandbox_requests, monkeypatch):
-    """Notify command failure must NOT prevent the wait / start. The wait
-    is the safety net; notification is nice-to-have. Fail-open at notify
-    layer so the print doesn't blow up on Telegram outage."""
+    """Q2: a configured countdown/CANCEL that cannot be delivered ABORTS the
+    start (operator decision 2026-07-08) — a print the operator can neither
+    see nor cancel must not fire. Escape hatch tested separately."""
     import u1_print_start_gate as gate
     rid = "u1_test_notify_fail"
     _seed_request(sandbox_requests, rid,
@@ -1341,7 +1352,7 @@ def test_grace_notify_failure_does_not_block_start(sandbox_requests, monkeypatch
     def fake_notify_fail(cmd, **kw):
         return {"ok": False, "exit_code": 1, "stderr_tail": "network down"}
     start_hit = {"n": 0}
-    gate.run_gate(
+    res = gate.run_gate(
         "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
         approval_token="test_token", stage2_approval_nonce="n",
         request_id=rid, operator="telegram:brent",
@@ -1351,9 +1362,47 @@ def test_grace_notify_failure_does_not_block_start(sandbox_requests, monkeypatch
         grace_notify_cmd="broken-cmd",
         grace_notify_fn=fake_notify_fail,
         out_dir=u1_request.request_dir(rid))
-    assert start_hit["n"] == 1, (
-        "notify failure must not block start_func — wait is the safety net, "
-        "notify is best-effort")
+    # Q2 (operator decision 2026-07-08): a configured countdown/CANCEL message
+    # that CANNOT be delivered aborts the start — never fire a print the
+    # operator can't see or cancel.
+    assert start_hit["n"] == 0, "undeliverable countdown must block the start"
+    assert res["started"] is False
+    assert res["stage"] == "gate_refused_notify_undeliverable"
+
+
+def test_grace_notify_failure_can_be_overridden_to_proceed(sandbox_requests, monkeypatch):
+    """The escape hatch: U1_GRACE_NOTIFY_OPTIONAL=1 restores the old fail-open
+    behavior for anyone who wants it (e.g. a headless/monitored setup)."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_NOTIFY_OPTIONAL", "1")
+    rid = "u1_test_notify_optional"
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={"approval_token": "test_token",
+                          "stage2_approval_nonce": "n",
+                          "stage2_approval_binds": {
+                              "request_revision": 1,
+                              "gcode_hash": "sha256:abc123",
+                              "prompt_key": "bed_clear_start"}})
+    monkeypatch.setattr(gate, "_approval_token_valid", lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+    start_hit = {"n": 0}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: start_hit.__setitem__("n", start_hit["n"]+1) or {"ok": True},
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        grace_notify_cmd="broken-cmd",
+        grace_notify_fn=lambda cmd, **kw: {"ok": False, "exit_code": 1, "stderr_tail": "down"},
+        out_dir=u1_request.request_dir(rid))
+    assert start_hit["n"] == 1  # opt-out honored: start proceeds
 
 
 def test_grace_no_notify_cmd_still_works(sandbox_requests, monkeypatch):
