@@ -1,6 +1,6 @@
 # Safety model — concrete details
 
-The high-level model is in the [README](../README.md#safety-model). This is the per-action breakdown, the test-operator fence, and the pre-start grace period with the model-free Telegram cancel.
+The high-level model is in the [README](../README.md#safety-model). This is the per-action breakdown, the test-operator fence, the pre-start grace period with the model-free Telegram cancel, and the model-free YES that starts the print.
 
 ---
 
@@ -77,11 +77,18 @@ via `hermes send` and a Gateway hook that touches the marker when you reply
 `cancel <code>` in the DM. Zero LLM, zero agent-loop — the hook runs directly
 in the Hermes gateway process.
 
-Install:
+Install (one installer covers this hook AND the confirm-start hook below):
 
 ```bash
-# One-time — installs the hook into Hermes' actual HOOKS_DIR + restarts gateway
-bash tools/install_hermes_cancel_hook.sh
+# One-time, on the box where the Hermes gateway runs — installs BOTH U1
+# gateway hooks (u1_grace_cancel + u1_confirm_start) into Hermes' actual
+# HOOKS_DIR and writes a per-hook install receipt
+bash tools/install_hermes_u1_hooks.sh
+
+# The gateway only discovers hooks at startup — restart it, then check
+# files + receipts + (when the gateway log is readable) actual load:
+hermes gateway restart
+bash tools/install_hermes_u1_hooks.sh --verify
 
 # Per environment — point the gate at the notify script
 export U1_GRACE_NOTIFY_CMD=/absolute/path/to/tools/u1_grace_notify_hermes.sh
@@ -103,10 +110,14 @@ isn't ambiguity) — but extra words never match: "cancel that plan" is safe
 from unintended cancels. Multi-request setups (two concurrent grace windows)
 each write their own pending-state file so they don't race each other.
 
-Honesty guard: the DM only promises reply-to-cancel when the installer's
-receipt file shows the hook actually loaded — otherwise it gives the SSH
-`touch <marker>` fallback instead of a reply that would silently do
-nothing.
+Honesty guard: the DM only promises reply-to-cancel when the notify
+receipt shows the hook actually loaded — `--verify` writes that receipt
+once the gateway log shows `u1_grace_cancel` came up. Otherwise the DM
+gives the SSH `touch <marker>` fallback instead of a reply that would
+silently do nothing.
+
+(`tools/install_hermes_cancel_hook.sh` still exists as a pointer that runs
+the unified installer — old runbooks keep working.)
 
 Cancelled by mistake, or the bed was actually fine? The refusal payload
 carries a `recovery.stage1_command`: the slice and upload are still
@@ -120,6 +131,49 @@ Opt-out for power users at the printer: `U1_GRACE_PERIOD_SECONDS=0`
 disables the window. `U1_GRACE_NOTIFY_CMD` unset disables the
 notification but the wait still runs (in that case an SSH `touch
 <marker>` cancels).
+
+### Model-free start hook (the YES that starts the print)
+
+Starting a print is the same trick in the other direction. At the
+bed-clear prompt the workflow arms a per-request window at
+`/tmp/u1_pending_confirm/<request_id>.json` and emits NO start command —
+the agent model is handed nothing it could fire. The `u1_confirm_start`
+gateway hook redeems the operator's actual YES reply (bare `yes` when one
+window is armed; `yes <code>` when several are — a bare yes with several
+armed refuses and logs, because a start never guesses) by spawning the
+confirm command directly from the gateway process. Every downstream check
+(single-use token, nonce, revision + gcode binding, grace window, cancel
+hook) is unchanged. Zero LLM in the loop.
+
+The YES is also **bound to the operator**: the armed window records the
+operator's platform + user id (auto-resolved from the gateway config), and
+the hook refuses a YES from any other sender — or from anyone, when the
+binding can't be resolved. Missing identity refuses; a start never guesses.
+
+The failure mode is deliberately boring: **with the hook missing, YES does
+nothing — by design.** The window is armed, nothing redeems it, the token
+expires, and the printer never starts. Fail-safe, but dead until you
+install the hook and restart the gateway. `tools/install_hermes_u1_hooks.sh`
+installs it together with the cancel hook (there is no separate installer),
+`--verify` reports whether both are actually in place, and
+`deploy_to_runtime.sh` prints a loud warning when the receipts are absent.
+
+**An honest boundary statement.** "Handed nothing" is not "can reach
+nothing": in the default single-container deployment the gateway and the
+agent's terminal tool run as the same Unix user, so a sufficiently
+deliberate agent could read the toolkit's own state files and reconstruct
+a confirm invocation (concretely: `--confirm-start-for <request_id>`, the
+same request-id redemption the gateway hook uses) — the same way it could
+touch the printer's API directly. What this design removes is the failure
+that actually happened in live testing: an agent firing a start command it
+was *given*. What contains the deliberate case is everything downstream:
+the invocation is audited with its operator identity, the full gate still
+runs, the countdown DM with the one-tap CANCEL still goes to the operator,
+and nothing moves for 120 seconds. Removing
+the capability domain itself requires running the gateway under a separate
+user (or host) from the agent worker so the state files and hook are
+simply out of reach — recommended for any deployment that is not a
+single-operator home printer, and a good idea even then.
 
 
 ---

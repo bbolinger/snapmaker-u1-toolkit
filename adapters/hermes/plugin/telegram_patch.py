@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 # S:<f>:<o> is a submit-verb (sets the Action option, then submits).
 FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|[SX])$"
 
+# Grace-window cancel button on the countdown DM (u1c:<request_id>). Handled
+# HERE — the gateway adapter layer — because a typed CANCEL that lands while
+# the agent's turn is still streaming gets injected mid-turn and never
+# reaches the dispatch hooks (lost live twice, 2026-07-07). Button callbacks
+# ride PTB's handler queue instead, which no agent turn can swallow.
+CANCEL_CB_PATTERN = r"^u1c:u1_[a-z0-9_]{4,40}$"
+
 
 def _load_renderer():
     """Import the vendored L1 renderer (copied into this plugin dir by
@@ -63,6 +70,52 @@ def _load_renderer():
             sys.path.insert(0, here)
         import u1_form_telegram  # type: ignore
         return u1_form_telegram
+
+
+async def _u1_handle_cancel_callback(adapter, update, ctx):
+    """Touch the gate's cancel marker for the tapped request. Model-free:
+    pure file touch, same contract as the u1_grace_cancel message hook. The
+    gate polls the marker once per second and refuses the start."""
+    import json as _json
+    import os as _os
+    from datetime import datetime, timezone
+    from pathlib import Path as _P
+    q = update.callback_query
+    rid = (q.data or "").split(":", 1)[-1]
+    pending = (_P(_os.environ.get("U1_PENDING_CANCEL_DIR",
+                                  "/tmp/u1_pending_cancel")) / f"{rid}.json")
+    touched = False
+    try:
+        st = _json.loads(pending.read_text())
+        fresh = True
+        exp = st.get("expires_at")
+        if exp:
+            try:
+                fresh = (datetime.now(timezone.utc)
+                         <= datetime.fromisoformat(exp.replace("Z", "+00:00")))
+            except ValueError:
+                pass
+        marker = st.get("cancel_marker")
+        if fresh and marker:
+            _P(marker).parent.mkdir(parents=True, exist_ok=True)
+            _P(marker).write_text("cancel via telegram button")
+            touched = True
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("u1-form: cancel button failed for %s", rid)
+    if touched:
+        await q.answer("Cancelling — nothing will be sent to the printer.")
+        try:
+            await q.edit_message_text(
+                (getattr(q.message, "text", "") or "")
+                + "\n\n🛑 CANCELLED — nothing was sent to the printer.")
+        except Exception:
+            pass
+        logger.info("u1-form: grace cancel button touched marker for %s", rid)
+    else:
+        await q.answer("No active grace window for this print (already "
+                       "started, cancelled, or expired).", show_alert=True)
 
 
 def _make_send_result(**kwargs):
@@ -167,9 +220,17 @@ def ensure_patched(adapter_cls) -> bool:
 
         handler = CallbackQueryHandler(_entry, pattern=FORM_CB_PATTERN)
         app.add_handler(handler, group=-11)
+
+        async def _cancel_entry(update, ctx, _self=self):
+            await _u1_handle_cancel_callback(_self, update, ctx)
+            raise ApplicationHandlerStop
+
+        app.add_handler(CallbackQueryHandler(_cancel_entry,
+                                             pattern=CANCEL_CB_PATTERN),
+                        group=-11)
         self._u1_form_cb_app = app
-        logger.info("u1-form: callback handler registered on live PTB app "
-                    "(group -11, pattern-scoped).")
+        logger.info("u1-form: callback handlers registered on live PTB app "
+                    "(group -11, pattern-scoped: form + grace-cancel button).")
 
     async def _send_form(self, chat_id, form_schema, form_id, session_key, metadata=None):
         """Render a form_schema as a sequence of inline-keyboard screens.

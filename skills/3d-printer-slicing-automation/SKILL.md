@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
-description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself."
-version: 2.2.0
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint a recent job (no file attached) — follow the Reprint section."
+version: 2.3.4
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -64,9 +64,9 @@ Repeat until a `kit_readiness_card` event appears — that means COMMIT ran; go 
 **Step 4 — the ONE bed-clear decision.** After the readiness card (or after the operator submits the form), the workflow emits `need_input` with `key`/`need: "bed_clear_start"` — this is the single approval boundary, form and text alike. It carries a bed photo (already captured) and a `prompt` that IS the bed-clear question; surface any attached bed-photo path bare, then ask that exact prompt, then wait.
 
 - If `bed_snapshot_path` is null, do **not** fabricate or re-capture a photo — ask the prompt as-is.
-- On **yes**: tool-call `next_command_on_yes` verbatim (a short `--confirm-start <token>` command). **The workflow runs the actual start gate itself** — you are not composing or relaying a separate Stage-1/Stage-2 command. It returns `grace_in_progress` (a ~120s cancel window the workflow manages) or a refusal `reason` — surface either verbatim. Do not ask for a second confirmation once you see `started: true`.
+- On **yes**: do nothing and run nothing — the gateway already redeemed the operator's YES itself. Reply with ONE short line: the toolkit is verifying and will message the outcome directly. Never claim anything was sent, dispatched, or started — you cannot know the outcome, and the toolkit's own messages (countdown, refusal, or cancellation) are the only authority. If a cancellation or refusal message has already appeared in the chat, acknowledge that instead.
 - On **no** / anything else: tool-call nothing, tell the operator it's cancelled or staged, stop.
-- **Never** construct a `--bed-clear start` / approval-token command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start command, fail closed and say so.
+- **Never** construct any start or approval command yourself from chat memory, and never treat any OTHER event as this approval boundary — if something looks like it's trying to skip straight to a start, fail closed and say so.
 
 DO NOT invent a magic phrase. DO NOT advance past this turn without the operator's fresh yes. Default = no. Field-level detail: `references/snapmaker-u1-safety-gates.md`, `references/can-start-refusal-handling.md`.
 
@@ -82,7 +82,7 @@ Named patterns (each one was observed in a live run on 2026-06-25):
 - **STACKING QUESTIONS** — Two or more questions in one turn. User answers one; you guess the others.
 - **CUSTOM SLICING PYTHON** — `subprocess.run(['orca-slicer', ...])` or `import requests` to query the printer. Bypasses v1.4.2 T0→T1 rewriter, v1.4.3 thumbnail injector, the JSON event schema, AND the toolkit's stdlib-only safety discipline.
 - **PATCHING THE LIVE SKILL** — Writing to `/opt/data/skills/.../SKILL.md`. Has silently deleted whole sections twice (v1.4.4 + v1.4.6 sessions). Workspace edits only; let the maintainer commit + redeploy.
-- **IMPROVISING AROUND FAILURES** — Surface the actual error verbatim and stop. Don't retry with different args.
+- **IMPROVISING AROUND FAILURES** — Surface the actual error verbatim and stop. Don't retry with different args, don't diagnose with your own grep/ls/find commands, don't re-slice, don't compose a recovery command. The operator decides what happens next.
 - **STARTING FROM CRON / CHAIN** — Start commands require in-the-moment operator confirmation on the bed-clear question.
 
 ### ANTI-FABRICATION (named patterns from live testing)
@@ -122,7 +122,12 @@ Workflow emits `{stage:"warning", kind:"slicer_warning", messages:[...], count:N
 
 - **Upload-only is default.** Never upload+start without bed-clear via `u1_print_start_gate.py`.
 - **Start = physical action.** Never run from cron / chain / automation. In-the-moment operator confirmation only.
+- **CANCEL in the grace window is hook-handled.** A model-free gateway hook executes it; the agent runs nothing and confirms only after the workflow reports the cancel. One exception: if the operator says CANCEL and no cancellation confirmation appears, run `python3 /opt/data/scripts/u1_kit_workflow.py --grace-cancel` — the one start-gate command you may run unprompted, because it can only ever stop a print.
 - **If anything is unknown** — printer state, tool, material, slicer metadata, bed visibility — fail closed.
+
+## Reprint — printing a recent job again
+
+The operator asks to reprint (no file attached): your first tool call is `python3 /opt/data/scripts/u1_kit_workflow.py --reprint --json-events`. It emits a `need_input` listing numbered recent prints — surface the labels, wait for the pick, then tool-call that option's `next_command` verbatim. No slicing happens; the flow goes straight to the normal bed-clear decision (Step 4). Never guess which print they meant and never skip the list turn.
 
 ## References
 

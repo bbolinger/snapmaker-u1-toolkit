@@ -812,6 +812,45 @@ def apply_supports_override(process_path: Path, enable_support: bool, out_dir: P
     return temp
 
 
+# Advanced per-run overrides (v2.3). Keys the operator may override from the
+# form's Advanced screen; everything else in the process profile is preserved.
+# Same mechanism as apply_supports_override: Orca has no CLI override flags, so
+# the reliable path is a flattened, self-contained temp process JSON.
+ADVANCED_OVERRIDE_KEYS = (
+    'sparse_infill_density', 'sparse_infill_pattern', 'wall_loops',
+    'brim_type', 'fuzzy_skin', 'support_type',
+)
+
+
+def apply_profile_overrides(process_path: Path, overrides: dict[str, str],
+                            out_dir: Path) -> Path:
+    """Materialize a temp process profile with the operator's advanced
+    overrides applied (infill density/pattern, wall loops, brim, fuzzy skin).
+
+    Only keys in ADVANCED_OVERRIDE_KEYS are honored — the form layer maps
+    operator choices to these; anything else is dropped defensively. Values
+    are written as strings in Orca's own formats ('30%', '3', 'gyroid',
+    'auto_brim', 'external'). Composes with apply_supports_override: each call
+    flattens its input, so chaining temp profiles stays self-contained.
+
+    Returns process_path unchanged when no honored overrides remain.
+    """
+    honored = {k: str(v) for k, v in (overrides or {}).items()
+               if k in ADVANCED_OVERRIDE_KEYS and v not in (None, '')}
+    if not honored:
+        return process_path
+    data = _flatten_process_profile(process_path)
+    data.update(honored)
+    data.setdefault('_u1_workflow_notes', []).append(
+        'advanced overrides applied per operator form answers: '
+        + ', '.join(f'{k}={v}' for k, v in sorted(honored.items()))
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp = out_dir / f'{process_path.stem}__adv.json'
+    temp.write_text(json.dumps(data, indent=2))
+    return temp
+
+
 def last_used_per_tool(nozzle: str | None = None, history_path: Path | None = None) -> dict[str, str]:
     """Return a {tool_id: print_settings_id} map for the most recent print on
     each tool that matches the given nozzle.

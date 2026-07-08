@@ -115,6 +115,7 @@ from typing import Any
 import u1_kit
 import u1_form
 import u1_arrange
+import u1_config
 import u1_request
 import u1_review_doc
 from u1_print_start_gate import build_stage1_command
@@ -125,6 +126,7 @@ from u1_slice_workflow import (
     list_profiles,
     profile_path,
     apply_supports_override,
+    apply_profile_overrides,
     _tool_to_index,
 )
 
@@ -1982,7 +1984,17 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "actions": ["start", "upload-only"],
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
         "_profiles_full": profiles_full,  # persisted at form-emit for index stability
+        # v2.3: offer the optional Advanced screen (infill/pattern/walls/brim/
+        # fuzzy skin) — reachable only from the form's Review button; the
+        # default path never sees it.
+        "offer_advanced": True,
     }
+    # v2.3: quantity (print N copies) — offered ONLY for single-part jobs.
+    # Multi-part kits keep per-part quantities out of scope; the operator
+    # picks parts instead. The commit path duplicates the lone path N times
+    # so the arranger + overflow split treat it exactly like a kit of N.
+    if len(parts) <= 1:
+        spec["offer_quantity"] = True
     if heads:
         spec["heads"] = heads
         spec["tool_materials"] = {h["tool"]: h["material"] for h in heads}
@@ -2082,7 +2094,39 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # verbatim command). Resolve the request + pending nonce from persisted
     # state, then fall through as a normal second-turn confirm (--action start
     # --bed-clear-confirmed). Single-use: the token is consumed on resolve.
+    #
+    # --confirm-start-for <request_id>: the gateway-hook shape of the same
+    # confirm. The pending marker the hook redeems is display-only — no
+    # command, no token (review finding: a same-UID /tmp writer could
+    # otherwise feed the hook arbitrary argv) — so the hook relays only the
+    # request id and the workflow looks up the persisted single-use confirm
+    # token here, server-side. From that point on this IS the --confirm-start
+    # path: same atomic token claim, nonce, revision, hash, and phase checks.
     _confirm_token = getattr(args, "confirm_start", None)
+    _confirm_for = getattr(args, "confirm_start_for", None)
+    if _confirm_for and not _confirm_token:
+        if not u1_request.is_request_id(str(_confirm_for)):
+            print(json.dumps({
+                "stage": "bed_clear_confirm_bad_request_id",
+                "reason": ("request id is not a valid u1 request id; "
+                           "nothing was started."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_bad_request_id"}
+        _for_pending = (((u1_request.read_request(_confirm_for) or {})
+                         .get("safety") or {})
+                        .get("pending_bed_clear_start") or {})
+        _confirm_token = _for_pending.get("confirm_token")
+        if not _confirm_token:
+            print(json.dumps({
+                "stage": "bed_clear_confirm_no_pending",
+                "request_id": _confirm_for,
+                "reason": ("no pending bed-clear confirmation exists for "
+                           "this request — nothing was started. Re-run "
+                           "--action start (no --bed-clear-confirmed) to "
+                           "get a fresh bed-clear prompt."),
+            }), flush=True)
+            return {"phase": "bed_clear_confirm_no_pending",
+                    "request_id": _confirm_for}
     if _confirm_token:
         _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
         _state = u1_request.read_request(_rid) if _rid else None
@@ -2100,8 +2144,36 @@ def run_kit_workflow(args) -> dict[str, Any]:
         args.action = "start"
         args.bed_clear_confirmed = True
         args.pending_nonce = _pending.get("nonce")
+        _disarm_pending_confirm(_rid)
         _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
                token_first6=str(_confirm_token)[:6])
+        if _state.get("reprint_of"):
+            # Reprint confirm (v2.3): there is NO archive to re-ingest — the
+            # gcode is already in printer storage and everything the confirmed
+            # turn validates (pending nonce, revision, plate hash, tool,
+            # material) is persisted on the request. Falling through would hit
+            # the model-positional recovery and die on the original upload's
+            # long-gone cache file (live 2026-07-06: the operator's YES
+            # errored, stranding the reprint at the finish line). Route
+            # straight to the gate turn.
+            return _action_start(None, _rid,
+                                 bool(getattr(args, "json_events", False)),
+                                 bed_clear_confirmed=True, operator=operator,
+                                 pending_nonce=_pending.get("nonce"))
+    # ── REPRINT (v2.3): both turns work with NO model positional ──
+    # Turn 1 (--reprint): list recent prints, one single-use pick token each.
+    # Turn 2 (--reprint-start <token>): seed a fresh request from the picked
+    # print and jump straight to the bed-clear boundary — no slicing at all.
+    if getattr(args, "grace_cancel", False):
+        return _action_grace_cancel(bool(getattr(args, "json_events", False)),
+                                    operator)
+    if getattr(args, "reprint_start", None):
+        return _action_reprint_start(None, bool(getattr(args, "json_events", False)),
+                                     operator, args.reprint_start)
+    if getattr(args, "reprint", False):
+        return _action_reprint_list(None, bool(getattr(args, "json_events", False)),
+                                    operator)
+
     # Fence 1 companion: visible stderr banner whenever the workflow is
     # invoked under a test-prefixed operator. Same prefix list as
     # u1_print_start_gate.py's gate refusal. Prevents the "oh it looked
@@ -2129,6 +2201,16 @@ def run_kit_workflow(args) -> dict[str, Any]:
     # fired, but don't refuse the call when the recovery succeeds.
     model_arg = getattr(args, "model", None)
     self_healed = False
+    _mangled_arg = None
+    if (model_arg and getattr(args, "request_id", None)
+            and not Path(model_arg).exists()):
+        # Anti-pattern #4b (live 2026-07-07): the agent RETYPED the verbatim
+        # next_command and corrupted the path mid-string (doc_ad25_ad25bc...),
+        # so the positional is present but points nowhere. Same recovery as
+        # the dropped-positional case: the request already persisted the real
+        # path at ingest; trust disk, not the relay.
+        _mangled_arg = model_arg
+        model_arg = None
     if not model_arg and getattr(args, "request_id", None):
         try:
             existing = u1_request.read_request(args.request_id) or {}
@@ -2138,6 +2220,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         if recovered and Path(recovered).exists():
             model_arg = recovered
             self_healed = True
+    if not model_arg and _mangled_arg:
+        model_arg = _mangled_arg  # nothing recoverable — fail on the original
     if not model_arg:
         raise SystemExit(
             "u1_kit_workflow: missing model positional and no recoverable "
@@ -2149,7 +2233,8 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # so the underlying agent-paraphrasing pattern is detectable later.
         _audit(args.request_id, "kit_workflow_self_healed_model_arg",
                getattr(args, "operator", None) or "unknown",
-               recovered_path=model_arg)
+               recovered_path=model_arg,
+               mangled_arg=(_mangled_arg or "")[:120] or None)
     json_events = bool(getattr(args, "json_events", False))
     nozzle = getattr(args, "nozzle", "0.4")
     no_live_material = bool(getattr(args, "no_live_material", False))
@@ -2318,15 +2403,17 @@ def run_kit_workflow(args) -> dict[str, Any]:
                 "prompt": _idem_prompt,
                 "instruction": ("The plate preview + bed photo were already sent "
                                 "on the previous turn — do NOT re-run the form. "
-                                "Re-surface the yes/no prompt and wait."),
+                                "Re-surface the yes/no prompt and wait. The "
+                                "operator's YES is handled by the gateway; you "
+                                "hold no start command."),
                 "expected_answers": ["yes", "no"],
-                "next_command_on_yes": (
-                    f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                    f"--confirm-start {_idem_tok}"),
                 "next_command_on_no": None,
                 "bed_snapshot_path": (_idem_safety.get("snapshot_path")
                                       or _idem_safety.get("bed_snapshot_path")),
             }, json_events)
+            _arm_pending_confirm(request_id,
+                                 _idem_req.get("printer_storage_filename"),
+                                 operator, events_file, json_events)
             _emit(events_file, {"stage": "awaiting_input",
                                 "need": "bed_clear_start",
                                 "request_id": request_id}, json_events)
@@ -3361,6 +3448,504 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "reason": None}
 
 
+# Model-free YES (post-incident 2026-07-07): the agent model fired the
+# emitted confirm command itself — no operator YES ever happened. Guidance
+# cannot bound an agentic model, so bed_clear_start events no longer carry
+# any confirm command. The workflow arms a marker file instead; the
+# u1_confirm_start gateway hook redeems the operator's actual YES message
+# by spawning the confirm command directly. The model has nothing to fire.
+_PENDING_CONFIRM_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
+                                           "/tmp/u1_pending_confirm"))
+_PENDING_CONFIRM_TTL_S = 15 * 60
+
+
+def _arm_pending_confirm(request_id: str, filename: str | None,
+                         operator: str | None,
+                         events_file: Path | None = None,
+                         json_events: bool = False) -> None:
+    """Write the per-request marker the u1_confirm_start hook redeems.
+    Overwrites any previous marker for this request (re-prompt re-arms).
+
+    The marker is deliberately OPAQUE: request id, display filename,
+    operator binding, timestamps. No command, no token, no paths — the
+    hook builds its own argv (`--confirm-start-for <request_id>`) and the
+    workflow resolves the persisted single-use token server-side. Review
+    finding: the old confirm_cmd field let any same-UID writer of /tmp
+    hand the gateway an arbitrary command to run on the next YES.
+
+    Operator binding comes from u1_config.get_operator_binding(). When
+    that's unconfigured we STILL arm — the print mid-flow shouldn't brick
+    on a config gap — but the hook will refuse the YES (fail closed), so
+    say so HERE, loudly, where the operator can act on it before typing a
+    YES that goes nowhere."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    # A per-arm generation token: re-prompting the same request overwrites
+    # the marker at the same path, and each arm spawns its own watchdog. The
+    # generation lets an old watchdog tell "my window" from "a newer window
+    # that reused this path" and leave the latter alone (cold-audit finding).
+    generation = f"{request_id}:{now.timestamp():.6f}:{os.getpid()}"
+    entry = {
+        "request_id": request_id,
+        "filename": filename,
+        "generation": generation,
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(
+            seconds=_PENDING_CONFIRM_TTL_S)).isoformat(),
+    }
+    try:
+        binding = u1_config.get_operator_binding()
+    except Exception:
+        binding = None
+    if binding:
+        entry["platform"], entry["operator_user_id"] = binding
+        # Private-DM assumption, stated where it lives: on Telegram the DM
+        # chat id equals the operator's user id. Model-free start is a
+        # private-DM feature; the hook refuses group chats and any other
+        # conversation outright. Override via U1_OPERATOR_CHAT_ID if a
+        # deployment ever separates them.
+        entry["operator_chat_id"] = os.environ.get(
+            "U1_OPERATOR_CHAT_ID", binding[1])
+    else:
+        _audit(request_id, "confirm_binding_unconfigured", operator or "")
+        _emit(events_file, {
+            "stage": "confirm_binding_unconfigured",
+            "request_id": request_id,
+            "message": ("Operator binding for the YES hook is not "
+                        "configured — set U1_OPERATOR_BINDING="
+                        "telegram:<numeric user id> (or TELEGRAM_HOME_"
+                        "CHANNEL / TELEGRAM_ALLOWED_USERS). The bed-clear "
+                        "prompt is armed, but the gateway hook will REFUSE "
+                        "the YES until it can verify who is answering."),
+        }, json_events)
+    _PENDING_CONFIRM_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
+    tmp.write_text(json.dumps(entry, indent=2))
+    tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+    _spawn_confirm_expiry_watchdog(request_id, filename, generation)
+
+
+def _spawn_confirm_expiry_watchdog(request_id: str,
+                                   filename: str | None,
+                                   generation: str = "") -> None:
+    """Silence is not an allowed outcome (operator feedback 2026-07-07):
+    a window that expires unredeemed must say so. Spawn the standalone
+    watchdog script with ALL inputs as argv — cold-review finding: the
+    previous version formatted the filename into a `python3 -c` string, and
+    a crafted filename produced runnable code. Argv carries no such risk
+    and the script is unit-testable. Best-effort: a watchdog failure
+    changes nothing about safety, only about feedback."""
+    marker = str(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+    script = str(Path(__file__).resolve().parent / "u1_confirm_watchdog.py")
+    try:
+        import subprocess as _sp
+        _sp.Popen(["python3", script, request_id,
+                   str(filename or "the pending print"), marker,
+                   str(_PENDING_CONFIRM_TTL_S), generation],
+                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                  stdin=_sp.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _disarm_pending_confirm(request_id: str) -> None:
+    try:
+        (_PENDING_CONFIRM_DIR / f"{request_id}.json").unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+_MODEL_FREE_YES_INSTRUCTION = (
+    "FIRST surface the kit_plate_preview + bed_snapshot image paths BARE "
+    "and attach the review_doc, THEN the prompt — the operator decides "
+    "looking at the real bed. The operator's YES and CANCEL are both "
+    "handled by the gateway directly; you hold NO start command and must "
+    "not compose one. After the operator replies YES the printer countdown "
+    "message arrives on its own. On NO: the gcode stays uploaded (staged), "
+    "nothing prints; acknowledge and stop.")
+
+
+def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, Any]:
+    """Model-relayable SAFE-direction fallback: touch every active grace
+    cancel marker (same contract as the u1_grace_cancel hook). Exists
+    because an operator message that arrives as a mid-turn interrupt
+    bypasses gateway hooks (live 2026-07-07) — the model can then still
+    relay a cancel. It can only ever stop a print with this; there is no
+    start analogue by design."""
+    from datetime import datetime, timezone
+    pending_dir = Path(os.environ.get("U1_PENDING_CANCEL_DIR",
+                                      "/tmp/u1_pending_cancel"))
+    touched: list[str] = []
+    now = datetime.now(timezone.utc)
+    if pending_dir.exists():
+        for f in sorted(pending_dir.iterdir()):
+            if not f.is_file() or f.suffix != ".json":
+                continue
+            try:
+                st = json.loads(f.read_text())
+                marker = st.get("cancel_marker")
+                exp = st.get("expires_at")
+                if exp:
+                    try:
+                        if now > datetime.fromisoformat(exp.replace("Z", "+00:00")):
+                            continue
+                    except ValueError:
+                        pass
+                if marker:
+                    Path(marker).parent.mkdir(parents=True, exist_ok=True)
+                    Path(marker).write_text("cancel via workflow --grace-cancel")
+                    touched.append(st.get("request_id", "unknown"))
+            except Exception:
+                continue
+    for rid in touched:
+        _audit(rid, "grace_cancel_via_workflow", operator)
+    _emit(None, {"stage": "grace_cancel",
+                 "cancelled_request_ids": touched,
+                 "message": (f"Cancelled {len(touched)} pending start(s)."
+                             if touched else
+                             "No active grace window to cancel."),
+                 "instruction": "Tell the operator this outcome verbatim."},
+          json_events)
+    return {"phase": "grace_cancel", "cancelled": touched}
+
+
+def _moonraker_host_port() -> tuple[str, int]:
+    from u1_config import get_u1_host, get_u1_port
+    return get_u1_host(), get_u1_port()
+
+
+def _printer_file_metadata(fname: str) -> dict[str, Any] | None:
+    """(size, modified) of a printer-side gcode via Moonraker metadata.
+    None on any failure — callers decide whether that fails closed. Review
+    finding 2026-07-07: reprint verified the FILENAME still existed but not
+    that the bytes were still the reviewed ones; size+modified binding
+    catches an overwrite between the pick and the start. (Weaker than a
+    content hash — Moonraker doesn't serve one — and documented as such.)"""
+    try:
+        import urllib.request as _rq
+        from urllib.parse import quote as _q
+        host, port = _moonraker_host_port()
+        url = (f"http://{host}:{port}/server/files/metadata"
+               f"?filename={_q(fname)}")
+        with _rq.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        res = data.get("result") or {}
+        size = res.get("size")
+        modified = res.get("modified")
+        if size is None or modified is None:
+            return None
+        return {"size": int(size), "modified": float(modified)}
+    except Exception:
+        return None
+
+
+def _printer_gcode_filenames() -> set[str] | None:
+    """Names in the printer's gcodes root, or None when Moonraker is
+    unreachable (callers treat None as unknown and fail closed at start)."""
+    import urllib.request
+    try:
+        from u1_config import get_u1_host, get_u1_port
+        url = (f"http://{get_u1_host()}:{get_u1_port()}"
+               "/server/files/list?root=gcodes")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            payload = json.loads(r.read().decode())
+        return {str(f.get("path", "")) for f in payload.get("result", [])}
+    except Exception:
+        return None
+
+
+def _reprint_candidates(limit: int = 6) -> list[dict[str, Any]]:
+    """Recent reprintable jobs: requests that uploaded a plate-1 gcode,
+    newest first, deduped by printer filename, enriched with the print-history
+    record (state/duration) and an on-printer check."""
+    from u1_config import get_data_dir
+    root = Path(get_data_dir()) / "requests"
+    if not root.is_dir():
+        return []
+    # History join: printer filename -> latest ledger record.
+    history: dict[str, dict[str, Any]] = {}
+    try:
+        hist = json.loads((Path(get_data_dir()) / "print_history.json").read_text())
+        for rec in hist.get("records", []):
+            if rec.get("filename"):
+                history[rec["filename"]] = rec
+    except Exception:
+        pass
+    on_printer = _printer_gcode_filenames()
+
+    dirs = sorted((d for d in root.iterdir() if d.is_dir()),
+                  key=lambda d: d.stat().st_mtime, reverse=True)[:60]
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for d in dirs:
+        try:
+            req = json.loads((d / "request.json").read_text())
+        except Exception:
+            continue
+        fname = req.get("printer_storage_filename")
+        plates = req.get("plates") or []
+        if not (fname and plates and plates[0].get("gcode_hash")):
+            continue  # never uploaded — nothing to reprint
+        if fname in seen:
+            continue
+        seen.add(fname)
+        rec = history.get(fname) or {}
+        est = rec.get("estimated_time_s")
+        dur = (f"{int(est // 3600)}h {int(est % 3600 // 60)}m" if est and est >= 3600
+               else f"{int(est // 60)}m" if est else None)
+        # Human name: strip the Hermes doc-cache prefix (doc_<hash>_), the
+        # same cleanup printer filenames get.
+        model = re.sub(r"^doc_[0-9a-f]{6,}_",
+                       "", Path(req.get("model_file") or fname).stem)
+        # Same model re-uploaded under a different cache hash reads as an
+        # identical option — keep only the newest per (model, tool, material).
+        model_key = f"{model}|{req.get('tool')}|{req.get('material')}"
+        if model_key in seen:
+            continue
+        seen.add(model_key)
+        out.append({
+            "request_id": req.get("request_id") or d.name,
+            "printer_storage_filename": fname,
+            "model": model,
+            "tool": req.get("tool"),
+            "material": req.get("material"),
+            "printed_state": rec.get("state"),
+            "duration": dur,
+            "last_seen_at": rec.get("last_seen_at"),
+            "on_printer": (None if on_printer is None else fname in on_printer),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _resolve_reprint_artifacts(old: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """(preview_path, iso_path, review_path) for a reprint source, walking
+    the reprint_of chain when needed. A reprint-seeded request carries gcode
+    pointers but (before this existed) not the render artifacts — live
+    2026-07-07: reprinting a reprint showed the operator a bed photo and
+    nothing else. The chain is short and cycle-guarded; first hop that has a
+    real preview on disk wins."""
+    seen: set[str] = set()
+    cur: dict[str, Any] | None = old
+    for _ in range(6):
+        if not cur:
+            break
+        p0 = (cur.get("plates") or [{}])[0]
+        prev = p0.get("preview_path")
+        if prev and Path(prev).is_file():
+            iso = p0.get("iso_path")
+            rev = cur.get("review_path") or str(
+                Path(cur.get("out_dir") or "") / "review.md")
+            return (prev,
+                    iso if iso and Path(iso).is_file() else None,
+                    rev if rev and Path(rev).is_file() else None)
+        nxt = cur.get("reprint_of")
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        cur = u1_request.read_request(nxt)
+    return None, None, None
+
+
+def _action_reprint_list(events_file: Path | None, json_events: bool,
+                         operator: str) -> dict[str, Any]:
+    """Turn 1: list recent prints, each with a single-use pick token. The
+    model relays ONE short token command verbatim — same mangle-proof shape
+    as --confirm-start."""
+    cands = _reprint_candidates()
+    if not cands:
+        _emit(events_file, {
+            "stage": "reprint_none_available",
+            "message": ("No reprintable jobs found — nothing in the request "
+                        "history has an uploaded plate. Send a model file to "
+                        "start a fresh print.")}, json_events)
+        return {"phase": "reprint_none_available"}
+    options = []
+    for i, c in enumerate(cands, 1):
+        tok = u1_form.new_confirm_token()
+        u1_form.persist_confirm_token(tok, c["request_id"])
+        bits = [c["model"]]
+        if c.get("material") or c.get("tool"):
+            bits.append(f"{c.get('material') or '?'} on {c.get('tool') or '?'}")
+        if c.get("printed_state") == "complete":
+            bits.append("printed" + (f", ~{c['duration']}" if c.get("duration") else ""))
+        elif c.get("printed_state"):
+            bits.append(str(c["printed_state"]))
+        else:
+            bits.append("uploaded, not printed")
+        label = " — ".join(bits)
+        if c.get("on_printer") is False:
+            label += " (no longer on printer)"
+        options.append({
+            "n": i, "label": label,
+            "next_command": (f"python3 /opt/data/scripts/u1_kit_workflow.py "
+                             f"--reprint-start {tok}"),
+        })
+    _emit(events_file, {
+        "stage": "need_input", "need": "reprint_pick", "key": "reprint_pick",
+        "prompt": "Which print do you want to run again?",
+        "options": options,
+        "instruction": ("Surface the options to the operator as a numbered "
+                        "list (labels only). Wait for their pick, then "
+                        "tool-call THAT option's next_command VERBATIM. Do "
+                        "not invent filenames or edit the token."),
+    }, json_events)
+    _emit(events_file, {"stage": "awaiting_input", "need": "reprint_pick"},
+          json_events)
+    return {"phase": "awaiting_reprint_pick", "options_count": len(options)}
+
+
+def _action_reprint_start(events_file: Path | None, json_events: bool,
+                          operator: str, token: str) -> dict[str, Any]:
+    """Turn 2: seed a fresh request from the picked print and enter the
+    standard bed-clear boundary. No slicing: the gcode is already in printer
+    storage; the gate still re-verifies material live, validates the file
+    exists before grace, and runs the full nonce/grace/cancel chain."""
+    old_rid = u1_form.resolve_confirm_token(token)  # single-use, atomic claim
+    old = u1_request.read_request(old_rid) if old_rid else None
+    if not (old_rid and old):
+        _emit(events_file, {
+            "stage": "reprint_token_invalid",
+            "reason": ("pick token is invalid, already used, or expired — "
+                       "run --reprint again for a fresh list.")}, json_events)
+        return {"phase": "reprint_token_invalid"}
+    plates = old.get("plates") or []
+    fname = old.get("printer_storage_filename") or (
+        plates[0].get("printer_storage_filename") if plates else None)
+    if not (fname and plates and plates[0].get("gcode_hash")):
+        _emit(events_file, {
+            "stage": "reprint_unavailable", "request_id": old_rid,
+            "reason": "that request never uploaded a plate — send the model "
+                      "file for a fresh slice instead."}, json_events)
+        return {"phase": "reprint_unavailable", "request_id": old_rid}
+
+    # Hard existence check now (better UX than failing at the gate; the gate
+    # still re-validates pre-grace as defense in depth).
+    names = _printer_gcode_filenames()
+    if names is None or fname not in names:
+        reason = ("printer unreachable — cannot verify the file is still on "
+                  "the printer" if names is None else
+                  f"'{fname}' is no longer in printer storage")
+        _emit(events_file, {
+            "stage": "reprint_file_missing", "request_id": old_rid,
+            "reason": reason,
+            "instruction": ("Tell the operator the reprint can't start and "
+                            "to re-send the original model file for a fresh "
+                            "slice.")}, json_events)
+        return {"phase": "reprint_file_missing", "request_id": old_rid}
+
+    new_rid = u1_request.generate_request_id()
+    new_dir = Path(u1_request.ensure_request_dir(new_rid))
+    bed = _capture_bed_and_issue_token(new_dir)
+    if not bed.get("ok"):
+        _emit(events_file, {
+            "stage": "reprint_bed_capture_failed", "request_id": new_rid,
+            "reason": bed.get("reason"),
+            "instruction": ("Bed photo failed — the reprint fails closed. "
+                            "Tell the operator why and stop.")}, json_events)
+        _audit(new_rid, "reprint_bed_capture_failed", operator,
+               reprint_of=old_rid, reason=str(bed.get("reason"))[:160])
+        return {"phase": "reprint_bed_capture_failed", "request_id": new_rid}
+
+    _art_preview, _art_iso, _art_review = _resolve_reprint_artifacts(old)
+    # Printer-side identity check (review finding): filename existence is not
+    # content identity. If the source recorded size+modified at upload,
+    # compare against the CURRENT printer file and refuse on drift; legacy
+    # records bind the current values so the pick-to-start window is covered
+    # either way.
+    _cur_meta = _printer_file_metadata(fname)
+    if _cur_meta is None:
+        _emit(events_file, {
+            "stage": "reprint_refused", "reason": "printer_metadata_unavailable",
+            "message": ("Could not verify the printer-side file before "
+                        "reprint. Try again when the printer is reachable."),
+        }, json_events)
+        _audit(old_rid, "reprint_refused_metadata_unavailable", operator,
+               printer_filename=fname)
+        return {"phase": "reprint_refused",
+                "reason": "printer_metadata_unavailable"}
+    _stored_size = plates[0].get("printer_file_size")
+    _stored_mod = plates[0].get("printer_file_modified")
+    if _stored_size is not None and _stored_mod is not None:
+        if (_cur_meta["size"] != _stored_size
+                or _cur_meta["modified"] != _stored_mod):
+            _emit(events_file, {
+                "stage": "reprint_refused", "reason": "printer_file_changed",
+                "message": ("The printer-side file changed since it was "
+                            "reviewed and uploaded (size or timestamp "
+                            "drifted). Refusing to reprint it — re-slice "
+                            "from the model instead."),
+            }, json_events)
+            _audit(old_rid, "reprint_refused_printer_file_changed", operator,
+                   printer_filename=fname,
+                   stored_size=_stored_size, current_size=_cur_meta["size"])
+            return {"phase": "reprint_refused",
+                    "reason": "printer_file_changed"}
+    u1_request.write_request(
+        new_rid,
+        reprint_of=old_rid,
+        model_file=old.get("model_file"),
+        tool=old.get("tool", "T0"),
+        material=old.get("material", "PETG"),
+        request_revision=1,
+        printer_storage_filename=fname,
+        # Top-level gcode_hash is what can_start() drift-checks against the
+        # audited readiness row.
+        gcode_hash=plates[0].get("gcode_hash"),
+        plates=[{"plate_idx": 1,
+                 "gcode_hash": plates[0].get("gcode_hash"),
+                 "gcode_path": plates[0].get("gcode_path"),
+                 "printer_storage_filename": fname,
+                 "printer_file_size": _cur_meta["size"],
+                 "printer_file_modified": _cur_meta["modified"],
+                 "preview_path": _art_preview,
+                 "iso_path": _art_iso,
+                 "uploaded": True}],
+        review_path=_art_review,
+        operator=operator,
+        safety={"approval_token": bed["token"],
+                "snapshot_path": bed.get("snapshot_path"),
+                "bed_clear_photo_captured": True,
+                "bed_clear_check_required": True},
+    )
+    _audit(new_rid, "reprint_initiated", operator, reprint_of=old_rid,
+           printer_filename=fname)
+
+    # Re-surface the ORIGINAL previews + review doc (they live in the old
+    # request dir), then the fresh bed photo — so the stock bed-clear prompt
+    # ("sliced plate, review doc, and a fresh bed photo are attached") stays
+    # literally true for a reprint.
+    for kind, path in (("kit_plate_preview", _art_preview),
+                       ("kit_plate_isometric", _art_iso)):
+        if path and Path(path).is_file():
+            _emit(events_file, {"stage": "render", "request_id": new_rid,
+                                "kind": kind, "image": path,
+                                "instruction": "Surface this image path BARE in your reply."},
+                  json_events)
+    if _art_review and Path(_art_review).is_file():
+        _emit(events_file, {"stage": "review_doc", "request_id": new_rid,
+                            "path": _art_review}, json_events)
+    if bed.get("snapshot_path"):
+        _emit(events_file, {"stage": "render", "request_id": new_rid,
+                            "kind": "bed_snapshot", "image": bed["snapshot_path"],
+                            "instruction": "Surface this fresh bed photo path BARE in your reply."},
+              json_events)
+
+    # This turn IS the operator's review moment (original previews + review
+    # doc + fresh bed photo, above). Record it with the same revision+hash
+    # binding a kit readiness card carries — can_start() drift-checks the
+    # start against exactly this row.
+    _audit(new_rid, "reprint_readiness_card_emitted", operator,
+           request_revision=1, gcode_hash=plates[0].get("gcode_hash"),
+           reprint_of=old_rid, printer_filename=fname)
+
+    return _action_start(events_file, new_rid, json_events,
+                         bed_clear_confirmed=False, operator=operator)
+
+
 def _action_start(events_file: Path | None, request_id: str,
                   json_events: bool,
                   yes_command: str | None = None,
@@ -3485,24 +4070,20 @@ def _action_start(events_file: Path | None, request_id: str,
             "requires_fresh_operator_bed_clear": True,
             "approval_prompt_key": "bed_clear_start",
             "prompt": prompt,
-            "instruction": ("FIRST surface the kit_plate_preview + bed_snapshot "
-                            "image paths BARE and attach the review_doc, THEN "
-                            "the prompt — the operator decides looking at the "
-                            "real bed. On NO: the gcode stays uploaded (staged), "
-                            "nothing prints; acknowledge and stop."),
+            "instruction": _MODEL_FREE_YES_INSTRUCTION,
             "expected_answers": ["yes", "no"],
-            # Short confirm token instead of a ~200-char verbatim command:
-            # the model relays ONE opaque token, the workflow resolves the
-            # request + nonce + full kit context from persisted state. This
-            # stopped gemma4 mangling the request_id mid-command. Single-use;
-            # the nonce still does the auth (revision + gcode binding).
-            "next_command_on_yes": (
-                f"python3 /opt/data/scripts/u1_kit_workflow.py "
-                f"--confirm-start {confirm_token}"),
+            # Model-free YES (2026-07-07 incident): no confirm command is
+            # emitted to the model AT ALL — it fired one itself once. The
+            # marker below arms the u1_confirm_start gateway hook, which
+            # redeems the operator's literal YES message. Same single-use
+            # token + nonce chain underneath; only the trigger moved.
             "next_command_on_no": None,
             "bed_snapshot_path": (safety.get("snapshot_path")
                                   or safety.get("bed_snapshot_path")),
         }
+        _arm_pending_confirm(request_id,
+                             state.get("printer_storage_filename"), operator,
+                             events_file, json_events)
         _emit(events_file, need, json_events)
         _emit(events_file, {"stage": "awaiting_input",
                             "need": "bed_clear_start",
@@ -3538,6 +4119,26 @@ def _action_start(events_file: Path | None, request_id: str,
             if pending.get("gcode_hash") != gcode_hash:
                 problems.append("gcode_hash mismatch (plan changed since "
                                 "bed-clear prompt was issued)")
+        # Printer-side identity re-check at the last gate before Stage 2
+        # (review finding): when upload recorded size+modified, the CURRENT
+        # printer file must still match — a same-name overwrite between the
+        # review and the confirmed yes refuses here. Metadata unavailable
+        # also refuses: this close to a start, unverifiable means no.
+        _p0 = (state.get("plates") or [{}])[0]
+        _psize = _p0.get("printer_file_size")
+        _pmod = _p0.get("printer_file_modified")
+        if _psize is not None and _pmod is not None and not problems:
+            _now_meta = _printer_file_metadata(
+                _p0.get("printer_storage_filename") or "")
+            if _now_meta is None:
+                problems.append("printer-side file metadata unavailable — "
+                                "cannot verify the file is still the "
+                                "reviewed one")
+            elif (_now_meta["size"] != _psize
+                  or _now_meta["modified"] != _pmod):
+                problems.append("printer-side file changed since upload "
+                                "(size/timestamp drift) — refusing to start "
+                                "unreviewed bytes")
         if problems:
             err = {
                 "stage": "bed_clear_approval_rejected",
@@ -4410,6 +5011,15 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     selected = [kit["parts"][i - 1] for i in sel_idx]
     selected_paths = [p["path"] for p in selected]
 
+    # Quantity (v2.3): N copies of a single-part job. Duplicating the lone
+    # path N times reuses the whole kit pipeline untouched — the arranger
+    # packs N instances, the instance-keyed previews draw every copy, and
+    # the plate-overflow split absorbs an N that can't fit one bed. Only
+    # single-part specs offer/parse the field, so real kits never hit this.
+    quantity = int(values.get("quantity") or 1)
+    if quantity > 1 and len(selected_paths) == 1:
+        selected_paths = selected_paths * quantity
+
     tool = values["tool"]
     material = values["material"]
     auto_orient = values.get("orient") == "auto"
@@ -4424,6 +5034,16 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
     override = _SUPPORTS_TO_OVERRIDE.get(supports, "no_supports")
     if override in ("supports", "no_supports"):
         process = apply_supports_override(process, override == "supports", out_dir)
+
+    # v2.3 advanced overrides (from the form's Advanced screen). Applied on top
+    # of the supports patch — each pass flattens, so the temp stays
+    # self-contained. The review doc's full-config sweep marks every override
+    # as DIFFERS automatically, so the operator sees them before the yes.
+    adv_overrides = values.get("overrides") or {}
+    if adv_overrides:
+        process = apply_profile_overrides(process, adv_overrides, out_dir)
+        _audit(request_id, "advanced_overrides_applied", operator,
+               **{k: str(v) for k, v in adv_overrides.items()})
 
     slice_out = out_dir / "slice"
     _emit(events_file, {"stage": "kit_slicing", "request_id": request_id,
@@ -4445,8 +5065,11 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         return {"phase": "slice_failed", "request_id": request_id, "error": str(exc)[:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
+    # quantity only appears in the audit trail when it changed the plan —
+    # default single-copy rows stay identical to every pre-quantity run.
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
-           parts=len(selected_paths), tool=tool, material=material, profile=profile_slug)
+           parts=len(selected), tool=tool, material=material, profile=profile_slug,
+           **({"quantity": quantity} if quantity > 1 else {}))
 
     kit_stem = u1_kit._sanitize(_strip_doc_prefix(archive.stem))
     live = bool(getattr(args, "live_upload", False))
@@ -4472,7 +5095,9 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         layout, injection = _render_and_inject_plate_preview(
             named, idx, len(arr["plates"]), out_dir,
             arranged_stls=(pl.get("arranged_stls") or []),
-            selected_count=len(selected),
+            # instance count, not distinct parts — a 3-copy plate labels "3
+            # parts", matching what the operator sees on the bed render
+            selected_count=len(selected_paths),
             tool_choice=tool, material=material,
             bed_mm=u1_kit.DEFAULT_BED_MM,
             arrange_3mf=pl.get("arrange_3mf"),
@@ -4510,11 +5135,18 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
         _arranged = pl.get("arranged_stls") or []
+        _pf_meta = (_printer_file_metadata(
+            up.get("uploaded_filename") or named.name)
+            if idx == 1 and up.get("moonraker_upload_ok") else None)
         plates_state.append({
             "plate_idx": idx,
             "gcode_path": str(named),
             "gcode_hash": post_inject_hash,
             "printer_storage_filename": up.get("uploaded_filename") or named.name,
+            # Printer-side identity captured at upload: the start path
+            # re-checks these so a same-name overwrite can't ride a review.
+            "printer_file_size": (_pf_meta or {}).get("size"),
+            "printer_file_modified": (_pf_meta or {}).get("modified"),
             "uploaded": up,
             "started": False,
             # metadata (est time + filament) + partition_parts were missing on
@@ -4606,7 +5238,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                        "profile": _profile_label,
                        "orient": values.get("orient"),
                        "supports": supports,
-                       "parts": _parts_display},
+                       "parts": _parts_display,
+                       **({"quantity": quantity} if quantity > 1 else {})},
             operator=operator,
             reference=u1_review_doc.build_reference(
                 profile_slug, material, nozzle=nozzle, out_dir=out_dir),
@@ -4665,10 +5298,14 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
              "selected": [p["part_id"] for p in selected], "orient_mode": values.get("orient")},
         plates=plates_state,
         tool=tool, material=material, profile=profile_slug, supports=override,
+        overrides=values.get("overrides") or {},
         gcode_hash=plate1["gcode_hash"],
         printer_storage_filename=plate1["printer_storage_filename"],
         start_gate_stage1_command=stage1_cmd,
         readiness_card_event=readiness,
+        # persisted only when the plan actually asked for copies — default
+        # runs keep request.json identical to every pre-quantity request
+        **({"quantity": quantity} if quantity > 1 else {}),
     )
     _audit(request_id, "kit_readiness_card_emitted", operator,
            plate_count=len(plates_state), gated_plate=plate1["printer_storage_filename"],
@@ -4745,6 +5382,12 @@ def main(argv=None) -> int:
                           "Optional ONLY when --request-id resolves a recoverable "
                           "model_path from request.json (resume case)."))
     ap.add_argument("--json-events", action="store_true")
+    ap.add_argument("--reprint", action="store_true",
+                    help="List recent prints to print again (no model file needed)")
+    ap.add_argument("--reprint-start", default=None, metavar="TOKEN",
+                    dest="reprint_start",
+                    help="Start the reprint the operator picked "
+                         "(single-use token minted by --reprint)")
 
     # Staged-flow flags (Phase 1) — each turn adds one.
     ap.add_argument("--parts", default=None,
@@ -4793,6 +5436,21 @@ def main(argv=None) -> int:
                           "short token (it mangled the old long command); the "
                           "workflow resolves the request + single-use nonce "
                           "from persisted state. Never hand-assemble it."))
+    ap.add_argument("--confirm-start-for", default=None,
+                    dest="confirm_start_for",
+                    help=("Gateway-hook bed-clear confirm: redeem the pending "
+                          "confirmation for this request id. The persisted "
+                          "single-use confirm token is resolved server-side "
+                          "and then this follows the exact --confirm-start "
+                          "path (same nonce/revision/hash checks). Written "
+                          "for the u1_confirm_start hook, which builds this "
+                          "command from its own constants — the pending "
+                          "marker carries no command and no token."))
+    ap.add_argument("--grace-cancel", action="store_true", dest="grace_cancel",
+                    help=("Cancel every active pre-start grace window (touches "
+                          "the same markers the gateway cancel hook does). The "
+                          "ONLY start-gate command the agent may run on its own "
+                          "initiative — it can only ever STOP a print."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "
@@ -4851,6 +5509,23 @@ def main(argv=None) -> int:
     ap.add_argument("--on-collision", choices=["rename", "overwrite", "cancel"], default=None)
     a = ap.parse_args(argv)
     res = run_kit_workflow(a)
+    # Hook-run confirms (--confirm-start-for) execute detached from any chat:
+    # their output lands in a log file nobody reads live. Any outcome short
+    # of the grace window must reach the operator as a model-free DM, or the
+    # silence gets narrated by an agent that saw nothing (live 2026-07-07:
+    # "start signal sent" about a preflight refusal).
+    if getattr(a, "confirm_start_for", None):
+        _phase = (res or {}).get("phase")
+        if _phase != "grace_in_progress":
+            _reason = ((res or {}).get("reason")
+                       or "; ".join((res or {}).get("reasons") or [])
+                       or _phase or "unknown refusal")
+            try:
+                import u1_notify
+                u1_notify.send_operator(
+                    "\U0001f6ab Print NOT started — " + str(_reason)[:300])
+            except Exception:
+                pass
     if not a.json_events:
         print(json.dumps(res, indent=2, default=str))
     return 0

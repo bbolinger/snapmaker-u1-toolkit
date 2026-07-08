@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 # us from matching "stl_pipeline.py" or similar false positives.
 _ATTACHMENT_RE = re.compile(r"\.(stl|3mf|zip)\b", re.IGNORECASE)
 
+# Reprint requests carry NO attachment, so the attachment match can't fire —
+# but the skill (v2.3) owns the reprint flow. Trigger the same auto-load on
+# reprint phrasing. Word-boundaried and narrow on purpose: "reprint" or
+# "print (it/that/this) again".
+_REPRINT_RE = re.compile(r"\b(reprint|print\s+(it|that|this)?\s*again)\b",
+                         re.IGNORECASE)
+
 
 def make_handler(skill_identifier: str) -> Callable[..., Any]:
     """Build the pre_gateway_dispatch handler with the resolved skill identifier baked in.
@@ -78,6 +85,8 @@ def make_handler(skill_identifier: str) -> Callable[..., Any]:
             matched_by = "text-regex"
         elif _doc_name and _ATTACHMENT_RE.search(_doc_name):
             matched_by = "doc-filename"
+        elif _text and _REPRINT_RE.search(_text):
+            matched_by = "reprint-phrase"
         if not matched_by:
             return None
         try:

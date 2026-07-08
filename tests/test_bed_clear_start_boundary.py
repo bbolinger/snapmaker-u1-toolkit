@@ -229,8 +229,9 @@ def test_bed_clear_start_prompt_key_is_bed_clear_start(sandbox_requests, capsys)
     assert need["key"] == "bed_clear_start"
     assert need["approval_prompt_key"] == "bed_clear_start"
     assert need["requires_fresh_operator_bed_clear"] is True
-    assert "next_command_on_yes" in need
-    assert "--confirm-start " in need["next_command_on_yes"]
+    # Model-free YES (2026-07-07): the event must NOT hand the model any
+    # start command — the confirm marker armed on disk is the only trigger.
+    assert "next_command_on_yes" not in need
     assert need["next_command_on_no"] is None
 
 
@@ -1411,12 +1412,18 @@ def test_action_start_confirm_without_pending_nonce_refused(sandbox_requests):
     assert any("nonce" in r for r in result["reasons"])
 
 
-def test_action_start_yes_command_uses_short_confirm_token(sandbox_requests, capsys):
-    """The emitted next_command_on_yes is a SHORT `--confirm-start <token>`
-    (a 26B model mangled the old ~200-char verbatim command). The token maps
-    to this request; the single-use nonce it fronts for still does the auth."""
-    import re as _re, json as _json
+def test_action_start_arms_model_free_confirm_marker(sandbox_requests, capsys,
+                                                     tmp_path, monkeypatch):
+    """Model-free YES (incident 2026-07-07: the model fired the emitted
+    confirm command itself). The bed-clear event carries NO start command;
+    the workflow arms an OPAQUE marker (no command, no token — the hook
+    builds its own --confirm-start-for argv) while the single-use token is
+    persisted server-side, and only the gateway hook redeems it."""
+    import json as _json
     import u1_form
+    monkeypatch.setattr(kw, "_PENDING_CONFIRM_DIR", tmp_path / "pending_confirm")
+    monkeypatch.setattr(kw.u1_config, "get_operator_binding",
+                        lambda: ("telegram", "555000111"))
     rid = "u1_test_nonce_cmd"
     _seed_request(sandbox_requests, rid)
     kw._action_start(None, rid, True, yes_command="python3 kit.py --action start --bed-clear-confirmed",
@@ -1424,10 +1431,20 @@ def test_action_start_yes_command_uses_short_confirm_token(sandbox_requests, cap
     out = capsys.readouterr().out
     evs = [_json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
     need = next(e for e in evs if e.get("stage") == "need_input")
-    cmd = need["next_command_on_yes"]
-    assert "--confirm-start " in cmd and "--pending-nonce" not in cmd
-    tok = _re.search(r"--confirm-start (\S+)", cmd).group(1)
+    assert "next_command_on_yes" not in need
+    assert "--confirm-start" not in out           # token never shown to the model
+    marker_text = (tmp_path / "pending_confirm" / f"{rid}.json").read_text()
+    marker = _json.loads(marker_text)
+    assert "confirm_cmd" not in marker            # marker carries NO argv
+    assert "log_path" not in marker
+    assert marker["platform"] == "telegram"
+    assert marker["operator_user_id"] == "555000111"
+    # the single-use token lives server-side, resolvable to this request —
+    # and never appears in the marker file the hook (or /tmp) can see
+    tok = (u1_request.read_request(rid)["safety"]
+           ["pending_bed_clear_start"]["confirm_token"])
     assert u1_form.resolve_confirm_token(tok, consume=False) == rid
+    assert tok not in marker_text
     assert u1_request.read_request(rid)["safety"]["pending_bed_clear_start"]["nonce"]
 
 

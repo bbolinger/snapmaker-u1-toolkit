@@ -56,20 +56,42 @@ boundary:
    (files land; the printer does NOT start).
 6. **One bed-clear decision.** A fresh photo of the bed from the U1's onboard
    camera arrives with the previews. Reply YES to start now, or NO to keep the
-   gcode uploaded without printing. The yes rides a single-use token bound to
-   the plan's revision + gcode hash — if anything changed since you looked, the
-   start refuses instead of printing stale state.
+   gcode uploaded without printing. **The YES is redeemed by the gateway
+   itself — the workflow hands the model no start command**, so a misbehaving
+   or prompt-injected agent has nothing to fire. The yes rides a single-use
+   token bound to the plan's revision + gcode hash and to your operator
+   identity in your private chat — if anything changed since you looked, or the
+   reply came from anyone else, the start refuses instead of printing stale
+   state.
 7. **Gated start with a last exit.** The gate re-verifies material against
-   what's physically loaded, then opens a ~120s grace window with a model-free
-   Telegram CANCEL before any command reaches the printer. Plate 1 is the only
-   toolkit-started plate; plates 2..N start from the Snapmaker app — the
-   watchdog photographs every plate either way.
+   what's physically loaded, then opens a ~120s grace window before any command
+   reaches the printer: **tap the CANCEL button on the countdown, or reply
+   CANCEL** — both handled model-free by the gateway, so neither can be
+   swallowed by the agent's turn. Every outcome (started, cancelled, or
+   refused-with-reason) is messaged to you by the machinery, never narrated by
+   the model. Plate 1 is the only toolkit-started plate; plates 2..N start from
+   the Snapmaker app — the watchdog photographs every plate either way.
 8. **Monitoring takes over** — first-layer photo, last-layer check, completion
    (see [Always-on print monitoring](#always-on-print-monitoring--no-agent-required)).
 
 Steps 1–5 are useful as CLI utilities even if you never touch an AI agent.
 Steps 6–8 are where the operator gate makes the difference between "AI presses
 print" and "AI safely shows you the print so you can press it."
+
+### Also in the flow
+
+The same entrypoint and the same bed-clear gate handle three more moves:
+
+- **Reprint.** Say "reprint" (no file needed) and pick from your recent jobs.
+  The gcode already on the printer is reused — no re-slicing — the original
+  previews and review doc come back with a fresh bed photo, and the normal
+  gate runs with the same drift and identity checks.
+- **Quantity.** On a single part, ask for 1–9 copies; they pack onto the plate
+  through the same arranger and split across plates when the bed fills.
+- **Advanced settings.** An optional screen off the review card exposes infill
+  density and pattern, wall count, brim, fuzzy skin, and tree-vs-grid supports
+  — each defaulting to the profile's own value, each verified into the sliced
+  gcode.
 
 ## What This Is Not
 
@@ -81,6 +103,8 @@ print" and "AI safely shows you the print so you can press it."
 ## Safety Model
 
 Hermes — and any other AI agent layered on top — can recommend, explain, and prepare a print, but the U1 toolkit owns the final safety checks and will not perform printer-affecting actions without an explicit operator approval tied to a specific request ID.
+
+**The model is never given a way to start a print.** The workflow hands the agent no start command at all — when you reply YES at the bed-clear prompt, the gateway itself redeems it and runs the start gate; the agent runs nothing. That YES is single-use and bound to your operator identity in your private chat, so a wrong sender, a wrong conversation, or a stale plan all refuse. The agent's only unattended power over the printer is in the safe direction: it can help you *cancel* a pending start, never begin one. This boundary was not designed on paper — it was forced by a live incident where an earlier build let the model fire a start it had been handed, then hardened across several rounds of adversarial review. In the default single-host deployment a deliberately hostile agent is *contained* (every start is audited, gated, and cancellable) rather than cryptographically *prevented*; the separate-user boundary that would make it prevention is on the roadmap. The full boundary, and that honest limit, are documented in [docs/SAFETY.md](docs/SAFETY.md).
 
 The default lifecycle:
 
@@ -130,10 +154,10 @@ The full per-action breakdown (the test-operator fence, the grace-period
 cancel chain, and every allowed-vs-gated command) lives in
 [docs/SAFETY.md](docs/SAFETY.md).
 
-None of this is aspirational: 710 tests run in CI on every change, and the
-cancel chain is **live-verified on real hardware**, including a reproducible,
-no-printer-needed drill anyone can run:
-[docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
+None of this is aspirational: the full test suite runs in CI on every change
+(the deployed runtime is Python 3.13), and the cancel chain is
+**live-verified on real hardware**, including a reproducible, no-printer-needed
+drill anyone can run: [docs/verify-cancel-hook.md](docs/verify-cancel-hook.md).
 
 ## Always-on print monitoring — no agent required
 
@@ -280,7 +304,25 @@ hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-a
 
 # 2. Deploy the workflow scripts to the runtime paths the skill calls into
 bash deploy_to_runtime.sh
+
+# 3. Install BOTH gateway hooks (the operator YES that starts a print and
+#    the reply/tap CANCEL that stops one), restart the gateway, verify
+bash tools/install_hermes_u1_hooks.sh
+hermes gateway restart
+bash tools/install_hermes_u1_hooks.sh --verify
 ```
+
+The YES/CANCEL hooks bind to one operator in one private Telegram DM. With a
+single user id in `TELEGRAM_ALLOWED_USERS` the binding resolves itself;
+otherwise set it explicitly in the runtime `.env`:
+
+```bash
+U1_OPERATOR_BINDING=telegram:<your-numeric-telegram-user-id>
+```
+
+Without the hooks installed, a YES at the bed-clear prompt does nothing
+(fail-safe: the printer never starts) — `--verify` and the deploy script
+both tell you loudly.
 
 The deploy script verifies the deployed workflow actually starts (`✓ workflow
 starts cleanly`); override target paths via `U1_DEPLOY_SCRIPTS` /
@@ -499,7 +541,8 @@ pip install Pillow numpy   # only needed for the thumbnail-injector tests
 pytest -v
 ```
 
-710 tests covering: config resolution (incl. 3-tier data-dir, `.env`
+The suite (CI runs it on every pull request; the deployed runtime is Python
+3.13) covers: config resolution (incl. 3-tier data-dir, `.env`
 auto-loader with quoted/commented/walk-up edge cases, import-without-config
 regression lock, and a smoke-runner that exercises every script's `main()`
 to catch leftover undefined refs), material gate (incl. fail-closed on
@@ -520,8 +563,8 @@ to omit if you only want to run the safety-script tests.
 
 ## Release validation
 
-Each tagged release is validated before publish: the full test suite in CI on
-Python 3.11 and 3.12, a fresh-clone install and script-help smoke test, the
+Each tagged release is validated before publish: the full test suite in CI (on
+the deployed Python 3.13 runtime), a fresh-clone install and script-help smoke test, the
 active-print upload-gate safety check against a mocked Moonraker, and, for
 releases that touch the safety boundary or the operator flow, a live run on a
 real U1. Per-release evidence lives in the [CHANGELOG](CHANGELOG.md).

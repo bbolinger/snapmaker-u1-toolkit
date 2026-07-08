@@ -759,6 +759,16 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                     cancel_marker=str(cancel_marker),
                     cancelled_after_wait_s=None)
         _clear_pending_state()
+        # Model-free outcome DM: the operator hears "cancelled" from the
+        # machinery, not from an agent narrating an outcome it never saw
+        # (live 2026-07-07: the agent claimed a cancel that never happened).
+        try:
+            import u1_notify
+            u1_notify.send_operator(
+                f"\U0001f6d1 Cancelled — nothing was sent to the printer. "
+                f"({filename})")
+        except Exception:
+            pass
         return False
 
     for _ in range(int(grace_seconds)):

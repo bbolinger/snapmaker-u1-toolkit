@@ -220,12 +220,20 @@ def notify_env(tmp_path):
     """Common env for notify-script tests plus cleanup of any real
     /tmp/u1_pending_cancel/<rid>.json this test wrote."""
     rid = f"u1_2026_0701_ntf{os.getpid() % 1000:03d}"
+    repo = Path(__file__).resolve().parent.parent
     yield {
         "U1_REQUEST_ID": rid,
         "U1_FILENAME": "test_plate1.gcode",
         "U1_GRACE_SECONDS": "120",
         "U1_CANCEL_MARKER": str(tmp_path / "the_marker"),
         "U1_OPERATOR": "test:script-verify",
+        # Hermetic: no runtime .env (so no bot token reachable) and the
+        # repo copy of the notifier — its Bot API path is skipped and it
+        # falls through to the stubbed `hermes send`, same as before the
+        # button existed.
+        "HERMES_HOME": str(tmp_path),
+        "TELEGRAM_BOT_TOKEN": "",
+        "U1_NOTIFY_PY": str(repo / "scripts" / "u1_notify.py"),
     }, tmp_path
     stale = Path(f"/tmp/u1_pending_cancel/{rid}.json")
     if stale.exists():
@@ -370,8 +378,8 @@ def test_notify_message_advertises_ssh_fallback_without_hook_receipt(notify_env)
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
     assert r.returncode == 0, r.stderr
     sent = (tmp / "hermes_calls.log").read_text()
-    assert "NOT detected" in sent
-    assert "Reply **CANCEL**" not in sent, (
+    assert "hook not detected" in sent
+    assert "or reply CANCEL" not in sent, (
         "without the hook, promising reply-CANCEL is a lie — the reply "
         "would silently do nothing")
 
@@ -387,7 +395,8 @@ def test_notify_message_advertises_reply_cancel_when_hook_installed(notify_env):
     sent = (tmp / "hermes_calls.log").read_text()
     # v2.2: plain "Reply CANCEL" only — no per-id `cancel <code>` targeting
     # (one printer, one thing to cancel) and no request-id in the message.
-    assert "Reply **CANCEL**" in sent
+    assert "or reply CANCEL" in sent
+    assert "Tap 🛑 CANCEL below" in sent
     code = env["U1_REQUEST_ID"][-6:]
     assert f"cancel {code}" not in sent
     assert env["U1_REQUEST_ID"] not in sent

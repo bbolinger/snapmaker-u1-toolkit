@@ -263,3 +263,62 @@ else
     exit 3
   fi
 fi
+
+# ===========================================================================
+# Gateway hook receipts check (v2.3)
+# ===========================================================================
+# The model-free start chain needs TWO gateway hooks installed where the
+# Hermes gateway actually runs: u1_confirm_start (the operator YES that
+# starts the print) and u1_grace_cancel (reply-CANCEL during the grace
+# window). This script deliberately does NOT install them — deploys can run
+# on boxes where the gateway lives elsewhere. It only checks for the
+# receipts tools/install_hermes_u1_hooks.sh writes, and yells when they're
+# absent: a fresh install without the confirm hook arms YES windows that
+# nothing redeems (fail-safe, but the printer never starts).
+_HOOKS_DIR="${HERMES_HOOKS_DIR:-}"
+if [[ -z "$_HOOKS_DIR" ]]; then
+  _HOOKS_DIR="$("${HERMES_PY:-/opt/hermes/.venv/bin/python}" -c 'from gateway.hooks import HOOKS_DIR; print(HOOKS_DIR)' 2>/dev/null || true)"
+fi
+if [[ -z "$_HOOKS_DIR" ]]; then
+  # No Hermes python here (e.g. deploying from the host side of the bind
+  # mount) — fall back to the same root the deploy targets. Inside the
+  # Hermes container that's /opt/data/hooks; from the host it's
+  # /appdata/hermes/hooks (the same dir through the bind).
+  _HOOKS_DIR="$_DEFAULT_ROOT/hooks"
+fi
+_CANCEL_RECEIPT=""
+_CONFIRM_RECEIPT=""
+if [[ -s "$_HOOKS_DIR/u1_grace_cancel/.install_receipt.json" ]]; then _CANCEL_RECEIPT=1; fi
+if [[ -s "$_HOOKS_DIR/u1_confirm_start/.install_receipt.json" ]]; then _CONFIRM_RECEIPT=1; fi
+if [[ -z "$_CANCEL_RECEIPT" && -z "$_CONFIRM_RECEIPT" ]]; then
+  printf '\n'
+  printf '############################################################################\n'
+  printf '##                                                                        ##\n'
+  printf '##   WARNING: MODEL-FREE START HOOK NOT INSTALLED                         ##\n'
+  printf '##                                                                        ##\n'
+  printf '############################################################################\n'
+  printf '\n'
+  printf '  No hook install receipts found in: %s\n' "$_HOOKS_DIR"
+  printf '\n'
+  printf '  Without the u1_confirm_start gateway hook, the workflow still arms the\n'
+  printf '  YES window at the bed-clear prompt but NOTHING redeems it: the operator\n'
+  printf '  replies YES and the printer never starts (fail-safe, but dead). Without\n'
+  printf '  u1_grace_cancel, reply-CANCEL during the grace window is dead too.\n'
+  printf '\n'
+  printf '  On the box where the Hermes gateway runs:\n'
+  printf '      bash tools/install_hermes_u1_hooks.sh\n'
+  printf '  then restart the gateway and confirm:\n'
+  printf '      bash tools/install_hermes_u1_hooks.sh --verify\n'
+  printf '\n'
+  printf '############################################################################\n'
+elif [[ -z "$_CONFIRM_RECEIPT" ]]; then
+  printf '\n  ⚠  u1_confirm_start hook receipt missing in %s — the operator YES at the\n' "$_HOOKS_DIR"
+  printf '     bed-clear prompt redeems nothing until it is installed (the printer\n'
+  printf '     never starts). Run: bash tools/install_hermes_u1_hooks.sh\n'
+elif [[ -z "$_CANCEL_RECEIPT" ]]; then
+  printf '\n  ⚠  u1_grace_cancel hook receipt missing in %s — reply-CANCEL during the\n' "$_HOOKS_DIR"
+  printf '     grace window does nothing until it is installed.\n'
+  printf '     Run: bash tools/install_hermes_u1_hooks.sh\n'
+else
+  printf '\n  ✓  Both gateway hook receipts present in %s.\n' "$_HOOKS_DIR"
+fi

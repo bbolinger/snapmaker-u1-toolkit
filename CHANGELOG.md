@@ -6,6 +6,100 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.3.0] — 2026-07-07
+
+Three operator-requested features plus one structural safety change born
+from a live incident during release testing: the agent model fired the
+emitted confirm command itself, starting a print no operator approved. The
+start trigger now lives where model behavior cannot reach it.
+
+### Safety
+
+- **The operator's YES is model-free.** The bed-clear prompt no longer
+  hands the agent any confirm command — the workflow arms an on-disk
+  marker and a gateway hook redeems the operator's literal YES message by
+  running the confirm itself. The model is handed nothing it could fire:
+  accidental or instruction-following command relay — the failure that
+  happened live — is structurally gone. (In the default same-user
+  deployment this is not a boundary against a deliberately malicious agent
+  with terminal access; every start still runs the audited gate, the
+  operator countdown, and the one-tap cancel, and SAFETY.md describes the
+  user-separation that makes it a hard boundary.) The
+  single-use token, nonce, and revision/hash binding underneath are
+  unchanged. With multiple pending starts, a bare YES refuses and asks
+  for `yes <code>`: a print start never guesses.
+- **Cancel gained a second route.** An operator message that arrives as a
+  mid-turn interrupt bypasses gateway hooks (how the incident's CANCEL
+  was lost), so the agent may now relay `--grace-cancel` — a command that
+  can only ever stop a pending start. Capability is asymmetric by design:
+  the model can help cancel, and is never handed a way to help start.
+- **Review hardening on the same boundary.** The armed YES window is
+  opaque (no command, no token — the hook builds its own fixed invocation
+  and never executes anything read from a file) and bound to the
+  operator's identity, refusing a YES from anyone else or when identity
+  can't be resolved. The stable-tier agent rules were rewritten to match
+  (they still taught the old command-relay flow — the strongest prompt
+  layer contradicting the boundary), with a repo test that fails if any
+  legacy start phrase reappears in a model-facing file. Reprint now binds
+  the printer-side file's size and timestamp at upload and re-checks them
+  at the confirmed yes, so a same-name overwrite can't ride a review
+  through the gate. One installer ships both gateway hooks with receipts
+  and a `--verify` mode, and an end-to-end test proves every advanced
+  override lands in the sliced gcode. SAFETY.md states the boundary
+  honestly: the agent is handed nothing it could fire, and full capability
+  separation calls for running the gateway under a separate user.
+
+### Added
+
+- **Reprint.** Say "reprint" (no file needed) and the workflow lists your
+  recent successful uploads with their model, head, and material. Pick one
+  and the flow goes straight to the bed-clear decision: no re-slicing, the
+  gcode already on the printer is reused, the original previews and review
+  document are re-surfaced alongside a fresh bed photo, and the start gate
+  runs with the same drift checks as a new job (the reviewed revision and
+  gcode hash must still match). Each listed option carries a single-use
+  pick token, so a stale or replayed message cannot start anything.
+- **Advanced settings screen.** The form's Review screen gains one
+  `Advanced settings` button opening a single optional screen: infill
+  density (10-50%), infill pattern (grid / gyroid / honeycomb / triangles /
+  cubic), wall loops (2-4), brim (off / auto), fuzzy skin, and support
+  style (tree vs grid, when supports are on). Every field defaults to the
+  profile's own value, so skipping the screen is exactly the old behavior.
+  Overrides are applied as a flattened temp process profile (the same
+  mechanism supports already used), persisted on the request, audited, and
+  flagged in the review document's settings sweep before you confirm.
+  Text mode accepts the same choices (`infill 30%`, `gyroid`, `walls 3`,
+  `brim off`, `fuzzy`, `tree supports`).
+- **Quantity.** Single-part jobs gain a Quantity choice on the setup screen
+  (1-9 copies). Copies are packed onto the plate by the normal arranger, so
+  the plate previews show every instance and jobs too large for one bed
+  split into multiple plates exactly like a kit. Text mode: `x3`, `qty 3`,
+  or `3 copies`.
+
+### Fixed
+
+- **Reprint confirm no longer re-ingests the original archive.** The YES
+  turn on a reprint routes directly to the start gate; previously it tried
+  to recover the original upload (long since cleaned from the cache) and
+  failed at the finish line.
+- **Reprint records its review moment.** The reprint turn re-surfaces the
+  plan previews and review document with a fresh bed photo, and now writes
+  the same revision-and-hash-bound readiness record a new job gets, so the
+  start gate's drift check passes for honest reprints and still refuses if
+  anything changed underneath.
+- **Advanced screen readability.** Option buttons are self-describing
+  ("Infill 30%", "Walls: 3") instead of bare values, and Review exposes
+  the screen through a single button plus a summary of non-default picks.
+
+### Changed
+
+- **Skill guidance hardened from live incidents:** on any relayed command
+  error or refusal the agent surfaces the message verbatim and stops (no
+  self-directed diagnosis or recovery), and a CANCEL during the grace
+  window is executed by a model-free gateway hook — the agent runs nothing.
+
+---
+
 ## [2.2.2] — 2026-07-06
 
 Safety hardening plus two operator-reported UX bugs, verified live on real
