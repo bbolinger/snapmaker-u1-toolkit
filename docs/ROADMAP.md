@@ -1,260 +1,202 @@
 # Roadmap — Safe AI Print Operator (U1 first)
 
-This document tracks the project's direction across 9 phases from v1.6 ("Hermes-compatible slicer") to v2.0 ("Safe AI Print Operator with a portable safety model"). All 9 phases ship as a single v2.0.0 release.
+This tracks the project's direction. The shipped history is summarized; the
+active plan is v2.4.
 
-The v1.x line is frozen on `main` at v1.6.0. The v2.0 work lives on the `v2.0-dev` branch until end-to-end acceptance, then merges to `main` with a v2.0.0 tag.
+**Current release:** v2.3.0 on `main`. Per-release detail lives in the
+[CHANGELOG](../CHANGELOG.md); the system contracts live in
+[`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md).
 
 Status markers:
-- ✅ **DONE** — shipped and validated end-to-end
+- ✅ **SHIPPED** — released and validated end-to-end
+- 🔜 **NEXT** — active or next-up
 - 📋 **QUEUED** — design clear, scope deferred; resume when a real need appears
 - 🎯 **POSTURE** — ongoing principle, not a sprint
 
-When you pick this up cold: read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the system contracts, then [`HERMES.md`](../HERMES.md) for the agent's procedural rules, then [`docs/events.md`](events.md) for the public event contract.
+When you pick this up cold: read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md)
+for the system contracts, then [`HERMES.md`](../HERMES.md) for the agent's
+stable-tier rules, then [`docs/events.md`](events.md) for the public event
+contract.
 
 ---
 
-## Phase 1 — Repo identity + README reframe
+## Shipped so far (v1.6 → v2.3)
 
-**Status:** ✅ DONE
+**Status:** ✅ SHIPPED
 
-Positions the project as "Safe AI Print Operator — Snapmaker U1 first." README explains the safety model, the three layers (CLI / operator workflow / Hermes mode), and what the operator approves to a new reader in three minutes.
+The spine that every future release builds on:
 
-**Cross-links:** [`README.md`](../README.md)
+- **Safe AI Print Operator framing** — CLI / operator-workflow / Hermes layers,
+  a portable safety model, and a three-minute README for a new reader.
+- **Print Request Objects** — every job is a first-class `request_id`
+  (`u1_YYYY_MMDD_xxxxxx`) with a durable `request.json`; content-hash recovery
+  resumes an in-flight request across model swaps.
+- **Audit log + start-safety gate** — append-only `audit.jsonl` per request and
+  a single `can_start()` precondition that refuses if the plan drifted since the
+  operator reviewed it (revision bump, re-slice, missing bed photo).
+- **One unified flow** — a lone STL is a kit of one; button form, text
+  fallback, and CLI all share `_action_start` and the same Gemma-proof confirm.
+- **First/last-layer photos + quiet monitoring** — cron-driven, no agent turn,
+  one alert per distinct issue, watches every active print not just ours.
+- **Model-free print-start boundary** — the agent is handed no start command;
+  the operator's YES is redeemed by a gateway hook bound to their identity and
+  private chat; the agent can only ever help cancel. Forced by a live incident,
+  hardened across four adversarial review rounds.
+- **v2.3 operator conveniences** — reprint (recall a recent job, no re-slice),
+  quantity (1–9 copies), and an optional advanced-settings screen (infill,
+  walls, brim, fuzzy skin, tree-vs-grid supports), each verified into the
+  sliced gcode.
 
----
-
-## Phase 2 — Print Request Objects
-
-**Status:** ✅ DONE
-
-Every print job is a first-class entity with a stable `request_id` (`u1_YYYY_MMDD_xxxxxx`) and a durable `requests/<id>/request.json`. Content-hash recovery resumes in-flight requests across model swaps when the agent loses conversation context. Approval flows attach to the ID.
-
-**Cross-links:** [`scripts/u1_request.py`](../scripts/u1_request.py), [`HERMES.md`](../HERMES.md) Rules 6 + 7
-
----
-
-## Phase 3 — Audit log + start-safety gate
-
-**Status:** ✅ DONE
-
-Per-request append-only `audit.jsonl` (forensic evidence trail) + the `can_start()` precondition function as the single source of truth for whether it's safe to physically dispatch a print. Every Stage 2 path routes through it; refuses if the print plan has drifted (revision bump, re-slice, missing bed photo) since the operator reviewed the readiness card.
-
-**Cross-links:** [`scripts/u1_audit.py`](../scripts/u1_audit.py), [`scripts/u1_safety.py`](../scripts/u1_safety.py), [`HERMES.md`](../HERMES.md) Rule 8
-
----
-
-## Phase 4 — Capability modes
-
-**Status:** 📋 QUEUED
-
-Three deployment postures: `read_only` (inspection only), `upload_only` (slice + preview + upload, no start), `operator_start` (current behavior — start requires Stage 1 token). Build out when a second deployment posture appears.
+The public event contract ([`docs/events.md`](events.md)) lets a new frontend
+wrap the workflow without reading source.
 
 ---
 
-## Phase 5 — Hermes skill operates on `request_id`
+## v2.4 — the plan
 
-**Status:** ✅ DONE
+Four buckets. A recommended order is at the end.
 
-Every operator-facing approval question includes the `request_id` verbatim, so the operator's "yes" routes to the specific named request rather than "whatever was most recent." Aligns the agent's behavior with the toolkit's already-built request_id primitives.
+### Safety
 
-**Cross-links:** [`skills/3d-printer-slicing-automation/SKILL.md`](../skills/3d-printer-slicing-automation/SKILL.md), [`HERMES.md`](../HERMES.md), [`README.md`](../README.md#what-an-approval-looks-like)
+#### Caller-bound start redemption (the broker)
 
----
+**Status:** 🔜 NEXT — the headline
 
-## Phase 6 — Public event contract
+Today the gateway hook that redeems the operator's YES and the workflow CLI run
+as the same Unix user, so redemption is operator-bound but not *caller*-bound: a
+deliberately hostile agent with terminal access could invoke it directly. It is
+contained — every start is audited, gated, and cancellable — but not prevented.
+This is the recurring finding across three adversarial audits.
 
-**Status:** ✅ DONE
+The fix moves redemption behind a boundary the agent worker cannot reach: the
+gateway (or a small broker) runs under a **separate user or host**, owns the
+confirmation secret, and exposes redemption only over a peer-credentialed
+channel. A request id alone stops being authorization. Honest limit worth
+stating up front: while the agent shares the gateway *process*, you cannot fully
+defend a process from itself — the real boundary needs the separate user/host,
+which is a deployment change, not just repo code. Turns "contained" into
+"prevented" for the same-user case; document what remains.
 
-[`docs/events.md`](events.md) is the public contract for both event streams (workflow `events.jsonl` and forensic `audit.jsonl`). A new frontend (Telegram bot, web UI, MCP server) can wrap the workflow using this doc alone, with no source-reading required.
+#### Fail-open decisions (from the round-3 audit)
 
-**Cross-links:** [`docs/events.md`](events.md)
+**Status:** 📋 QUEUED (operator decision, then implement)
 
----
+Three start-path behaviors currently fail *safe*; flipping any to fail *closed*
+is a UX-vs-strictness tradeoff to decide as a batch alongside the broker work,
+since all three live in the same path:
 
-## Phase 7 — Sandbox / demo mode
+1. Printer-side gcode existence check fails open on Moonraker 500 / timeout.
+2. The confirm hook consumes the YES on process spawn, not on redemption
+   success (a child crash strands a valid YES; fails safe).
+3. Grace-window notification failure does not block the physical start (the
+   operator already said YES, but loses the advertised cancel window).
 
-**Status:** 📋 QUEUED
+### Reliability
 
-Run the workflow without a U1 for CI and demos. The toolkit's existing `--no-live-material` flag + dry-run upload already cover the meaningful workflow steps (analysis, slice, upload). Stage 1/2 require real hardware by design — they verify physical state, so a sandbox would have to fake the moat to be useful, which would mislead evaluators. Build out a non-misleading version when a contributor without a U1 actually needs it.
+#### Native-endpoint shim for the Ollama `/v1` tool-call leak
 
----
+**Status:** 🔜 NEXT — highest daily payoff
 
-## Phase 8 — First/last-layer photos + quiet monitoring
+The `<channel|>` / template-token residue and garble epochs all trace to
+Ollama's `/v1` compatibility endpoint mangling gemma4 tool calls (upstream
+ollama/ollama#15798); the native `/api/chat` parser is clean. A tiny proxy that
+accepts Hermes' `/v1` requests and forwards them to `/api/chat` removes the
+broken parser from the path entirely — no model change, no Hermes downgrade. De-
+risks every future live test.
 
-**Status:** ✅ DONE
-
-Cron-driven: `u1_last_layer_watch.py` captures milestone photos (first 5 layers + last layer), and `u1_print_watchdog.py` runs a 20-minute health poll. Both follow the "print nothing unless operator-worthy" contract — quiet during normal print, one alert per distinct issue, no spam.
-
-**Cross-links:** [`scripts/u1_last_layer_watch.py`](../scripts/u1_last_layer_watch.py), [`scripts/u1_print_watchdog.py`](../scripts/u1_print_watchdog.py)
-
----
-
-## Phase 9 — Multi-printer scope avoidance
-
-**Status:** 🎯 POSTURE
-
-Resist scope creep. Make the U1 implementation excellent before chasing Bambu / Prusa / OctoPrint / Klipper / etc. Design internals so a second printer could be added later, but don't pre-build the abstraction — it will be wrong without a real second printer to design against.
-
-The U1 implementation is the proving ground for the safety model + event contract. When a second printer eventually appears, refactor along the seams the U1 implementation has proven, not along guessed seams.
-
----
-
-## Phase 10 — Single-STL system-width parity (NEXT)
-
-**Status:** 🔜 NEXT WORK (2026-07-03)
-
-The kit / multi-STL flow (`u1_kit_workflow.py`) was brought to full parity across
-all interaction modes — button form, text fallback, and direct CLI all share
-`_action_start` and use the "Slice & review" verb + the short-token
-`--confirm-start` bed-clear confirm (Gemma-proof). The **single-STL** flow
-(`u1_slice_workflow.py`) is a separate, older implementation that did NOT get any
-of it and is the remaining "path parity" gap for tiny local models:
-
-1. **Verbiage.** "Upload + start gate" → "Slice & review" framing (the `Upload?`
-   prompt options + any pre-commit "Start" wording). Collapse the double-yes the
-   same way: the bed-clear yes/no is the single start decision.
-2. **Short-token confirm (safety-critical).** Single-STL currently makes the
-   agent run a Stage-1 command, then *extract the approval token from the output
-   and hand-rebuild the Stage-2 command* (`--bed-clear start --approval-token
-   <token>`). This is the worst-case mangle pattern — a 26B model butchers it.
-   Give single-STL a `--confirm-start <token>` path (its own, or refactor it to
-   share the kit's `_action_start`). Keep the nonce/approval-token as the auth.
-3. **Buttons (was Phase-4 / Increment 4).** Single-STL has no form mode yet.
-   A shared decision-collection module gives it the same button UX as the kit.
-
-Also fold in the small consistency cleanup: the kit **manual-bed-check override**
-path still emits the long yes-command instead of a short token (rare degraded /
-camera-failed path) — tokenize it for uniformity.
-
-Rationale for "system width": a super-tiny model that can't drive buttons must
-still work through the text fallback, and a human at a terminal must work through
-the CLI — all three modes need the same verbiage + the same Gemma-proof confirm.
-The kit flow already delivers this; single-STL must too before the demo can claim
-path parity (kit AND single-STL both work on the model users actually run).
-
-**UX order + wording (from live kit/Gemma run 2026-07-04) — apply to kit AND single-STL buttons:**
-- ORDER: surface [plate preview + bed photo + review.md] BEFORE the decision (currently the question shows above the photo); do not let the verbose skill-ack land mid-flow.
-- WORDING: hide the request-id from operator-facing text (leaks in the prompt, cancel hint, and cancelled message); one decision not a double question; plain "Reply CANCEL" (no `cancel <id>` targeting — single printer).
-- Strip the Hermes doc-cache prefix (doc_<hash>_) from the printer filename too (kit got this in 82a9681; single-STL names off archive.stem the same way).
-- KEEP: the parts thumbnail grid, "Submitted - slicing in the background", and surfacing preview+bed photo+review.
-
-Reference: Ollama/gemma4 tool-call bug + the fixes are documented in the README
-"Local model & serving requirements" section and TROUBLESHOOTING.md.
-
----
-
-## v2.3 — Operator conveniences (planned 2026-07-06)
-
-Three features, ordered cheapest-to-richest. All three reuse proven machinery;
-none touches the safety boundary's shape.
-
-### 1. Reprint — recall recent prints, restart through the gate
-
-**Status:** 📋 QUEUED (first up)
-
-List recent prints from the `u1_print_history` ledger (filename, tool,
-material, when, duration) as a single-select form. Picking one skips slicing
-entirely: straight to Stage-1 bed photo → operator yes → Stage-2 start on the
-gcode already in printer storage.
-
-Why it's cheap: the ledger already records everything needed, and the start
-gate already (a) takes a printer-storage filename, (b) re-verifies material
-against what's physically loaded, and (c) validates the file exists on the
-printer before opening the grace window. If the file was deleted from the
-printer, re-upload from the request dir when it still exists; otherwise offer
-a fresh slice.
-
-### 2. Quantity — print N copies
-
-**Status:** 📋 QUEUED
-
-Orca 2.4.0 CLI natively supports `--repetitions count` (whole plate) and
-repeated positional STL paths (per-part control). Form gets a quantity
-selector — single-model (kit-of-one) runs first; per-part ×N for kits only if
-a real need appears. The instance-keyed 3D render already draws duplicate
-copies correctly, and multi-plate overflow is already handled by the extent
-guard + plate split.
-
-### 3. Advanced settings screen (infill, walls, brim, fuzzy skin)
-
-**Status:** 📋 QUEUED
-
-An optional "Advanced" button on the form's Review screen jumps to an extra
-group and returns to Review (the edit-return mechanism the re-edit fix added).
-Skipping it = today's behavior, so the default path costs nothing — and since
-the form schema rides on disk (the model only relays a `form_id`), extra
-fields cost a small local model zero tokens.
-
-Fields (button presets only — the renderer is single/multi-select, and preset
-lists beat free-typed numbers for reliability):
-
-- Infill density: 10 / 15 / 20 / 30 / 40 / 50 %
-- Infill pattern: grid / gyroid / honeycomb / triangles
-- Wall loops: 2 / 3 / 4
-- Brim: off / auto
-- Fuzzy skin: off / on
-
-Backend: generalize `apply_supports_override` into
-`apply_profile_overrides(dict)` — same flatten-profile → patch keys →
-self-contained temp JSON pattern (Orca has no CLI override flags; profile
-patching is the only reliable path). Keys: `sparse_infill_density`,
-`sparse_infill_pattern`, `wall_loops`, `brim_type`, `fuzzy_skin`. Every
-override must appear in `review.md` so what the operator approved is what
-prints. Text mode: optional prefixed tokens in the one-liner; staged mode
-skips advanced entirely.
-
-Scope fence: layer height and supports stay where they are (profile choice +
-the existing supports field). Seam, speeds, and temperatures stay out —
-that's profile territory, and every added option is another decision on the
-operator's screen.
-
----
-
-## v2.4 — 3MF ingest (planned 2026-07-06)
-
-### Hardened deployment: caller-bound start redemption
-
-Today the gateway hook that redeems the operator's YES and the workflow CLI
-run as the same Unix user, so the redemption path is operator-bound but not
-caller-bound — a deliberately malicious agent with terminal access could
-invoke it directly (contained by the audited gate, the operator countdown,
-and one-tap cancel, but not prevented). The v2.4 hardening moves redemption
-behind a boundary the agent worker cannot reach: the gateway (or a small
-broker) runs under a separate user or host, owns the confirmation secret,
-and exposes redemption only over a peer-credentialed channel. A request id
-alone stops being authorization.
-
-**Status:** 📋 QUEUED
-
-Accept a multi-object `.3mf` as a kit. Lean path: normalize to the proven STL
-pipeline by having Orca itself explode the file (`--export-stls <dir>`), then
-feed the extracted parts through the existing ingest → form → arrange → slice
-flow. No new geometry parsing. The packer divergence that bit the old 3D
-preview doesn't apply here — extraction only; our own arrange step re-packs
-everything. Embedded profiles and paint/multi-material data are ignored:
-geometry only. `--allow-newer-file` covers newer 3mf versions. Zip-of-STLs
-stays the primary kit shape.
-
----
-
-## Model bench — 12B-class tool callers (standing)
+#### 12B-class tool-caller bench
 
 **Status:** 📋 QUEUED (independent of releases)
 
-Candidates to test against the skill, in order: Qwen3 14B (native tool
-template, ~9 GB), Llama-3-Groq-8B-Tool-Use (top small-class tool-calling
-benchmark; verify its context window fits the skill payload), Mistral Nemo
-12B, Granite4 small. Skip thinking-variant models (empty content in tool
-turns). Protocol per model: create a temp-0.2 variant, then the live
-gauntlet — does `form()` fire, does `next_command` relay verbatim, does it
-freelance on a bare zip. Three runs each; score = forms fired / verbatim
-relays / freelance incidents.
+Find a model that relays `form()` and `next_command` verbatim without
+freelancing. Candidates in order: Qwen3 14B (native tool template, ~9 GB),
+Llama-3-Groq-8B-Tool-Use (verify context fits the skill payload), Mistral Nemo
+12B, Granite4 small. Skip thinking-variant models (empty content in tool turns).
+Per model: temp-0.2 variant, then a three-run live gauntlet scored on forms
+fired / verbatim relays / freelance incidents.
+
+### Features
+
+#### 3MF ingest
+
+**Status:** 📋 QUEUED
+
+Accept a multi-object `.3mf` as a kit. Lean path: let Orca explode the file
+(`--export-stls <dir>`), then feed the extracted parts through the existing
+ingest → form → arrange → slice flow. No new geometry parsing; our own arrange
+step re-packs, so the old packer divergence does not apply. Geometry only —
+embedded profiles and paint/multi-material data are ignored. Zip-of-STLs stays
+the primary kit shape.
+
+### Debt / cleanup
+
+#### Consolidate the go/stop control surface
+
+**Status:** 📋 QUEUED (pairs with the broker)
+
+"Operator says go/stop" now spans a confirm marker, a cancel marker, two gateway
+hooks, a button callback, typed cancel, a `--grace-cancel` arg, and an expiry
+watchdog. Each piece is incident-justified and correct, but the surface is wide.
+Fold the two marker dirs and two hooks into one confirmation-window module with a
+single per-request state file carrying both go and stop affordances. Best done
+alongside the broker, since both touch the redemption path.
+
+#### Small stragglers
+
+**Status:** 📋 QUEUED
+
+- Tokenize the kit manual-bed-check override yes-command (the rare degraded /
+  camera-failed path still emits the long command instead of a short token).
+- Image-order / skill-ack polish on the staged flow.
+- Courtesy amend to the awesome-hermes-agent listing (staged → unified/form).
+
+### Recommended order
+
+1. **Native-endpoint shim** — cheapest, highest daily-annoyance payoff, makes
+   every subsequent live test reliable instead of a dice roll.
+2. **Decide the three fail-open calls** — quick operator judgment; settles the
+   audit's open items.
+3. **Broker + control-surface consolidation together** — the safety headline,
+   done once as a clean refactor of the redemption path.
+4. **3MF ingest** — the user-facing feature; an easy win whenever a lighter
+   task is wanted.
+5. **Model bench + stragglers** as fill-in.
+
+---
+
+## Standing postures
+
+### Multi-printer scope avoidance
+
+**Status:** 🎯 POSTURE
+
+Make the U1 implementation excellent before chasing Bambu / Prusa / OctoPrint /
+etc. Design internals so a second printer *could* be added later, but do not
+pre-build the abstraction — it will be wrong without a real second printer to
+design against. Refactor along the seams the U1 has proven, not guessed seams.
+
+### Capability modes
+
+**Status:** 📋 QUEUED
+
+Three deployment postures: `read_only`, `upload_only`, `operator_start` (current
+behavior). Build out when a second posture actually appears.
+
+### Sandbox / demo mode
+
+**Status:** 📋 QUEUED
+
+Run the workflow without a U1 for CI and demos. The existing `--no-live-material`
++ dry-run upload already cover analysis / slice / upload. Stage 1/2 verify
+physical state by design, so a sandbox would have to fake the moat to be useful —
+which would mislead evaluators. Build a non-misleading version when a contributor
+without a U1 actually needs it.
 
 ---
 
 ## How to pick up this work cold
 
 1. Read [`docs/DESIGN-CONTRACT.md`](DESIGN-CONTRACT.md) for the immutable system contracts.
-2. Read [`HERMES.md`](../HERMES.md) for the agent's procedural rules (Rules 1–8).
+2. Read [`HERMES.md`](../HERMES.md) for the agent's stable-tier rules.
 3. Read [`docs/events.md`](events.md) for the public event contract.
-4. Check `git log --oneline main..v2.0-dev` for in-flight work that hasn't merged yet.
+4. Check the [CHANGELOG](../CHANGELOG.md) for what the current release actually shipped.
