@@ -326,3 +326,53 @@ def test_confirm_turn_refuses_on_printer_file_drift(monkeypatch, capsys):
     assert "gate" not in reached, "gate must not launch on drifted bytes"
     assert out_res["phase"] == "bed_clear_approval_rejected"
     assert "changed since upload" in out
+
+
+
+def test_normal_kit_confirm_skips_reingest(monkeypatch, capsys):
+    """Live 2026-07-08: a normal (non-reprint) kit's YES returned
+    'awaiting_parts'. gemma re-ran the kit command mid-flow, which left
+    kit.selected unset; the confirm turn then RE-INGESTED and re-prompted for
+    parts instead of starting. A confirmed start must route straight to the
+    gate — never re-ingest — regardless of kit.selected, since everything it
+    validates is already persisted."""
+    from types import SimpleNamespace
+    old_rid, fname = _seed_uploaded_request()
+    # make it a NORMAL kit at the bed-clear boundary: no reprint_of, and the
+    # exact bug state — kit.selected unset.
+    st = u1_request.read_request(old_rid)
+    st.pop("reprint_of", None)
+    kitblk = dict(st.get("kit") or {}); kitblk["selected"] = None
+    tok = u1_form.new_confirm_token()
+    pending = dict((st.get("safety") or {}).get("pending_bed_clear_start") or {})
+    pending.update({"nonce": "n0", "confirm_token": tok,
+                    "prompt_key": "bed_clear_start",
+                    "request_revision": st.get("request_revision", 1),
+                    "gcode_hash": st["plates"][0]["gcode_hash"]})
+    safety = dict(st.get("safety") or {})
+    safety["pending_bed_clear_start"] = pending
+    safety.setdefault("approval_token", "tok_test")       # bed-clear emit sets this
+    safety.setdefault("bed_clear_photo_captured", True)
+    u1_request.write_request(old_rid, kit=kitblk, safety=safety,
+                             gcode_hash=st["plates"][0]["gcode_hash"],
+                             phase="awaiting_bed_clear_start")
+    u1_form.persist_confirm_token(tok, old_rid)
+
+    reached = {}
+    def _fake_gate(gate_py, argv, out_dir):
+        reached["argv"] = argv
+        return None  # None == grace window opened, gate detached
+    monkeypatch.setattr(kw, "_invoke_stage2_gate", _fake_gate)
+
+    args = SimpleNamespace(
+        model=None, confirm_start=None, confirm_start_for=old_rid,
+        reprint=False, reprint_start=None, grace_cancel=False,
+        json_events=True, operator="test-op", events_file=None,
+        request_id=None, action=None, bed_clear_confirmed=False,
+        pending_nonce=None, nozzle="0.4",
+    )
+    out_res = kw.run_kit_workflow(args)
+    out = capsys.readouterr().out
+    assert reached, f"confirm must reach the gate, not re-prompt; res={out_res} out={out[:300]}"
+    assert "awaiting_parts" not in out and "awaiting_parts" != out_res.get("phase")
+    assert "kit_ingested" not in out            # NO re-ingest on the confirm turn
