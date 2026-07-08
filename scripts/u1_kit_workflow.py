@@ -3480,9 +3480,15 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
     YES that goes nowhere."""
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
+    # A per-arm generation token: re-prompting the same request overwrites
+    # the marker at the same path, and each arm spawns its own watchdog. The
+    # generation lets an old watchdog tell "my window" from "a newer window
+    # that reused this path" and leave the latter alone (cold-audit finding).
+    generation = f"{request_id}:{now.timestamp():.6f}:{os.getpid()}"
     entry = {
         "request_id": request_id,
         "filename": filename,
+        "generation": generation,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(
             seconds=_PENDING_CONFIRM_TTL_S)).isoformat(),
@@ -3516,11 +3522,12 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
     tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
     tmp.write_text(json.dumps(entry, indent=2))
     tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
-    _spawn_confirm_expiry_watchdog(request_id, filename)
+    _spawn_confirm_expiry_watchdog(request_id, filename, generation)
 
 
 def _spawn_confirm_expiry_watchdog(request_id: str,
-                                   filename: str | None) -> None:
+                                   filename: str | None,
+                                   generation: str = "") -> None:
     """Silence is not an allowed outcome (operator feedback 2026-07-07):
     a window that expires unredeemed must say so. Spawn the standalone
     watchdog script with ALL inputs as argv — cold-review finding: the
@@ -3534,7 +3541,7 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
         import subprocess as _sp
         _sp.Popen(["python3", script, request_id,
                    str(filename or "the pending print"), marker,
-                   str(_PENDING_CONFIRM_TTL_S)],
+                   str(_PENDING_CONFIRM_TTL_S), generation],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
     except Exception:

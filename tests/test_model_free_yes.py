@@ -57,7 +57,7 @@ _OMIT = object()
 def _no_real_watchdogs(monkeypatch):
     """Arm calls spawn a detached expiry watchdog; tests must not."""
     monkeypatch.setattr(kw, "_spawn_confirm_expiry_watchdog",
-                        lambda rid, fn: None)
+                        lambda rid, fn, gen="": None)
 
 
 @pytest.fixture(autouse=True)
@@ -425,7 +425,7 @@ def test_far_future_expiry_is_quarantined(pending_dir, monkeypatch, tmp_path):
 def test_arm_writes_opaque_marker_and_disarm_removes(pending_dir):
     kw._arm_pending_confirm("u1_2026_0707_ccc333", "p.gcode", "telegram:brent")
     m = json.loads((pending_dir / "u1_2026_0707_ccc333.json").read_text())
-    assert set(m) == {"request_id", "filename", "platform", "operator_chat_id",
+    assert set(m) == {"request_id", "filename", "generation", "platform", "operator_chat_id",
                       "operator_user_id", "created_at", "expires_at"}
     assert m["platform"] == _OP_PLATFORM
     assert m["operator_user_id"] == _OP_USER
@@ -756,7 +756,7 @@ def test_no_yes_no_dm(pending_dir, monkeypatch):
 def test_arm_spawns_expiry_watchdog(pending_dir, tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(kw, "_spawn_confirm_expiry_watchdog",
-                        lambda rid, fn: calls.append((rid, fn)))
+                        lambda rid, fn, gen="": calls.append((rid, fn)))
     monkeypatch.setattr(kw.u1_request, "request_dir",
                         lambda rid: tmp_path / "req" / rid)
     monkeypatch.setattr(kw.u1_config, "get_operator_binding",

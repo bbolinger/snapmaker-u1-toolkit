@@ -92,6 +92,38 @@ def request_dir(request_id: str) -> Path:
     return _requests_root() / request_id
 
 
+import fcntl as _fcntl
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def request_lock(request_id: str):
+    """Exclusive per-request advisory lock (flock on
+    ``<request_dir>/.request.lock``) held across a full read-modify-write.
+
+    Cold-audit finding 2026-07-07: ``write_request`` was atomic against a
+    TORN read (os.replace) but not against a LOST UPDATE — process B reads
+    the request, process A consumes the single-use Stage 2 nonce under its
+    own narrower lock and writes, then B writes its stale full document back
+    and RESURRECTS the consumed nonce. Serializing every request read-
+    modify-write under one lock closes that race for the nonce and for the
+    whole lost-update family (revision bumps, safety-block edits, plate
+    state). Linux runtime: fcntl is always present. A lock failure raises
+    rather than silently proceeding unlocked — for a safety-state file a
+    missing mutex must fail loud, not fail open."""
+    ensure_request_dir(request_id)
+    lock_path = request_dir(request_id) / ".request.lock"
+    lf = open(lock_path, "w")
+    try:
+        _fcntl.flock(lf, _fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            _fcntl.flock(lf, _fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+
 def ensure_request_dir(request_id: str) -> Path:
     """Path to the request dir, creating it if missing.
 
@@ -257,26 +289,30 @@ def write_request(request_id: str, **fields: Any) -> Path:
     """
     ensure_request_dir(request_id)
     p = _request_json_path(request_id)
-    prior = read_request(request_id) or {}
-    now = time.time()
-    if 'created_at' not in prior:
-        prior['created_at'] = now
-    # Compute new revision against PRIOR state BEFORE merging the new fields.
-    new_revision = _bump_revision_if_changed(prior, fields)
-    prior.update(fields)
-    prior['request_id'] = request_id
-    prior['updated_at'] = now
-    prior['request_revision'] = new_revision
-    _ensure_schema_defaults(prior)
-    # Atomic write: write to sibling temp file, then os.replace.
-    tmp = p.with_suffix(p.suffix + f'.tmp.{os.getpid()}')
-    try:
-        tmp.write_text(json.dumps(prior, indent=2, default=str))
-        os.replace(tmp, p)
-    finally:
-        if tmp.exists():
-            try: tmp.unlink()
-            except OSError: pass
+    # Hold the per-request lock across read-modify-write so a stale writer
+    # cannot clobber a concurrent update (e.g. resurrect a just-consumed
+    # Stage 2 nonce) — cold-audit finding 2026-07-07.
+    with request_lock(request_id):
+        prior = read_request(request_id) or {}
+        now = time.time()
+        if 'created_at' not in prior:
+            prior['created_at'] = now
+        # Compute new revision against PRIOR state BEFORE merging new fields.
+        new_revision = _bump_revision_if_changed(prior, fields)
+        prior.update(fields)
+        prior['request_id'] = request_id
+        prior['updated_at'] = now
+        prior['request_revision'] = new_revision
+        _ensure_schema_defaults(prior)
+        # Atomic write: write to sibling temp file, then os.replace.
+        tmp = p.with_suffix(p.suffix + f'.tmp.{os.getpid()}')
+        try:
+            tmp.write_text(json.dumps(prior, indent=2, default=str))
+            os.replace(tmp, p)
+        finally:
+            if tmp.exists():
+                try: tmp.unlink()
+                except OSError: pass
     return p
 
 

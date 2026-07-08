@@ -268,7 +268,7 @@ def _no_real_operator_notifications(monkeypatch, tmp_path):
     try:
         import u1_kit_workflow as _kw
         monkeypatch.setattr(_kw, "_spawn_confirm_expiry_watchdog",
-                            lambda rid, fn: None, raising=False)
+                            lambda rid, fn, gen="": None, raising=False)
     except Exception:
         pass
     sent = []

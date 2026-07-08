@@ -62,3 +62,43 @@ def test_main_argv_smoke(tmp_path, monkeypatch):
     monkeypatch.setattr(wd.time, "sleep", lambda s: None)
     assert wd.main(["u1_x", "g.gcode", str(marker), "0"]) == 0
     assert not marker.exists()
+
+
+
+def test_old_watchdog_leaves_re_armed_window_alone(tmp_path, monkeypatch):
+    """Cold-audit finding: A armed -> redeemed -> same request re-armed as B
+    at the same path. A's watchdog must NOT delete B's window."""
+    import json as _json
+    marker = tmp_path / "u1_x.json"
+    marker.write_text(_json.dumps({"generation": "B-newer"}))
+    sent = []
+    monkeypatch.setattr(wd.subprocess, "run",
+                        lambda cmd, timeout=0: sent.append(cmd))
+    # watchdog A fires with A's generation; the marker now belongs to B
+    outcome = wd.run("u1_x", "grip.gcode", str(marker), 0, "A-older",
+                     sleep=lambda s: None)
+    assert outcome == "silent"
+    assert marker.exists()                     # B's window preserved
+    assert sent == []                          # no false expiry DM
+
+
+def test_matching_generation_still_expires(tmp_path, monkeypatch):
+    import json as _json
+    marker = tmp_path / "u1_x.json"
+    marker.write_text(_json.dumps({"generation": "same"}))
+    sent = []
+    monkeypatch.setattr(wd.subprocess, "run",
+                        lambda cmd, timeout=0: sent.append(cmd))
+    outcome = wd.run("u1_x", "grip.gcode", str(marker), 0, "same",
+                     sleep=lambda s: None)
+    assert outcome == "notified" and not marker.exists() and sent
+
+
+def test_empty_generation_is_backward_compatible(tmp_path, monkeypatch):
+    """A marker without a generation (or a watchdog armed before this fix)
+    still expires — the guard only bites when a generation is supplied AND
+    differs."""
+    marker = tmp_path / "u1_x.json"; marker.write_text("{}")
+    monkeypatch.setattr(wd.subprocess, "run", lambda *a, **k: None)
+    assert wd.run("u1_x", "g.gcode", str(marker), 0, "",
+                  sleep=lambda s: None) == "notified"

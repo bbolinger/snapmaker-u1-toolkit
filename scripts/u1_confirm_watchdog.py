@@ -15,9 +15,8 @@ safety, only about feedback.
 from __future__ import annotations
 
 import argparse
-import os
+import json
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -25,13 +24,27 @@ _NOTIFY_PY = "/opt/data/scripts/u1_notify.py"
 
 
 def run(request_id: str, filename: str, marker_path: str, ttl: int,
-        *, sleep=time.sleep) -> str:
-    """Returns one of: 'notified' | 'silent' (marker gone) | 'error'.
-    `sleep` is injectable so a test can drive it without waiting."""
+        generation: str = "", *, sleep=time.sleep) -> str:
+    """Returns 'notified' | 'silent' (marker gone or a NEWER window replaced
+    it) | 'error'. `sleep` is injectable so a test can drive it without
+    waiting.
+
+    Generation guard (cold-audit finding 2026-07-07): the marker is
+    request-scoped, so re-prompting the SAME request overwrites it and each
+    arm starts its own watchdog. Without a generation token an old watchdog
+    would wake and delete the NEW window. It now deletes only when the
+    marker on disk still carries the generation this watchdog was armed
+    with — a re-armed window has a different generation and is left alone."""
     sleep(ttl)
     marker = Path(marker_path)
-    if not marker.exists():
-        return "silent"
+    try:
+        current_gen = json.loads(marker.read_text()).get("generation", "")
+    except FileNotFoundError:
+        return "silent"                       # redeemed / cancelled
+    except Exception:
+        current_gen = None                    # unreadable — do not touch
+    if generation and current_gen != generation:
+        return "silent"                       # a newer window owns this path
     try:
         marker.unlink()
     except FileNotFoundError:
@@ -54,8 +67,9 @@ def main(argv=None) -> int:
     ap.add_argument("filename")
     ap.add_argument("marker_path")
     ap.add_argument("ttl", type=int)
+    ap.add_argument("generation", nargs="?", default="")
     a = ap.parse_args(argv)
-    run(a.request_id, a.filename, a.marker_path, a.ttl)
+    run(a.request_id, a.filename, a.marker_path, a.ttl, a.generation)
     return 0
 
 
