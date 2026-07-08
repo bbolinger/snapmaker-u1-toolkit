@@ -141,6 +141,19 @@ Fold the two marker dirs and two hooks into one confirmation-window module with 
 single per-request state file carrying both go and stop affordances. Best done
 alongside the broker, since both touch the redemption path.
 
+#### De-hardcode the runtime script paths
+
+**Status:** 📋 QUEUED (community-first)
+
+The gateway hooks, the expiry watchdog, the start gate, and many emitted
+`next_command` strings carry literal `/opt/data/scripts/...` paths. `/opt/data`
+is the documented Hermes default, so a standard install works — but the *deploy*
+target is already configurable (`U1_DEPLOY_SCRIPTS`) while the *runtime* paths
+are not, so a maker who deploys elsewhere has working files the hooks point
+past. Derive the runtime script directory from config once (same source the
+deploy targets use) so the whole thing runs wherever a community member puts it,
+not just this layout.
+
 #### Small stragglers
 
 **Status:** 📋 QUEUED
@@ -165,6 +178,30 @@ alongside the broker, since both touch the redemption path.
 ---
 
 ## Standing postures
+
+### Community-first, single-operator by design
+
+**Status:** 🎯 POSTURE
+
+This is a shared repo for makers, not a personal tool. The supported deployment
+is one operator running their own instance for their own U1 — "single operator"
+is the per-user unit, not a specific person. That posture has consequences the
+codebase must honor:
+
+- **No deployment-specific hardcodes.** Printer host/port, data dir, operator
+  identity, and script paths come from config with sane defaults — never a value
+  that only fits one person's box. When a feature is tightened to a setup (e.g.
+  the operator binding), it is a documented config default, never a literal.
+- **The supported shape is stated, not implied.** Model-free start is bound to
+  one operator in one private chat by design; a shared team channel or multiple
+  operators on one instance is out of scope, and the docs say so up front rather
+  than letting a maker discover it.
+- **Ship nothing personal.** No real ids, hosts, or paths in tracked code —
+  examples use obvious placeholders.
+
+A shared multi-operator / team deployment (several people driving one instance,
+with auth and shared-channel binding) is a different product with a different
+safety model; it is deliberately not on this roadmap.
 
 ### Multi-printer scope avoidance
 

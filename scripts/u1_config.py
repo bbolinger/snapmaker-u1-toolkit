@@ -182,7 +182,7 @@ def get_u1_base_url(host: str | None = None, port: int | None = None) -> str:
 
 def get_operator_binding() -> tuple[str, str] | None:
     """Resolve the (platform, user_id) pair the confirm-start hook binds
-    the operator's YES to — e.g. ("telegram", "8131922235"). Returns None
+    the operator's YES to — e.g. ("telegram", "123456789"). Returns None
     when unconfigured: the hook then refuses every YES (fail closed) and
     the workflow warns at arm time.
 
