@@ -3243,6 +3243,20 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                             "kind": "bed_snapshot",
                             "image": bed_result["snapshot_path"]}, json_events)
 
+    # Arm the structural-attachment marker with the SAME image paths the render
+    # events carry, so the transform_llm_output hook attaches them regardless of
+    # whether the model echoes them (v2.4 — kills the reprint bed-photo-as-text
+    # bug observed 2026-07-09). Normal and reprint both reach this card via
+    # _action_start, so this one site covers both.
+    _attach_images: list[str] = []
+    if preview_result and preview_result.get("ok"):
+        _attach_images.append(preview_result["path"])
+        if preview_result.get("iso_path"):
+            _attach_images.append(preview_result["iso_path"])
+    if bed_result["ok"]:
+        _attach_images.append(bed_result["snapshot_path"])
+    _arm_pending_attach(request_id, _attach_images, operator)
+
     _emit(events_file, {
         "stage": "need_input",
         "key": "confirm",
@@ -3450,6 +3464,52 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "approval_expires_at": expires_at,
             "captured_at_utc": captured_ts,
             "reason": None}
+
+
+# Structural image attachment (v2.4). Hermes core attaches images by scanning
+# the model's final reply for bare on-disk file paths. Relying on gemma to echo
+# the workflow's paths verbatim broke live on reprint (2026-07-09): a mangled
+# request_id pointed the paths at nothing, so the bed photo + previews rendered
+# as raw text and the operator lost the visual bed-clear check. The workflow
+# owns the real paths, so it arms this one-shot marker when it emits an
+# image-bearing card; the plugin's transform_llm_output hook
+# (snapmaker_u1.hooks.attachment_injector) injects the authoritative paths into
+# the outbound reply. Keyed by HERMES_SESSION_KEY, which the workflow subprocess
+# inherits from the gateway process the hook runs in, so both sides resolve the
+# same marker (same cross-process trick the pending_confirm marker uses).
+_PENDING_ATTACH_DIR = Path(os.environ.get("U1_PENDING_ATTACH_DIR",
+                                          "/tmp/u1_pending_attach"))
+
+
+def _arm_pending_attach(request_id: str, images: "list[str] | None",
+                        operator: "str | None",
+                        session_key: "str | None" = None) -> None:
+    """Drop the one-shot marker the attachment_injector hook redeems on the next
+    outbound turn. ``images`` are absolute paths in the request dir (plate
+    preview, isometric, bed snapshot). No-op when there's nothing to attach.
+
+    Best-effort: an attachment is never worth failing the card or the safety
+    gate over, so every error is swallowed."""
+    import hashlib
+    imgs = [str(p) for p in (images or []) if p]
+    if not imgs:
+        return
+    key = session_key if session_key is not None else os.environ.get("HERMES_SESSION_KEY", "")
+    try:
+        _PENDING_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        target = _PENDING_ATTACH_DIR / f"{digest}.json"
+        payload = {
+            "request_id": request_id,
+            "images": imgs,
+            "operator": operator,
+            "created_at": time.time(),
+        }
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, target)  # atomic publish
+    except Exception:
+        pass
 
 
 # Model-free YES (post-incident 2026-07-07): the agent model fired the
