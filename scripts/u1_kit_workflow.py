@@ -2127,6 +2127,10 @@ def run_kit_workflow(args) -> dict[str, Any]:
             }), flush=True)
             return {"phase": "bed_clear_confirm_no_pending",
                     "request_id": _confirm_for}
+        # Child-ack commitment point: we have a token and are about to consume
+        # it. Release our claim now — a crash before here is recoverable by
+        # the hook reaper; a crash after here spent the token either way.
+        _release_confirm_claim(_confirm_for, getattr(args, "confirm_claim_id", None))
     if _confirm_token:
         _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
         _state = u1_request.read_request(_rid) if _rid else None
@@ -2147,19 +2151,19 @@ def run_kit_workflow(args) -> dict[str, Any]:
         _disarm_pending_confirm(_rid)
         _audit(_rid, "bed_clear_confirm_token_redeemed", operator,
                token_first6=str(_confirm_token)[:6])
-        if _state.get("reprint_of"):
-            # Reprint confirm (v2.3): there is NO archive to re-ingest — the
-            # gcode is already in printer storage and everything the confirmed
-            # turn validates (pending nonce, revision, plate hash, tool,
-            # material) is persisted on the request. Falling through would hit
-            # the model-positional recovery and die on the original upload's
-            # long-gone cache file (live 2026-07-06: the operator's YES
-            # errored, stranding the reprint at the finish line). Route
-            # straight to the gate turn.
-            return _action_start(None, _rid,
-                                 bool(getattr(args, "json_events", False)),
-                                 bed_clear_confirmed=True, operator=operator,
-                                 pending_nonce=_pending.get("nonce"))
+        # EVERY confirmed start routes straight to the gate turn — never
+        # re-ingest the archive. The confirmed turn only validates state
+        # already persisted on the request (pending nonce, revision, gcode
+        # hash, tool, material, approval token); re-ingesting is unnecessary
+        # AND fragile. Two live failures proved it: a reprint's confirm died
+        # on the long-gone upload cache (2026-07-06), and a normal kit's
+        # confirm re-analyzed parts and returned 'awaiting_parts' after a
+        # duplicate mid-flow re-run left kit.selected unset (2026-07-08). The
+        # reprint special-case is now the universal rule.
+        return _action_start(None, _rid,
+                             bool(getattr(args, "json_events", False)),
+                             bed_clear_confirmed=True, operator=operator,
+                             pending_nonce=_pending.get("nonce"))
     # ── REPRINT (v2.3): both turns work with NO model positional ──
     # Turn 1 (--reprint): list recent prints, one single-use pick token each.
     # Turn 2 (--reprint-start <token>): seed a fresh request from the picked
@@ -3544,6 +3548,34 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
                    str(_PENDING_CONFIRM_TTL_S), generation],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _release_confirm_claim(request_id: str, claim_id: str | None = None) -> None:
+    """Child-ack (Q3, 2026-07-08; scoped by claim_id in audit 2026-07-09):
+    remove THIS spawn's claim marker right before the single-use token is
+    consumed — the point of commitment. A child that crashes before here leaves
+    the claim for the hook's reaper to restore, so the operator's YES is not
+    spent by a child that never redeemed it.
+
+    With a claim_id (the normal hook path) we unlink ONLY
+    <rid>.claimed.<claim_id>.json — deleting every claim for the request could
+    strand a concurrently re-armed generation whose own child hasn't committed
+    yet (audit finding #3). Without one (direct/legacy invocation) fall back to
+    the request-wide glob."""
+    try:
+        if claim_id:
+            try:
+                (_PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json").unlink()
+            except FileNotFoundError:
+                pass
+            return
+        for c in _PENDING_CONFIRM_DIR.glob(f"{request_id}.claimed.*.json"):
+            try:
+                c.unlink()
+            except FileNotFoundError:
+                pass
     except Exception:
         pass
 
@@ -5446,6 +5478,12 @@ def main(argv=None) -> int:
                           "for the u1_confirm_start hook, which builds this "
                           "command from its own constants — the pending "
                           "marker carries no command and no token."))
+    ap.add_argument("--confirm-claim-id", default=None, dest="confirm_claim_id",
+                    help=("Q3 (audit 2026-07-09): the exact claim id the confirm "
+                          "hook created for THIS spawn. At the commitment point "
+                          "the child releases ONLY its own "
+                          "<rid>.claimed.<id>.json, so a concurrently re-armed "
+                          "generation's claim is never deleted. Hook-set only."))
     ap.add_argument("--grace-cancel", action="store_true", dest="grace_cancel",
                     help=("Cancel every active pre-start grace window (touches "
                           "the same markers the gateway cancel hook does). The "

@@ -494,12 +494,20 @@ def start_print(host, port, filename):
     return post_json(f'http://{host}:{port}/printer/print/start', {'filename': filename})
 
 
+# Retry knobs for gcode_exists_on_printer (tests set these to run fast).
+_GCODE_EXISTS_ATTEMPTS = 3
+_GCODE_EXISTS_TIMEOUT = 8.0
+_GCODE_EXISTS_BACKOFF = 1.0
+
+
 def gcode_exists_on_printer(host, port, filename):
     """Does ``filename`` actually exist in the printer's gcodes storage?
 
     Returns True (confirmed present), False (confirmed ABSENT — Moonraker 404),
-    or None (couldn't verify: network/other error → the caller fails OPEN so a
-    flaky metadata query never blocks a real print).
+    or None (couldn't verify after retries: network/other error). Q1 (audit
+    2026-07-08): a single flaky query is absorbed by the retry loop; a
+    persistent None means the caller FAILS CLOSED — this close to a physical
+    start, can't-confirm means no. (This used to fail OPEN; it no longer does.)
 
     Why the gate needs this: the grace window fires an operator "print
     starting" notification BEFORE the actual start. A confused agent that
@@ -510,17 +518,29 @@ def gcode_exists_on_printer(host, port, filename):
     fast, silent refusal — no notification.
     """
     import urllib.error
+    import time as _t
+    sleep = _t.sleep
     url = (f'http://{host}:{port}/server/files/metadata'
            f'?filename={urllib.parse.quote(str(filename))}')
-    try:
-        http_json(url, timeout=8.0)
-        return True
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return False
-        return None  # 500 etc. — can't be sure; fail open
-    except Exception:
-        return None  # unreachable / timeout — fail open (don't block real prints)
+    # Operator decision 2026-07-08: retry a few times, then FAIL CLOSED. A
+    # single transient blip (one 500 / one timeout) is absorbed by the
+    # retries — not "flaky enough" to block a legitimate print. A printer
+    # STILL unreachable after them is "broken", not "flaky", and this close
+    # to a physical start, unverifiable means no. A confirmed-absent file
+    # (404) is definitive and refuses immediately without retrying.
+    attempts = max(1, int(_GCODE_EXISTS_ATTEMPTS))
+    for _i in range(attempts):
+        try:
+            http_json(url, timeout=_GCODE_EXISTS_TIMEOUT)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return False          # definitive — no retry
+        except Exception:
+            pass                      # unreachable / timeout — retry
+        if _i < attempts - 1:
+            sleep(_GCODE_EXISTS_BACKOFF)
+    return None                       # unverifiable after every attempt
 
 
 def _resolve_operator_for_gate(cli_operator: str | None) -> str:
@@ -691,16 +711,19 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                                  filename: str = '',
                                  notify_cmd: str | None = None,
                                  sleep_fn=None,
-                                 notify_fn=None) -> bool:
+                                 notify_fn=None) -> str:
     """Wait up to grace_seconds for cancel_marker to appear on disk.
 
-    Returns True if the caller should proceed to start_func, False if
-    the operator cancelled during the grace window (no HTTP call
-    should follow). Audit rows on both start and end. ``sleep_fn`` is
-    injected for tests so they don't actually sleep. ``notify_fn`` is
+    Returns a status string: ``'proceed'`` (start), ``'cancelled'`` (the
+    operator cancelled during the window), or ``'notify_failed'`` (a
+    configured countdown/CANCEL message could not be delivered, so the start
+    is aborted — Q2, operator decision 2026-07-08). Audit rows on both start
+    and end. ``sleep_fn`` is injected for tests so they don't actually sleep.
+    ``notify_fn`` is
     injected for tests so we don't shell out."""
     import time as _time
     _sleep = sleep_fn or _time.sleep
+    import os
     _notify = notify_fn or _run_grace_notify
     # Fresh window: any leftover marker from a prior request must be
     # cleared before we start listening.
@@ -727,15 +750,48 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
     # what the DM promised.
     if notify_cmd:
         if _grace_notify_allowed(request_id):
-            _notify(notify_cmd,
-                    request_id=request_id,
-                    filename=filename,
-                    grace_seconds=grace_seconds,
-                    cancel_marker=cancel_marker,
-                    operator=resolved_operator)
+            _nres = _notify(notify_cmd,
+                            request_id=request_id,
+                            filename=filename,
+                            grace_seconds=grace_seconds,
+                            cancel_marker=cancel_marker,
+                            operator=resolved_operator)
+            # Q2 (operator decision 2026-07-08): if a countdown/CANCEL DM was
+            # configured but could NOT be delivered, do not start a print the
+            # operator can neither see nor cancel — abort. Local-console runs
+            # (no notify_cmd) never reach here. Escape hatch:
+            # U1_GRACE_NOTIFY_OPTIONAL=1 restores the old fail-open behavior.
+            if (isinstance(_nres, dict) and not _nres.get("ok")
+                    and os.environ.get("U1_GRACE_NOTIFY_OPTIONAL", "") not in
+                    ("1", "true", "yes", "on")):
+                _audit_gate(request_id, 'pre_start_grace_notify_failed_abort',
+                            resolved_operator,
+                            stderr_tail=str(_nres.get("stderr_tail"))[:160])
+                try:
+                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                except Exception:
+                    pass
+                return 'notify_failed'
         else:
-            # Loop guard tripped: suppress the DM but STILL run the wait so the
-            # cancel safety net is intact. Audited so a real loop is visible.
+            # Q2 loop-guard alignment (audit 2026-07-09): the notify cap tripped,
+            # so NO countdown/CANCEL DM will be delivered and no
+            # /tmp/u1_pending_cancel/<rid>.json routing entry is created. Under
+            # Q2 we must not start a print the operator can neither see nor
+            # cancel — so treat an exhausted cap exactly like a hard notify
+            # failure: abort. (Previously this suppressed the DM but still ran
+            # the wait and returned 'proceed' — a real fail-open hole, since a
+            # gemma re-run storm can push grace_notify_count past the cap.) The
+            # escape hatch keeps the old suppress-and-proceed for opt-in setups.
+            if os.environ.get("U1_GRACE_NOTIFY_OPTIONAL", "") not in (
+                    "1", "true", "yes", "on"):
+                _audit_gate(request_id,
+                            'pre_start_grace_notify_loop_guard_abort',
+                            resolved_operator, cap=GRACE_NOTIFY_CAP)
+                try:
+                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                except Exception:
+                    pass
+                return 'notify_failed'
             _audit_gate(request_id, 'pre_start_grace_notify_suppressed_loop_guard',
                         resolved_operator, cap=GRACE_NOTIFY_CAP)
     # Contract with the Hermes gateway hook + notify script: the notify
@@ -753,7 +809,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
         except OSError:
             pass
 
-    def _cancelled() -> bool:
+    def _cancelled() -> str:
         _audit_gate(request_id, 'pre_start_grace_cancelled',
                     resolved_operator,
                     cancel_marker=str(cancel_marker),
@@ -769,7 +825,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                 f"({filename})")
         except Exception:
             pass
-        return False
+        return 'cancelled'
 
     for _ in range(int(grace_seconds)):
         if cancel_marker.exists():
@@ -785,7 +841,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                 resolved_operator, grace_seconds=grace_seconds,
                 proceeded_to_start=True)
     _clear_pending_state()
-    return True
+    return 'proceed'
 
 
 def run_gate(filename: str,
@@ -807,7 +863,7 @@ def run_gate(filename: str,
              grace_sleep_fn=None,
              grace_notify_cmd: str | None = None,
              grace_notify_fn=None,
-             gcode_exists_fn=gcode_exists_on_printer):
+             gcode_exists_fn=None):
     host = host or get_u1_host()
     port = port or get_u1_port()
     # Per-request token + photo storage: if we have a
@@ -1296,7 +1352,8 @@ def run_gate(filename: str,
     # Fails OPEN: only a CONFIRMED-absent file (Moonraker 404) refuses; a flaky
     # metadata query (None) proceeds so a transient error never blocks a real
     # print — the start itself still fails safely if the file is truly gone.
-    _exists = gcode_exists_fn(host, port, printer_filename)
+    _gcode_exists = gcode_exists_fn or gcode_exists_on_printer
+    _exists = _gcode_exists(host, port, printer_filename)
     if _exists is False:
         _audit_gate(request_id, 'gate_refused_file_missing',
                     resolved_operator, printer_storage_filename=printer_filename)
@@ -1309,6 +1366,22 @@ def run_gate(filename: str,
                 "gcode storage, so there is nothing to start. No notification "
                 "was sent. If you meant a real plate, re-run the workflow so "
                 "the sliced file is uploaded first."),
+        }
+    if _exists is None:
+        # Fail CLOSED (operator decision 2026-07-08): the printer could not
+        # confirm the file exists after several tries — unreachable or
+        # erroring. This close to a physical start, do not fire blind.
+        _audit_gate(request_id, 'gate_refused_file_unverifiable',
+                    resolved_operator, printer_storage_filename=printer_filename)
+        return {
+            'stage': 'gate_refused_file_unverifiable',
+            'filename': printer_filename,
+            'ok': False, 'started': False,
+            'reason': (
+                f"gate refuses: could not confirm {printer_filename!r} is on "
+                "the printer after several tries — the printer is unreachable "
+                "or erroring. Nothing was started and no notification was "
+                "sent. Check the printer is online, then re-run."),
         }
 
     def _grace_cancel_refusal() -> dict[str, Any]:
@@ -1349,13 +1422,27 @@ def run_gate(filename: str,
         # actually opened (vs. the child stalling in a pre-grace check).
         _write_gate_state(out_dir, 'grace_started', request_id=request_id,
                           grace_seconds=_resolved_grace)
-        if not _wait_pre_start_grace_period(
+        _grace_status = _wait_pre_start_grace_period(
                 cancel_marker, _resolved_grace, request_id,
                 resolved_operator,
                 filename=printer_filename,
                 notify_cmd=_resolved_notify,
                 sleep_fn=grace_sleep_fn,
-                notify_fn=grace_notify_fn):
+                notify_fn=grace_notify_fn)
+        if _grace_status == 'notify_failed':
+            return {
+                'stage': 'gate_refused_notify_undeliverable',
+                'filename': printer_filename,
+                'ok': False, 'started': False,
+                'reason': (
+                    "gate refuses: the pre-start countdown/CANCEL message "
+                    "could not be delivered, so the print was NOT started — "
+                    "you would have had no way to see it or cancel it. Fix "
+                    "the notifier (or check Telegram) and re-run. Set "
+                    "U1_GRACE_NOTIFY_OPTIONAL=1 to start anyway on notify "
+                    "failure."),
+            }
+        if _grace_status != 'proceed':
             return _grace_cancel_refusal()
         # Belt: one more marker check between the window closing and the
         # HTTP call — audit/log latency in the wait's exit path is real

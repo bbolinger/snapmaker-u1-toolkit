@@ -1175,3 +1175,70 @@ def test_form_handler_legacy_full_schema_still_works(monkeypatch, tmp_path):
     out = json.loads(mod._form_handler(
         {"form_schema": schema}, session_id="sess2"))
     assert out.get("user_answer") == {"parts": ["a"]}
+
+
+
+def test_form_tap_edit_strategy_v231(monkeypatch, tmp_path):
+    """v2.3.1 button responsiveness: a tap that only changes the SELECTION
+    (stays on the same screen) edits JUST the keyboard — snappy; a tap that
+    advances to a different screen edits the full message. The old code edited
+    the whole message on every tap, which Telegram throttled and made the
+    selection dot lag visibly behind the tap."""
+    pytest.importorskip("telegram")
+    import asyncio
+    _load_plugin_pkg(monkeypatch, tmp_path)
+    tp = importlib.import_module("hermes_plugins.u1_form.telegram_patch")
+    import u1_form as _u1form
+    import u1_form_telegram as tgr
+
+    cls = _fake_adapter_cls()
+    tp.ensure_patched(cls)
+    adapter = cls()
+    adapter._u1_form_state = {}
+
+    spec = {"parts": [{"id": "a", "label": "a"}, {"id": "b", "label": "b"}],
+            "tools": ["T0"], "materials": ["PLA"],
+            "profiles": [{"idx": 1, "label": "x"}],
+            "supports": ["supports", "no-supports"], "actions": ["start"]}
+    schema = _u1form.build_form_schema(spec)
+    form = tgr.new_form(schema)
+    screen0 = tgr.render_screen(form)
+    adapter._u1_form_state["fabc12"] = {
+        "form": form, "schema": schema, "session_key": "s",
+        "msg_id": 42, "chat_id": 7, "last_text": screen0["text"]}
+    parts_fi = next(i for i, f in enumerate(schema["fields"]) if f["id"] == "parts")
+
+    calls = []
+    class _Msg:
+        chat_id = 7
+        message_id = 42
+        text = screen0["text"]
+    class _Q:
+        def __init__(self, data):
+            self.data = data
+            self.message = _Msg()
+        async def answer(self, *a, **k):
+            pass
+        async def edit_message_text(self, *a, **k):
+            calls.append("text")
+        async def edit_message_reply_markup(self, *a, **k):
+            calls.append("markup")
+
+    async def tap(data):
+        await adapter._u1_handle_form_callback(
+            types.SimpleNamespace(callback_query=_Q(data)), None)
+
+    supports_fi = next(i for i, f in enumerate(schema["fields"])
+                       if f["id"] == "supports")
+
+    # 'Done' on parts ADVANCES to the setup group -> screen text changes ->
+    # full edit_message_text.
+    asyncio.run(tap("n:%d" % parts_fi))
+    assert calls == ["text"], f"screen advance must be a full edit, got {calls}"
+
+    # a grouped radio pick (supports) stays on the SAME setup screen and only
+    # moves the selection dot -> keyboard-only edit (the snappy path; this is
+    # the exact 'dot took forever' tap the operator hit on v2.3.0).
+    calls.clear()
+    asyncio.run(tap("s:%d:0" % supports_fi))
+    assert calls == ["markup"], f"dot-move tap must be keyboard-only, got {calls}"

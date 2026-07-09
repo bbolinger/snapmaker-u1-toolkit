@@ -1,3 +1,23 @@
+
+
+import pytest as _pytest_fx
+
+
+@_pytest_fx.fixture(autouse=True)
+def _gate_file_exists_by_default(request, monkeypatch):
+    """Q1 (2026-07-08): the gate now FAILS CLOSED when it can't confirm the
+    gcode exists on the printer. Gate tests that aren't about existence
+    should assume the file is present so they isolate their own logic. Tests
+    that exercise the real gcode_exists_on_printer opt out with
+    @pytest.mark.real_gcode_exists."""
+    if request.node.get_closest_marker("real_gcode_exists"):
+        return
+    try:
+        import u1_print_start_gate as _gate
+        monkeypatch.setattr(_gate, "gcode_exists_on_printer",
+                            lambda *a, **k: True)
+    except Exception:
+        pass
 import hashlib
 import io
 import json
@@ -343,8 +363,11 @@ def test_gate_proceeds_when_file_exists(monkeypatch, tmp_path):
     assert res2['started'] is True and started['s'] is True
 
 
-def test_gate_fails_open_when_existence_unverifiable(monkeypatch, tmp_path):
-    # A flaky metadata query (None) must NOT block a real print.
+def test_gate_fails_closed_when_existence_unverifiable(monkeypatch, tmp_path):
+    # Q1 (operator decision 2026-07-08): after the retries, a still-
+    # unverifiable file (None) REFUSES — this close to a physical start,
+    # can't-confirm means no. A single blip is absorbed by the retries; a
+    # persistent None means the printer is unreachable/erroring.
     monkeypatch.setattr(g, 'query_state', lambda h, p: idle())
     monkeypatch.setattr(g, 'capture_real_bed_photo', _fake_capture(success=True))
     rid = _seed_can_start_passing_request()
@@ -357,9 +380,12 @@ def test_gate_fails_open_when_existence_unverifiable(monkeypatch, tmp_path):
                       approval_token=token, request_id=rid, grace_seconds=0,
                       gcode_exists_fn=lambda *a: None,   # couldn't verify
                       start_func=lambda *a: started.__setitem__('s', True) or {'result': 'ok'})
-    assert res2['started'] is True
+    assert res2['started'] is False
+    assert res2['stage'] == 'gate_refused_file_unverifiable'
+    assert started['s'] is False
 
 
+@_pytest_fx.mark.real_gcode_exists
 def test_gcode_exists_on_printer_maps_404_to_false(monkeypatch):
     import urllib.error
     def _raise_404(url, timeout=10.0):
@@ -368,6 +394,7 @@ def test_gcode_exists_on_printer_maps_404_to_false(monkeypatch):
     assert g.gcode_exists_on_printer('h', 1, 'nope.gcode') is False
 
 
+@_pytest_fx.mark.real_gcode_exists
 def test_gcode_exists_on_printer_present_and_unreachable(monkeypatch):
     monkeypatch.setattr(g, 'http_json', lambda url, timeout=10.0: {'result': {'size': 1}})
     assert g.gcode_exists_on_printer('h', 1, 'real.gcode') is True
@@ -491,3 +518,50 @@ def test_consume_stage2_nonce_fails_closed_on_exception(monkeypatch, tmp_path):
         raise OSError("simulated fs failure under the lock")
     monkeypatch.setattr(u1_request, "ensure_request_dir", _boom)
     assert g._consume_stage2_nonce("u1_2026_0101_abcdef", "some-nonce") is False
+
+
+@_pytest_fx.mark.real_gcode_exists
+def test_gcode_exists_retries_then_fails_closed(monkeypatch):
+    """A printer that stays unreachable across every attempt -> None
+    (caller fails closed). Proves 'broken, not flaky' is caught."""
+    import u1_print_start_gate as gate, urllib.error
+    calls = {"n": 0}
+    def _always_fail(url, timeout=8.0):
+        calls["n"] += 1
+        raise urllib.error.URLError("unreachable")
+    monkeypatch.setattr(gate, "http_json", _always_fail)
+    monkeypatch.setattr(gate, "_GCODE_EXISTS_ATTEMPTS", 3)
+    monkeypatch.setattr(gate, "_GCODE_EXISTS_BACKOFF", 0)  # instant
+    assert gate.gcode_exists_on_printer("h", 1, "f.gcode") is None
+    assert calls["n"] == 3, "must retry every attempt before giving up"
+
+
+@_pytest_fx.mark.real_gcode_exists
+def test_gcode_exists_transient_blip_is_absorbed(monkeypatch):
+    """One blip then success -> True. Proves a single flake never blocks
+    a legit print (the operator's concern)."""
+    import u1_print_start_gate as gate, urllib.error
+    seq = {"n": 0}
+    def _blip_then_ok(url, timeout=8.0):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            raise urllib.error.URLError("one blip")
+        return {"result": {}}
+    monkeypatch.setattr(gate, "http_json", _blip_then_ok)
+    monkeypatch.setattr(gate, "_GCODE_EXISTS_BACKOFF", 0)
+    assert gate.gcode_exists_on_printer("h", 1, "f.gcode") is True
+    assert seq["n"] == 2, "second attempt succeeds after the blip"
+
+
+@_pytest_fx.mark.real_gcode_exists
+def test_gcode_exists_404_refuses_without_retry(monkeypatch):
+    """A definitive 'absent' (404) refuses immediately — no retries, no wait."""
+    import u1_print_start_gate as gate, urllib.error
+    calls = {"n": 0}
+    def _404(url, timeout=8.0):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    monkeypatch.setattr(gate, "http_json", _404)
+    monkeypatch.setattr(gate, "_GCODE_EXISTS_BACKOFF", 0)
+    assert gate.gcode_exists_on_printer("h", 1, "gone.gcode") is False
+    assert calls["n"] == 1, "404 is definitive — do not retry"

@@ -277,6 +277,7 @@ def ensure_patched(adapter_cls) -> bool:
             "form": form, "schema": form_schema,
             "session_key": session_key, "msg_id": msg.message_id,
             "chat_id": int(chat_id),
+            "last_text": screen["text"],
         }
         return _make_send_result(success=True, message_id=str(msg.message_id))
 
@@ -354,10 +355,23 @@ def ensure_patched(adapter_cls) -> bool:
         text = screen["text"] + (f"\n\n⚠ {warning}" if warning else "")
         try:
             from telegram.constants import ParseMode  # type: ignore
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-                                      reply_markup=_rows_to_markup(screen["keyboard"]))
+            markup = _rows_to_markup(screen["keyboard"])
+            if text == slot.get("last_text"):
+                # Only the SELECTION changed, not the screen text (a radio/
+                # multi tap within the current screen). Edit JUST the keyboard
+                # — a full edit_message_text re-sends all the HTML text too,
+                # which Telegram throttles on rapid taps and makes the
+                # selection dot visibly lag behind the tap. Keyboard-only
+                # edits are a fraction of the payload and snap immediately.
+                await q.edit_message_reply_markup(reply_markup=markup)
+            else:
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                          reply_markup=markup)
+                slot["last_text"] = text
         except Exception as exc:
-            logger.warning("u1-form: rerender edit failed: %s", exc)
+            # "message is not modified" (identical tap) is benign; others log.
+            if "not modified" not in str(exc).lower():
+                logger.warning("u1-form: rerender edit failed: %s", exc)
 
     # NOTE deliberately NOT touching adapter_cls._handle_callback_query —
     # PTB holds the bound method it captured at connect(); replacing the

@@ -1,3 +1,6 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_gcode_exists: exercise the real gcode_exists_on_printer (skip the file-exists stub)",
+]
 pythonpath = ["scripts"]
