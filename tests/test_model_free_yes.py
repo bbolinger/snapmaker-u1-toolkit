@@ -845,6 +845,28 @@ def test_spawn_records_actual_child_pid_not_gateway(pending_dir, monkeypatch):
     assert cid != str(_os.getpid())
 
 
+def test_fast_child_commit_is_not_recreated_by_parent(pending_dir, monkeypatch):
+    """Follow-up audit race: a fast child can reach its commitment point and
+    DELETE its claim before the parent records the child pid. The parent must
+    NOT recreate the claim — recreating it would let the reaper later 'restore'
+    a dead confirmation window. Popen here simulates the child committing
+    (deleting the exact claim) before it returns."""
+    entry = _marker(pending_dir)
+    rid = entry["request_id"]
+
+    def _popen_child_commits_immediately(cmd, **kw_):
+        for c in pending_dir.glob(f"{rid}.claimed.*.json"):
+            c.unlink()                      # child released its claim
+        return SimpleNamespace(pid=555000)
+
+    monkeypatch.setattr(hook.subprocess, "Popen", _popen_child_commits_immediately)
+    asyncio.run(hook.handle("agent:start", _ctx()))
+    assert not list(pending_dir.glob(f"{rid}.claimed.*.json")), \
+        "parent must not recreate a claim the child already committed"
+    assert not (pending_dir / f"{rid}.json").exists(), \
+        "a committed confirmation must not be re-armed"
+
+
 def test_reaper_restores_orphaned_claim(pending_dir):
     """Dead CHILD pid + live window = child crashed before consuming -> restore."""
     rid = "u1_2026_0708_cafe01"

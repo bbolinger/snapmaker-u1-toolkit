@@ -45,10 +45,15 @@ Contract with u1_kit_workflow.py:
     also refuses — fail closed; the workflow warns at arm time when the
     binding config is missing, so this shows up before the YES, not at it.
   * Claim-then-spawn: the marker is atomically renamed to
-    <rid>.claimed.<pid>.json BEFORE spawning (of N concurrent YESes exactly
-    one wins the rename; the rest find nothing). Spawn success deletes the
-    claimed file; spawn failure renames it back while unexpired, so the
-    operator's next YES retries instead of the window dying silently.
+    <rid>.claimed.<claim_id>.json (an opaque per-spawn id) BEFORE spawning (of
+    N concurrent YESes exactly one wins the rename; the rest find nothing).
+    The spawned child is passed --confirm-claim-id and, at its commitment
+    point (right before it consumes the single-use token), releases ONLY its
+    own claim. The parent records the ACTUAL child pid into the claim content
+    so the reaper can tell a live confirm from a crashed one. Spawn failure
+    renames the claim back while unexpired, so the operator's next YES retries
+    instead of the window dying silently. A child that dies BEFORE its
+    commitment point leaves the claim for _reap_orphaned_claims to restore.
   * Expiry fails closed: expires_at missing -> marker deleted; unparseable
     or more than 24h out -> quarantined to <name>.bad (kept for
     inspection); expired -> deleted. All logged.
@@ -394,12 +399,14 @@ def _spawn_confirm(state: dict) -> bool:
     marker's only contribution is a request id that already matched
     _REQUEST_ID_RE in the loader (checked again for direct callers).
 
-    Claim = atomic rename to <rid>.claimed.<pid>.json: of N concurrent
-    YESes exactly one wins; the losers see FileNotFoundError and stand
-    down. Spawn success deletes the claimed file. Spawn failure renames it
-    back (while unexpired) so the next YES retries — the old unlink-then-
-    spawn burned the window when Popen failed. Returns True when the spawn
-    was issued."""
+    Claim = atomic rename to <rid>.claimed.<claim_id>.json (opaque per-spawn
+    id): of N concurrent YESes exactly one wins; the losers see
+    FileNotFoundError and stand down. On spawn success the claim is RETAINED
+    and annotated with the actual child pid; the child releases its own claim
+    at its commitment point, and the reaper restores it if the child dies
+    first. Spawn failure renames it back (while unexpired) so the next YES
+    retries — the old unlink-then-spawn burned the window when Popen failed.
+    Returns True when the spawn was issued."""
     rid = str(state.get("request_id") or "")
     src = state.get("_source_file")
     if not src or not _REQUEST_ID_RE.match(rid):
@@ -463,17 +470,31 @@ def _spawn_confirm(state: dict) -> bool:
         # holds: a concurrent YES skips `.claimed.` markers.
         #
         # Record the ACTUAL child pid + claim_id into the claim content so the
-        # reaper checks the CHILD's liveness, not the gateway's. Best-effort:
-        # if this write fails the reaper falls back to an mtime grace window.
+        # reaper checks the CHILD's liveness, not the gateway's.
+        #
+        # RACE (follow-up audit 2026-07-09): a fast child can reach its
+        # commitment point and DELETE this claim before we get here. We must
+        # NOT recreate a claim the child intentionally removed — doing so would
+        # let the reaper later "restore" a dead confirmation window. So open the
+        # EXISTING file read+write with NO create:
+        #   * already gone   -> FileNotFoundError -> child committed, do nothing;
+        #   * deleted mid-write -> our bytes land on the now-unlinked inode and
+        #     the claim is never resurrected (no path points at it).
         try:
-            _st = json.loads(claimed.read_text())
-        except Exception:
-            _st = dict(state)
-        _st["child_pid"] = child.pid if child is not None else None
-        _st["claim_id"] = claim_id
-        _st.setdefault("request_id", rid)
-        try:
-            claimed.write_text(json.dumps(_st))
+            with open(claimed, "r+") as _fh:
+                try:
+                    _st = json.loads(_fh.read() or "{}")
+                except Exception:
+                    _st = dict(state)
+                _st["child_pid"] = child.pid if child is not None else None
+                _st["claim_id"] = claim_id
+                _st.setdefault("request_id", rid)
+                _fh.seek(0)
+                _fh.truncate()
+                _fh.write(json.dumps(_st))
+        except FileNotFoundError:
+            _log({"event": "confirm_claim_released_before_pid_record",
+                  "request_id": rid})
         except Exception as exc:
             _log({"event": "confirm_claim_pid_record_failed", "request_id": rid,
                   "error": f"{type(exc).__name__}: {exc}"})
