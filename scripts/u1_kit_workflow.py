@@ -4026,6 +4026,18 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                             "instruction": "Surface this fresh bed photo path BARE in your reply."},
               json_events)
 
+    # Arm the structural-attachment marker for the reprint card (v2.4). The
+    # reprint path emits its images as render events above and asks the model to
+    # echo the paths, which is the fragile bit that showed the bed photo as text
+    # on 2026-07-09. Arm the same paths here so the transform_llm_output hook
+    # attaches them regardless of what the model echoes. This is the reprint
+    # sibling of the arm in _emit_confirm_card (reprints never reach that path).
+    _reprint_attach: list[str] = []
+    for _p in (_art_preview, _art_iso, bed.get("snapshot_path")):
+        if _p and Path(_p).is_file():
+            _reprint_attach.append(_p)
+    _arm_pending_attach(new_rid, _reprint_attach, operator)
+
     # This turn IS the operator's review moment (original previews + review
     # doc + fresh bed photo, above). Record it with the same revision+hash
     # binding a kit readiness card carries — can_start() drift-checks the

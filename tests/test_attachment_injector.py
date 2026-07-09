@@ -73,6 +73,27 @@ def test_roundtrip_strips_mangled_path_and_attaches_real_ones(attach_dir, tmp_pa
     assert not list(attach_dir.iterdir()), "marker must be consumed"
 
 
+def test_space_dollar_split_mangle_is_fully_stripped(attach_dir, tmp_path):
+    """The exact live 2026-07-09 reprint failure: gemma emitted
+    'requests/ $u1_..._8dfe85/bed_snapshot.jpg' which whitespace-splits into a
+    bare '/snapmaker_u1/requests/' prefix plus a '$..._8dfe85/bed_snapshot.jpg'
+    tail. Neither fragment may survive; the real bed photo is attached instead."""
+    bed = _png(tmp_path, "bed_snapshot.jpg")  # authoritative, in /tmp (no U1 dir sig)
+    wf._arm_pending_attach("u1_2026_0709_8dfe85", [bed], "brent")
+    reply = (
+        "2\n"
+        "/opt/data/snapmaker_u1/requests/ $u1_2026_0709_8dfe85/bed_snapshot.jpg\n"
+        "Sliced plate, review doc, and a fresh bed photo are attached. "
+        "Reply YES to start."
+    )
+    out = ai.transform(response_text=reply, session_id="s")
+    assert out is not None
+    assert bed in out, "real bed photo injected"
+    assert "$u1_2026_0709_8dfe85" not in out, "mangled tail stripped"
+    assert "snapmaker_u1/requests" not in out, "mangled dir prefix stripped too"
+    assert "Reply YES to start." in out, "prose kept"
+
+
 def test_correct_echo_is_not_doubled(attach_dir, tmp_path):
     preview = _png(tmp_path, "plate_1_preview.png")
     wf._arm_pending_attach("u1_2026_0709_abccb7", [preview], "op")

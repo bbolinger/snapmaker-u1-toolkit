@@ -117,8 +117,17 @@ def _load_and_consume_marker() -> dict[str, Any] | None:
     return data
 
 
-def _looks_like_u1_image(token: str) -> bool:
+def _is_u1_artifact_path(token: str) -> bool:
     low = token.lower()
+    # Any token that references a U1 request path is ours to remove, even when
+    # the model splits or corrupts it. Gemma has been seen to jam a space and a
+    # '$' into the path ("requests/ $u1_..._8dfe85/bed_snapshot.jpg", live
+    # 2026-07-09), which whitespace-splits into a bare "/snapmaker_u1/requests/"
+    # prefix plus a "$..._8dfe85/bed_snapshot.jpg" tail. Catch BOTH: any token
+    # holding the request-path fragment, plus any image-extension token with a
+    # U1 filename signature. Neither should survive into the visible reply.
+    if "/snapmaker_u1/requests" in low or "snapmaker_u1/requests" in low:
+        return True
     if not low.endswith(_IMAGE_EXTS):
         return False
     return any(sig in low for sig in _U1_SIGNATURES)
@@ -132,7 +141,7 @@ def _strip_echoed_u1_images(text: str) -> str:
         return text
     out_lines: list[str] = []
     for line in text.splitlines():
-        kept = [tok for tok in line.split() if not _looks_like_u1_image(tok)]
+        kept = [tok for tok in line.split() if not _is_u1_artifact_path(tok)]
         # A line that was ONLY a path (or several) collapses to empty; drop it.
         # A line with prose plus a trailing path keeps the prose.
         if not line.split():
