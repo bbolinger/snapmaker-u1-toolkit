@@ -68,6 +68,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 
 PENDING_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
                                   "/tmp/u1_pending_confirm"))
@@ -169,6 +170,11 @@ def _delete_marker(p: Path, event: str, **details) -> None:
               "error": f"{type(exc).__name__}: {exc}", **details})
 
 
+# A spawn that has claimed but not yet recorded its child pid is given
+# this long to finish before the reaper treats it as a failed spawn.
+_CLAIM_SPAWN_GRACE_S = 30.0
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -182,39 +188,53 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _reap_orphaned_claims() -> None:
-    """Restore a claim whose child died BEFORE releasing it (Q3, 2026-07-08).
+    """Restore a claim whose child died BEFORE releasing it (Q3, 2026-07-08;
+    pid source fixed in audit 2026-07-09).
 
-    A `<rid>.claimed.<pid>.json` still on disk with a DEAD pid means the child
-    crashed before it reached the token-consume point (where it removes its
-    own claim), so the operator's YES was never actually spent. Rename it back
-    to `<rid>.json` if the window is still live, else delete it. A live pid is
-    a confirm in flight — left alone."""
+    Liveness is the CHILD pid recorded in the claim CONTENT (`child_pid`) by
+    _spawn_confirm — NOT a pid parsed from the filename (the name now carries an
+    opaque claim_id). The old code parsed os.getpid() = the gateway pid, always
+    alive, so it never reaped. A dead child_pid means the child crashed before
+    its commitment point; restore `<rid>.json` if the window is still live, else
+    drop. A live child_pid is a confirm in flight — left alone. A claim with no
+    child_pid yet is a spawn still recording; it gets a short mtime grace before
+    being treated as a failed-spawn orphan."""
     if not PENDING_DIR.exists():
         return
     now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     for p in list(PENDING_DIR.iterdir()):
         if not p.is_file() or ".claimed." not in p.name:
             continue
-        # filename: <rid>.claimed.<pid>.json
-        try:
-            pid = int(p.name.rsplit(".claimed.", 1)[1].split(".")[0])
-        except Exception:
-            continue
-        if _pid_alive(pid):
-            continue
         try:
             st = json.loads(p.read_text())
-            rid = str(st.get("request_id") or "")
-            exp = st.get("expires_at")
-            live = True
-            if exp:
-                try:
-                    live = now <= datetime.fromisoformat(
-                        str(exp).replace("Z", "+00:00"))
-                except Exception:
-                    live = True
         except Exception:
-            live, rid = False, ""
+            st = {}
+        rid = str(st.get("request_id") or "")
+        child_pid = st.get("child_pid")
+        if child_pid is None:
+            # spawn hasn't recorded the child pid yet (or died before it could).
+            try:
+                age = now_ts - p.stat().st_mtime
+            except Exception:
+                age = 0.0
+            if age < _CLAIM_SPAWN_GRACE_S:
+                continue  # genuinely in flight — leave it
+            # stale + no pid -> the recording never happened -> orphan.
+        else:
+            try:
+                if _pid_alive(int(child_pid)):
+                    continue  # child running -> in flight
+            except Exception:
+                continue  # unparseable pid -> do not reap on uncertainty
+        exp = st.get("expires_at")
+        live = True
+        if exp:
+            try:
+                live = now <= datetime.fromisoformat(
+                    str(exp).replace("Z", "+00:00"))
+            except Exception:
+                live = True
         if not rid or not _REQUEST_ID_RE.match(rid):
             _delete_marker(p, "confirm_claim_orphan_bad_dropped")
             continue
@@ -223,7 +243,7 @@ def _reap_orphaned_claims() -> None:
             try:
                 os.replace(p, target)
                 _log({"event": "confirm_claim_orphan_restored",
-                      "request_id": rid, "dead_pid": pid})
+                      "request_id": rid, "dead_child_pid": child_pid})
             except Exception as exc:
                 _log({"event": "confirm_claim_orphan_restore_failed",
                       "request_id": rid,
@@ -385,7 +405,13 @@ def _spawn_confirm(state: dict) -> bool:
     if not src or not _REQUEST_ID_RE.match(rid):
         return False
     src_path = Path(src)
-    claimed = src_path.with_name(f"{rid}.claimed.{os.getpid()}.json")
+    # Q3 fix (audit 2026-07-09): the claim filename carries an opaque claim_id,
+    # NOT os.getpid(). The old name embedded the GATEWAY pid (this hook runs in
+    # the gateway), so the reaper's liveness check always saw a live process
+    # and never restored an orphaned claim. Liveness now lives in the claim
+    # CONTENT as the actual spawned child pid (recorded below).
+    claim_id = uuid.uuid4().hex[:12]
+    claimed = src_path.with_name(f"{rid}.claimed.{claim_id}.json")
     try:
         os.rename(src_path, claimed)
     except FileNotFoundError:
@@ -394,17 +420,21 @@ def _spawn_confirm(state: dict) -> bool:
         _log({"event": "confirm_marker_claim_failed", "request_id": rid,
               "error": f"{type(exc).__name__}: {exc}"})
         return False
-    cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid, "--json-events"]
+    # The child releases ONLY this claim_id at its commitment point (audit #3),
+    # so a concurrently re-armed generation's claim is never deleted.
+    cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid,
+           "--confirm-claim-id", claim_id, "--json-events"]
     # Log path is DERIVED, never read from the marker.
     log_path = Path(f"/tmp/u1_confirm_start_{rid}.log")
     out = None
     spawn_ok = False
+    child = None
     try:
         try:
             out = open(log_path, "ab")
         except Exception:
             out = None  # losing the log is acceptable; losing the start isn't
-        subprocess.Popen(
+        child = subprocess.Popen(
             cmd,
             stdout=out if out is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
@@ -431,6 +461,22 @@ def _spawn_confirm(state: dict) -> bool:
         # child that dies before that point leaves the claim for the reaper
         # to restore, so the operator's next YES retries. Single-fire still
         # holds: a concurrent YES skips `.claimed.` markers.
+        #
+        # Record the ACTUAL child pid + claim_id into the claim content so the
+        # reaper checks the CHILD's liveness, not the gateway's. Best-effort:
+        # if this write fails the reaper falls back to an mtime grace window.
+        try:
+            _st = json.loads(claimed.read_text())
+        except Exception:
+            _st = dict(state)
+        _st["child_pid"] = child.pid if child is not None else None
+        _st["claim_id"] = claim_id
+        _st.setdefault("request_id", rid)
+        try:
+            claimed.write_text(json.dumps(_st))
+        except Exception as exc:
+            _log({"event": "confirm_claim_pid_record_failed", "request_id": rid,
+                  "error": f"{type(exc).__name__}: {exc}"})
         return True
     # Spawn failed — put the marker back while the window is still live so
     # the operator's next YES can retry.

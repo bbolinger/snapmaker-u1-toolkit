@@ -1405,6 +1405,78 @@ def test_grace_notify_failure_can_be_overridden_to_proceed(sandbox_requests, mon
     assert start_hit["n"] == 1  # opt-out honored: start proceeds
 
 
+def _seed_loop_guard_request(sandbox_requests, rid):
+    """Seed a request already AT the notify cap (grace_notify_count == cap), so
+    the next start attempt trips _grace_notify_allowed -> False."""
+    import u1_print_start_gate as gate
+    _seed_request(sandbox_requests, rid,
+                  kit={"parts": [{"part_id": "p1"}], "part_count": 1},
+                  safety={"approval_token": "test_token",
+                          "stage2_approval_nonce": "n",
+                          "grace_notify_count": gate.GRACE_NOTIFY_CAP,
+                          "stage2_approval_binds": {
+                              "request_revision": 1,
+                              "gcode_hash": "sha256:abc123",
+                              "prompt_key": "bed_clear_start"}})
+
+
+def _stub_gate_ready(monkeypatch, gate):
+    monkeypatch.setattr(gate, "_approval_token_valid", lambda stored, tok: (True, "ok"))
+    monkeypatch.setattr(gate, "preflight", lambda *a, **kw: [])
+    monkeypatch.setattr(gate, "query_state", lambda h, p: {})
+    monkeypatch.setattr(gate, "_read_approval_token", lambda d: {"token": "test_token"})
+    import u1_safety
+    monkeypatch.setattr(u1_safety, "can_start", lambda req: (True, "ok"))
+    monkeypatch.setattr(gate, "capture_real_bed_photo",
+                        lambda *a, **kw: {"ok": True, "brightness_check": "deferred"})
+
+
+def test_grace_notify_loop_guard_exhaustion_aborts(sandbox_requests, monkeypatch):
+    """AUDIT #1: when the notify loop guard trips (a re-run storm pushes
+    grace_notify_count past the cap), NO countdown/CANCEL DM is delivered — so
+    per Q2 the start must ABORT, not silently suppress the DM and proceed. The
+    notify_fn is intentionally a SUCCESS: proving it's the loop guard, not a
+    delivery failure, that blocks the start."""
+    import u1_print_start_gate as gate
+    rid = "u1_test_loop_guard_abort"
+    _seed_loop_guard_request(sandbox_requests, rid)
+    _stub_gate_ready(monkeypatch, gate)
+    start_hit = {"n": 0}
+    res = gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: start_hit.__setitem__("n", start_hit["n"]+1) or {"ok": True},
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        grace_notify_cmd="some-cmd",
+        grace_notify_fn=lambda cmd, **kw: {"ok": True},   # delivery WOULD succeed
+        out_dir=u1_request.request_dir(rid))
+    assert start_hit["n"] == 0, "loop-guard suppression must not start a blind print"
+    assert res["started"] is False
+    assert res["stage"] == "gate_refused_notify_undeliverable"
+
+
+def test_grace_notify_loop_guard_exhaustion_can_be_overridden(sandbox_requests, monkeypatch):
+    """Same escape hatch applies to the loop-guard path: U1_GRACE_NOTIFY_OPTIONAL=1
+    restores suppress-and-proceed for opt-in setups."""
+    import u1_print_start_gate as gate
+    monkeypatch.setenv("U1_GRACE_NOTIFY_OPTIONAL", "1")
+    rid = "u1_test_loop_guard_optional"
+    _seed_loop_guard_request(sandbox_requests, rid)
+    _stub_gate_ready(monkeypatch, gate)
+    start_hit = {"n": 0}
+    gate.run_gate(
+        "test_plate1.gcode", "start", host="127.0.0.1", port=7125,
+        approval_token="test_token", stage2_approval_nonce="n",
+        request_id=rid, operator="telegram:brent",
+        start_func=lambda *a, **kw: start_hit.__setitem__("n", start_hit["n"]+1) or {"ok": True},
+        grace_seconds=2, grace_sleep_fn=lambda s: None,
+        grace_notify_cmd="some-cmd",
+        grace_notify_fn=lambda cmd, **kw: {"ok": True},
+        out_dir=u1_request.request_dir(rid))
+    assert start_hit["n"] == 1  # opt-out honored
+
+
 def test_grace_no_notify_cmd_still_works(sandbox_requests, monkeypatch):
     """No notify command configured → grace period still runs cleanly.
     Nobody gets notified, but the SSH-touch cancel path still works."""

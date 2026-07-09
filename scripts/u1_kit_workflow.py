@@ -2130,7 +2130,7 @@ def run_kit_workflow(args) -> dict[str, Any]:
         # Child-ack commitment point: we have a token and are about to consume
         # it. Release our claim now — a crash before here is recoverable by
         # the hook reaper; a crash after here spent the token either way.
-        _release_confirm_claim(_confirm_for)
+        _release_confirm_claim(_confirm_for, getattr(args, "confirm_claim_id", None))
     if _confirm_token:
         _rid = u1_form.resolve_confirm_token(_confirm_token)  # consumes it
         _state = u1_request.read_request(_rid) if _rid else None
@@ -3552,13 +3552,25 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
         pass
 
 
-def _release_confirm_claim(request_id: str) -> None:
-    """Child-ack (Q3, 2026-07-08): remove the confirm hook's claim marker(s)
-    for this request. Called by the confirmed turn RIGHT BEFORE it consumes
-    the single-use token — the point of commitment. A child that crashes
-    before here leaves the claim for the hook's reaper to restore, so the
-    operator's YES is not spent by a child that never redeemed it."""
+def _release_confirm_claim(request_id: str, claim_id: str | None = None) -> None:
+    """Child-ack (Q3, 2026-07-08; scoped by claim_id in audit 2026-07-09):
+    remove THIS spawn's claim marker right before the single-use token is
+    consumed — the point of commitment. A child that crashes before here leaves
+    the claim for the hook's reaper to restore, so the operator's YES is not
+    spent by a child that never redeemed it.
+
+    With a claim_id (the normal hook path) we unlink ONLY
+    <rid>.claimed.<claim_id>.json — deleting every claim for the request could
+    strand a concurrently re-armed generation whose own child hasn't committed
+    yet (audit finding #3). Without one (direct/legacy invocation) fall back to
+    the request-wide glob."""
     try:
+        if claim_id:
+            try:
+                (_PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json").unlink()
+            except FileNotFoundError:
+                pass
+            return
         for c in _PENDING_CONFIRM_DIR.glob(f"{request_id}.claimed.*.json"):
             try:
                 c.unlink()
@@ -5466,6 +5478,12 @@ def main(argv=None) -> int:
                           "for the u1_confirm_start hook, which builds this "
                           "command from its own constants — the pending "
                           "marker carries no command and no token."))
+    ap.add_argument("--confirm-claim-id", default=None, dest="confirm_claim_id",
+                    help=("Q3 (audit 2026-07-09): the exact claim id the confirm "
+                          "hook created for THIS spawn. At the commitment point "
+                          "the child releases ONLY its own "
+                          "<rid>.claimed.<id>.json, so a concurrently re-armed "
+                          "generation's claim is never deleted. Hook-set only."))
     ap.add_argument("--grace-cancel", action="store_true", dest="grace_cancel",
                     help=("Cancel every active pre-start grace window (touches "
                           "the same markers the gateway cancel hook does). The "

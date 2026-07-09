@@ -504,8 +504,10 @@ def gcode_exists_on_printer(host, port, filename):
     """Does ``filename`` actually exist in the printer's gcodes storage?
 
     Returns True (confirmed present), False (confirmed ABSENT — Moonraker 404),
-    or None (couldn't verify: network/other error → the caller fails OPEN so a
-    flaky metadata query never blocks a real print).
+    or None (couldn't verify after retries: network/other error). Q1 (audit
+    2026-07-08): a single flaky query is absorbed by the retry loop; a
+    persistent None means the caller FAILS CLOSED — this close to a physical
+    start, can't-confirm means no. (This used to fail OPEN; it no longer does.)
 
     Why the gate needs this: the grace window fires an operator "print
     starting" notification BEFORE the actual start. A confused agent that
@@ -709,7 +711,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                                  filename: str = '',
                                  notify_cmd: str | None = None,
                                  sleep_fn=None,
-                                 notify_fn=None) -> bool:
+                                 notify_fn=None) -> str:
     """Wait up to grace_seconds for cancel_marker to appear on disk.
 
     Returns a status string: ``'proceed'`` (start), ``'cancelled'`` (the
@@ -771,8 +773,25 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                     pass
                 return 'notify_failed'
         else:
-            # Loop guard tripped: suppress the DM but STILL run the wait so the
-            # cancel safety net is intact. Audited so a real loop is visible.
+            # Q2 loop-guard alignment (audit 2026-07-09): the notify cap tripped,
+            # so NO countdown/CANCEL DM will be delivered and no
+            # /tmp/u1_pending_cancel/<rid>.json routing entry is created. Under
+            # Q2 we must not start a print the operator can neither see nor
+            # cancel — so treat an exhausted cap exactly like a hard notify
+            # failure: abort. (Previously this suppressed the DM but still ran
+            # the wait and returned 'proceed' — a real fail-open hole, since a
+            # gemma re-run storm can push grace_notify_count past the cap.) The
+            # escape hatch keeps the old suppress-and-proceed for opt-in setups.
+            if os.environ.get("U1_GRACE_NOTIFY_OPTIONAL", "") not in (
+                    "1", "true", "yes", "on"):
+                _audit_gate(request_id,
+                            'pre_start_grace_notify_loop_guard_abort',
+                            resolved_operator, cap=GRACE_NOTIFY_CAP)
+                try:
+                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                except Exception:
+                    pass
+                return 'notify_failed'
             _audit_gate(request_id, 'pre_start_grace_notify_suppressed_loop_guard',
                         resolved_operator, cap=GRACE_NOTIFY_CAP)
     # Contract with the Hermes gateway hook + notify script: the notify
