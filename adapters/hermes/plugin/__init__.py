@@ -204,7 +204,25 @@ def _pre_gateway_dispatch(**kwargs: Any) -> None:
         for platform_key, adapter in dict(adapters).items():
             name = str(getattr(platform_key, "value", platform_key)).lower()
             if "telegram" in name:
-                telegram_patch.ensure_patched(type(adapter))
+                if telegram_patch.ensure_patched(type(adapter)):
+                    # Register the callback handlers (form + grace-cancel button)
+                    # on the LIVE PTB app NOW, every inbound message — not lazily
+                    # on the first send_form. The countdown CANCEL button
+                    # (u1c:<rid>) rides the same pattern-scoped handler; a reprint
+                    # never sends a form, so before this the button had no handler
+                    # and taps were silently dropped (live 2026-07-09: a reprint
+                    # countdown CANCEL flashed, the grace expired, and the print
+                    # started anyway). _ensure_cb_handler is idempotent per-app
+                    # and re-registers on reconnect, so calling it per message is
+                    # cheap and guarantees the abort button is live before any
+                    # countdown.
+                    _reg = getattr(adapter, "_u1_ensure_cb_handler", None)
+                    if _reg is not None:
+                        try:
+                            _reg()
+                        except Exception:
+                            logger.warning("u1-form: proactive callback-handler "
+                                           "registration failed", exc_info=True)
     except Exception:
         logger.warning("u1-form: pre_gateway_dispatch patch attempt failed",
                        exc_info=True)
