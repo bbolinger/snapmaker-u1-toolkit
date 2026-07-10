@@ -166,6 +166,40 @@ def test_unrelated_image_path_is_not_stripped(attach_dir, tmp_path):
     assert bed in out, "the real bed photo is attached"
 
 
+def test_review_doc_injected_as_bare_path(attach_dir, tmp_path):
+    """The review .md must be injected as a BARE path so core send_document's it.
+    The model's live failure was a MEDIA: directive on a mangled path, which core
+    drops for .md. Assert the bare doc path is injected and the mangled MEDIA line
+    (keyword + path) is gone."""
+    bed = _png(tmp_path, "bed_snapshot.jpg")
+    review = tmp_path / "review.md"
+    review.write_text("# Print review\n- part 1\n")
+    wf._arm_pending_attach("u1_2026_0709_abccb7", [bed], "brent",
+                           documents=[str(review)])
+    reply = (
+        "Plate and bed below.\n"
+        "MEDIA: /opt/data/snapmaker_u1/requests/u2026_0709_abccb7_review.md\n"
+        "Reply YES."
+    )
+    out = ai.transform(response_text=reply, session_id="s")
+    assert out is not None
+    assert bed in out, "bed photo injected"
+    assert str(review) in out, "review doc injected as a bare path"
+    assert "u2026_0709_abccb7_review.md" not in out, "mangled doc path stripped"
+    assert "MEDIA:" not in out, "orphaned MEDIA directive keyword removed"
+
+
+def test_documents_only_marker_still_injects(attach_dir, tmp_path):
+    """A marker with no images but a document still delivers the document."""
+    review = tmp_path / "review.md"
+    review.write_text("# review\n")
+    wf._arm_pending_attach("u1_2026_0709_abccb7", [], "brent",
+                           documents=[str(review)])
+    out = ai.transform(response_text="Review attached. Reply YES.", session_id="s")
+    assert out is not None
+    assert str(review) in out
+
+
 def test_corrupt_marker_never_raises(attach_dir):
     target = ai._marker_path_for_session()
     target.write_text("{ this is not json")

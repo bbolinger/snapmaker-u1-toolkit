@@ -3255,7 +3255,11 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             _attach_images.append(preview_result["iso_path"])
     if bed_result["ok"]:
         _attach_images.append(bed_result["snapshot_path"])
-    _arm_pending_attach(request_id, _attach_images, operator)
+    _attach_docs = ([review_doc_path]
+                    if (review_doc_path and Path(review_doc_path).is_file())
+                    else [])
+    _arm_pending_attach(request_id, _attach_images, operator,
+                        documents=_attach_docs)
 
     _emit(events_file, {
         "stage": "need_input",
@@ -3483,16 +3487,21 @@ _PENDING_ATTACH_DIR = Path(os.environ.get("U1_PENDING_ATTACH_DIR",
 
 def _arm_pending_attach(request_id: str, images: "list[str] | None",
                         operator: "str | None",
+                        documents: "list[str] | None" = None,
                         session_key: "str | None" = None) -> None:
     """Drop the one-shot marker the attachment_injector hook redeems on the next
     outbound turn. ``images`` are absolute paths in the request dir (plate
-    preview, isometric, bed snapshot). No-op when there's nothing to attach.
+    preview, isometric, bed snapshot); ``documents`` are non-image files to
+    deliver as attachments (the review .md, which core sends via send_document
+    only from a bare path, never a MEDIA: directive). No-op when there's nothing
+    to attach.
 
     Best-effort: an attachment is never worth failing the card or the safety
     gate over, so every error is swallowed."""
     import hashlib
     imgs = [str(p) for p in (images or []) if p]
-    if not imgs:
+    docs = [str(p) for p in (documents or []) if p]
+    if not imgs and not docs:
         return
     key = session_key if session_key is not None else os.environ.get("HERMES_SESSION_KEY", "")
     try:
@@ -3502,6 +3511,7 @@ def _arm_pending_attach(request_id: str, images: "list[str] | None",
         payload = {
             "request_id": request_id,
             "images": imgs,
+            "documents": docs,
             "operator": operator,
             "created_at": time.time(),
         }
@@ -4036,7 +4046,10 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
     for _p in (_art_preview, _art_iso, bed.get("snapshot_path")):
         if _p and Path(_p).is_file():
             _reprint_attach.append(_p)
-    _arm_pending_attach(new_rid, _reprint_attach, operator)
+    _reprint_docs = ([_art_review]
+                     if (_art_review and Path(_art_review).is_file()) else [])
+    _arm_pending_attach(new_rid, _reprint_attach, operator,
+                        documents=_reprint_docs)
 
     # This turn IS the operator's review moment (original previews + review
     # doc + fresh bed photo, above). Record it with the same revision+hash

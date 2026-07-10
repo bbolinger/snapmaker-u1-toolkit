@@ -141,14 +141,21 @@ def _strip_echoed_u1_images(text: str) -> str:
         return text
     out_lines: list[str] = []
     for line in text.splitlines():
-        kept = [tok for tok in line.split() if not _is_u1_artifact_path(tok)]
+        toks = line.split()
+        removed = any(_is_u1_artifact_path(t) for t in toks)
+        kept = [t for t in toks if not _is_u1_artifact_path(t)]
+        if removed:
+            # When we pulled a U1 path off a line, drop an orphaned "MEDIA:"
+            # directive keyword it was riding on (the model wraps the review doc
+            # as "MEDIA: <path>"; without this the bare "MEDIA:" would leak).
+            kept = [t for t in kept if t.upper() != "MEDIA:"]
         # A line that was ONLY a path (or several) collapses to empty; drop it.
         # A line with prose plus a trailing path keeps the prose.
-        if not line.split():
+        if not toks:
             out_lines.append(line)
         elif kept:
             out_lines.append(" ".join(kept))
-        # else: line was purely image path(s) -> omit entirely
+        # else: line was purely path(s)/MEDIA: -> omit entirely
     cleaned = "\n".join(out_lines)
     # Collapse 3+ newlines left by removed blocks down to a paragraph break.
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -157,7 +164,15 @@ def _strip_echoed_u1_images(text: str) -> str:
 
 def transform(response_text: str = "", session_id: str = "", model: str = "",
               platform: str = "", **kwargs: Any) -> Any:
-    """Inject authoritative U1 image paths so core attaches the real images.
+    """Inject authoritative U1 attachment paths so core delivers the real files.
+
+    The marker carries images (plate preview / isometric / bed snapshot) and
+    documents (the review doc). Both are injected as BARE paths: core's
+    extract_local_files sends image extensions as native photos and everything
+    else (the .md review doc) through send_document. A .md can only ride the
+    bare-path route -- the MEDIA: directive has an extension allowlist that
+    excludes it -- which is why the model echoing "MEDIA: ...review.md" never
+    delivered the doc.
 
     Returns a replacement string, or None to leave the reply unchanged.
     """
@@ -166,41 +181,44 @@ def transform(response_text: str = "", session_id: str = "", model: str = "",
         if not marker:
             return None  # no U1 card this turn -> no-op
 
-        # Keep only images that actually exist on disk right now.
-        images: list[str] = []
-        for p in marker.get("images", []) or []:
+        # Authoritative attachments = images + documents, in that order, keeping
+        # only what exists on disk right now.
+        paths: list[str] = []
+        for p in ((marker.get("images", []) or [])
+                  + (marker.get("documents", []) or [])):
             try:
-                if p and Path(p).is_file() and p not in images:
-                    images.append(str(p))
+                if p and Path(p).is_file() and p not in paths:
+                    paths.append(str(p))
             except OSError:
                 continue
 
         cleaned = _strip_echoed_u1_images(response_text or "")
 
-        if not images:
+        if not paths:
             # Marker existed but nothing survives on disk. Return the cleaned
             # text only if we actually removed a dead/mangled path AND something
             # is left to send. A bare "" would be treated by turn_finalizer as
             # "leave unchanged" (falsy), so never return that.
             if cleaned and cleaned != (response_text or "").strip():
-                logger.info("snapmaker_u1 attachment_injector: no live images; "
+                logger.info("snapmaker_u1 attachment_injector: no live files; "
                             "stripped echoed path(s) from reply "
                             "(request_id=%s)", marker.get("request_id"))
                 return cleaned
             return None
 
         # Append the real paths as bare lines. Core's extract_local_files will
-        # attach each as a native photo and remove the line from the visible
-        # text, so the operator sees the card text plus the images, never a path.
+        # deliver each (photo for images, document for the review .md) and remove
+        # the line from the visible text, so the operator sees the card text plus
+        # the attachments, never a path.
         body = cleaned.rstrip()
-        new_text = (body + "\n\n" if body else "") + "\n".join(images)
+        new_text = (body + "\n\n" if body else "") + "\n".join(paths)
         logger.info(
             "snapmaker_u1 attachment_injector: injected %d authoritative "
-            "image path(s) (request_id=%s), replacing model-echoed paths",
-            len(images), marker.get("request_id"),
+            "file path(s) (request_id=%s), replacing model-echoed paths",
+            len(paths), marker.get("request_id"),
         )
         return new_text
-    except Exception as exc:  # never break the operator's reply over an image
+    except Exception as exc:  # never break the operator's reply over an attachment
         logger.warning("snapmaker_u1 attachment_injector: failed, leaving reply "
                        "unchanged: %s", exc)
         return None
