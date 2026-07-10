@@ -3504,6 +3504,11 @@ def _arm_pending_attach(request_id: str, images: "list[str] | None",
     if not imgs and not docs:
         return
     key = session_key if session_key is not None else os.environ.get("HERMES_SESSION_KEY", "")
+    if not key:
+        # No stable per-session key -> don't write the shared empty-key slot,
+        # which an unrelated turn could redeem (audit #3). The hook refuses the
+        # empty-key slot on read too; keep both ends aligned.
+        return
     try:
         _PENDING_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]

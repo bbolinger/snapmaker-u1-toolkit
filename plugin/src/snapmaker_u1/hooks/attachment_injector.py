@@ -40,9 +40,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -60,8 +62,29 @@ _PENDING_ATTACH_DIR = Path(
 # Images are only relevant to the immediate reply; a marker older than this is
 # stale (a crash or a non-card turn) and is discarded rather than re-attached.
 _PENDING_ATTACH_TTL_S = 120.0
+# Allow a little clock slack for a marker stamped microseconds in the "future".
+_CLOCK_SKEW_S = 60.0
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+# The marker file is writable by anything running as the same uid, so its paths
+# are NOT trusted. Before handing a path to core (which will send it to the
+# operator), it must resolve to a real, non-symlink file that is a KNOWN U1
+# artifact by name, sitting in a request-id directory under the canonical
+# requests root. Audit 2026-07-10: a forged marker injected "/etc/hosts" and the
+# hook would have delivered it. We validate the destination, not the marker.
+_REQUESTS_ROOT = Path(
+    os.environ.get("SNAPMAKER_U1_DATA_DIR", "/opt/data/snapmaker_u1")) / "requests"
+# Exact artifact basenames the workflow ever emits (plate N preview/isometric,
+# the fresh bed snapshot, the parts grid, and the review doc). Nothing else.
+_ALLOWED_ARTIFACT_RE = re.compile(
+    r"^(?:plate_\d+_preview\.png|plate_\d+_iso\.png|bed_snapshot\.jpg|"
+    r"parts_thumbnails\.png|review\.md)$")
+# A request-id directory name (the immediate parent of an artifact). Reprints
+# reuse the ORIGINAL request's artifacts, so the parent is not necessarily the
+# marker's own request_id -- any valid request dir under the root is acceptable,
+# which is why we match the shape rather than the exact id.
+_REQUEST_ID_RE = re.compile(r"^u1_\d{4}_\d{4}_[a-z0-9]+$")
 
 # A whitespace-delimited token "looks like a U1 image path" when it ends in an
 # image extension AND carries a U1 signature. This strips both the correct paths
@@ -79,40 +102,58 @@ _U1_SIGNATURES = (
 
 def _marker_path_for_session() -> Path | None:
     key = os.environ.get("HERMES_SESSION_KEY", "")
-    # Empty key still hashes deterministically; on a single-operator U1 install
-    # that simply means one shared slot, which is correct (one operator).
+    if not key:
+        # Refuse the empty-key shared slot: without a stable per-session key,
+        # every session hashes to the same file and one request's marker could
+        # be redeemed by an unrelated turn (audit #3). No key -> no marker.
+        return None
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return _PENDING_ATTACH_DIR / f"{digest}.json"
 
 
 def _load_and_consume_marker() -> dict[str, Any] | None:
-    """Return the marker for this session and delete it (one-shot). None if
-    absent or stale. Never raises."""
+    """Atomically claim the marker for this session and return it, or None.
+
+    Single-use is enforced by an atomic rename to a unique name: only the caller
+    whose ``os.rename`` wins may read it, so two concurrent finalizers cannot
+    both consume the same marker (audit #4 -- read-then-unlink let both win).
+    Never raises."""
     path = _marker_path_for_session()
     if path is None:
         return None
+    claimed = path.with_name(path.name + f".claimed.{uuid.uuid4().hex[:8]}")
     try:
-        raw = path.read_text()
-    except FileNotFoundError:
+        os.rename(path, claimed)  # atomic on POSIX; loser gets FileNotFoundError
+    except (FileNotFoundError, OSError):
         return None
-    except OSError:
-        return None
-    # Consume immediately so a half-processed / stale marker can't be re-used
-    # on a later turn.
     try:
-        path.unlink()
+        raw = claimed.read_text()
     except OSError:
-        pass
+        raw = ""
+    finally:
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
     try:
         data = json.loads(raw or "{}")
     except (ValueError, TypeError):
         return None
     if not isinstance(data, dict):
         return None
+    # created_at must be a finite number in a sane window. A missing or string
+    # timestamp previously skipped the TTL check entirely and was accepted as
+    # fresh (audit #6); bool is an int subclass, so exclude it explicitly.
     created = data.get("created_at")
-    if isinstance(created, (int, float)) and (time.time() - created) > _PENDING_ATTACH_TTL_S:
-        logger.info("snapmaker_u1 attachment_injector: discarding stale marker "
-                    "(age %.0fs > %.0fs)", time.time() - created, _PENDING_ATTACH_TTL_S)
+    if (not isinstance(created, (int, float)) or isinstance(created, bool)
+            or not math.isfinite(created)):
+        logger.info("snapmaker_u1 attachment_injector: rejecting marker with "
+                    "missing/malformed created_at")
+        return None
+    age = time.time() - created
+    if age > _PENDING_ATTACH_TTL_S or age < -_CLOCK_SKEW_S:
+        logger.info("snapmaker_u1 attachment_injector: discarding stale/future "
+                    "marker (age %.0fs)", age)
         return None
     return data
 
@@ -162,6 +203,30 @@ def _strip_echoed_u1_images(text: str) -> str:
     return cleaned.strip()
 
 
+def _is_safe_artifact(path_str: str) -> bool:
+    """True only for a real, non-symlink file that is a known U1 artifact by name,
+    inside a request-id directory under the canonical requests root.
+
+    The marker is same-uid-writable and therefore untrusted; this is what stops a
+    forged marker turning the hook into a "send any readable local file" primitive
+    (audit #2). resolve(strict=True) follows every symlink, so a symlinked
+    component pointing outside the root is caught by the final under-root check."""
+    try:
+        p = Path(path_str)
+        if p.is_symlink():
+            return False
+        rp = p.resolve(strict=True)
+        if not rp.is_file():
+            return False
+        if not _ALLOWED_ARTIFACT_RE.match(rp.name):
+            return False
+        if not _REQUEST_ID_RE.match(rp.parent.name):
+            return False
+        return _REQUESTS_ROOT.resolve() in rp.parents
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def transform(response_text: str = "", session_id: str = "", model: str = "",
               platform: str = "", **kwargs: Any) -> Any:
     """Inject authoritative U1 attachment paths so core delivers the real files.
@@ -181,16 +246,22 @@ def transform(response_text: str = "", session_id: str = "", model: str = "",
         if not marker:
             return None  # no U1 card this turn -> no-op
 
-        # Authoritative attachments = images + documents, in that order, keeping
-        # only what exists on disk right now.
+        # Authoritative attachments = images + documents, in that order. Every
+        # path is validated (real, non-symlink, known artifact name, under the
+        # requests root) because the marker is untrusted (audit #2). Anything
+        # else is dropped and logged, never delivered.
         paths: list[str] = []
         for p in ((marker.get("images", []) or [])
                   + (marker.get("documents", []) or [])):
-            try:
-                if p and Path(p).is_file() and p not in paths:
-                    paths.append(str(p))
-            except OSError:
+            sp = str(p) if p else ""
+            if not sp or sp in paths:
                 continue
+            if _is_safe_artifact(sp):
+                paths.append(sp)
+            else:
+                logger.warning("snapmaker_u1 attachment_injector: refusing path "
+                               "that is not a known U1 artifact under the "
+                               "requests root: %r", sp)
 
         cleaned = _strip_echoed_u1_images(response_text or "")
 
