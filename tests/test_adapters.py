@@ -493,6 +493,72 @@ def test_plugin_registers_form_tool_and_dispatch_hook(monkeypatch, tmp_path):
     assert [h for h, _ in ctx.hooks] == ["pre_gateway_dispatch"]
 
 
+# --------------------------------------------------------------------------- #
+# Grace-window CANCEL button handler must be registered from an inbound
+# message, NOT only as a side effect of send_form. A reprint never sends a
+# form, so before this fix its countdown CANCEL button had no callback handler
+# and taps were silently dropped (live 2026-07-09: reprint cancel flashed, the
+# 120s grace expired, the print started anyway).
+# --------------------------------------------------------------------------- #
+
+def _patch_ensure(monkeypatch):
+    """Isolate the dispatch hook from the real (PTB-dependent) patcher: force
+    ensure_patched True so we can assert the hook proactively drives per-instance
+    handler registration."""
+    tp = importlib.import_module("hermes_plugins.u1_form.telegram_patch")
+    monkeypatch.setattr(tp, "ensure_patched", lambda cls: True)
+    return tp
+
+
+def test_pre_dispatch_registers_cancel_handler_every_message(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+    calls = []
+
+    class _Adapter:
+        def _u1_ensure_cb_handler(self):
+            calls.append("reg")
+
+    class _Gw:
+        adapters = {"telegram": _Adapter()}
+
+    mod._pre_gateway_dispatch(gateway=_Gw(), event=None)
+    assert calls == ["reg"], (
+        "pre_gateway_dispatch must register the form + grace-cancel callback "
+        "handler on every inbound message (a reprint sends no form)")
+
+
+def test_pre_dispatch_skips_non_telegram_adapters(monkeypatch, tmp_path):
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+    calls = []
+
+    class _Adapter:
+        def _u1_ensure_cb_handler(self):
+            calls.append("reg")
+
+    class _Gw:
+        adapters = {"discord": _Adapter()}
+
+    mod._pre_gateway_dispatch(gateway=_Gw(), event=None)
+    assert calls == [], "only the telegram adapter carries the U1 patch"
+
+
+def test_pre_dispatch_survives_registration_error(monkeypatch, tmp_path):
+    """A failure registering the handler must never break message dispatch."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+
+    class _Adapter:
+        def _u1_ensure_cb_handler(self):
+            raise RuntimeError("app not ready")
+
+    class _Gw:
+        adapters = {"telegram": _Adapter()}
+
+    assert mod._pre_gateway_dispatch(gateway=_Gw(), event=None) is None
+
+
 def _fake_form_gateway(monkeypatch):
     """Stand-in for tools.form_gateway with the callback registry surface."""
     fg = types.ModuleType("tools.form_gateway")
