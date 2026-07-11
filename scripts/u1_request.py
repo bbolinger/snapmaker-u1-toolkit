@@ -92,13 +92,14 @@ def request_dir(request_id: str) -> Path:
     return _requests_root() / request_id
 
 
-import fcntl as _fcntl
 from contextlib import contextmanager as _contextmanager
+
+from u1_lockfile import exclusive_lock as _exclusive_lock
 
 
 @_contextmanager
 def request_lock(request_id: str):
-    """Exclusive per-request advisory lock (flock on
+    """Exclusive per-request lock (u1_lockfile sidecar lock on
     ``<request_dir>/.request.lock``) held across a full read-modify-write.
 
     Cold-audit finding 2026-07-07: ``write_request`` was atomic against a
@@ -108,20 +109,13 @@ def request_lock(request_id: str):
     and RESURRECTS the consumed nonce. Serializing every request read-
     modify-write under one lock closes that race for the nonce and for the
     whole lost-update family (revision bumps, safety-block edits, plate
-    state). Linux runtime: fcntl is always present. A lock failure raises
-    rather than silently proceeding unlocked — for a safety-state file a
-    missing mutex must fail loud, not fail open."""
+    state). u1_lockfile backs this with fcntl on POSIX and msvcrt on
+    Windows — never a no-op. A lock failure raises rather than silently
+    proceeding unlocked — for a safety-state file a missing mutex must
+    fail loud, not fail open."""
     ensure_request_dir(request_id)
-    lock_path = request_dir(request_id) / ".request.lock"
-    lf = open(lock_path, "w")
-    try:
-        _fcntl.flock(lf, _fcntl.LOCK_EX)
+    with _exclusive_lock(request_dir(request_id) / ".request.lock"):
         yield
-    finally:
-        try:
-            _fcntl.flock(lf, _fcntl.LOCK_UN)
-        finally:
-            lf.close()
 
 
 def ensure_request_dir(request_id: str) -> Path:

@@ -442,10 +442,9 @@ def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
     already consumed/changed (the caller must then refuse the start)."""
     import u1_request
     try:
-        import fcntl
+        from u1_lockfile import exclusive_lock
         req_dir = Path(u1_request.ensure_request_dir(request_id))
-        with open(req_dir / '.stage2_nonce.lock', 'w') as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
+        with exclusive_lock(req_dir / '.stage2_nonce.lock'):
             fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
             if fresh_safety.get('stage2_approval_nonce') != expected_nonce:
                 return False  # already consumed / changed by a concurrent start
@@ -457,10 +456,10 @@ def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
     except Exception as exc:
         # Fail CLOSED (v2.2.2): if we cannot prove the nonce was valid AND
         # durably consumed under the lock, REFUSE the start. Authorizing on a
-        # lock/read/write error (or a missing fcntl) is exactly backwards for a
-        # safety gate — the old best-effort fallback turned any such failure into
-        # an authorization. The target runtime is Linux, where fcntl is always
-        # present, so no permissive path is needed.
+        # lock/read/write error (or an unimportable lock backend) is exactly
+        # backwards for a safety gate — the old best-effort fallback turned any
+        # such failure into an authorization. u1_lockfile has no silent no-op
+        # path on any platform, so a broken lock always lands here.
         try:
             _audit_gate(request_id, 'stage2_nonce_consume_failed', 'gate',
                         error=f"{type(exc).__name__}: {exc}"[:200])
