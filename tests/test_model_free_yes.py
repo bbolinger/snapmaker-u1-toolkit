@@ -121,8 +121,9 @@ def _run(context):
 
 def _expected_cmd(rid):
     """The one and only argv shape the hook may spawn — built by the hook
-    from its own constants, never from marker content."""
-    return ["python3", "/opt/data/scripts/u1_kit_workflow.py",
+    from its own constants (hook.WORKFLOW_PY resolves per deployment),
+    never from marker content."""
+    return ["python3", hook.WORKFLOW_PY,
             "--confirm-start-for", rid, "--json-events"]
 
 

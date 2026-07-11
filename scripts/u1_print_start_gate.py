@@ -48,8 +48,10 @@ APPROVAL_TTL_SEC = 1800  # 30 minutes
 DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
 
 # Canonical deployed path of this gate script — used when building the Stage-1
-# command string the workflow hands to the agent.
-GATE_SCRIPT_PATH = "/opt/data/scripts/u1_print_start_gate.py"
+# command string the workflow hands to the agent. Self-locating via
+# u1_runtime_paths (this file IS in the runtime scripts dir).
+from u1_runtime_paths import script_path as _script_path
+GATE_SCRIPT_PATH = _script_path("u1_print_start_gate.py")
 
 
 def build_stage1_command(*, printer_filename: str, intended_tool: str,
@@ -660,6 +662,10 @@ def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
     # polls the same dir. Pass the GATE's resolution explicitly so the two
     # sides can never disagree (the script's own fallback is for manual runs).
     env['U1_PENDING_CANCEL_DIR'] = str(_pending_dir('cancel'))
+    # Same for the notifier path: an operator override wins, else the gate's
+    # sibling copy (self-locating, correct on any platform).
+    env['U1_NOTIFY_PY'] = (_os.environ.get('U1_NOTIFY_PY', '').strip()
+                           or _script_path('u1_notify.py'))
     try:
         proc = _sp.run(notify_cmd, shell=True, env=env,
                        capture_output=True, text=True, timeout=20)

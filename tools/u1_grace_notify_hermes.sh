@@ -77,7 +77,9 @@ EOF
 # the gateway adapter layer, immune to the mid-turn-interrupt loss that ate
 # typed CANCELs twice on 2026-07-07); it falls back to plain `hermes send`
 # internally when the token/API is unavailable.
-NOTIFY_PY="${U1_NOTIFY_PY:-/opt/data/scripts/u1_notify.py}"
+# The invoking gate exports U1_NOTIFY_PY with its own resolution; the
+# fallback chain mirrors it for manual runs.
+NOTIFY_PY="${U1_NOTIFY_PY:-${U1_RUNTIME_SCRIPTS_DIR:-${HERMES_HOME:-/opt/data}/scripts}/u1_notify.py}"
 if ! python3 "${NOTIFY_PY}" "${MSG}" --cancel-button "${U1_REQUEST_ID}"; then
     echo "grace-notify: operator send failed on all channels, skipping pending state write" >&2
     exit 1

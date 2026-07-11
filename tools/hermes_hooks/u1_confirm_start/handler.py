@@ -32,7 +32,7 @@ Contract with u1_kit_workflow.py:
     instructions to run (review finding: the old confirm_cmd field made
     anything that could write /tmp a command author, gated only by the
     word "yes"). The spawned command is exactly
-      python3 /opt/data/scripts/u1_kit_workflow.py \
+      python3 <scripts-dir>/u1_kit_workflow.py \
           --confirm-start-for <request_id> --json-events
     with request_id validated against ^u1_[a-z0-9_]+$ first. The workflow
     resolves the persisted single-use confirm token server-side and then
@@ -92,9 +92,25 @@ def _pending_dir(kind: str) -> Path:
 PENDING_DIR = _pending_dir("confirm")
 LOG_FILE = Path(__file__).parent / "hook.log"
 
+def _scripts_dir() -> Path:
+    """Runtime scripts dir, resolved from THIS hook's side of the boundary.
+    KEEP IN SYNC with adapters/hermes/tools/u1_kit_tool.py (same chain);
+    scripts/ consumers self-locate via u1_runtime_paths instead. Never
+    resolved from marker content — the marker contributes ONLY a request id."""
+    explicit = os.environ.get("U1_RUNTIME_SCRIPTS_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        cand = Path(hermes_home) / "scripts"
+        if (cand / "u1_kit_workflow.py").is_file():
+            return cand
+    return Path("/opt/data/scripts")
+
+
 # The ONLY thing this hook ever executes. Marker content contributes one
 # argv element — a request id that must match _REQUEST_ID_RE.
-WORKFLOW_PY = "/opt/data/scripts/u1_kit_workflow.py"
+WORKFLOW_PY = str(_scripts_dir() / "u1_kit_workflow.py")
 _REQUEST_ID_RE = re.compile(r"^u1_[a-z0-9_]+$")
 
 # A marker claiming to be valid for more than a day is not a window
@@ -120,7 +136,7 @@ def _notify_operator(text: str) -> None:
     declined something and why. Best-effort; failures only log."""
     try:
         import subprocess as _sp
-        _sp.Popen(["python3", "/opt/data/scripts/u1_notify.py", text],
+        _sp.Popen(["python3", str(_scripts_dir() / "u1_notify.py"), text],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
     except Exception as exc:

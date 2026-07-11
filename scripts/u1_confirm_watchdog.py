@@ -20,7 +20,9 @@ import subprocess
 import time
 from pathlib import Path
 
-_NOTIFY_PY = "/opt/data/scripts/u1_notify.py"
+from u1_runtime_paths import script_path as _script_path
+
+_NOTIFY_PY = _script_path("u1_notify.py")
 
 
 def run(request_id: str, filename: str, marker_path: str, ttl: int,
