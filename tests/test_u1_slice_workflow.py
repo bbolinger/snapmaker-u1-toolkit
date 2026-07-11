@@ -555,6 +555,105 @@ def test_apply_supports_override_uses_flattened_profile(tmp_path):
     assert 'inherits' not in d  # fully resolved
 
 
+# ---------- Platform-neutral Orca resource-root discovery (v2.4.1) ----------
+# Two real-world layouts:
+#   Windows portable zip:   <dir>/orca-slicer.exe  +  <dir>/resources/
+#   Linux AppImage extract: <squashfs-root>/bin/orca-slicer  +  <squashfs-root>/resources/
+# The old lookup hardcoded orca_bin.parents[1]/resources (AppImage-only), so on
+# Windows portable the inherits-chain flattener couldn't find the vendor dir and
+# Orca silently fell back to PLA defaults (reproduced on a real Windows desktop
+# 2026-07-10: upstream PETG leaf profile produced filament_type=PLA gcode).
+
+def _fake_orca_portable(tmp_path):
+    """Windows-portable layout: exe beside resources/."""
+    root = tmp_path / 'orca242'
+    (root / 'resources' / 'profiles' / 'Snapmaker').mkdir(parents=True)
+    exe = root / 'orca-slicer.exe'
+    exe.write_bytes(b'MZ')
+    return exe, root / 'resources'
+
+
+def _fake_orca_appimage(tmp_path):
+    """Linux-AppImage layout: bin/orca-slicer with sibling resources/."""
+    root = tmp_path / 'squashfs-root'
+    (root / 'resources' / 'profiles' / 'Snapmaker').mkdir(parents=True)
+    (root / 'bin').mkdir(parents=True)
+    exe = root / 'bin' / 'orca-slicer'
+    exe.write_bytes(b'\x7fELF')
+    return exe, root / 'resources'
+
+
+def test_orca_resources_root_windows_portable_layout(tmp_path):
+    from u1_slice_workflow import orca_resources_root
+    exe, resources = _fake_orca_portable(tmp_path)
+    assert orca_resources_root(exe) == resources
+
+
+def test_orca_resources_root_appimage_layout(tmp_path):
+    from u1_slice_workflow import orca_resources_root
+    exe, resources = _fake_orca_appimage(tmp_path)
+    assert orca_resources_root(exe) == resources
+
+
+def test_orca_resources_root_none_when_absent(tmp_path):
+    # Wrapper/shim binary with no resources tree anywhere near it.
+    from u1_slice_workflow import orca_resources_root
+    shim = tmp_path / 'orca-via-shim'
+    shim.write_text('#!/bin/sh\n')
+    assert orca_resources_root(shim) is None
+
+
+def test_orca_resources_root_nonexistent_binary_no_crash(tmp_path):
+    from u1_slice_workflow import orca_resources_root
+    assert orca_resources_root(tmp_path / 'missing' / 'orca-slicer.exe') is None
+
+
+def test_flatten_filament_resolves_chain_in_portable_vendor_dir(tmp_path):
+    # The PETG leaf lives in OUR profile tree; its parent lives ONLY in the
+    # (Windows-portable-shaped) Orca vendor dir. The flattener must find it
+    # via the resolver, not via the old parents[1] AppImage assumption.
+    from u1_slice_workflow import _flatten_filament_profile
+    exe, resources = _fake_orca_portable(tmp_path)
+    vendor_fil = resources / 'profiles' / 'Snapmaker' / 'filament'
+    vendor_fil.mkdir(parents=True)
+    (vendor_fil / 'PETG base.json').write_text(json.dumps(
+        {'name': 'PETG base', 'filament_type': ['PETG'], 'hot_plate_temp': ['80']}))
+    leaf_dir = tmp_path / 'ours' / 'filament'
+    leaf_dir.mkdir(parents=True)
+    leaf = leaf_dir / 'PETG leaf.json'
+    leaf.write_text(json.dumps({'name': 'PETG leaf', 'inherits': 'PETG base'}))
+    flat = _flatten_filament_profile(leaf, orca_bin=exe)
+    assert flat['filament_type'] == ['PETG']
+    assert flat['hot_plate_temp'] == ['80']
+    assert 'inherits' not in flat  # chain fully resolved
+
+
+def test_flatten_process_resolves_chain_in_portable_vendor_dir(tmp_path):
+    from u1_slice_workflow import _flatten_process_profile
+    exe, resources = _fake_orca_portable(tmp_path)
+    vendor_proc = resources / 'profiles' / 'Snapmaker' / 'process'
+    vendor_proc.mkdir(parents=True)
+    (vendor_proc / 'fdm_process_common.json').write_text(json.dumps(
+        {'name': 'fdm_process_common', 'line_width': 0.4}))
+    leaf_dir = tmp_path / 'ours' / 'process'
+    leaf_dir.mkdir(parents=True)
+    leaf = leaf_dir / 'leaf.json'
+    leaf.write_text(json.dumps({'name': 'leaf', 'inherits': 'fdm_process_common'}))
+    flat = _flatten_process_profile(leaf, orca_bin=exe)
+    assert flat['line_width'] == 0.4
+    assert 'inherits' not in flat
+
+
+def test_machine_profile_found_in_portable_layout(tmp_path):
+    from u1_slice_workflow import machine_profile_for_orca
+    exe, resources = _fake_orca_portable(tmp_path)
+    machine_dir = resources / 'profiles' / 'Snapmaker' / 'machine'
+    machine_dir.mkdir(parents=True)
+    vendor_machine = machine_dir / 'Snapmaker U1 (0.4 nozzle).json'
+    vendor_machine.write_text(json.dumps({'name': 'Snapmaker U1 (0.4 nozzle)'}))
+    assert machine_profile_for_orca(exe) == vendor_machine
+
+
 def test_last_used_print_settings_id_empty_nozzle_skips_filter(tmp_path):
     # Cold-review F7: nozzle='' or None should NOT silently filter every
     # record (the pre-fix '( nozzle)' literal substring match dropped all).

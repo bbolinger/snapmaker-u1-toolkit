@@ -580,6 +580,37 @@ def promote_to_supports_variant(profile_value: str) -> str | None:
     return None
 
 
+def orca_resources_root(orca_bin: Path) -> Path | None:
+    """Locate Orca's bundled resources/ dir from the executable location.
+
+    Two layouts exist in the wild:
+      Windows portable zip:   <dir>/orca-slicer.exe  +  <dir>/resources/
+      Linux AppImage extract: <squashfs-root>/bin/orca-slicer  +
+                              <squashfs-root>/resources/
+
+    The old lookup hardcoded orca_bin.parents[1]/resources (AppImage-only).
+    On Windows portable that reaches the directory ABOVE the Orca dir, misses
+    the bundled vendor profiles, and the inherits-chain flatteners can't
+    resolve upstream parents — Orca then silently falls back to PLA defaults
+    (reproduced on a real Windows desktop 2026-07-10: upstream PETG leaf
+    profile produced filament_type=PLA gcode; the upload gate caught it, but
+    the slice itself was wrong). Returns None when neither layout matches
+    (wrapper/shim binaries, test harnesses) so callers fall through to their
+    well-known absolute candidates."""
+    try:
+        rp = orca_bin.resolve()
+    except OSError:
+        rp = orca_bin
+    for cand in (rp.parent / 'resources',            # Windows portable
+                 rp.parent.parent / 'resources'):    # AppImage: <root>/bin/<exe>
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None) -> dict[str, Any]:
     """Walk a filament profile's inherits chain and merge into a self-contained
     dict. Same shape as _flatten_process_profile but searches the vendor
@@ -607,8 +638,10 @@ def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None)
     if orca_bin is None:
         orca_bin = DEFAULT_ORCA
     vendor_dirs: list[Path] = []
-    vendor_root_candidates = [
-        orca_bin.resolve().parents[1] / 'resources' / 'profiles' / 'Snapmaker',
+    resources = orca_resources_root(orca_bin)
+    vendor_root_candidates = (
+        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
     ]
@@ -616,7 +649,7 @@ def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None)
         try:
             if not vendor_root.exists():
                 continue
-        except (OSError, IndexError):
+        except OSError:
             continue
         if vendor_root not in vendor_dirs:
             vendor_dirs.append(vendor_root)
@@ -729,11 +762,13 @@ def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -
     if orca_bin is None:
         orca_bin = DEFAULT_ORCA
     vendor_dirs: list[Path] = []
-    # Primary path: orca_bin's own squashfs-root tree. Works in production
-    # where orca_bin IS the real binary. Fallbacks for the test-harness/
-    # wrapper case where parents[1] isn't a squashfs-root.
-    vendor_root_candidates = [
-        orca_bin.resolve().parents[1] / 'resources' / 'profiles' / 'Snapmaker',
+    # Primary path: orca_bin's own resources tree (portable OR AppImage, via
+    # orca_resources_root). Fallbacks for the test-harness/wrapper case where
+    # the binary isn't inside a real Orca tree.
+    resources = orca_resources_root(orca_bin)
+    vendor_root_candidates = (
+        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
     ]
@@ -741,7 +776,7 @@ def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -
         try:
             if not vendor_root.exists():
                 continue
-        except (OSError, IndexError):
+        except OSError:
             continue
         if vendor_root not in vendor_dirs:
             vendor_dirs.append(vendor_root)
@@ -1202,19 +1237,22 @@ def rewrite_gcode_for_tool(gcode: Path, tool_idx: int) -> int:
 def machine_profile_for_orca(orca_bin: Path = DEFAULT_ORCA) -> Path:
     """Resolve the Snapmaker U1 (0.4 nozzle) vendor machine profile.
 
-    Primary path: orca_bin.resolve().parents[1] / resources/profiles/...
-    This works when orca_bin IS the real Orca binary inside its
-    squashfs-root tree (production slice path).
+    Primary path: orca_bin's own resources tree via orca_resources_root
+    (handles both the Linux AppImage and Windows portable layouts). Works
+    when orca_bin IS the real Orca binary (production slice path).
 
     Fallbacks: well-known absolute locations on this host. Needed when
     orca_bin is a wrapper/shim (test harness, /opt/orca-via-* style)
-    whose parents[1] isn't the Orca tree — without these, the function
+    that isn't inside a real Orca tree — without these, the function
     falls back to ROOT/'profiles/machine/snapmaker_u1_0_4_nozzle.json'
     which carries a stale 'MyToolChanger 0.4 nozzle - Copy'
     printer_settings_id that Orca then rejects as incompatible with
     stock process profiles (verified live 2026-06-26)."""
-    candidates = [
-        orca_bin.resolve().parents[1] / 'resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json',
+    resources = orca_resources_root(orca_bin)
+    candidates = (
+        [resources / 'profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json']
+        if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json'),
     ]

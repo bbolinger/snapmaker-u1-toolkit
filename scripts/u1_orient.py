@@ -25,7 +25,14 @@ _COST_RE = re.compile(r"cost\s*[:=]\s*([-+]?\d+(?:\.\d+)?)", re.I)
 
 def orca_env(orca_bin: Path = DEFAULT_ORCA) -> dict[str, str]:
     env=os.environ.copy()
-    root=orca_bin.resolve().parents[1]
+    # LD_LIBRARY_PATH shimming only applies to the extracted-AppImage layout;
+    # on other layouts (e.g. Windows portable, shallow paths) the lib dirs
+    # simply don't exist and env is returned unchanged. parents[1] raises
+    # IndexError for a binary sitting at filesystem root — treat as no-libs.
+    try:
+        root=orca_bin.resolve().parents[1]
+    except (OSError, IndexError):
+        return env
     lib_paths=[root.parent/'local-libs/usr/lib/x86_64-linux-gnu', root/'usr/lib', root/'usr/lib/x86_64-linux-gnu']
     existing=[str(p) for p in lib_paths if p.exists()]
     if existing:
