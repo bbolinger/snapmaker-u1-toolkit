@@ -17,7 +17,7 @@ code is the last chars of the request_id. Anything else does NOT match;
 
 Contract with u1_kit_workflow.py:
   * When the workflow reaches the bed-clear prompt it writes
-    /tmp/u1_pending_confirm/<request_id>.json:
+    <pending-confirm dir>/<request_id>.json (u1_pending resolver):
       {
         "request_id":       "u1_2026_0707_abc123",
         "filename":         "plate1.gcode",
@@ -75,8 +75,21 @@ import re
 import subprocess
 import uuid
 
-PENDING_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
-                                  "/tmp/u1_pending_confirm"))
+def _pending_dir(kind: str) -> Path:
+    """KEEP IN SYNC with scripts/u1_pending.py (canonical copy + rationale).
+    This hook file deploys standalone into the gateway's hooks dir, so the
+    ~10-line rule is duplicated; test_pending_paths.py asserts identity."""
+    import tempfile
+    explicit = os.environ.get(f"U1_PENDING_{kind.upper()}_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    root = os.environ.get("U1_PENDING_STATE_DIR", "").strip()
+    if root:
+        return Path(root) / kind
+    return Path(tempfile.gettempdir()) / "u1_pending" / kind
+
+
+PENDING_DIR = _pending_dir("confirm")
 LOG_FILE = Path(__file__).parent / "hook.log"
 
 # The ONLY thing this hook ever executes. Marker content contributes one
@@ -432,7 +445,11 @@ def _spawn_confirm(state: dict) -> bool:
     cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid,
            "--confirm-claim-id", claim_id, "--json-events"]
     # Log path is DERIVED, never read from the marker.
-    log_path = Path(f"/tmp/u1_confirm_start_{rid}.log")
+    log_path = _pending_dir("log") / f"u1_confirm_start_{rid}.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass  # the open() below already tolerates a missing log
     out = None
     spawn_ok = False
     child = None

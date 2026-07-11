@@ -68,8 +68,8 @@ see `.env.example`). The wait still runs fail-open in that case.
 Seed a fake grace window by hand, then reply in Telegram:
 
 ```bash
-mkdir -p /tmp/u1_pending_cancel
-cat > /tmp/u1_pending_cancel/u1_2026_0702_dr1ll0.json <<'EOF'
+mkdir -p /tmp/u1_pending/cancel
+cat > /tmp/u1_pending/cancel/u1_2026_0702_dr1ll0.json <<'EOF'
 {
   "request_id": "u1_2026_0702_dr1ll0",
   "cancel_marker": "/tmp/u1_cancel_drill.marker",
@@ -101,7 +101,7 @@ for the other match modes:
 Clean up:
 
 ```bash
-rm -f /tmp/u1_cancel_drill.marker /tmp/u1_pending_cancel/u1_2026_0702_dr1ll0.json
+rm -f /tmp/u1_cancel_drill.marker /tmp/u1_pending/cancel/u1_2026_0702_dr1ll0.json
 ```
 
 ## 5. Full live checklist (real print)

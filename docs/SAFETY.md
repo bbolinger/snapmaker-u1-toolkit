@@ -136,7 +136,9 @@ notification but the wait still runs (in that case an SSH `touch
 
 Starting a print is the same trick in the other direction. At the
 bed-clear prompt the workflow arms a per-request window at
-`/tmp/u1_pending_confirm/<request_id>.json` and emits NO start command —
+`<pending-confirm dir>/<request_id>.json` (the shared `u1_pending`
+resolver; `<tempdir>/u1_pending/confirm` by default) and emits NO start
+command —
 the agent model is handed nothing it could fire. The `u1_confirm_start`
 gateway hook redeems the operator's actual YES reply (bare `yes` when one
 window is armed; `yes <code>` when several are — a bare yes with several

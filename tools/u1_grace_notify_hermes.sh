@@ -12,7 +12,7 @@
 #   U1_OPERATOR       — resolved operator identity (e.g. telegram:brent)
 #
 # Wire: this script writes a per-request pending-cancel state file at
-# /tmp/u1_pending_cancel/<request_id>.json. The Hermes gateway hook at
+# <pending-cancel dir>/<request_id>.json. The Hermes gateway hook at
 # tools/hermes_hooks/u1_grace_cancel/ watches that dir and reacts to a
 # bare CANCEL / STOP / ABORT reply (cancels every active window) or
 # `cancel <code>` where <code> is the last 6 chars of the request_id
@@ -37,7 +37,16 @@ set -euo pipefail
 
 HERMES_BIN="${HERMES_BIN:-hermes}"
 DEST="${U1_GRACE_NOTIFY_DEST:-telegram}"
-PENDING_DIR="/tmp/u1_pending_cancel"
+# Pending-cancel dir: the invoking gate exports U1_PENDING_CANCEL_DIR with
+# its own resolution, so both sides of the marker contract always agree.
+# The fallback mirrors scripts/u1_pending.py for manual runs only.
+if [[ -n "${U1_PENDING_CANCEL_DIR:-}" ]]; then
+    PENDING_DIR="${U1_PENDING_CANCEL_DIR}"
+elif [[ -n "${U1_PENDING_STATE_DIR:-}" ]]; then
+    PENDING_DIR="${U1_PENDING_STATE_DIR}/cancel"
+else
+    PENDING_DIR="${TMPDIR:-/tmp}/u1_pending/cancel"
+fi
 HOOK_RECEIPT="${U1_CANCEL_HOOK_RECEIPT:-${HERMES_HOME:-/opt/data}/.u1_cancel_hook_receipt}"
 
 # ISO timestamp `now + grace_seconds + 60` — the +60 is slack for

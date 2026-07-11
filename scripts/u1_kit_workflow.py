@@ -3490,8 +3490,8 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
 # the outbound reply. Keyed by HERMES_SESSION_KEY, which the workflow subprocess
 # inherits from the gateway process the hook runs in, so both sides resolve the
 # same marker (same cross-process trick the pending_confirm marker uses).
-_PENDING_ATTACH_DIR = Path(os.environ.get("U1_PENDING_ATTACH_DIR",
-                                          "/tmp/u1_pending_attach"))
+from u1_pending import pending_dir as _pending_dir  # noqa: E402
+_PENDING_ATTACH_DIR = _pending_dir("attach")
 
 
 def _arm_pending_attach(request_id: str, images: "list[str] | None",
@@ -3542,8 +3542,7 @@ def _arm_pending_attach(request_id: str, images: "list[str] | None",
 # any confirm command. The workflow arms a marker file instead; the
 # u1_confirm_start gateway hook redeems the operator's actual YES message
 # by spawning the confirm command directly. The model has nothing to fire.
-_PENDING_CONFIRM_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
-                                           "/tmp/u1_pending_confirm"))
+_PENDING_CONFIRM_DIR = _pending_dir("confirm")
 _PENDING_CONFIRM_TTL_S = 15 * 60
 
 
@@ -3691,8 +3690,7 @@ def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, A
     relay a cancel. It can only ever stop a print with this; there is no
     start analogue by design."""
     from datetime import datetime, timezone
-    pending_dir = Path(os.environ.get("U1_PENDING_CANCEL_DIR",
-                                      "/tmp/u1_pending_cancel"))
+    pending_dir = _pending_dir("cancel")
     touched: list[str] = []
     now = datetime.now(timezone.utc)
     if pending_dir.exists():

@@ -3,7 +3,7 @@ the Hermes gateway cancel-hook handler. Unit-level, no Hermes runtime
 needed — subprocess for bash, direct import for Python.
 
 Guards the contract:
-  * shell notify writes /tmp/u1_pending_cancel/<request_id>.json with
+  * shell notify writes <pending-cancel dir>/<request_id>.json with
     the exact schema the handler expects
   * shell notify does NOT write the pending file when `hermes send`
     fails (send-first ordering)
@@ -217,16 +217,18 @@ def _run_notify(env_overrides: dict[str, str], hermes_stub_exit: int = 0,
 
 @pytest.fixture
 def notify_env(tmp_path):
-    """Common env for notify-script tests plus cleanup of any real
-    /tmp/u1_pending_cancel/<rid>.json this test wrote."""
+    """Common env for notify-script tests. U1_PENDING_CANCEL_DIR points
+    into tmp_path — the same explicit-env contract the gate uses when it
+    invokes the script — so tests never touch a real pending dir."""
     rid = f"u1_2026_0701_ntf{os.getpid() % 1000:03d}"
     repo = Path(__file__).resolve().parent.parent
-    yield {
+    return {
         "U1_REQUEST_ID": rid,
         "U1_FILENAME": "test_plate1.gcode",
         "U1_GRACE_SECONDS": "120",
         "U1_CANCEL_MARKER": str(tmp_path / "the_marker"),
         "U1_OPERATOR": "test:script-verify",
+        "U1_PENDING_CANCEL_DIR": str(tmp_path / "pending_cancel"),
         # Hermetic: no runtime .env (so no bot token reachable) and the
         # repo copy of the notifier — its Bot API path is skipped and it
         # falls through to the stubbed `hermes send`, same as before the
@@ -235,16 +237,13 @@ def notify_env(tmp_path):
         "TELEGRAM_BOT_TOKEN": "",
         "U1_NOTIFY_PY": str(repo / "scripts" / "u1_notify.py"),
     }, tmp_path
-    stale = Path(f"/tmp/u1_pending_cancel/{rid}.json")
-    if stale.exists():
-        stale.unlink()
 
 
 def test_notify_writes_pending_state_with_correct_schema(notify_env):
     env, tmp = notify_env
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
     assert r.returncode == 0, f"notify exited {r.returncode}: {r.stderr}"
-    state_file = Path(f"/tmp/u1_pending_cancel/{env['U1_REQUEST_ID']}.json")
+    state_file = Path(env["U1_PENDING_CANCEL_DIR"]) / f"{env['U1_REQUEST_ID']}.json"
     assert state_file.exists(), "pending state file must be written on success"
     state = json.loads(state_file.read_text())
     assert state["request_id"] == env["U1_REQUEST_ID"]
@@ -276,7 +275,7 @@ def test_notify_does_not_persist_pending_state_if_hermes_send_fails(notify_env):
     r = _run_notify(env, hermes_stub_exit=1, tmpdir=tmp)
     assert r.returncode != 0, (
         "notify must exit non-zero when hermes send fails")
-    state_file = Path(f"/tmp/u1_pending_cancel/{env['U1_REQUEST_ID']}.json")
+    state_file = Path(env["U1_PENDING_CANCEL_DIR"]) / f"{env['U1_REQUEST_ID']}.json"
     assert not state_file.exists(), (
         "pending state must NOT be written when hermes send fails")
 
@@ -293,20 +292,16 @@ def test_notify_writes_per_request_files_not_shared(notify_env, tmp_path):
     r_a = _run_notify(env_a, hermes_stub_exit=0, tmpdir=tmp_a)
     r_b = _run_notify(env_b, hermes_stub_exit=0, tmpdir=tmp_a)
     assert r_a.returncode == 0 and r_b.returncode == 0
-    file_a = Path("/tmp/u1_pending_cancel/u1_2026_0701_notfyA.json")
-    file_b = Path("/tmp/u1_pending_cancel/u1_2026_0701_notfyB.json")
-    try:
-        assert file_a.exists()
-        assert file_b.exists()
-        # Confirm they didn't clobber each other's marker paths
-        state_a = json.loads(file_a.read_text())
-        state_b = json.loads(file_b.read_text())
-        assert state_a["cancel_marker"] == env_a["U1_CANCEL_MARKER"]
-        assert state_b["cancel_marker"] == env_b["U1_CANCEL_MARKER"]
-    finally:
-        for f in (file_a, file_b):
-            if f.exists():
-                f.unlink()
+    pending = Path(env_a["U1_PENDING_CANCEL_DIR"])
+    file_a = pending / "u1_2026_0701_notfyA.json"
+    file_b = pending / "u1_2026_0701_notfyB.json"
+    assert file_a.exists()
+    assert file_b.exists()
+    # Confirm they didn't clobber each other's marker paths
+    state_a = json.loads(file_a.read_text())
+    state_b = json.loads(file_b.read_text())
+    assert state_a["cancel_marker"] == env_a["U1_CANCEL_MARKER"]
+    assert state_b["cancel_marker"] == env_b["U1_CANCEL_MARKER"]
 
 
 # ─── Code-scoped cancel (v2.1.0-rc2: `cancel <code>` is now implemented) ────
@@ -366,7 +361,7 @@ def test_notify_state_file_valid_json_with_hostile_filename(notify_env):
     env["U1_FILENAME"] = 'we"ird\nname\t|.gcode'
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
     assert r.returncode == 0, r.stderr
-    state_file = Path(f"/tmp/u1_pending_cancel/{env['U1_REQUEST_ID']}.json")
+    state_file = Path(env["U1_PENDING_CANCEL_DIR"]) / f"{env['U1_REQUEST_ID']}.json"
     state = json.loads(state_file.read_text())  # must not raise
     assert state["filename"] == env["U1_FILENAME"]
 

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port, get_data_dir
+from u1_pending import pending_dir as _pending_dir
 
 
 # Approval-token TTL: how long after Stage 1's photo is captured can the
@@ -655,6 +656,10 @@ def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
     env['U1_GRACE_SECONDS'] = str(grace_seconds)
     env['U1_CANCEL_MARKER'] = str(cancel_marker)
     env['U1_OPERATOR'] = operator
+    # The notify script writes the pending-cancel routing entry; the gate
+    # polls the same dir. Pass the GATE's resolution explicitly so the two
+    # sides can never disagree (the script's own fallback is for manual runs).
+    env['U1_PENDING_CANCEL_DIR'] = str(_pending_dir('cancel'))
     try:
         proc = _sp.run(notify_cmd, shell=True, env=env,
                        capture_output=True, text=True, timeout=20)
@@ -767,14 +772,14 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                             resolved_operator,
                             stderr_tail=str(_nres.get("stderr_tail"))[:160])
                 try:
-                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                    (_pending_dir('cancel') / f'{request_id}.json').unlink()
                 except Exception:
                     pass
                 return 'notify_failed'
         else:
             # Q2 loop-guard alignment (audit 2026-07-09): the notify cap tripped,
             # so NO countdown/CANCEL DM will be delivered and no
-            # /tmp/u1_pending_cancel/<rid>.json routing entry is created. Under
+            # pending-cancel/<rid>.json routing entry is created. Under
             # Q2 we must not start a print the operator can neither see nor
             # cancel — so treat an exhausted cap exactly like a hard notify
             # failure: abort. (Previously this suppressed the DM but still ran
@@ -787,14 +792,15 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                             'pre_start_grace_notify_loop_guard_abort',
                             resolved_operator, cap=GRACE_NOTIFY_CAP)
                 try:
-                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                    (_pending_dir('cancel') / f'{request_id}.json').unlink()
                 except Exception:
                     pass
                 return 'notify_failed'
             _audit_gate(request_id, 'pre_start_grace_notify_suppressed_loop_guard',
                         resolved_operator, cap=GRACE_NOTIFY_CAP)
     # Contract with the Hermes gateway hook + notify script: the notify
-    # script wrote /tmp/u1_pending_cancel/<request_id>.json so a
+    # script wrote pending-cancel/<request_id>.json (u1_pending resolver;
+    # the gate exports the resolved dir to the script's env) so a
     # `cancel <code>` reply in Telegram routes to the right marker.
     # Clean up our OWN entry on ANY exit path (cancel OR expire) so a
     # stale entry doesn't cause the next unrelated print to abort on
@@ -802,7 +808,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
     # windows don't step on each other.
     def _clear_pending_state() -> None:
         try:
-            pending = Path(f'/tmp/u1_pending_cancel/{request_id}.json')
+            pending = _pending_dir('cancel') / f'{request_id}.json'
             if pending.exists():
                 pending.unlink()
         except OSError:

@@ -12,7 +12,8 @@ cancels nothing (logged), rather than guessing.
 
 Contract with u1_print_start_gate.py + u1_grace_notify_hermes.sh:
   * When the gate opens a grace window, the notify script writes a
-    per-request file at /tmp/u1_pending_cancel/<request_id>.json:
+    per-request file at <pending-cancel dir>/<request_id>.json
+    (u1_pending resolver — all sides resolve the same dir):
       {
         "request_id":    "u1_2026_0701_abc123",
         "cancel_marker": "/opt/data/.../pre_start_cancel.marker",
@@ -42,9 +43,25 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import os
 import re
 
-PENDING_DIR = Path("/tmp/u1_pending_cancel")
+
+def _pending_dir(kind: str) -> Path:
+    """KEEP IN SYNC with scripts/u1_pending.py (canonical copy + rationale).
+    This hook file deploys standalone into the gateway's hooks dir, so the
+    ~10-line rule is duplicated; test_pending_paths.py asserts identity."""
+    import tempfile
+    explicit = os.environ.get(f"U1_PENDING_{kind.upper()}_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    root = os.environ.get("U1_PENDING_STATE_DIR", "").strip()
+    if root:
+        return Path(root) / kind
+    return Path(tempfile.gettempdir()) / "u1_pending" / kind
+
+
+PENDING_DIR = _pending_dir("cancel")
 LOG_FILE = Path(__file__).parent / "hook.log"
 
 CANCEL_KEYWORDS = {

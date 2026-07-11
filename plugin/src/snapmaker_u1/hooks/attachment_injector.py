@@ -53,12 +53,13 @@ logger = logging.getLogger(__name__)
 # Marker location + schema. Mirrors the workflow's _arm_pending_attach in
 # scripts/u1_kit_workflow.py (kept in lockstep by these two comments, the same
 # way the pending_confirm marker is shared with the u1_confirm_start hook).
-#   dir     : $U1_PENDING_ATTACH_DIR (default /tmp/u1_pending_attach)
+#   dir     : u1_pending resolver, kind "attach" (env-overridable)
 #   file    : sha256(HERMES_SESSION_KEY)[:16].json
 #   content : {"request_id": str, "images": [abs path, ...],
 #              "operator": str|None, "created_at": float}
-_PENDING_ATTACH_DIR = Path(
-    os.environ.get("U1_PENDING_ATTACH_DIR", "/tmp/u1_pending_attach"))
+from ..pending import pending_dir as _resolve_pending_dir
+
+_PENDING_ATTACH_DIR = _resolve_pending_dir("attach")
 # Images are only relevant to the immediate reply; a marker older than this is
 # stale (a crash or a non-card turn) and is discarded rather than re-attached.
 _PENDING_ATTACH_TTL_S = 120.0
