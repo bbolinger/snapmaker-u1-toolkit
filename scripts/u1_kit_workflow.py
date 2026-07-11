@@ -45,7 +45,7 @@ from pathlib import Path
 def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> bool:
     try:
         proc = subprocess.run(
-            [python_path, "-c", f"import {', '.join(deps)}"],
+            [python_path, "-c", "import numpy; from PIL import Image, ImageDraw"],
             capture_output=True, text=True, timeout=10,
         )
         return proc.returncode == 0
@@ -54,18 +54,27 @@ def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> 
 
 
 def _ensure_compat_python() -> None:
+    # Import the COMPILED Pillow entry (Image/ImageDraw), not just the `PIL`
+    # package: a mismatched interpreter can import bare PIL yet fail to load the
+    # _imaging C extension, so `import PIL` alone passes a broken install (live
+    # on Windows Hermes Desktop where PYTHONPATH pointed 3.13 at a 3.11 venv,
+    # install report 2026-07-10). Catch broad exceptions, since a broken
+    # extension can surface as more than ImportError.
     try:
         import numpy  # noqa: F401
-        import PIL    # noqa: F401
+        from PIL import Image, ImageDraw  # noqa: F401
         return
-    except ImportError:
+    except Exception:
         pass
     missing = []
-    for dep in ("numpy", "PIL"):
-        try:
-            __import__(dep)
-        except ImportError:
-            missing.append("pillow" if dep == "PIL" else dep)
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append("numpy")
+    try:
+        from PIL import Image, ImageDraw  # noqa: F401
+    except Exception:
+        missing.append("pillow")
     here = Path(__file__).resolve().parent
     root = here.parent
     candidates: list[str] = []

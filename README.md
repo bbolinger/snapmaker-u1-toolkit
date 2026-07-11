@@ -235,6 +235,11 @@ python3 scripts/u1_slice_workflow.py --help
 python3 scripts/snapmaker_u1_status.py
 ```
 
+The networked steps (`extract_profiles_from_printer.py`, `snapmaker_u1_status.py`)
+time out until `SNAPMAKER_U1_HOST` points at your printer's real LAN IP. The
+`.env.example` default `192.168.1.100` is only a placeholder, so edit `.env`
+first, or skip those two until the printer is reachable.
+
 On Windows (PowerShell) the same steps apply with `Copy-Item .env.example .env`
 and backslash paths; the data dir defaults to
 `C:\Users\<you>\.local\share\snapmaker-u1` (override with
@@ -338,6 +343,11 @@ bash tools/install_hermes_u1_hooks.sh
 hermes gateway restart
 bash tools/install_hermes_u1_hooks.sh --verify
 ```
+
+If you run these from inside a Hermes Desktop or gateway chat, run `hermes
+gateway restart` from a **separate** terminal outside Hermes. The gateway
+refuses to restart itself from within its own process (it would kill the command
+mid-run), so the hooks stay unloaded until you restart it externally.
 
 The YES/CANCEL hooks bind to one operator in one private Telegram DM. With a
 single user id in `TELEGRAM_ALLOWED_USERS` the binding resolves itself;
