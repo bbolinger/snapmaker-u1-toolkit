@@ -280,3 +280,55 @@ def test_corrupt_marker_never_raises(attach_dir):
 def test_arm_is_noop_with_no_images(attach_dir):
     wf._arm_pending_attach(_RID, [], "op")
     assert not list(attach_dir.iterdir()), "no marker when there's nothing to attach"
+
+
+# --------------------------------------------------------------------------- #
+# Session-key source: gateway contextvars, NOT gateway os.environ
+# --------------------------------------------------------------------------- #
+# Live 2026-07-11: the gateway never writes HERMES_SESSION_KEY into its own
+# process env (concurrent sessions would clobber it), so the env-only read
+# returned empty at transform time and the hook refused EVERY turn — the
+# marker sat unconsumed while attachment silently fell back to model echo.
+# The hook must read Hermes' session contextvar (gateway.session_context
+# .get_session_env), the same source the u1_kit tool exports to the
+# workflow subprocess that writes the marker.
+
+def _stub_gateway_session(monkeypatch, key):
+    import types
+    gw = types.ModuleType("gateway")
+    sc = types.ModuleType("gateway.session_context")
+    sc.get_session_env = lambda name, default="": (
+        key if name == "HERMES_SESSION_KEY" else default)
+    monkeypatch.setitem(sys.modules, "gateway", gw)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", sc)
+
+
+def test_contextvar_key_found_without_env(attach_dir, tmp_path, monkeypatch):
+    """The gateway-process case: no env var at all, key only in contextvars."""
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    _stub_gateway_session(monkeypatch, _SESSION_KEY)
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op", session_key=_SESSION_KEY)
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out
+    assert not list(attach_dir.iterdir()), "marker consumed via contextvar key"
+
+
+def test_contextvar_key_wins_over_env(attach_dir, tmp_path, monkeypatch):
+    """A stale env value must not shadow the turn's real session key."""
+    monkeypatch.setenv("HERMES_SESSION_KEY", "telegram:STALE:main")
+    _stub_gateway_session(monkeypatch, _SESSION_KEY)
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op", session_key=_SESSION_KEY)
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out
+
+
+def test_env_fallback_when_gateway_absent(attach_dir, tmp_path):
+    """Non-gateway callers (tests, subprocess side) keep the env path.
+    All earlier tests in this file exercise it implicitly; this pins it."""
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op")
+    assert ai._session_key() == _SESSION_KEY  # from the fixture's env var
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out

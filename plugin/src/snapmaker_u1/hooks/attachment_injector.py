@@ -101,8 +101,30 @@ _U1_SIGNATURES = (
 )
 
 
+def _session_key() -> str:
+    """The session key this hook's turn belongs to.
+
+    The gateway deliberately never writes HERMES_SESSION_KEY into its own
+    os.environ (upstream: process-global env + concurrent sessions clobber
+    each other), so at transform time the key lives in Hermes' session
+    contextvars — the same source the u1_kit tool exports into the workflow
+    subprocess that WRITES the marker. Reading anything else desyncs the
+    two sides: live 2026-07-11, the env read returned empty here, the hook
+    refused fail-closed every turn, and attachment fell back to model echo
+    (photos survived by luck, the review doc's mangled path did not).
+    os.environ stays as the fallback for tests and non-gateway callers."""
+    try:
+        from gateway.session_context import get_session_env
+        key = (get_session_env("HERMES_SESSION_KEY") or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("HERMES_SESSION_KEY", "").strip()
+
+
 def _marker_path_for_session() -> Path | None:
-    key = os.environ.get("HERMES_SESSION_KEY", "")
+    key = _session_key()
     if not key:
         # Refuse the empty-key shared slot: without a stable per-session key,
         # every session hashes to the same file and one request's marker could
