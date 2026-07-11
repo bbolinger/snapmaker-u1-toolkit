@@ -755,7 +755,7 @@ def resolve_confirm_token(token: str, consume: bool = True):
     except OSError:
         return None  # already claimed by another caller, or never existed
     try:
-        rid = _json.loads(claimed.read_text()).get("request_id")
+        rid = _json.loads(_read_claimed_text(claimed)).get("request_id")
     except Exception:
         rid = None
     try:
@@ -763,6 +763,24 @@ def resolve_confirm_token(token: str, consume: bool = True):
     except OSError:
         pass
     return rid
+
+
+def _read_claimed_text(path) -> str:
+    """Read a freshly-claimed file, tolerating Windows' rename-race window.
+
+    A LOSING racer's in-flight os.replace opens the source file object
+    before discovering the winner already renamed it — for a few
+    microseconds that handle can deny the winner's first read with a share
+    violation (PermissionError, observed 25/25 on the 2026-07-11 Windows
+    validation). The claim itself is already won; retry briefly. POSIX
+    never takes the except branch."""
+    import time as _time
+    for _ in range(20):
+        try:
+            return path.read_text()
+        except PermissionError:
+            _time.sleep(0.01)
+    return path.read_text()  # final attempt — let a real error raise
 
 
 def write_answers_file(form_id: str, obj: dict) -> "Path":
@@ -801,7 +819,7 @@ def read_and_consume_answers(form_id: str) -> dict:
         raise FileNotFoundError(
             f"no pending answers for form {form_id!r} (missing or already used)")
     try:
-        text = claimed.read_text()
+        text = _read_claimed_text(claimed)
     finally:
         try:
             os.replace(claimed, p.with_suffix(".json.consumed"))

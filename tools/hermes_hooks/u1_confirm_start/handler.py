@@ -210,6 +210,26 @@ _CLAIM_SPAWN_GRACE_S = 30.0
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # NEVER os.kill(pid, 0) on Windows: CPython implements any
+        # non-CTRL-event signal as OpenProcess + TerminateProcess, so
+        # "probing" a live child would KILL the in-flight confirm, and a
+        # dead pid raises an exception type the POSIX branch reads as
+        # "alive" (never reaped). Query the process state instead.
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False     # no such process
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # unknown — do not reap on uncertainty
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True

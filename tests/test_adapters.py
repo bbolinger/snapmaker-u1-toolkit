@@ -932,7 +932,8 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     # pip install -e <repo>/plugin
     assert calls[1][0] == str(venv / "bin" / "python3")
     assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
-    assert calls[1][5].endswith("/plugin")
+    # Path, not string suffix: Windows stringifies with backslashes.
+    assert Path(calls[1][5]).name == "plugin"
     # bare-composite invariant check with syntactically valid source
     assert calls[2][0] == str(venv / "bin" / "python3")
     assert calls[2][1] == "-c"
