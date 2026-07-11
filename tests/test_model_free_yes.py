@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -174,7 +175,7 @@ def test_single_window_yes_spawns_and_single_fires(pending_dir, monkeypatch):
     entry = _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx("Yes!"))
     assert [_strip_claim_id(c) for c in spawned] == [_expected_cmd(entry["request_id"])]
     assert not (pending_dir / f"{entry['request_id']}.json").exists()
@@ -191,7 +192,7 @@ def test_bare_yes_with_two_windows_refuses(pending_dir, monkeypatch):
     _marker(pending_dir, rid="u1_2026_0707_bbb222")
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx())
     assert spawned == []                      # START NEVER GUESSES
     assert len(list(pending_dir.glob("*.json"))) == 2
@@ -221,7 +222,7 @@ def test_hostile_confirm_cmd_field_is_ignored(pending_dir, monkeypatch):
                     log_path="/tmp/somewhere/else.log")
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx())
     assert [_strip_claim_id(c) for c in spawned] == [_expected_cmd(entry["request_id"])]
 
@@ -267,7 +268,7 @@ def test_yes_from_bound_operator_spawns(pending_dir, monkeypatch):
     entry = _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx(platform=_OP_PLATFORM, user_id=_OP_USER))
     assert [_strip_claim_id(c) for c in spawned] == [_expected_cmd(entry["request_id"])]
 
@@ -319,7 +320,7 @@ def test_int_user_id_normalizes_against_marker_string(pending_dir, monkeypatch):
     entry = _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx(user_id=int(_OP_USER)))
     assert [_strip_claim_id(c) for c in spawned] == [_expected_cmd(entry["request_id"])]
 
@@ -342,7 +343,7 @@ def test_spawn_failure_restores_marker(pending_dir, monkeypatch, tmp_path):
     # and the restored marker still works on the next YES
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     _run(_ctx())
     assert [_strip_claim_id(c) for c in spawned] == [_expected_cmd(entry["request_id"])]
     # Q3: successful retry retains the claim for the child
@@ -360,7 +361,7 @@ def test_second_yes_mid_claim_finds_nothing(pending_dir, monkeypatch):
             # marker already claimed (renamed) at this point — this is
             # exactly what a second YES arriving mid-spawn would load
             assert hook._load_pending_windows() == []
-        return SimpleNamespace(pid=1)
+        return SimpleNamespace(pid=os.getpid())
     monkeypatch.setattr(hook.subprocess, "Popen", _popen)
     _run(_ctx())
     assert len(calls) == 1
@@ -709,7 +710,7 @@ def test_private_dm_chat_type_synonyms_succeed(pending_dir, monkeypatch, ctype):
     _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     asyncio.run(hook.handle("agent:start", _ctx(chat_type=ctype)))
     assert len(spawned) == 1
 
@@ -721,7 +722,7 @@ def test_empty_chat_type_with_right_chat_id_succeeds(pending_dir, monkeypatch):
     _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     asyncio.run(hook.handle("agent:start", _ctx(chat_type="")))
     assert len(spawned) == 1
 
@@ -800,7 +801,7 @@ def test_spawn_leaves_claim_for_child(pending_dir, monkeypatch):
     entry = _marker(pending_dir)
     spawned = []
     monkeypatch.setattr(hook.subprocess, "Popen",
-                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=1))
+                        lambda cmd, **kw_: spawned.append(cmd) or SimpleNamespace(pid=os.getpid()))
     asyncio.run(hook.handle("agent:start", _ctx()))
     assert spawned, "should have spawned"
     rid = entry["request_id"]
