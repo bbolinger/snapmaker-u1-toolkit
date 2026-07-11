@@ -68,11 +68,21 @@ def test_keep_pythonpath_escape_hatch_respected(poison_dir):
 
 
 def test_reexec_loop_guard_prevents_infinite_retry(poison_dir):
-    # If a re-exec'd child STILL can't import (env poison wasn't the
-    # cause), it must not self-retry forever — it falls through to the
-    # candidate hunt and then the clear error.
+    # If a re-exec'd child STILL can't import (env poison wasn't the cause),
+    # it must not self-retry forever. Two legitimate terminal outcomes:
+    # a box WITH a working candidate interpreter (the Windows validation box
+    # has the project venv) heals via the CANDIDATE hunt and exits 0; a box
+    # with none exits 2 with the actionable error. Either way the sanitized
+    # self-retry must not fire (the guard marker is set), and _run_workflow's
+    # timeout is the backstop against an actual re-exec loop.
     r = _run_workflow({"PYTHONPATH": str(poison_dir),
                        "U1_BOOTSTRAP_REEXEC": "1"})
-    assert r.returncode == 2
-    assert "retrying with it cleared" not in r.stderr
-    assert "PYTHONPATH is set" in r.stderr, "diagnosis note must name the poison"
+    assert "retrying with it cleared" not in r.stderr, (
+        "self-retry fired despite the loop-guard marker")
+    if r.returncode == 0:
+        assert "switching to" in r.stderr, (
+            "rc=0 is only legitimate via the candidate hunt")
+    else:
+        assert r.returncode == 2
+        assert "PYTHONPATH is set" in r.stderr, (
+            "diagnosis note must name the poison")

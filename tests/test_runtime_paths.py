@@ -114,14 +114,17 @@ def test_gateway_chain_hermes_home_probed(monkeypatch, tmp_path):
 
 def test_gateway_chain_unrelated_hermes_home_falls_back(monkeypatch, tmp_path):
     # HERMES_HOME set but no deployed scripts there -> the probe must NOT
-    # hijack; fall back to the Linux deploy default.
+    # hijack; fall back to the Linux deploy default. Compare as Path: on
+    # native Windows the same fallback stringifies with backslashes
+    # (caught by the 2026-07-10 Windows validation run).
     monkeypatch.delenv("U1_RUNTIME_SCRIPTS_DIR", raising=False)
     monkeypatch.delenv("U1_KIT_WORKFLOW", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     hook = _load_confirm_hook()
-    assert hook.WORKFLOW_PY == "/opt/data/scripts/u1_kit_workflow.py"
+    assert Path(hook.WORKFLOW_PY) == Path("/opt/data/scripts/u1_kit_workflow.py")
     tool = _load_kit_tool()
-    assert tool.DEFAULT_WORKFLOW_SCRIPT == "/opt/data/scripts/u1_kit_workflow.py"
+    assert Path(tool.DEFAULT_WORKFLOW_SCRIPT) == Path(
+        "/opt/data/scripts/u1_kit_workflow.py")
 
 
 def test_gate_exports_notify_py_to_notify_script(monkeypatch, tmp_path):
