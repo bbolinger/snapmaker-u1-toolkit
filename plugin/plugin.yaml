@@ -4,5 +4,6 @@ description: Auto-trigger the Snapmaker U1 slicing skill on STL/3MF/ZIP attachme
 provides_hooks:
   - pre_gateway_dispatch
   - transform_tool_result
+  - transform_llm_output
 provides_skills:
   - 3d-printer-slicing-automation

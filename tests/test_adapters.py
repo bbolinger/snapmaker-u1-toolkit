@@ -917,15 +917,26 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
     assert bak.read_text() == _STOCK_RUN_PY
 
-    # enable + verify both ran: `hermes plugins enable u1-form`, then the
-    # bare-composite invariant check with syntactically valid source.
-    assert len(calls) == 2
+    # Four subprocess steps now run, in order: enable u1-form, pip-install the
+    # snapmaker_u1 hook plugin, the bare-composite toolset invariant verify, and
+    # the hook-plugin registration verify.
+    assert len(calls) == 4
     assert calls[0][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
+    # pip install -e <repo>/plugin
     assert calls[1][0] == str(venv / "bin" / "python3")
-    assert calls[1][1] == "-c"
-    compile(calls[1][2], "<verify-src>", "exec")
-    assert "'clarify' in ts" in calls[1][2]  # the eviction regression check
-    assert "'form' in ts" in calls[1][2]
+    assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
+    assert calls[1][5].endswith("/plugin")
+    # bare-composite invariant check with syntactically valid source
+    assert calls[2][0] == str(venv / "bin" / "python3")
+    assert calls[2][1] == "-c"
+    compile(calls[2][2], "<verify-src>", "exec")
+    assert "'clarify' in ts" in calls[2][2]  # the eviction regression check
+    assert "'form' in ts" in calls[2][2]
+    # hook-plugin registration verify must assert transform_llm_output loads
+    assert calls[3][0] == str(venv / "bin" / "python3")
+    assert calls[3][1] == "-c"
+    compile(calls[3][2], "<hook-verify-src>", "exec")
+    assert "transform_llm_output" in calls[3][2]
 
 
 def test_install_patched_run_py_body_is_valid_python(tmp_path, monkeypatch):

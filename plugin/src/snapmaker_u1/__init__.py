@@ -114,3 +114,16 @@ def register(ctx: Any) -> None:
         "snapmaker_u1 plugin: transform_tool_result hook registered "
         "(next_action_required directive)",
     )
+
+    # Register the transform_llm_output hook that attaches U1 images
+    # structurally instead of relying on the model echoing their paths. The
+    # workflow arms a per-session marker when it emits an image-bearing card;
+    # this hook injects the authoritative paths into the outbound reply so core
+    # attaches the real images even when the model mangles or omits the paths
+    # (observed live on reprint 2026-07-09: bed photo shown as raw text).
+    from .hooks.attachment_injector import transform as attachment_injector_transform
+    ctx.register_hook("transform_llm_output", attachment_injector_transform)
+    logger.info(
+        "snapmaker_u1 plugin: transform_llm_output hook registered "
+        "(structural U1 image attachment)",
+    )

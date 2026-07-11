@@ -235,6 +235,11 @@ python3 scripts/u1_slice_workflow.py --help
 python3 scripts/snapmaker_u1_status.py
 ```
 
+The networked steps (`extract_profiles_from_printer.py`, `snapmaker_u1_status.py`)
+time out until `SNAPMAKER_U1_HOST` points at your printer's real LAN IP. The
+`.env.example` default `192.168.1.100` is only a placeholder, so edit `.env`
+first, or skip those two until the printer is reachable.
+
 On Windows (PowerShell) the same steps apply with `Copy-Item .env.example .env`
 and backslash paths; the data dir defaults to
 `C:\Users\<you>\.local\share\snapmaker-u1` (override with
@@ -294,23 +299,55 @@ contract (every event the workflow + audit log emit, with payload shapes), see
 
 ## Hermes integration
 
-Hermes typically ships `numpy` + `Pillow` in its bundled venv (verify:
-`/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'` — the
-toolkit's interpreter auto-detection finds it). Then:
+**Install on Linux.** The deploy scripts are bash and `install.py` targets a
+Linux venv (`bin/`, `lib/pythonX.Y/`). Run it inside the Hermes container, on a
+Linux host, or under WSL / Git Bash on Windows — not raw Windows `cmd`. Hermes
+typically ships `numpy` + `Pillow` in its bundled venv (verify:
+`/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'`).
+
+Run each step and let it finish before the next. Step 1 asks a `y/N` you have to
+answer, so do not paste the whole block at once.
+
+**1. Install the bundled skill** (answer `y` at the prompt):
 
 ```bash
-# 1. Install the bundled skill
 hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-automation
+```
 
-# 2. Deploy the workflow scripts to the runtime paths the skill calls into
+**2. Deploy the workflow scripts** to the runtime paths the skill calls into:
+
+```bash
 bash deploy_to_runtime.sh
+```
 
-# 3. Install BOTH gateway hooks (the operator YES that starts a print and
-#    the reply/tap CANCEL that stops one), restart the gateway, verify
+**3. Install both Hermes plugins and patch the gateway.** This installs the
+`u1-form` tool plugin and the `snapmaker_u1` hook plugin (auto-skill load,
+next-action guard, and the image / review-doc attachment injector). Add
+`--venv <path>` if your Hermes venv is not `/opt/hermes/.venv`:
+
+```bash
+python3 adapters/hermes/install.py
+```
+
+`install.py` loads two plugins: `u1-form` and `snapmaker_u1` (a pip entry point,
+installed editable so `git pull` updates it). Without this step the form, the
+auto-skill trigger, and the image/review-doc attachments do not load. Watch for
+its `[4/6] install the snapmaker_u1 hook plugin` and a `[6/6]` verify ending
+`OK: hooks=...transform_llm_output`.
+
+**4. Install both gateway hooks** (the operator YES that starts a print and the
+reply/tap CANCEL that stops one), restart the gateway, and verify:
+
+```bash
 bash tools/install_hermes_u1_hooks.sh
 hermes gateway restart
 bash tools/install_hermes_u1_hooks.sh --verify
 ```
+
+If you run these from inside a Hermes Desktop or gateway chat, run `hermes
+gateway restart` from a **separate** terminal outside Hermes. The gateway
+refuses to restart itself from within its own process (it would kill the command
+mid-run), so the hooks stay unloaded until you restart it externally.
 
 The YES/CANCEL hooks bind to one operator in one private Telegram DM. With a
 single user id in `TELEGRAM_ALLOWED_USERS` the binding resolves itself;

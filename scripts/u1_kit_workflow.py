@@ -45,7 +45,7 @@ from pathlib import Path
 def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> bool:
     try:
         proc = subprocess.run(
-            [python_path, "-c", f"import {', '.join(deps)}"],
+            [python_path, "-c", "import numpy; from PIL import Image, ImageDraw"],
             capture_output=True, text=True, timeout=10,
         )
         return proc.returncode == 0
@@ -54,18 +54,27 @@ def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> 
 
 
 def _ensure_compat_python() -> None:
+    # Import the COMPILED Pillow entry (Image/ImageDraw), not just the `PIL`
+    # package: a mismatched interpreter can import bare PIL yet fail to load the
+    # _imaging C extension, so `import PIL` alone passes a broken install (live
+    # on Windows Hermes Desktop where PYTHONPATH pointed 3.13 at a 3.11 venv,
+    # install report 2026-07-10). Catch broad exceptions, since a broken
+    # extension can surface as more than ImportError.
     try:
         import numpy  # noqa: F401
-        import PIL    # noqa: F401
+        from PIL import Image, ImageDraw  # noqa: F401
         return
-    except ImportError:
+    except Exception:
         pass
     missing = []
-    for dep in ("numpy", "PIL"):
-        try:
-            __import__(dep)
-        except ImportError:
-            missing.append("pillow" if dep == "PIL" else dep)
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append("numpy")
+    try:
+        from PIL import Image, ImageDraw  # noqa: F401
+    except Exception:
+        missing.append("pillow")
     here = Path(__file__).resolve().parent
     root = here.parent
     candidates: list[str] = []
@@ -3243,6 +3252,24 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                             "kind": "bed_snapshot",
                             "image": bed_result["snapshot_path"]}, json_events)
 
+    # Arm the structural-attachment marker with the SAME image paths the render
+    # events carry, so the transform_llm_output hook attaches them regardless of
+    # whether the model echoes them (v2.4 — kills the reprint bed-photo-as-text
+    # bug observed 2026-07-09). Normal and reprint both reach this card via
+    # _action_start, so this one site covers both.
+    _attach_images: list[str] = []
+    if preview_result and preview_result.get("ok"):
+        _attach_images.append(preview_result["path"])
+        if preview_result.get("iso_path"):
+            _attach_images.append(preview_result["iso_path"])
+    if bed_result["ok"]:
+        _attach_images.append(bed_result["snapshot_path"])
+    _attach_docs = ([review_doc_path]
+                    if (review_doc_path and Path(review_doc_path).is_file())
+                    else [])
+    _arm_pending_attach(request_id, _attach_images, operator,
+                        documents=_attach_docs)
+
     _emit(events_file, {
         "stage": "need_input",
         "key": "confirm",
@@ -3450,6 +3477,63 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
             "approval_expires_at": expires_at,
             "captured_at_utc": captured_ts,
             "reason": None}
+
+
+# Structural image attachment (v2.4). Hermes core attaches images by scanning
+# the model's final reply for bare on-disk file paths. Relying on gemma to echo
+# the workflow's paths verbatim broke live on reprint (2026-07-09): a mangled
+# request_id pointed the paths at nothing, so the bed photo + previews rendered
+# as raw text and the operator lost the visual bed-clear check. The workflow
+# owns the real paths, so it arms this one-shot marker when it emits an
+# image-bearing card; the plugin's transform_llm_output hook
+# (snapmaker_u1.hooks.attachment_injector) injects the authoritative paths into
+# the outbound reply. Keyed by HERMES_SESSION_KEY, which the workflow subprocess
+# inherits from the gateway process the hook runs in, so both sides resolve the
+# same marker (same cross-process trick the pending_confirm marker uses).
+_PENDING_ATTACH_DIR = Path(os.environ.get("U1_PENDING_ATTACH_DIR",
+                                          "/tmp/u1_pending_attach"))
+
+
+def _arm_pending_attach(request_id: str, images: "list[str] | None",
+                        operator: "str | None",
+                        documents: "list[str] | None" = None,
+                        session_key: "str | None" = None) -> None:
+    """Drop the one-shot marker the attachment_injector hook redeems on the next
+    outbound turn. ``images`` are absolute paths in the request dir (plate
+    preview, isometric, bed snapshot); ``documents`` are non-image files to
+    deliver as attachments (the review .md, which core sends via send_document
+    only from a bare path, never a MEDIA: directive). No-op when there's nothing
+    to attach.
+
+    Best-effort: an attachment is never worth failing the card or the safety
+    gate over, so every error is swallowed."""
+    import hashlib
+    imgs = [str(p) for p in (images or []) if p]
+    docs = [str(p) for p in (documents or []) if p]
+    if not imgs and not docs:
+        return
+    key = session_key if session_key is not None else os.environ.get("HERMES_SESSION_KEY", "")
+    if not key:
+        # No stable per-session key -> don't write the shared empty-key slot,
+        # which an unrelated turn could redeem (audit #3). The hook refuses the
+        # empty-key slot on read too; keep both ends aligned.
+        return
+    try:
+        _PENDING_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        target = _PENDING_ATTACH_DIR / f"{digest}.json"
+        payload = {
+            "request_id": request_id,
+            "images": imgs,
+            "documents": docs,
+            "operator": operator,
+            "created_at": time.time(),
+        }
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, target)  # atomic publish
+    except Exception:
+        pass
 
 
 # Model-free YES (post-incident 2026-07-07): the agent model fired the
@@ -3965,6 +4049,21 @@ def _action_reprint_start(events_file: Path | None, json_events: bool,
                             "kind": "bed_snapshot", "image": bed["snapshot_path"],
                             "instruction": "Surface this fresh bed photo path BARE in your reply."},
               json_events)
+
+    # Arm the structural-attachment marker for the reprint card (v2.4). The
+    # reprint path emits its images as render events above and asks the model to
+    # echo the paths, which is the fragile bit that showed the bed photo as text
+    # on 2026-07-09. Arm the same paths here so the transform_llm_output hook
+    # attaches them regardless of what the model echoes. This is the reprint
+    # sibling of the arm in _emit_confirm_card (reprints never reach that path).
+    _reprint_attach: list[str] = []
+    for _p in (_art_preview, _art_iso, bed.get("snapshot_path")):
+        if _p and Path(_p).is_file():
+            _reprint_attach.append(_p)
+    _reprint_docs = ([_art_review]
+                     if (_art_review and Path(_art_review).is_file()) else [])
+    _arm_pending_attach(new_rid, _reprint_attach, operator,
+                        documents=_reprint_docs)
 
     # This turn IS the operator's review moment (original previews + review
     # doc + fresh bed photo, above). Record it with the same revision+hash

@@ -26,7 +26,7 @@ def _check_python_has_deps(python_path: str, deps: tuple = ('numpy', 'PIL')) -> 
     """Return True iff `python_path` can import every dep without error."""
     try:
         proc = subprocess.run(
-            [python_path, '-c', f'import {", ".join(deps)}'],
+            [python_path, '-c', 'import numpy; from PIL import Image, ImageDraw'],
             capture_output=True, text=True, timeout=10,
         )
         return proc.returncode == 0
@@ -38,21 +38,30 @@ def _ensure_compat_python() -> None:
     """If the current interpreter lacks numpy/PIL, find a known-good Python
     that has them and re-exec self with it. Exit with a clear error if none
     of the candidates work."""
-    # Fast path: current interpreter has the deps
+    # Fast path: current interpreter has the deps. Import the COMPILED Pillow
+    # entry (Image/ImageDraw), not just the `PIL` package -- a mismatched
+    # interpreter can import bare PIL yet fail to load the _imaging C extension,
+    # so `import PIL` alone passes a broken install (live on Windows Hermes
+    # Desktop with a 3.13/3.11 PYTHONPATH mix, install report 2026-07-10). Catch
+    # broad exceptions, since a broken extension can surface as more than
+    # ImportError.
     try:
         import numpy  # noqa: F401
-        import PIL    # noqa: F401
+        from PIL import Image, ImageDraw  # noqa: F401
         return
-    except ImportError:
+    except Exception:
         pass
 
     # Identify which deps are actually missing (for the error message)
     missing = []
-    for dep in ('numpy', 'PIL'):
-        try:
-            __import__(dep)
-        except ImportError:
-            missing.append('pillow' if dep == 'PIL' else dep)
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append('numpy')
+    try:
+        from PIL import Image, ImageDraw  # noqa: F401
+    except Exception:
+        missing.append('pillow')
 
     # Candidate Python paths, in priority order. The U1_TOOLKIT_PYTHON env
     # var wins so users can override on any host without code changes.
