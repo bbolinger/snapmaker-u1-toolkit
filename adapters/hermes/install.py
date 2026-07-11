@@ -301,6 +301,58 @@ def _verify(venv_python: Path, tools_dir: Path) -> str:
     return proc.stdout.strip()
 
 
+def _install_hook_plugin(venv_python: Path, plugin_pkg: Path, *,
+                         dry_run: bool) -> str:
+    """pip-install the ``snapmaker_u1`` entry-point plugin into the Hermes venv.
+
+    This is a DIFFERENT plugin from the u1-form one deployed above: it carries
+    the pip ``hermes_agent.plugins`` entry point that registers the auto-skill
+    loader, the next-action directive, and the v2.4 transform_llm_output image /
+    review-doc attach hook. Because it is an entry-point plugin, pip-installing
+    it is all Hermes needs to discover and load it (no ``plugins enable`` step).
+    Editable (-e) so a later ``git pull`` in the clone takes effect without a
+    reinstall."""
+    if not (plugin_pkg / "pyproject.toml").is_file():
+        return f"SKIPPED: no plugin package at {plugin_pkg}"
+    cmd = [str(venv_python), "-m", "pip", "install", "-e", str(plugin_pkg)]
+    if dry_run:
+        return "would run: " + " ".join(cmd)
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=300)
+    except Exception as exc:  # noqa: BLE001 - surface any launch failure
+        return f"FAILED to launch pip: {exc}"
+    if proc.returncode != 0:
+        return f"FAILED (rc={proc.returncode}): {proc.stderr.strip()[:400]}"
+    return "installed (editable)"
+
+
+def _verify_hook_plugin(venv_python: Path) -> str:
+    """Confirm the snapmaker_u1 plugin loads in the venv and registers all three
+    hooks -- in particular transform_llm_output, without which v2.4 image and
+    review-doc delivery silently does nothing."""
+    src = (
+        "import logging; logging.disable(logging.CRITICAL)\n"
+        "class C:\n"
+        "    def __init__(s): s.h=[]\n"
+        "    def register_hook(s,n,cb): s.h.append(n)\n"
+        "    def register_skill(s,*a,**k): pass\n"
+        "import importlib\n"
+        "m=importlib.import_module('snapmaker_u1')\n"
+        "c=C(); m.register(c)\n"
+        "need={'pre_gateway_dispatch','transform_tool_result','transform_llm_output'}\n"
+        "miss=need-set(c.h)\n"
+        "print('OK: hooks='+','.join(c.h)) if not miss "
+        "else print('MISSING hooks: '+','.join(sorted(miss)))\n"
+    )
+    try:
+        proc = subprocess.run([str(venv_python), "-c", src], text=True,
+                              capture_output=True, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        return f"verify FAILED to launch: {exc}"
+    return (proc.stdout or proc.stderr or
+            f"no output (rc={proc.returncode})").strip()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Install the u1 form flow into Hermes.")
     ap.add_argument("--venv", type=Path, default=Path("/opt/hermes/.venv"),
@@ -328,6 +380,10 @@ def main(argv=None) -> int:
     here = Path(__file__).resolve().parent
     plugin_src = here / "plugin"
     plugin_dst = _plugin_dir_dest()
+    # The pip entry-point plugin (auto-skill loader + next-action guard + the
+    # v2.4 attachment injector) lives at <repo>/plugin, two levels up from
+    # adapters/hermes/.
+    hook_plugin_src = here.parent.parent / "plugin"
     # u1_form_telegram.py (the L1 pure renderer) is single-sourced from the
     # sibling adapters/telegram/ directory — the hermes tree carries no copy.
     renderer_src = here.parent / "telegram" / "u1_form_telegram.py"
@@ -356,6 +412,17 @@ def main(argv=None) -> int:
                 shutil.rmtree(plugin_dst)
                 print(f"removed       {plugin_dst}")
         print(f"plugin disable: {_disable_plugin(venv, dry_run=a.dry_run)}")
+        # Remove the pip entry-point plugin too (best-effort).
+        _uni = [str(venv_python), "-m", "pip", "uninstall", "-y",
+                "snapmaker-u1-toolkit-plugin"]
+        if a.dry_run:
+            print("would run: " + " ".join(_uni))
+        else:
+            try:
+                _p = subprocess.run(_uni, text=True, capture_output=True, timeout=120)
+                print(f"hook plugin pip uninstall: rc={_p.returncode}")
+            except Exception as _exc:  # noqa: BLE001
+                print(f"hook plugin pip uninstall failed to launch: {_exc}")
         bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
         # Only restore the backup when OUR patch is actually present in the
         # current run.py. If Hermes was upgraded since install, pip replaced
@@ -390,7 +457,7 @@ def main(argv=None) -> int:
         print("       before copying anything — no files were modified.")
         return 2
 
-    print("[1/5] copy tools/ (form_gateway) + remove pre-plugin layout files")
+    print("[1/6] copy tools/ (form_gateway) + remove pre-plugin layout files")
     for name, src in tools_src.items():
         if not src.exists():
             raise SystemExit(f"source missing: {src}")
@@ -411,7 +478,7 @@ def main(argv=None) -> int:
                 print(f"  removed   {tgt} (superseded by the plugin)")
 
     print()
-    print(f"[2/5] deploy plugin -> {plugin_dst}")
+    print(f"[2/6] deploy plugin -> {plugin_dst}")
     plugin_files = {name: plugin_src / name for name in PLUGIN_FILES}
     plugin_files["u1_form_telegram.py"] = renderer_src
     for name, src in plugin_files.items():
@@ -426,11 +493,15 @@ def main(argv=None) -> int:
             print(f"  {'copied   ' if changed else 'unchanged '} {tgt}")
 
     print()
-    print("[3/5] enable plugin (user plugins are opt-in)")
+    print("[3/6] enable plugin (user plugins are opt-in)")
     print(f"  {_enable_plugin(venv, dry_run=a.dry_run)}")
 
     print()
-    print("[4/5] patch gateway/run.py (anchor-based, marker-guarded)")
+    print("[4/6] install the snapmaker_u1 hook plugin (pip entry point)")
+    print(f"  {_install_hook_plugin(venv_python, hook_plugin_src, dry_run=a.dry_run)}")
+
+    print()
+    print("[5/6] patch gateway/run.py (anchor-based, marker-guarded)")
     status = _patch_run_py(run_py, dry_run=a.dry_run)
     print(f"  {status}: {run_py}")
     if status == "anchor-not-found":
@@ -453,11 +524,12 @@ def main(argv=None) -> int:
         return 0
 
     print()
-    print("[5/5] verify: bare-composite toolset resolution (clarify held + form offered)")
+    print("[6/6] verify: toolset resolution + hook-plugin registration")
     print(" ", _verify(venv_python, tools_dir))
+    print(" ", _verify_hook_plugin(venv_python))
 
     print()
-    print("Done. Restart the Hermes gateway so the plugin loads and the patched")
+    print("Done. Restart the Hermes gateway so both plugins load and the patched")
     print("gateway/run.py takes effect. First inbound Telegram message installs")
     print("send_form on the live adapter class (watch for the")
     print("'u1-form: TelegramAdapter.send_form installed' log line).")

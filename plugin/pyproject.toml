@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snapmaker-u1-toolkit-plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Hermes plugin: auto-trigger the snapmaker U1 3D-printer-slicing skill on STL/3MF/ZIP attachments. Wraps the existing snapmaker-u1-toolkit skill + scripts."
 license = {text = "MIT"}
 requires-python = ">=3.11"

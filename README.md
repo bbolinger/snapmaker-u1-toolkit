@@ -305,12 +305,25 @@ hermes skills install bbolinger/snapmaker-u1-toolkit/skills/3d-printer-slicing-a
 # 2. Deploy the workflow scripts to the runtime paths the skill calls into
 bash deploy_to_runtime.sh
 
-# 3. Install BOTH gateway hooks (the operator YES that starts a print and
+# 3. Install the plugins into Hermes: the u1-form tool plus the snapmaker_u1
+#    hook plugin (auto-skill load, next-action guard, and the image /
+#    review-doc attachment injector), and patch the gateway. Add
+#    --venv <path> if your Hermes venv is not /opt/hermes/.venv.
+python3 adapters/hermes/install.py
+
+# 4. Install BOTH gateway hooks (the operator YES that starts a print and
 #    the reply/tap CANCEL that stops one), restart the gateway, verify
 bash tools/install_hermes_u1_hooks.sh
 hermes gateway restart
 bash tools/install_hermes_u1_hooks.sh --verify
 ```
+
+Step 3 installs two plugins: the `u1-form` tool plugin and the `snapmaker_u1`
+hook plugin (a pip entry point, editable so `git pull` updates it). Restarting
+the gateway loads both; a fresh message logs
+`u1-form: TelegramAdapter.send_form installed`, and the attachment injector's
+hook comes up with the other `snapmaker_u1` hooks. Without step 3 the form,
+the auto-skill trigger, and the image/review-doc attachments do not load.
 
 The YES/CANCEL hooks bind to one operator in one private Telegram DM. With a
 single user id in `TELEGRAM_ALLOWED_USERS` the binding resolves itself;
