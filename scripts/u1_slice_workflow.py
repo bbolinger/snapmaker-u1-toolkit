@@ -1735,7 +1735,7 @@ def main(argv=None)->int:
                     help='Whether operator chose Stage-1 path (upload_start) or upload-only (upload).')
     ap.add_argument('--on-collision', choices=['rename', 'overwrite', 'cancel'], default=None,
                     help="Operator's resolution if the target storage filename already exists on the U1. "
-                         "Passed through to u1_upload_gcode.py. Default = unset → helper detects collision "
+                         "Passed through to u1_upload_gcode.py. Default = unset -> helper detects collision "
                          "and emits a filename_collision need_input prompt; re-run with this flag to commit.")
     ap.add_argument('--no-live-material', action='store_true', help='Do not query live material state; use supplied/headless option')
     ap.add_argument('--out-dir', type=Path,

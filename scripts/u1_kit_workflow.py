@@ -3645,9 +3645,14 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
                         "the YES until it can verify who is answering."),
         }, json_events)
     _PENDING_CONFIRM_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
+    # Unique tmp + os.replace: re-arming an existing window must OVERWRITE
+    # the old marker on every platform. Path.rename refuses an existing
+    # target on Windows (WinError 183, caught by the 2026-07-10 Windows
+    # validation), and a fixed tmp name lets two writers collide.
+    import uuid as _uuid
+    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.{_uuid.uuid4().hex}.tmp"
     tmp.write_text(json.dumps(entry, indent=2))
-    tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+    os.replace(tmp, _PENDING_CONFIRM_DIR / f"{request_id}.json")
     _spawn_confirm_expiry_watchdog(request_id, filename, generation)
 
 
@@ -5593,7 +5598,7 @@ def main(argv=None) -> int:
                           "verbatim; answer content never passes through it."))
     ap.add_argument("--redeem-pending-form", action="store_true",
                     dest="redeem_pending_form", default=False,
-                    help=("Redeem the pending form WITHOUT relaying its form_id — "
+                    help=("Redeem the pending form WITHOUT relaying its form_id - "
                           "the workflow reads form_id off the request. Preferred "
                           "over --form-answers-from for model-relayed redeems: a "
                           "26B model mangled the random-hex id verbatim "
@@ -5612,7 +5617,7 @@ def main(argv=None) -> int:
                           "and then this follows the exact --confirm-start "
                           "path (same nonce/revision/hash checks). Written "
                           "for the u1_confirm_start hook, which builds this "
-                          "command from its own constants — the pending "
+                          "command from its own constants - the pending "
                           "marker carries no command and no token."))
     ap.add_argument("--confirm-claim-id", default=None, dest="confirm_claim_id",
                     help=("Q3 (audit 2026-07-09): the exact claim id the confirm "
@@ -5624,11 +5629,11 @@ def main(argv=None) -> int:
                     help=("Cancel every active pre-start grace window (touches "
                           "the same markers the gateway cancel hook does). The "
                           "ONLY start-gate command the agent may run on its own "
-                          "initiative — it can only ever STOP a print."))
+                          "initiative - it can only ever STOP a print."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "
-                          "it — copy the emitted command VERBATIM; a "
+                          "it - copy the emitted command VERBATIM; a "
                           "hand-assembled confirm is refused."))
     # Layer 3 override metadata (per Brent design 2026-06-30). When the agent
     # surfaces an override option (start manual-bed-check / start
@@ -5648,8 +5653,8 @@ def main(argv=None) -> int:
     ap.add_argument("--interaction-mode", default=None,
                     choices=["text", "form"],
                     help=("Model-capability-based UX split. `text` = staged "
-                          "6-turn Q&A (parts → orient → tool → preset → "
-                          "supports → confirm), cheap intermediates, safe for "
+                          "6-turn Q&A (parts -> orient -> tool -> preset -> "
+                          "supports -> confirm), cheap intermediates, safe for "
                           "small local models. `form` = single kit_form event "
                           "with form_schema (buttons UX, requires the u1-form "
                           "Hermes plugin). Falls through to env U1_INTERACTION_MODE "
@@ -5676,7 +5681,7 @@ def main(argv=None) -> int:
     ap.add_argument("--live-upload", action="store_true",
                     help=("In legacy --form-answers one-liner mode: opt IN to "
                           "the real Moonraker upload (default is dry-run for "
-                          "CLI tests). In staged mode: no-op — live upload is "
+                          "CLI tests). In staged mode: no-op - live upload is "
                           "the default; use --no-live-upload to opt out."))
     ap.add_argument("--no-live-upload", action="store_true",
                     help="Opt out of the real Moonraker upload (CLI smoke tests only)")

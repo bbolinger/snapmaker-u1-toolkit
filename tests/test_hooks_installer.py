@@ -15,6 +15,17 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+# Linux deployment lane: the installer script drives bash + a python3 that
+# must resolve inside the shell, which native Windows (Git Bash +
+# py-launcher stubs) does not guarantee. The hook HANDLERS' portable logic
+# is covered in test_pending_paths / test_runtime_paths / test_model_free_yes;
+# the Windows install flow is exercised via install.py's Windows fixtures.
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Linux deployment lane: runs the .sh installer via bash+python3")
+
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "tools" / "install_hermes_u1_hooks.sh"
 OLD_INSTALLER = REPO / "tools" / "install_hermes_cancel_hook.sh"

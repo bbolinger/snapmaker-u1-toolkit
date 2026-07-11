@@ -19,12 +19,12 @@ def _seed(rid):
 
 
 def _consume(rid, expected):
-    """Mirror the gate's _consume_stage2_nonce read-check-write, which goes
-    through write_request (now request-locked)."""
-    import fcntl
+    """Mirror the gate's _consume_stage2_nonce read-check-write, using the
+    same cross-platform lock the production code uses (u1_lockfile —
+    the old direct fcntl import made this test POSIX-only)."""
+    from u1_lockfile import exclusive_lock
     req_dir = u1_request.ensure_request_dir(rid)
-    with open(req_dir / ".stage2_nonce.lock", "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    with exclusive_lock(req_dir / ".stage2_nonce.lock"):
         fresh = dict((u1_request.read_request(rid) or {}).get("safety") or {})
         if fresh.get("stage2_approval_nonce") != expected:
             return False

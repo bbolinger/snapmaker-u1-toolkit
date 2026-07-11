@@ -1497,14 +1497,14 @@ def main(argv=None):
                     help='Either the host gcode path or the printer storage filename. '
                          'Host paths are auto-stripped to basename for the Moonraker call.')
     ap.add_argument('--bed-clear', choices=['start', 'cancel'], default='cancel',
-                    help="'cancel' (default): Stage 1 — captures real photo + writes approval token, never starts. "
-                         "'start': Stage 2 — operator's explicit approval; requires --approval-token from Stage 1.")
+                    help="'cancel' (default): Stage 1 - captures real photo + writes approval token, never starts. "
+                         "'start': Stage 2 - operator's explicit approval; requires --approval-token from Stage 1.")
     ap.add_argument('--approval-token',
                     help='Token printed by Stage 1. Required for Stage 2; ties the start to the photo the operator reviewed.')
     ap.add_argument('--stage2-approval-nonce', default=None,
                     help=('Single-use nonce minted by u1_kit_workflow._action_start() '
                           'AFTER the operator answers yes to the fresh bed_clear_start '
-                          'prompt. Kit paths REQUIRE this — without it, Stage 2 '
+                          'prompt. Kit paths REQUIRE this - without it, Stage 2 '
                           'refuses even if the approval-token is valid. Consumed '
                           'on successful start (single-use). Closes the direct-'
                           'Stage-2 attack.'))
@@ -1514,7 +1514,7 @@ def main(argv=None):
                     help='Where to write the bed snapshot + approval token. Defaults to U1 data dir.')
     ap.add_argument('--request-id', type=str, default=None,
                     help='v2.0 Phase 3b: the Print Request Object ID this Stage is acting on. '
-                         'Stage 2 REQUIRES this — without it, can_start() has no request to verify '
+                         'Stage 2 REQUIRES this - without it, can_start() has no request to verify '
                          'and the gate refuses. Stage 1 uses it to stamp safety.bed_clear_photo_captured '
                          'on the matching request.json. SKILL.md fills it in from the readiness card.')
     ap.add_argument('--operator', type=str, default=None,

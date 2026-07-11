@@ -872,7 +872,14 @@ def _fake_hermes(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
     run_py.write_text(run_py_text)
     bin_dir = venv / "bin"
     bin_dir.mkdir()
-    (bin_dir / "python3").symlink_to(sys.executable)
+    # Symlink where permitted, copy where not (Windows without developer
+    # mode raises WinError 1314). The installer only needs a python* file
+    # to exist in bin/ — every subprocess call in these tests is stubbed.
+    try:
+        (bin_dir / "python3").symlink_to(sys.executable)
+    except OSError:
+        import shutil
+        shutil.copy2(sys.executable, bin_dir / "python3")
     (bin_dir / "hermes").write_text("#!/bin/sh\nexit 0\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     return venv, sp, run_py

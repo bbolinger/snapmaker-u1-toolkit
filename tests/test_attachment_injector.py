@@ -193,12 +193,19 @@ def test_disallowed_name_under_root_refused(attach_dir, tmp_path):
 
 
 def test_symlinked_artifact_refused(attach_dir, tmp_path):
-    """A symlink named like an artifact but pointing outside is refused."""
+    """A symlink named like an artifact but pointing outside is refused.
+
+    Requires real symlink capability: on Windows without developer mode the
+    OS refuses creation (WinError 1314) — and an attacker on such a host
+    cannot plant one either, so skipping there does not hide exposure."""
     link = tmp_path / "requests" / _RID / "bed_snapshot.jpg"
     link.parent.mkdir(parents=True, exist_ok=True)
     target = tmp_path / "outside.jpg"
     target.write_bytes(b"x")
-    os.symlink(target, link)
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"symlink creation not permitted on this host ({exc})")
     _write_marker(_SESSION_KEY, {
         "request_id": _RID, "images": [str(link)], "documents": [],
         "operator": "op", "created_at": time.time(),

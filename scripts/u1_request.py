@@ -144,7 +144,11 @@ def ensure_request_dir(request_id: str) -> Path:
         while cur != data_root and data_root in cur.parents:
             cst = cur.stat()
             if cst.st_uid != target_uid or cst.st_gid != target_gid:
-                os.chown(cur, target_uid, target_gid)
+                # POSIX-only: Windows os has no chown at all (attribute
+                # access raises AttributeError, which the except below
+                # would NOT catch — 2026-07-10 Windows validation).
+                if hasattr(os, "chown"):
+                    os.chown(cur, target_uid, target_gid)
             cur = cur.parent
     except (OSError, PermissionError):
         pass  # best-effort; not authoritative

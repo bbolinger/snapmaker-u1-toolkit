@@ -321,7 +321,7 @@ def main() -> int:
     ap.add_argument("--on-collision", choices=["cancel", "overwrite", "rename"],
                     default=None,
                     help="What to do if the target filename already exists on the U1. "
-                         "Not set + collision detected → exit rc=5 with a collision packet "
+                         "Not set + collision detected -> exit rc=5 with a collision packet "
                          "the caller can present to the operator. 'cancel' = exit. "
                          "'overwrite' = upload over the existing file. "
                          "'rename' = upload as <stem>_<timestamp><suffix> (preferred default).")

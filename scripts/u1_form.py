@@ -743,7 +743,13 @@ def resolve_confirm_token(token: str, consume: bool = True):
     # source already gone and return None. The old read-then-unlink let two
     # callers both read the same token before either deleted it, and both
     # returned the same request_id (and unlink failures were swallowed).
-    claimed = p.with_name(f".claim.{os.getpid()}.{token}.json")
+    # Claim destination must be unique PER CLAIMANT, not per process: threads
+    # share a pid, so pid-only names sent every racer to the SAME destination
+    # (zero-winner races + PermissionError on Windows, caught by the
+    # 2026-07-10 Windows validation). The atomic single-winner property lives
+    # in os.replace on the SOURCE; the uuid just de-collides destinations.
+    import uuid as _uuid
+    claimed = p.with_name(f".claim.{_uuid.uuid4().hex}.{token}.json")
     try:
         os.replace(p, claimed)
     except OSError:
@@ -765,7 +771,8 @@ def write_answers_file(form_id: str, obj: dict) -> "Path":
     import os
     p = _answers_path(form_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(f".tmp.{os.getpid()}")
+    import uuid as _uuid
+    tmp = p.with_suffix(f".tmp.{_uuid.uuid4().hex}")
     tmp.write_text(_json.dumps(obj, indent=2))
     os.replace(tmp, p)
     return p
@@ -783,7 +790,11 @@ def read_and_consume_answers(form_id: str) -> dict:
     import json as _json
     import os
     p = _answers_path(form_id)
-    claimed = p.with_suffix(f".claimed.{os.getpid()}")
+    # Per-claimant unique destination (threads share a pid — see
+    # resolve_confirm_token); os.replace on the source stays the atomic
+    # single-winner step.
+    import uuid as _uuid
+    claimed = p.with_suffix(f".claimed.{_uuid.uuid4().hex}")
     try:
         os.replace(p, claimed)
     except OSError:

@@ -543,7 +543,11 @@ def _spawn_confirm(state: dict) -> bool:
             exp = None
     try:
         if exp is not None and datetime.now(timezone.utc) <= exp:
-            os.rename(claimed, src_path)
+            # os.replace, not os.rename: POSIX rename overwrites an existing
+            # target (a freshly re-armed marker) but Windows rename refuses
+            # (WinError 183) - replace gives the same overwrite semantics on
+            # both platforms.
+            os.replace(claimed, src_path)
             _log({"event": "confirm_spawn_failed_marker_restored",
                   "request_id": rid})
         else:

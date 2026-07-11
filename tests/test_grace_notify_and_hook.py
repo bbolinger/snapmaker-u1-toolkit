@@ -194,6 +194,14 @@ def test_handler_ignores_empty_message(sandbox_pending_dir):
 
 # ─── Notify shell script tests ──────────────────────────────────────────────
 
+# Linux deployment lane for the .sh-executing tests below: the notify script
+# runs python3 inside bash, which native Windows does not guarantee resolves.
+# The marker-dir contract itself is covered portably in test_pending_paths.
+_sh_lane = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Linux deployment lane: runs the notify .sh via bash+python3")
+
+
 def _run_notify(env_overrides: dict[str, str], hermes_stub_exit: int = 0,
                 tmpdir: Path | None = None) -> subprocess.CompletedProcess:
     """Run the notify script with `hermes` stubbed to a shell script
@@ -239,6 +247,7 @@ def notify_env(tmp_path):
     }, tmp_path
 
 
+@_sh_lane
 def test_notify_writes_pending_state_with_correct_schema(notify_env):
     env, tmp = notify_env
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
@@ -254,6 +263,7 @@ def test_notify_writes_pending_state_with_correct_schema(notify_env):
     datetime.fromisoformat(state["expires_at"].replace("Z", "+00:00"))
 
 
+@_sh_lane
 def test_notify_calls_hermes_send_with_message(notify_env):
     env, tmp = notify_env
     r = _run_notify(env, hermes_stub_exit=0, tmpdir=tmp)
@@ -267,6 +277,7 @@ def test_notify_calls_hermes_send_with_message(notify_env):
     assert "cancel" in log.lower()
 
 
+@_sh_lane
 def test_notify_does_not_persist_pending_state_if_hermes_send_fails(notify_env):
     """Send-first ordering. If Telegram delivery fails, we
     must not leave a phantom pending window that a future unrelated
@@ -280,6 +291,7 @@ def test_notify_does_not_persist_pending_state_if_hermes_send_fails(notify_env):
         "pending state must NOT be written when hermes send fails")
 
 
+@_sh_lane
 def test_notify_writes_per_request_files_not_shared(notify_env, tmp_path):
     """Two concurrent notifies must NOT clobber each
     other. Each writes to <request_id>.json."""
@@ -355,6 +367,7 @@ def test_handler_bare_cancel_still_cancels_all(sandbox_pending_dir):
 
 # ─── Notify script: JSON safety + hook-receipt honesty ──────────────────────
 
+@_sh_lane
 def test_notify_state_file_valid_json_with_hostile_filename(notify_env):
     env, tmp = notify_env
     env = dict(env)
@@ -366,6 +379,7 @@ def test_notify_state_file_valid_json_with_hostile_filename(notify_env):
     assert state["filename"] == env["U1_FILENAME"]
 
 
+@_sh_lane
 def test_notify_message_advertises_ssh_fallback_without_hook_receipt(notify_env):
     env, tmp = notify_env
     env = dict(env)
@@ -379,6 +393,7 @@ def test_notify_message_advertises_ssh_fallback_without_hook_receipt(notify_env)
         "would silently do nothing")
 
 
+@_sh_lane
 def test_notify_message_advertises_reply_cancel_when_hook_installed(notify_env):
     env, tmp = notify_env
     env = dict(env)
