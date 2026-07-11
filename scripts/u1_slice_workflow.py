@@ -22,16 +22,46 @@ import os, sys, subprocess
 from pathlib import Path
 
 
+def _bootstrap_env() -> dict:
+    """os.environ copy without PYTHONPATH/PYTHONHOME (escape hatch:
+    U1_KEEP_PYTHONPATH=1). A foreign PYTHONPATH is how Hermes Desktop
+    poisoned python3=3.13 with a 3.11 venv's compiled Pillow (install
+    report 2026-07-10): bare `import PIL` passed, `from PIL import Image`
+    died in _imaging. Candidates probed or re-exec'd under the same
+    poison fail identically, so every bootstrap subprocess runs sanitized."""
+    env = os.environ.copy()
+    if env.get('U1_KEEP_PYTHONPATH', '').strip().lower() not in (
+            '1', 'true', 'yes', 'on'):
+        env.pop('PYTHONPATH', None)
+        env.pop('PYTHONHOME', None)
+    return env
+
+
 def _check_python_has_deps(python_path: str, deps: tuple = ('numpy', 'PIL')) -> bool:
     """Return True iff `python_path` can import every dep without error."""
     try:
         proc = subprocess.run(
             [python_path, '-c', 'import numpy; from PIL import Image, ImageDraw'],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_bootstrap_env(),
         )
         return proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _reexec(python_path: str) -> None:
+    """Continue under `python_path` with the sanitized env. POSIX: execve
+    (true process replacement, the caller keeps our stdout/stderr).
+    Windows: subprocess + exit with the child's code — execv there does NOT
+    replace the process, it abandons the console while the child keeps
+    writing, garbling agent-captured output."""
+    env = _bootstrap_env()
+    env['U1_BOOTSTRAP_REEXEC'] = '1'  # loop guard for the self-retry path
+    argv = [python_path, __file__, *sys.argv[1:]]
+    if os.name == 'nt':
+        proc = subprocess.run(argv, env=env)
+        sys.exit(proc.returncode)
+    os.execve(python_path, argv, env)
 
 
 def _ensure_compat_python() -> None:
@@ -63,6 +93,21 @@ def _ensure_compat_python() -> None:
     except Exception:
         missing.append('pillow')
 
+    # A poisoned PYTHONPATH alone can produce exactly this failure while the
+    # interpreter itself is fine. Retry SELF with it cleared before hunting
+    # other interpreters (skipped after one re-exec — the loop guard proves
+    # the env wasn't the problem).
+    if (os.environ.get('U1_BOOTSTRAP_REEXEC') != '1'
+            and os.environ.get('PYTHONPATH')
+            and _check_python_has_deps(sys.executable)):
+        print(
+            f'[env] current python lacks {", ".join(missing)} under the '
+            f'inherited PYTHONPATH; retrying with it cleared '
+            f'(U1_KEEP_PYTHONPATH=1 keeps it)',
+            file=sys.stderr,
+        )
+        _reexec(sys.executable)
+
     # Candidate Python paths, in priority order. The U1_TOOLKIT_PYTHON env
     # var wins so users can override on any host without code changes.
     here = Path(__file__).resolve().parent
@@ -75,6 +120,8 @@ def _ensure_compat_python() -> None:
         '/opt/hermes/.venv/bin/python',         # Hermes-bundled venv (common host)
         str(root / 'venv' / 'bin' / 'python'),  # project-local venv
         str(root / '.venv' / 'bin' / 'python'), # uv/poetry-style hidden venv
+        str(root / 'venv' / 'Scripts' / 'python.exe'),   # project venv (Windows)
+        str(root / '.venv' / 'Scripts' / 'python.exe'),  # hidden venv (Windows)
         '/opt/homebrew/bin/python3',             # macOS Homebrew (Apple Silicon — default for M-series)
         '/usr/local/bin/python3',                # macOS Homebrew (Intel) — legacy install path
     ])
@@ -83,16 +130,15 @@ def _ensure_compat_python() -> None:
         if not Path(cand).exists():
             continue
         if _check_python_has_deps(cand):
-            # Re-exec with the working interpreter. execv replaces this process,
-            # so the agent that spawned us still gets stdout/stderr of the
-            # workflow. Pass the same script + the same argv tail.
+            # Continue under the working interpreter (sanitized env — the
+            # same PYTHONPATH that broke us would break the candidate too).
+            # The agent that spawned us still gets the workflow's output.
             print(
                 f'[env] current python lacks {", ".join(missing)}; '
                 f'switching to {cand}',
                 file=sys.stderr,
             )
-            os.execv(cand, [cand, __file__, *sys.argv[1:]])
-            # execv does not return on success
+            _reexec(cand)
 
     # Nothing worked — print a clear, actionable error and exit non-zero.
     msg = [
@@ -114,6 +160,13 @@ def _ensure_compat_python() -> None:
         f'     cd {Path(__file__).resolve().parent.parent}',
         f'     python3 -m venv venv && venv/bin/pip install numpy pillow',
     ]
+    if os.environ.get('PYTHONPATH'):
+        msg += [
+            f'',
+            f'NOTE: PYTHONPATH is set ({os.environ["PYTHONPATH"][:200]}).',
+            f'A foreign PYTHONPATH can shadow working installs; the checks',
+            f'above already ran with it cleared (U1_KEEP_PYTHONPATH=1 keeps it).',
+        ]
     print('\n'.join(msg), file=sys.stderr)
     sys.exit(2)
 

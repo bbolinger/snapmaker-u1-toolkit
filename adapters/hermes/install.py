@@ -132,12 +132,37 @@ LEGACY_TOOLS_FILES = ("form_tool.py", "u1_form_telegram.py")
 
 
 def _site_packages(venv: Path) -> Path:
-    """Find the lib/pythonX.Y/site-packages under a venv."""
+    """Find the site-packages under a venv — POSIX (lib/pythonX.Y/) or
+    Windows (Lib/) layout (native Windows Hermes Desktop, install report
+    2026-07-10)."""
     for sub in (venv / "lib").glob("python*"):
         sp = sub / "site-packages"
         if sp.is_dir():
             return sp
-    raise SystemExit(f"no site-packages under {venv / 'lib'}")
+    win_sp = venv / "Lib" / "site-packages"
+    if win_sp.is_dir():
+        return win_sp
+    raise SystemExit(
+        f"no site-packages under {venv} (tried lib/pythonX.Y/ and Lib/)")
+
+
+def _venv_python(venv: Path) -> Path | None:
+    """The venv's interpreter — bin/python* (POSIX) or Scripts/python.exe
+    (Windows)."""
+    cand = next((venv / "bin").glob("python*"), None) if (venv / "bin").is_dir() else None
+    if cand is not None:
+        return cand
+    win = venv / "Scripts" / "python.exe"
+    return win if win.exists() else None
+
+
+def _venv_hermes_bin(venv: Path) -> Path:
+    """The venv's hermes entry point — bin/hermes or Scripts/hermes.exe."""
+    posix = venv / "bin" / "hermes"
+    if posix.exists():
+        return posix
+    win = venv / "Scripts" / "hermes.exe"
+    return win if win.exists() else posix  # posix path keeps old error text
 
 
 def _hermes_home() -> Path:
@@ -240,7 +265,7 @@ def _plugin_dir_dest() -> Path:
 
 def _enable_plugin(venv: Path, *, dry_run: bool) -> str:
     """Enable the plugin via the Hermes CLI (user plugins are opt-in)."""
-    hermes_bin = venv / "bin" / "hermes"
+    hermes_bin = _venv_hermes_bin(venv)
     cmd = [str(hermes_bin), "plugins", "enable", PLUGIN_KEY]
     if dry_run:
         return f"would run: {' '.join(cmd)}"
@@ -259,7 +284,7 @@ def _enable_plugin(venv: Path, *, dry_run: bool) -> str:
 
 
 def _disable_plugin(venv: Path, *, dry_run: bool) -> str:
-    hermes_bin = venv / "bin" / "hermes"
+    hermes_bin = _venv_hermes_bin(venv)
     cmd = [str(hermes_bin), "plugins", "disable", PLUGIN_KEY]
     if dry_run:
         return f"would run: {' '.join(cmd)}"
@@ -373,9 +398,10 @@ def main(argv=None) -> int:
     run_py = gateway_dir / "run.py"
     if not tools_dir.is_dir() or not run_py.exists():
         raise SystemExit(f"unexpected layout under {sp}: tools/ or gateway/run.py missing")
-    venv_python = next((venv / "bin").glob("python*"), None)
+    venv_python = _venv_python(venv)
     if venv_python is None:
-        raise SystemExit(f"no python in {venv / 'bin'}")
+        raise SystemExit(
+            f"no python under {venv} (tried bin/python* and Scripts/python.exe)")
 
     here = Path(__file__).resolve().parent
     plugin_src = here / "plugin"

@@ -939,6 +939,45 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     assert "transform_llm_output" in calls[3][2]
 
 
+def _fake_hermes_windows(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
+    """Native-Windows Hermes venv layout: Lib/site-packages +
+    Scripts/{python.exe, hermes.exe} (install report 2026-07-10). Same
+    content as _fake_hermes otherwise."""
+    venv = tmp_path / "hermes-venv-win"
+    sp = venv / "Lib" / "site-packages"
+    (sp / "tools").mkdir(parents=True)
+    (sp / "gateway").mkdir()
+    run_py = sp / "gateway" / "run.py"
+    run_py.write_text(run_py_text)
+    scripts = venv / "Scripts"
+    scripts.mkdir()
+    (scripts / "python.exe").write_text("stub")
+    (scripts / "hermes.exe").write_text("stub")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    return venv, sp, run_py
+
+
+def test_install_supports_windows_venv_layout(tmp_path, monkeypatch):
+    """install.py must discover Lib/site-packages and Scripts/*.exe — the
+    2026-07-10 desktop report died at 'no site-packages under .../lib'."""
+    venv, sp, run_py = _fake_hermes_windows(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+
+    rc = hermes_install.main(["--venv", str(venv)])
+    assert rc == 0
+
+    # Same patch outcome as the POSIX layout.
+    txt = run_py.read_text()
+    assert hermes_install.RUN_PY_MARKER in txt
+    assert (sp / "tools" / "form_gateway.py").exists()
+
+    # Subprocess steps target the Windows executables.
+    assert calls[0][0] == str(venv / "Scripts" / "hermes.exe")
+    assert calls[1][0] == str(venv / "Scripts" / "python.exe")
+    assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
+
+
 def test_install_patched_run_py_body_is_valid_python(tmp_path, monkeypatch):
     """The inserted block must compile in situ — an indent drift or template
     typo here would take down the whole gateway at import."""

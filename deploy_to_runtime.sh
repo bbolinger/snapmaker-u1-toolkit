@@ -13,8 +13,19 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # exists (the marker of a Hermes-shared dataset).
 if [[ -d /appdata/hermes/scripts ]] && [[ "$ROOT" == /appdata/hermes/* ]]; then
   _DEFAULT_ROOT="/appdata/hermes"
-else
+elif [[ -d /opt/data ]]; then
   _DEFAULT_ROOT="/opt/data"
+elif [[ -n "${HERMES_HOME:-}" ]] && [[ -d "${HERMES_HOME}" ]]; then
+  # Native Windows (Git Bash) / non-container installs: no /opt/data.
+  # Deploy into the Hermes home the gateway actually reads from.
+  _DEFAULT_ROOT="${HERMES_HOME}"
+else
+  echo "deploy: no deploy root found." >&2
+  echo "  Neither /opt/data nor \$HERMES_HOME exists on this host." >&2
+  echo "  Native Windows: run from Git Bash with HERMES_HOME set to your" >&2
+  echo "  Hermes data dir, or set U1_DEPLOY_SCRIPTS / U1_DEPLOY_TOOLS /" >&2
+  echo "  U1_DEPLOY_SKILL / U1_DEPLOY_PROFILES explicitly." >&2
+  exit 1
 fi
 SCRIPT_DST="${U1_DEPLOY_SCRIPTS:-$_DEFAULT_ROOT/scripts}"
 TOOLS_DST="${U1_DEPLOY_TOOLS:-$_DEFAULT_ROOT/tools}"

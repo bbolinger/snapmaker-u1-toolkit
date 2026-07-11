@@ -42,15 +42,41 @@ import os, sys, subprocess, time
 from pathlib import Path
 
 
+def _bootstrap_env() -> dict:
+    """os.environ copy without PYTHONPATH/PYTHONHOME (escape hatch:
+    U1_KEEP_PYTHONPATH=1). Mirrors u1_slice_workflow's bootstrap — a foreign
+    PYTHONPATH poisoned compiled Pillow on Windows Hermes Desktop (install
+    report 2026-07-10), so every bootstrap subprocess runs sanitized."""
+    env = os.environ.copy()
+    if env.get("U1_KEEP_PYTHONPATH", "").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+    return env
+
+
 def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> bool:
     try:
         proc = subprocess.run(
             [python_path, "-c", "import numpy; from PIL import Image, ImageDraw"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_bootstrap_env(),
         )
         return proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _reexec(python_path: str) -> None:
+    """Continue under `python_path` with the sanitized env. POSIX: execve.
+    Windows: subprocess + exit with the child's code (execv there abandons
+    the console mid-run). Mirrors u1_slice_workflow's bootstrap."""
+    env = _bootstrap_env()
+    env["U1_BOOTSTRAP_REEXEC"] = "1"
+    argv = [python_path, __file__, *sys.argv[1:]]
+    if os.name == "nt":
+        proc = subprocess.run(argv, env=env)
+        sys.exit(proc.returncode)
+    os.execve(python_path, argv, env)
 
 
 def _ensure_compat_python() -> None:
@@ -75,6 +101,16 @@ def _ensure_compat_python() -> None:
         from PIL import Image, ImageDraw  # noqa: F401
     except Exception:
         missing.append("pillow")
+    # A poisoned PYTHONPATH alone can produce exactly this failure while the
+    # interpreter itself is fine. Retry SELF with it cleared before hunting
+    # other interpreters (loop-guarded by the re-exec marker).
+    if (os.environ.get("U1_BOOTSTRAP_REEXEC") != "1"
+            and os.environ.get("PYTHONPATH")
+            and _check_python_has_deps(sys.executable)):
+        print(f"[env] current python lacks {', '.join(missing)} under the "
+              f"inherited PYTHONPATH; retrying with it cleared "
+              f"(U1_KEEP_PYTHONPATH=1 keeps it)", file=sys.stderr)
+        _reexec(sys.executable)
     here = Path(__file__).resolve().parent
     root = here.parent
     candidates: list[str] = []
@@ -85,6 +121,8 @@ def _ensure_compat_python() -> None:
         "/opt/hermes/.venv/bin/python",
         str(root / "venv" / "bin" / "python"),
         str(root / ".venv" / "bin" / "python"),
+        str(root / "venv" / "Scripts" / "python.exe"),   # Windows venv layout
+        str(root / ".venv" / "Scripts" / "python.exe"),
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3",
     ])
@@ -94,7 +132,7 @@ def _ensure_compat_python() -> None:
         if _check_python_has_deps(cand):
             print(f"[env] current python lacks {', '.join(missing)}; switching to {cand}",
                   file=sys.stderr)
-            os.execv(cand, [cand, __file__, *sys.argv[1:]])
+            _reexec(cand)
     msg = [
         "ERROR: u1_kit_workflow.py needs numpy + PIL (Pillow).",
         f"Missing on the current interpreter ({sys.executable}): {', '.join(missing)}",
