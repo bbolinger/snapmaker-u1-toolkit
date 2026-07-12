@@ -176,6 +176,24 @@ def get_u1_port(default: int = FALLBACK_PORT) -> int:
     return int(raw)
 
 
+def set_printer(host: str, port: int | None = None) -> Path:
+    """Persist the printer endpoint into the config file so every future
+    process (including emitted child commands) resolves it. MERGES with
+    existing keys - orca_bin and friends survive; never a wholesale
+    replace."""
+    import uuid as _uuid
+    path = get_config_path()
+    cfg = _load_file()
+    cfg["host"] = str(host)
+    if port is not None:
+        cfg["port"] = int(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{_uuid.uuid4().hex}")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    os.replace(tmp, path)
+    return path
+
+
 def get_orca_bin(
         default: str = "/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer",
 ) -> str:

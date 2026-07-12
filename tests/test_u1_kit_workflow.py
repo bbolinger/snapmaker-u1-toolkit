@@ -775,3 +775,71 @@ def test_slice_failure_classification_names_missing_executable():
     generic = kw._classify_slice_failure(RuntimeError("orca rc=1"), "u1_2026_0101_aaaaaa")
     assert generic["error_class"] == "slice_failed"
     assert "too big" in generic["instruction"]
+
+
+# ---------- First-run printer configuration (v2.4.1) ----------
+# Live 2026-07-12: with NO printer configured anywhere the flow fell through
+# to "material unknown - Moonraker unreachable" tool options. That state is
+# for a printer that is OFF; a printer that was never configured is a setup
+# question, and the workflow should ask it like any other need_input.
+
+def _unconfigure_printer(tmp_path, monkeypatch):
+    import u1_config
+    monkeypatch.delenv("SNAPMAKER_U1_HOST", raising=False)
+    monkeypatch.delenv("SNAPMAKER_U1_PORT", raising=False)
+    cfg = tmp_path / "cfg" / "u1_config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(u1_config, "get_config_path", lambda: cfg)
+    monkeypatch.setattr(
+        u1_config, "_load_file",
+        lambda: json.loads(cfg.read_text()) if cfg.exists() else {})
+    return cfg
+
+
+def test_unconfigured_printer_asks_for_address(tmp_path, monkeypatch, capsys, fake_profiles):
+    cfg = _unconfigure_printer(tmp_path, monkeypatch)
+    stl = _cube(tmp_path / "part.stl", 20)
+    res = kw.main([str(stl), "--json-events"])
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    ask = next((e for e in events if e.get("need") == "printer_host"), None)
+    assert ask is not None, f"no printer_host ask; stages={[e.get('stage') for e in events]}"
+    assert "--set-printer" in ask["next_command"]
+    assert not cfg.exists(), "the ask must not write config itself"
+
+
+def test_set_printer_persists_and_merges(tmp_path, monkeypatch, capsys, fake_profiles):
+    cfg = _unconfigure_printer(tmp_path, monkeypatch)
+    cfg.write_text(json.dumps({"orca_bin": "C:/orca/orca-slicer.exe"}))
+    stl = _cube(tmp_path / "part.stl", 20)
+    res = kw.main([str(stl), "--json-events",
+                   "--set-printer", "192.168.1.50:7125"])
+    saved = json.loads(cfg.read_text())
+    assert saved["host"] == "192.168.1.50"
+    assert saved["port"] == 7125
+    assert saved["orca_bin"] == "C:/orca/orca-slicer.exe", "merge, not replace"
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    assert any(e.get("stage") == "printer_configured" for e in events)
+    assert not any(e.get("need") == "printer_host" for e in events), (
+        "once configured, the flow must continue instead of re-asking")
+
+
+def test_set_printer_rejects_garbage(tmp_path, monkeypatch, capsys, fake_profiles):
+    cfg = _unconfigure_printer(tmp_path, monkeypatch)
+    stl = _cube(tmp_path / "part.stl", 20)
+    kw.main([str(stl), "--json-events", "--set-printer", "not a host;rm -rf"])
+    assert not cfg.exists(), "invalid address must not be persisted"
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    assert any(e.get("kind") == "bad_printer_address" for e in events)
+
+
+def test_no_live_material_skips_the_ask(tmp_path, monkeypatch, capsys, fake_profiles):
+    _unconfigure_printer(tmp_path, monkeypatch)
+    stl = _cube(tmp_path / "part.stl", 20)
+    kw.main([str(stl), "--json-events", "--no-live-material"])
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    assert not any(e.get("need") == "printer_host" for e in events), (
+        "explicit offline mode must not demand a printer address")

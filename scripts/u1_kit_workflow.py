@@ -2140,6 +2140,33 @@ def run_kit_workflow(args) -> dict[str, Any]:
     _CLI_OPERATOR = getattr(args, "operator", None) or None
     operator = _resolve_operator(args)
 
+    # --set-printer IP[:PORT]: the answer to the printer_host need_input
+    # below. Validate hard - this becomes the host every safety check
+    # talks to - then merge-persist so every later child command sees it.
+    _sp = getattr(args, "set_printer", None)
+    if _sp:
+        host, _, port_s = str(_sp).strip().partition(":")
+        port = None
+        if port_s:
+            try:
+                port = int(port_s)
+                if not (0 < port < 65536):
+                    raise ValueError
+            except ValueError:
+                _emit(None, {"stage": "error", "kind": "bad_printer_address",
+                             "message": f"not a valid port: {port_s!r}"},
+                      getattr(args, "json_events", True))
+                return {"phase": "error", "error": f"bad port {port_s!r}"}
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,253}$", host):
+            _emit(None, {"stage": "error", "kind": "bad_printer_address",
+                         "message": f"not a valid host/IP: {host!r}"},
+                  getattr(args, "json_events", True))
+            return {"phase": "error", "error": f"bad host {host!r}"}
+        cfg_path = u1_config.set_printer(host, port)
+        _emit(None, {"stage": "printer_configured", "host": host,
+                     "port": port or 7125, "config": str(cfg_path)},
+              getattr(args, "json_events", True))
+
     # --confirm-start <token>: the operator said "yes" at the bed-clear prompt.
     # The model relays ONLY this short token (it mangled the old 200-char
     # verbatim command). Resolve the request + pending nonce from persisted
@@ -2341,6 +2368,41 @@ def run_kit_workflow(args) -> dict[str, Any]:
     }, json_events)
     _audit(request_id, "kit_ingested", operator,
            part_count=kit["part_count"], oversized=kit["oversized_part_ids"])
+
+    # First-run gap caught live 2026-07-12: with NO printer configured
+    # anywhere, the flow used to fall through to "material unknown -
+    # Moonraker unreachable" tool options - indistinguishable from a
+    # printer that is merely off. Never-configured is a setup question,
+    # and the workflow already speaks need_input: ask for the address.
+    # Explicit offline mode (--no-live-material) skips the ask; a
+    # configured-but-unreachable printer keeps the offline-selection
+    # behavior (the start gate re-verifies physical state before
+    # anything prints).
+    if not getattr(args, "no_live_material", False):
+        try:
+            u1_config.get_u1_host()
+        except Exception:
+            base_cmd = _build_next_command(
+                archive, request_id, nozzle=nozzle,
+                no_live_material=False, no_live_upload=no_live_upload)
+            _emit(events_file, {
+                "stage": "need_input", "need": "printer_host",
+                "key": "printer_host", "request_id": request_id,
+                "prompt": ("No printer is configured yet. What is the "
+                           "U1's IP address? (add :port only if it is "
+                           "not 7125)"),
+                "instruction": ("Ask the operator for the address, then "
+                                "re-run the same command with "
+                                "--set-printer <their answer> appended. "
+                                "Example: --set-printer 192.168.1.50"),
+                "next_command": f"{base_cmd} --set-printer <ip[:port]>",
+            }, json_events)
+            _emit(events_file, {"stage": "awaiting_input",
+                                "need": "printer_host",
+                                "request_id": request_id}, json_events)
+            _audit(request_id, "printer_host_requested", operator)
+            return {"phase": "awaiting_printer_host",
+                    "request_id": request_id}
 
     if kit["oversized_part_ids"]:
         _emit(events_file, {
@@ -5726,6 +5788,12 @@ def main(argv=None) -> int:
                     help="LEGACY: structured JSON answer (bypasses staged Q&A)")
 
     ap.add_argument("--request-id", default=None)
+    ap.add_argument("--set-printer", default=None, dest="set_printer",
+                    metavar="IP[:PORT]",
+                    help=("Persist the printer endpoint to u1_config.json "
+                          "(merge - other keys survive) and continue. The "
+                          "workflow asks for this via a need_input when no "
+                          "printer is configured."))
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--operator", default=None)
     ap.add_argument("--nozzle", default="0.4")
