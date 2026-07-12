@@ -50,8 +50,12 @@ DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
 # Canonical deployed path of this gate script — used when building the Stage-1
 # command string the workflow hands to the agent. Self-locating via
 # u1_runtime_paths (this file IS in the runtime scripts dir).
-from u1_runtime_paths import script_path as _script_path, python_cmd as _python_cmd
-GATE_SCRIPT_PATH = _script_path("u1_print_start_gate.py")
+from u1_runtime_paths import (script_shell_path as _script_shell_path,
+                              script_path as _script_path,
+                              python_cmd as _python_cmd)
+# Shell-serialized (forward slashes on Windows): its only consumer is the
+# EMITTED stage-1 command string the agent runs through Git Bash.
+GATE_SCRIPT_PATH = _script_shell_path("u1_print_start_gate.py")
 
 
 def build_stage1_command(*, printer_filename: str, intended_tool: str,

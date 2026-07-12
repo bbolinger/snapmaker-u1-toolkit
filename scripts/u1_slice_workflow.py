@@ -1685,9 +1685,11 @@ def run_workflow(args)->dict[str,Any]:
     # unconditional). --operator is baked ONLY when explicit on this CLI so a
     # test-flavored operator stays sticky across the chain (Fence 1);
     # env-resolved identity stays env-resolved (replay-safe).
-    from u1_runtime_paths import script_path as _script_path, python_cmd as _python_cmd
-    _kit_cmd = (f'{_python_cmd()} {_script_path("u1_kit_workflow.py")} '
-                f'{_shell_quote(str(model))} --json-events')
+    from u1_runtime_paths import (script_shell_path as _script_shell_path,
+                                  shell_path as _shell_path,
+                                  python_cmd as _python_cmd)
+    _kit_cmd = (f'{_python_cmd()} {_script_shell_path("u1_kit_workflow.py")} '
+                f'{_shell_quote(_shell_path(model))} --json-events')
     _cli_op = getattr(args, 'operator', None)
     if _cli_op:
         _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'

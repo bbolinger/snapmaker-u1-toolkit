@@ -166,7 +166,10 @@ import u1_config
 import u1_request
 import u1_review_doc
 from u1_print_start_gate import build_stage1_command
-from u1_runtime_paths import script_path as _script_path, python_cmd as _python_cmd
+from u1_runtime_paths import (script_path as _script_path,
+                              script_shell_path as _script_shell_path,
+                              shell_path as _shell_path,
+                              python_cmd as _python_cmd)
 from u1_slice_workflow import (
     _resolve_operator,
     _shell_quote,
@@ -297,8 +300,8 @@ def _build_next_command(archive: Path, request_id: str, *,
     if operator is None:
         operator = _CLI_OPERATOR
     parts_q = []
-    parts_q.append(f"{_python_cmd()} {_script_path('u1_kit_workflow.py')}")
-    parts_q.append(_shell_quote(str(archive)))
+    parts_q.append(f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')}")
+    parts_q.append(_shell_quote(_shell_path(archive)))
     parts_q.append("--json-events")
     parts_q.append(f"--request-id {request_id}")
     if nozzle:
@@ -3959,7 +3962,7 @@ def _action_reprint_list(events_file: Path | None, json_events: bool,
             label += " (no longer on printer)"
         options.append({
             "n": i, "label": label,
-            "next_command": (f"{_python_cmd()} {_script_path('u1_kit_workflow.py')} "
+            "next_command": (f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')} "
                              f"--reprint-start {tok}"),
         })
     _emit(events_file, {
@@ -4771,7 +4774,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
             "next_command_on_yes": (yes_command or (
                 # Legacy fallback (state-recovery path) — should never be
                 # taken; callers always pass yes_command with full context.
-                f"{_python_cmd()} {_script_path('u1_kit_workflow.py')} "
+                f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')} "
                 f"--request-id {request_id} --action 'start manual-bed-check' "
                 f"--bed-clear-confirmed "
                 f"--operator-text {_shell_quote(operator_text)} "
@@ -4887,7 +4890,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
     _tidx = _tool_to_index(tool)
     extruder = "extruder" if _tidx == 0 else f"extruder{_tidx}"
     stage2_cmd = (
-        f"{_python_cmd()} {_script_path('u1_print_start_gate.py')} "
+        f"{_python_cmd()} {_script_shell_path('u1_print_start_gate.py')} "
         f"{_shell_quote(plate_filename)} "
         f"--intended-tool {extruder} --requested-material {_shell_quote(material)} "
         f"--request-id {request_id} --bed-clear start "

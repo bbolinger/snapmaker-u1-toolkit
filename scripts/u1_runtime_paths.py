@@ -36,6 +36,25 @@ def script_path(name: str) -> str:
     return str(scripts_dir() / name)
 
 
+def shell_path(p) -> str:
+    """Serialize a path for an EMITTED shell command string.
+
+    The agent's terminal on Windows is Git Bash, which eats backslashes in
+    unquoted words: an emitted C:\\Users\\... script path arrived at Python
+    as 'C:Usersbbolinger...' (live 2026-07-11, the first real Windows model
+    hand-off). Forward slashes are valid for both Git Bash and Windows
+    itself, so emitted strings always use them; POSIX output is unchanged.
+    Direct argv construction should keep using script_path/Path objects."""
+    from pathlib import Path as _Path
+    p = _Path(p)
+    return p.as_posix() if os.name == "nt" else str(p)
+
+
+def script_shell_path(name: str) -> str:
+    """script_path(), serialized for an emitted shell command string."""
+    return shell_path(scripts_dir() / name)
+
+
 def python_cmd() -> str:
     """Interpreter name for EMITTED command strings (next_command, stage-1
     commands) that the agent's terminal or an operator will run on this
