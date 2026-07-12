@@ -250,6 +250,81 @@ def _is_safe_artifact(path_str: str) -> bool:
         return False
 
 
+def arm_from_tool_result(tool_output: str) -> int:
+    """Arm the attach marker from a terminal tool's workflow stdout, keyed by
+    THIS turn's session (the gateway contextvar).
+
+    This is the RELIABLE arming path. The workflow's own `_arm_pending_attach`
+    can't arm on the fresh-kit flow: Hermes' terminal tool never threads
+    HERMES_SESSION_KEY into the spawned command's env (it only builds a
+    "session:<key>" identifier), so the workflow reads an empty key and
+    refuses (live 2026-07-12: a fresh kit's iso image dropped because gemma
+    echoed a mangled path and the injector, unarmed, could not override it).
+    This function runs gateway-side inside `transform_tool_result`, where
+    `_session_key()` resolves via the same contextvar the injector reads — so
+    arming no longer depends on how gemma spawned the workflow or on gemma
+    echoing paths correctly.
+
+    Reads the AUTHORITATIVE `render`/`review_doc` paths straight from the
+    workflow's own JSON events (never gemma's reply), validates each with
+    `_is_safe_artifact`, and writes the marker only at the review moment
+    (a `bed_clear_start`/`kit_readiness_card` event present). Returns the
+    number of artifacts armed. Best-effort; never raises."""
+    try:
+        if not tool_output or '"render"' not in tool_output:
+            return 0
+        # Only arm at the operator's review moment, not on every render event.
+        if ("bed_clear_start" not in tool_output
+                and "kit_readiness_card" not in tool_output):
+            return 0
+        images: list[str] = []
+        docs: list[str] = []
+        request_id: str | None = None
+        for line in tool_output.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if not request_id and ev.get("request_id"):
+                request_id = str(ev["request_id"])
+            stage = ev.get("stage")
+            if stage == "render" and ev.get("image"):
+                images.append(str(ev["image"]))
+            elif stage == "review_doc" and ev.get("path"):
+                docs.append(str(ev["path"]))
+        safe_imgs = [p for p in dict.fromkeys(images) if _is_safe_artifact(p)]
+        safe_docs = [p for p in dict.fromkeys(docs) if _is_safe_artifact(p)]
+        if not safe_imgs and not safe_docs:
+            return 0
+        path = _marker_path_for_session()
+        if path is None:
+            return 0  # no session key even gateway-side -> can't key the marker
+        _PENDING_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "request_id": request_id,
+            "images": safe_imgs,
+            "documents": safe_docs,
+            "operator": None,
+            "created_at": time.time(),
+        }
+        tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+        logger.info(
+            "snapmaker_u1 attach: armed marker gateway-side from tool result "
+            "(%d image(s), %d doc(s), request_id=%s)",
+            len(safe_imgs), len(safe_docs), request_id,
+        )
+        return len(safe_imgs) + len(safe_docs)
+    except Exception:
+        return 0
+
+
 def transform(response_text: str = "", session_id: str = "", model: str = "",
               platform: str = "", **kwargs: Any) -> Any:
     """Inject authoritative U1 attachment paths so core delivers the real files.

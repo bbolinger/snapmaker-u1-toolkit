@@ -339,3 +339,91 @@ def test_env_fallback_when_gateway_absent(attach_dir, tmp_path):
     assert ai._session_key() == _SESSION_KEY  # from the fixture's env var
     out = ai.transform(response_text="Reply YES.", session_id="s")
     assert out is not None and bed in out
+
+
+# --------------------------------------------------------------------------- #
+# Gateway-side arming from the tool result (v2.4.1 fix, live 2026-07-12)
+# The workflow can't arm on the fresh-kit flow (Hermes' terminal tool doesn't
+# thread HERMES_SESSION_KEY into the command env), so the transform_tool_result
+# hook arms the marker from the workflow's authoritative render paths instead.
+# --------------------------------------------------------------------------- #
+
+def _tool_output(*events):
+    """The workflow's JSON-lines stdout as the terminal tool returns it."""
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_arm_from_tool_result_writes_marker_and_injects(attach_dir, tmp_path):
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    iso = _artifact(tmp_path, "plate_1_iso.png")
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    review = _artifact(tmp_path, "review.md")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "kind": "kit_plate_preview", "image": preview},
+        {"stage": "render", "request_id": _RID, "kind": "kit_plate_isometric", "image": iso},
+        {"stage": "review_doc", "request_id": _RID, "path": review},
+        {"stage": "render", "request_id": _RID, "kind": "bed_snapshot", "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 4
+    out = ai.transform(response_text="Reply YES to start.", session_id="s")
+    assert out is not None
+    for p in (preview, iso, bed, review):
+        assert p in out
+
+
+def test_arm_from_tool_result_overrides_gemma_mangled_echo(attach_dir, tmp_path):
+    """The exact live failure: gemma echoes a mangled iso path (u1_206 vs
+    u1_2026). Gateway-side arming + injection must strip the mangle and deliver
+    the real file from the workflow's own authoritative path."""
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    iso = _artifact(tmp_path, "plate_1_iso.png")
+    review = _artifact(tmp_path, "review.md")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "render", "request_id": _RID, "image": iso},
+        {"stage": "review_doc", "request_id": _RID, "path": review},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    ai.arm_from_tool_result(output)
+    mangled_iso = iso.replace("u1_2026", "u1_206")  # gemma dropped a digit
+    reply = f"Sliced plate below.\n{preview} {mangled_iso}\nBed clear? Reply YES."
+    out = ai.transform(response_text=reply, session_id="s")
+    assert out is not None
+    assert iso in out, "authoritative iso injected"
+    assert "u1_206" not in out, "gemma's mangled echo stripped"
+    assert review in out
+
+
+def test_arm_from_tool_result_noop_before_review_moment(attach_dir, tmp_path):
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "kit_ingested", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 0
+    assert not list(attach_dir.iterdir())
+
+
+def test_arm_from_tool_result_rejects_forged_paths(attach_dir, tmp_path):
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": "/etc/hosts"},
+        {"stage": "review_doc", "request_id": _RID, "path": "/etc/passwd"},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 0
+    assert not list(attach_dir.iterdir())
+
+
+def test_next_action_hook_arms_attach_as_side_effect(attach_dir, tmp_path):
+    from snapmaker_u1.hooks import next_action_directive as nad
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "render", "request_id": _RID, "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    nad.transform(tool_name="terminal", result=json.dumps({"output": output}))
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and preview in out and bed in out

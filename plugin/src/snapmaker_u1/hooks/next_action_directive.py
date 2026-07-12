@@ -57,6 +57,20 @@ def transform(tool_name: str = "", args: Any = None, result: Any = None,
     except (ValueError, TypeError):
         return None
     output = result_dict.get("output", "") or ""
+
+    # Side effect (v2.4.1 fix, live 2026-07-12): arm the structural-attach
+    # marker here, gateway-side, from the workflow's authoritative render
+    # paths. The workflow itself cannot arm on the fresh-kit flow because
+    # Hermes' terminal tool never threads HERMES_SESSION_KEY into the command
+    # env; this hook runs with the session contextvar available. Arming is a
+    # pure side effect and never changes what this hook returns.
+    if output:
+        try:
+            from .attachment_injector import arm_from_tool_result
+            arm_from_tool_result(output)
+        except Exception:
+            pass
+
     if not output or "next_action_required" not in output:
         return None
     m = _NEXT_ACTION_RE.search(output)
