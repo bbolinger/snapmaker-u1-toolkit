@@ -477,7 +477,31 @@ def main() -> int:
         upload_source = Path(_tmp_for_rename.name) / Path(uploaded_filename).name
         shutil.copyfile(gcode, upload_source)
     try:
-        response = multipart_upload(upload_url, {"root": "gcodes", "path": args.path, "print": "false"}, "file", upload_source)
+        _t0 = time.monotonic()
+        try:
+            response = multipart_upload(upload_url, {"root": "gcodes", "path": args.path, "print": "false"}, "file", upload_source)
+        except Exception as exc:
+            # Transport failure IS the rc=4 contract - it must not escape as
+            # a bare traceback and generic rc=1 (first Windows live upload,
+            # 2026-07-12: a connect timeout left nothing diagnosable). Record
+            # the same granular artifact the success path writes, with the
+            # target URL (no credentials ride in it), exception class, and
+            # elapsed time.
+            diag = {
+                "moonraker_upload_ok": False,
+                "remote_metadata_ok": False,
+                "ok": False,
+                "transport_error": f"{type(exc).__name__}: {exc}"[:400],
+                "upload_url": upload_url,
+                "elapsed_s": round(time.monotonic() - _t0, 1),
+                "uploaded_filename": uploaded_filename,
+            }
+            art = get_data_dir() / "latest_upload_result.json"
+            art.parent.mkdir(parents=True, exist_ok=True)
+            art.write_text(json.dumps(diag, indent=2), encoding="utf-8")
+            print("UPLOAD FAILED (transport error before Moonraker answered)")
+            print(json.dumps(diag, indent=2))
+            return 4
     finally:
         if _tmp_for_rename is not None:
             _tmp_for_rename.cleanup()

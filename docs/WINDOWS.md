@@ -53,10 +53,14 @@ Most path plumbing resolves itself:
 - `deploy_to_runtime.sh` deploys into `$HERMES_HOME` when `/opt/data`
   does not exist. Set `HERMES_HOME` first.
 
-The bundled skill text shows the Linux command paths. After deploying on
-Windows, the workflow's own emitted `next_command` strings are correct
-for your install; if the model's FIRST call fails on a Linux-style path,
-update the deployed SKILL.md copy to your scripts dir.
+The bundled skill text shows the Linux command paths. After installing
+the skill on Windows, edit the deployed SKILL.md copy (under your Hermes
+skills dir) and change its `python3 /opt/data/scripts/...` commands to
+`python C:/path/to/checkout/scripts/...`. Everything AFTER the model's
+first call self-corrects — the workflow's own emitted commands carry the
+right interpreter and paths — but that first call comes from the skill
+text, and a Linux-shaped one dies on Windows. Automating this rewrite at
+install time is planned; for now it is a one-time manual step.
 
 ## Live workflow setup (before pointing at a real printer)
 

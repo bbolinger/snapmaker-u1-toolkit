@@ -2999,6 +2999,10 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                     "moonraker_upload_ok": ok,
                     "post_upload_blockers": up.get("post_upload_blockers"),
                     "human_summary": up.get("human_summary"),
+                    # The helper's actual stdout tail - without it the event
+                    # tells the operator to read an error it never carried
+                    # (first Windows live upload, 2026-07-12).
+                    "output": str(up.get("output") or "")[-1500:],
                 })
             elif rc == 3:
                 # File IS on printer; post-upload blockers are state warnings
@@ -5418,6 +5422,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                     "returncode": _rc,
                     "moonraker_upload_ok": up.get("moonraker_upload_ok"),
                     "human_summary": up.get("human_summary"),
+                    # Helper stdout tail (see the staged-path twin above).
+                    "output": str(up.get("output") or "")[-1500:],
                 })
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])

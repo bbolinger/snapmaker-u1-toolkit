@@ -32,6 +32,34 @@ FALLBACK_PORT = 7125
 _DOTENV_LOADED = False
 
 
+# Values _load_dotenv_if_present injected into os.environ, keyed by env var.
+# Lets resolution tell an EXPLICIT process environment value apart from a
+# .env fallback: a copied .env.example placeholder host must not beat the
+# operator's deliberately persisted u1_config.json (live 2026-07-12 on the
+# first Windows workflow - children resolved the sample 192.168.1.100 while
+# the saved real printer sat unused).
+_DOTENV_VALUES: dict[str, str] = {}
+
+
+def _env_explicit(key: str) -> str | None:
+    """The process-environment value for key, ONLY if it did not come from
+    the .env fallback loader (same key, same value => dotenv-injected)."""
+    val = os.environ.get(key)
+    if val is None:
+        return None
+    if _DOTENV_VALUES.get(key) == val:
+        return None
+    return val
+
+
+def _env_dotenv(key: str) -> str | None:
+    """The .env-injected value for key, if that is what os.environ holds."""
+    val = os.environ.get(key)
+    if val is not None and _DOTENV_VALUES.get(key) == val:
+        return val
+    return None
+
+
 def _load_dotenv_if_present() -> None:
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
@@ -69,6 +97,7 @@ def _load_dotenv_if_present() -> None:
                     v = v[1:-1]
                 if k and k not in os.environ:
                     os.environ[k] = v
+                    _DOTENV_VALUES[k] = v
         except OSError:
             pass
         return  # first .env wins; don't keep walking
@@ -158,9 +187,14 @@ def _load_file() -> dict[str, Any]:
 
 
 def get_u1_host(default: str | None = None) -> str:
+    """Precedence: explicit process env > persisted u1_config.json > .env
+    fallback > caller default. The persisted config is the operator's
+    deliberate first-run choice (--set-printer); only an EXPLICIT env var
+    outranks it, never a value the .env loader injected."""
     _load_dotenv_if_present()
     file_cfg = _load_file()
-    host = os.environ.get("SNAPMAKER_U1_HOST") or file_cfg.get("host") or default
+    host = (_env_explicit("SNAPMAKER_U1_HOST") or file_cfg.get("host")
+            or _env_dotenv("SNAPMAKER_U1_HOST") or default)
     if not host:
         raise RuntimeError(
             f"Snapmaker U1 host not configured; set SNAPMAKER_U1_HOST or "
@@ -172,7 +206,8 @@ def get_u1_host(default: str | None = None) -> str:
 def get_u1_port(default: int = FALLBACK_PORT) -> int:
     _load_dotenv_if_present()
     file_cfg = _load_file()
-    raw = os.environ.get("SNAPMAKER_U1_PORT") or file_cfg.get("port") or default
+    raw = (_env_explicit("SNAPMAKER_U1_PORT") or file_cfg.get("port")
+           or _env_dotenv("SNAPMAKER_U1_PORT") or default)
     return int(raw)
 
 
@@ -205,8 +240,8 @@ def get_orca_bin(
     path)."""
     _load_dotenv_if_present()
     file_cfg = _load_file()
-    return str(os.environ.get("ORCA_SLICER_BIN")
-               or file_cfg.get("orca_bin") or default)
+    return str(_env_explicit("ORCA_SLICER_BIN") or file_cfg.get("orca_bin")
+               or _env_dotenv("ORCA_SLICER_BIN") or default)
 
 
 def get_u1_base_url(host: str | None = None, port: int | None = None) -> str:
