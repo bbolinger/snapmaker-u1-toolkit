@@ -314,12 +314,20 @@ def test_transport_failure_maps_to_rc4_with_diagnostics(tmp_path, monkeypatch,
     def _boom(*a, **kw):
         raise TimeoutError("connect timed out")
 
-    monkeypatch.setattr(u1_upload_gcode, "multipart_upload", _boom)
+    # Resolve the module FRESH from sys.modules: an earlier test
+    # (test_scripts_import_without_any_config) re-imports the scripts, so
+    # this file's import-time reference can be a stale module object that
+    # mock_http (string-target patching) never touches - the stale copy's
+    # real http_json then walks to the network (caught in the 2026-07-12
+    # full-suite run after passing solo).
+    import importlib
+    uug = importlib.import_module("u1_upload_gcode")
+    monkeypatch.setattr(uug, "multipart_upload", _boom)
     monkeypatch.setenv("SNAPMAKER_U1_HOST", "192.0.2.1")
     import sys as _sys
     monkeypatch.setattr(_sys, "argv",
                         ["u1_upload_gcode.py", str(gcode), "--material", "PETG"])
-    rc = u1_upload_gcode.main()
+    rc = uug.main()
     assert rc == 4, capsys.readouterr().out[-800:]
     out = capsys.readouterr().out
     assert "transport error" in out
