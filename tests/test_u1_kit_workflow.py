@@ -843,3 +843,32 @@ def test_no_live_material_skips_the_ask(tmp_path, monkeypatch, capsys, fake_prof
     events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
     assert not any(e.get("need") == "printer_host" for e in events), (
         "explicit offline mode must not demand a printer address")
+
+
+def test_missing_operator_binding_warns_at_ingest(tmp_path, monkeypatch, capsys, fake_profiles):
+    """The YES gate's hard requirement must be announced at step zero, not
+    discovered at the bed-clear prompt after a full flow + slice + upload
+    (live 2026-07-12, first Windows E2E)."""
+    monkeypatch.setattr(kw.u1_config, "get_operator_binding", lambda: None)
+    stl = _cube(tmp_path / "part.stl", 20)
+    kw.main([str(stl), "--json-events"])
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    warn = next((e for e in events
+                 if e.get("kind") == "operator_binding_unconfigured"), None)
+    assert warn is not None, f"stages={[e.get('stage') for e in events]}"
+    assert "U1_OPERATOR_BINDING" in warn["message"]
+    assert "not through this chat" in warn["message"]
+    # Non-blocking: the flow still reaches the first real prompt.
+    assert any(e.get("stage") == "need_input" for e in events)
+
+
+def test_configured_binding_does_not_warn(tmp_path, monkeypatch, capsys, fake_profiles):
+    monkeypatch.setattr(kw.u1_config, "get_operator_binding",
+                        lambda: ("telegram", "8131922235"))
+    stl = _cube(tmp_path / "part.stl", 20)
+    kw.main([str(stl), "--json-events"])
+    out = capsys.readouterr().out
+    events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
+    assert not any(e.get("kind") == "operator_binding_unconfigured"
+                   for e in events)

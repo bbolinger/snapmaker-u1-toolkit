@@ -2404,6 +2404,28 @@ def run_kit_workflow(args) -> dict[str, Any]:
             return {"phase": "awaiting_printer_host",
                     "request_id": request_id}
 
+    # Same first-run courtesy as the printer address, but as a WARNING, not
+    # an ask: the operator binding is an auth root, so it must be configured
+    # out-of-band (whoever is chatting - stranger or model - must not be able
+    # to bind themselves). Discovering this hard gate only at the bed-clear
+    # prompt, after a full flow + slice + upload, is hostile (live 2026-07-12
+    # on the first Windows E2E). Announce it at step zero instead; slicing
+    # and staging still work unbound - only the final YES refuses.
+    if u1_config.get_operator_binding() is None:
+        _emit(events_file, {
+            "stage": "warning", "kind": "operator_binding_unconfigured",
+            "request_id": request_id,
+            "message": ("No operator binding is configured, so the final "
+                        "start confirmation will be REFUSED. Slicing and "
+                        "uploading still work. To enable starts, add "
+                        "U1_OPERATOR_BINDING=telegram:<your numeric user id> "
+                        "to the .env next to the toolkit (message "
+                        "@userinfobot on Telegram to see your id), then "
+                        "restart the gateway. This must be set in the file, "
+                        "not through this chat."),
+        }, json_events)
+        _audit(request_id, "operator_binding_unconfigured_warned", operator)
+
     if kit["oversized_part_ids"]:
         _emit(events_file, {
             "stage": "warning", "kind": "oversized_parts",
