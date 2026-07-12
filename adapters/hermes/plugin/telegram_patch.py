@@ -72,6 +72,10 @@ def _load_renderer():
         return u1_form_telegram
 
 
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5 (see the cancel handler).
+_U1_LEGACY_CANCEL_DIR = "/tmp/u1_pending_cancel"
+
+
 def _u1_pending_dir(kind):
     """KEEP IN SYNC with scripts/u1_pending.py (canonical copy + rationale).
     This file deploys standalone as the u1-form plugin, so the ~10-line
@@ -98,6 +102,13 @@ async def _u1_handle_cancel_callback(adapter, update, ctx):
     q = update.callback_query
     rid = (q.data or "").split(":", 1)[-1]
     pending = _u1_pending_dir("cancel") / f"{rid}.json"
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: a pre-v2.4.1 notify
+    # script writes the routing entry to the old literal location; the
+    # button must not go dead across a partial upgrade.
+    if not pending.exists():
+        legacy = _P(_U1_LEGACY_CANCEL_DIR) / f"{rid}.json"
+        if legacy.exists():
+            pending = legacy
     touched = False
     try:
         st = _json.loads(pending.read_text())

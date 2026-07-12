@@ -22,7 +22,8 @@ def test_expired_window_notifies(tmp_path, monkeypatch):
     outcome = wd.run("u1_x", "grip.gcode", str(marker), 0, sleep=lambda s: None)
     assert outcome == "notified"
     assert not marker.exists()                    # window cleaned up
-    assert sent and sent[0][:2] == ["python3", wd._NOTIFY_PY]
+    import sys
+    assert sent and sent[0][:2] == [sys.executable, wd._NOTIFY_PY]
     assert "grip.gcode" in sent[0][2] and "expired" in sent[0][2]
 
 

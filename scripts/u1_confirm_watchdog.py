@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def run(request_id: str, filename: str, marker_path: str, ttl: int,
            "expired with no YES. Nothing was printed. Re-run the flow when "
            "ready.")
     try:
-        subprocess.run(["python3", _NOTIFY_PY, msg], timeout=30)
+        subprocess.run([sys.executable, _NOTIFY_PY, msg], timeout=30)
     except Exception:
         return "error"
     return "notified"

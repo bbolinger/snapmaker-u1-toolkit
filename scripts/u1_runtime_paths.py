@@ -34,3 +34,13 @@ def script_path(name: str) -> str:
     """Absolute path of a sibling runtime script, as a string ready for
     argv or an emitted next_command."""
     return str(scripts_dir() / name)
+
+
+def python_cmd() -> str:
+    """Interpreter name for EMITTED command strings (next_command, stage-1
+    commands) that the agent's terminal or an operator will run on this
+    same machine. POSIX keeps the conventional python3; stock Windows has
+    no python3 - only python (and a WindowsApps python3 STUB that spawns
+    and dies silently, worse than not existing). Code that spawns
+    subprocesses directly should use sys.executable instead."""
+    return "python" if os.name == "nt" else "python3"

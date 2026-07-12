@@ -35,6 +35,12 @@ Everything else resolves itself:
 - If Hermes Desktop injects its own venv into `PYTHONPATH`, the
   workflow detects the poisoned environment and relaunches itself with
   it cleared (set `U1_KEEP_PYTHONPATH=1` if you genuinely need it kept).
+- Interpreter resolution: gateway-side components spawn their own
+  interpreter (`sys.executable`), never a bare `python3` (stock Windows
+  has none, only the WindowsApps stub). Emitted commands use `python` on
+  Windows. Overrides if you need them: `U1_KIT_PYTHON` (the u1_kit tool),
+  `U1_PYTHON` (the notify script), `U1_TOOLKIT_PYTHON` (the workflow
+  bootstrap's first candidate).
 - `adapters/hermes/install.py` understands the Windows venv layout
   (`Lib\site-packages`, `Scripts\python.exe`). Pass
   `--venv 'C:/Users/<you>/AppData/Local/hermes/hermes-agent/venv'`

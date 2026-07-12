@@ -51,6 +51,8 @@ def sandbox_pending_dir(tmp_path, monkeypatch):
     pending = tmp_path / "u1_pending_cancel"
     pending.mkdir()
     monkeypatch.setattr(handler, "PENDING_DIR", pending)
+    # Sandbox the v2.4.1 legacy-dir shim away from the real /tmp.
+    monkeypatch.setattr(handler, "LEGACY_PENDING_DIR", tmp_path / "legacy")
     monkeypatch.setattr(handler, "LOG_FILE", tmp_path / "hook.log")
     return handler, pending, tmp_path
 
@@ -190,6 +192,18 @@ def test_handler_ignores_empty_message(sandbox_pending_dir):
     _seed_pending(pending, "u1_2026_0701_empt01", marker)
     _run(handler, "")
     assert not marker.exists()
+
+
+def test_handler_cancels_window_in_legacy_dir(sandbox_pending_dir):
+    """v2.4.1 upgrade shim: a routing entry written by a pre-v2.4.1 notify
+    script (old literal location) must still be cancellable by reply-CANCEL."""
+    handler, pending, tmp = sandbox_pending_dir
+    legacy = tmp / "legacy"
+    legacy.mkdir(exist_ok=True)
+    marker = tmp / "marker_legacy.txt"
+    _seed_pending(legacy, "u1_2026_0701_leg001", marker)
+    _run(handler, "cancel")
+    assert marker.exists(), "legacy-dir window must still cancel"
 
 
 # ─── Notify shell script tests ──────────────────────────────────────────────

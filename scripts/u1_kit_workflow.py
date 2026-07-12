@@ -166,7 +166,7 @@ import u1_config
 import u1_request
 import u1_review_doc
 from u1_print_start_gate import build_stage1_command
-from u1_runtime_paths import script_path as _script_path
+from u1_runtime_paths import script_path as _script_path, python_cmd as _python_cmd
 from u1_slice_workflow import (
     _resolve_operator,
     _shell_quote,
@@ -297,7 +297,7 @@ def _build_next_command(archive: Path, request_id: str, *,
     if operator is None:
         operator = _CLI_OPERATOR
     parts_q = []
-    parts_q.append(f"python3 {_script_path('u1_kit_workflow.py')}")
+    parts_q.append(f"{_python_cmd()} {_script_path('u1_kit_workflow.py')}")
     parts_q.append(_shell_quote(str(archive)))
     parts_q.append("--json-events")
     parts_q.append(f"--request-id {request_id}")
@@ -3582,6 +3582,8 @@ def _arm_pending_attach(request_id: str, images: "list[str] | None",
 # u1_confirm_start gateway hook redeems the operator's actual YES message
 # by spawning the confirm command directly. The model has nothing to fire.
 _PENDING_CONFIRM_DIR = _pending_dir("confirm")
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5 (see _relay grace-cancel).
+_LEGACY_PENDING_CANCEL_DIR = Path("/tmp/u1_pending_cancel")
 _PENDING_CONFIRM_TTL_S = 15 * 60
 
 
@@ -3670,7 +3672,7 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
     script = str(Path(__file__).resolve().parent / "u1_confirm_watchdog.py")
     try:
         import subprocess as _sp
-        _sp.Popen(["python3", script, request_id,
+        _sp.Popen([sys.executable, script, request_id,
                    str(filename or "the pending print"), marker,
                    str(_PENDING_CONFIRM_TTL_S), generation],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -3692,17 +3694,28 @@ def _release_confirm_claim(request_id: str, claim_id: str | None = None) -> None
     yet (audit finding #3). Without one (direct/legacy invocation) fall back to
     the request-wide glob."""
     try:
+        def _unlink_tolerant(path: Path) -> None:
+            # Windows share-violation window: the parent gateway holds the
+            # claim open mid-pid-record (open 'r+') exactly when the child
+            # commits. A PermissionError here must not silently strand the
+            # claim past its commitment point (the reaper would later
+            # "restore" a window whose token is spent) — retry briefly.
+            for _ in range(20):
+                try:
+                    path.unlink()
+                    return
+                except FileNotFoundError:
+                    return
+                except PermissionError:
+                    time.sleep(0.01)
+            path.unlink()  # final attempt; a real error surfaces
+
         if claim_id:
-            try:
-                (_PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json").unlink()
-            except FileNotFoundError:
-                pass
+            _unlink_tolerant(
+                _PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json")
             return
         for c in _PENDING_CONFIRM_DIR.glob(f"{request_id}.claimed.*.json"):
-            try:
-                c.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink_tolerant(c)
     except Exception:
         pass
 
@@ -3735,10 +3748,17 @@ def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, A
     start analogue by design."""
     from datetime import datetime, timezone
     pending_dir = _pending_dir("cancel")
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: also scan the
+    # pre-v2.4.1 literal location so this cancel fallback can't go dead
+    # across a partial upgrade (readers scan both, writers only write the
+    # new location).
+    scan_dirs = [pending_dir] + (
+        [_LEGACY_PENDING_CANCEL_DIR]
+        if _LEGACY_PENDING_CANCEL_DIR != pending_dir else [])
     touched: list[str] = []
     now = datetime.now(timezone.utc)
-    if pending_dir.exists():
-        for f in sorted(pending_dir.iterdir()):
+    if any(d.exists() for d in scan_dirs):
+        for f in sorted(f for d in scan_dirs if d.exists() for f in d.iterdir()):
             if not f.is_file() or f.suffix != ".json":
                 continue
             try:
@@ -3939,7 +3959,7 @@ def _action_reprint_list(events_file: Path | None, json_events: bool,
             label += " (no longer on printer)"
         options.append({
             "n": i, "label": label,
-            "next_command": (f"python3 {_script_path('u1_kit_workflow.py')} "
+            "next_command": (f"{_python_cmd()} {_script_path('u1_kit_workflow.py')} "
                              f"--reprint-start {tok}"),
         })
     _emit(events_file, {
@@ -4751,7 +4771,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
             "next_command_on_yes": (yes_command or (
                 # Legacy fallback (state-recovery path) — should never be
                 # taken; callers always pass yes_command with full context.
-                f"python3 {_script_path('u1_kit_workflow.py')} "
+                f"{_python_cmd()} {_script_path('u1_kit_workflow.py')} "
                 f"--request-id {request_id} --action 'start manual-bed-check' "
                 f"--bed-clear-confirmed "
                 f"--operator-text {_shell_quote(operator_text)} "
@@ -4867,7 +4887,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
     _tidx = _tool_to_index(tool)
     extruder = "extruder" if _tidx == 0 else f"extruder{_tidx}"
     stage2_cmd = (
-        f"python3 {_script_path('u1_print_start_gate.py')} "
+        f"{_python_cmd()} {_script_path('u1_print_start_gate.py')} "
         f"{_shell_quote(plate_filename)} "
         f"--intended-tool {extruder} --requested-material {_shell_quote(material)} "
         f"--request-id {request_id} --bed-clear start "

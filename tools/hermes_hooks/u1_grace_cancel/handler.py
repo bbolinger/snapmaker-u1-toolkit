@@ -62,6 +62,12 @@ def _pending_dir(kind: str) -> Path:
 
 
 PENDING_DIR = _pending_dir("cancel")
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5. Pre-v2.4.1 notify scripts
+# write routing entries to the old literal location; a partially upgraded
+# install (deploy run, hooks installer forgotten, or vice versa) must not
+# leave the advertised reply-CANCEL silently dead across the skew. Readers
+# scan both; writers only ever write the new location.
+LEGACY_PENDING_DIR = Path("/tmp/u1_pending_cancel")
 LOG_FILE = Path(__file__).parent / "hook.log"
 
 CANCEL_KEYWORDS = {
@@ -127,13 +133,15 @@ def _is_cancel_message(text: str) -> bool:
 
 
 def _load_pending_windows() -> list[dict]:
-    """Read every json file in PENDING_DIR, drop expired or malformed
-    entries. Returns a list of active pending-window state dicts."""
-    if not PENDING_DIR.exists():
-        return []
+    """Read every json file in PENDING_DIR (and, one release only, the
+    pre-v2.4.1 legacy dir), drop expired or malformed entries. Returns a
+    list of active pending-window state dicts."""
+    scan_dirs = [PENDING_DIR]
+    if LEGACY_PENDING_DIR != PENDING_DIR and LEGACY_PENDING_DIR.exists():
+        scan_dirs.append(LEGACY_PENDING_DIR)
     now = datetime.now(timezone.utc)
     out = []
-    for p in PENDING_DIR.iterdir():
+    for p in (f for d in scan_dirs if d.exists() for f in d.iterdir()):
         if not p.is_file() or p.suffix != ".json":
             continue
         try:

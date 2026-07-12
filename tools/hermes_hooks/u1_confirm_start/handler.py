@@ -32,7 +32,7 @@ Contract with u1_kit_workflow.py:
     instructions to run (review finding: the old confirm_cmd field made
     anything that could write /tmp a command author, gated only by the
     word "yes"). The spawned command is exactly
-      python3 <scripts-dir>/u1_kit_workflow.py \
+      <this gateway's own interpreter> <scripts-dir>/u1_kit_workflow.py \
           --confirm-start-for <request_id> --json-events
     with request_id validated against ^u1_[a-z0-9_]+$ first. The workflow
     resolves the persisted single-use confirm token server-side and then
@@ -73,6 +73,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import uuid
 
 def _pending_dir(kind: str) -> Path:
@@ -90,6 +91,10 @@ def _pending_dir(kind: str) -> Path:
 
 
 PENDING_DIR = _pending_dir("confirm")
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5: scan the pre-v2.4.1
+# literal location too (readers scan both, writers only write the new
+# location) so a partial upgrade cannot leave armed YES windows dead.
+LEGACY_PENDING_DIR = Path("/tmp/u1_pending_confirm")
 LOG_FILE = Path(__file__).parent / "hook.log"
 
 def _scripts_dir() -> Path:
@@ -136,7 +141,7 @@ def _notify_operator(text: str) -> None:
     declined something and why. Best-effort; failures only log."""
     try:
         import subprocess as _sp
-        _sp.Popen(["python3", str(_scripts_dir() / "u1_notify.py"), text],
+        _sp.Popen([sys.executable, str(_scripts_dir() / "u1_notify.py"), text],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
     except Exception as exc:
@@ -222,7 +227,12 @@ def _pid_alive(pid: int) -> bool:
         k32 = ctypes.windll.kernel32
         handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not handle:
-            return False     # no such process
+            # ERROR_ACCESS_DENIED means the pid EXISTS but is protected
+            # (e.g. recycled to an elevated process) — treat as alive, do
+            # not reap on uncertainty. Anything else: no such process.
+            # Accepted collision: a child exiting with code 259
+            # (STILL_ACTIVE) reads as alive; the window TTL bounds it.
+            return k32.GetLastError() == 5  # ERROR_ACCESS_DENIED
         try:
             code = ctypes.c_ulong()
             if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -319,12 +329,19 @@ def _load_pending_windows() -> list[dict]:
       * expires_at more than 24h out        -> quarantine
       * expired                             -> delete
     `.claimed.` files are in-flight spawns, not windows — skipped."""
-    if not PENDING_DIR.exists():
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: also scan the
+    # pre-v2.4.1 literal location so a partially upgraded install's YES
+    # windows are still redeemable (readers scan both, writers only write
+    # the new location; this side fails closed either way, the shim just
+    # spares the operator a dead YES during the skew).
+    scan_dirs = [PENDING_DIR] + (
+        [LEGACY_PENDING_DIR] if LEGACY_PENDING_DIR != PENDING_DIR else [])
+    if not any(d.exists() for d in scan_dirs):
         return []
     _reap_orphaned_claims()
     now = datetime.now(timezone.utc)
     out = []
-    for p in sorted(PENDING_DIR.iterdir()):
+    for p in sorted(p for d in scan_dirs if d.exists() for p in d.iterdir()):
         if not p.is_file() or p.suffix != ".json" or ".claimed." in p.name:
             continue
         try:
@@ -478,7 +495,11 @@ def _spawn_confirm(state: dict) -> bool:
         return False
     # The child releases ONLY this claim_id at its commitment point (audit #3),
     # so a concurrently re-armed generation's claim is never deleted.
-    cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid,
+    # sys.executable, never a bare python3: this hook runs inside the
+    # gateway interpreter, which is guaranteed to exist; on stock native
+    # Windows python3 is absent or a WindowsApps stub that spawns and
+    # dies silently (claim recorded, child gone, endless reaper retries).
+    cmd = [sys.executable, WORKFLOW_PY, "--confirm-start-for", rid,
            "--confirm-claim-id", claim_id, "--json-events"]
     # Log path is DERIVED, never read from the marker.
     log_path = _pending_dir("log") / f"u1_confirm_start_{rid}.log"

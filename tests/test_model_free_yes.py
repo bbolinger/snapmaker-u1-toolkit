@@ -85,6 +85,8 @@ def _stable_printer_metadata(monkeypatch):
 def pending_dir(tmp_path, monkeypatch):
     d = tmp_path / "pending_confirm"
     monkeypatch.setattr(hook, "PENDING_DIR", d)
+    # Sandbox the v2.4.1 legacy-dir shim away from the real /tmp.
+    monkeypatch.setattr(hook, "LEGACY_PENDING_DIR", tmp_path / "legacy_confirm")
     monkeypatch.setattr(kw, "_PENDING_CONFIRM_DIR", d)
     monkeypatch.setattr(hook, "LOG_FILE", tmp_path / "hook.log")
     monkeypatch.setattr(kw.u1_config, "get_operator_binding",
@@ -124,7 +126,8 @@ def _expected_cmd(rid):
     """The one and only argv shape the hook may spawn — built by the hook
     from its own constants (hook.WORKFLOW_PY resolves per deployment),
     never from marker content."""
-    return ["python3", hook.WORKFLOW_PY,
+    import sys as _sys
+    return [_sys.executable, hook.WORKFLOW_PY,
             "--confirm-start-for", rid, "--json-events"]
 
 

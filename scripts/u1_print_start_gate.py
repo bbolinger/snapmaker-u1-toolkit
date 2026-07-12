@@ -50,7 +50,7 @@ DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
 # Canonical deployed path of this gate script — used when building the Stage-1
 # command string the workflow hands to the agent. Self-locating via
 # u1_runtime_paths (this file IS in the runtime scripts dir).
-from u1_runtime_paths import script_path as _script_path
+from u1_runtime_paths import script_path as _script_path, python_cmd as _python_cmd
 GATE_SCRIPT_PATH = _script_path("u1_print_start_gate.py")
 
 
@@ -62,7 +62,7 @@ def build_stage1_command(*, printer_filename: str, intended_tool: str,
     """
     import shlex
     return (
-        f"python3 {GATE_SCRIPT_PATH} {printer_filename} "
+        f"{_python_cmd()} {GATE_SCRIPT_PATH} {printer_filename} "
         f"--intended-tool {intended_tool} --requested-material {shlex.quote(str(material))} "
         f"--request-id {request_id}"
     )
@@ -666,6 +666,10 @@ def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
     # sibling copy (self-locating, correct on any platform).
     env['U1_NOTIFY_PY'] = (_os.environ.get('U1_NOTIFY_PY', '').strip()
                            or _script_path('u1_notify.py'))
+    # And the interpreter itself: the notify script's bare python3 fallback
+    # does not exist on stock native Windows.
+    env['U1_PYTHON'] = (_os.environ.get('U1_PYTHON', '').strip()
+                        or sys.executable)
     try:
         proc = _sp.run(notify_cmd, shell=True, env=env,
                        capture_output=True, text=True, timeout=20)

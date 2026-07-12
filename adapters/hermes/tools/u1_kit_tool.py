@@ -36,6 +36,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,7 +64,9 @@ def _default_workflow_script() -> str:
 
 
 DEFAULT_WORKFLOW_SCRIPT = _default_workflow_script()
-DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "python3")
+# sys.executable, not a bare python3: this tool runs inside the gateway
+# interpreter (guaranteed present); stock native Windows has no python3.
+DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "").strip() or sys.executable
 
 # 25 min covers a slow multi-plate slice; analysis phase is seconds.
 SUBPROCESS_TIMEOUT_SEC = int(os.environ.get("U1_KIT_TIMEOUT_SEC", "1500"))

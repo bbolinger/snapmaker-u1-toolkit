@@ -51,9 +51,11 @@ HOOK_RECEIPT="${U1_CANCEL_HOOK_RECEIPT:-${HERMES_HOME:-/opt/data}/.u1_cancel_hoo
 
 # ISO timestamp `now + grace_seconds + 60` — the +60 is slack for
 # clock skew; expired entries are ignored by the hook so a crashed
-# gate can't leave a permanent phantom. python3 is guaranteed here:
-# the gate that invokes this script is itself python3.
-EXPIRES_AT="$(python3 -c "from datetime import datetime, timezone, timedelta; import os; print((datetime.now(timezone.utc) + timedelta(seconds=int(os.environ['U1_GRACE_SECONDS']) + 60)).isoformat())")" || EXPIRES_AT=""
+# gate can't leave a permanent phantom. The invoking gate exports
+# U1_PYTHON with its own interpreter (native Windows has no python3);
+# the bare fallback is for manual runs on POSIX.
+PYTHON_BIN="${U1_PYTHON:-python3}"
+EXPIRES_AT="$("${PYTHON_BIN}" -c "from datetime import datetime, timezone, timedelta; import os; print((datetime.now(timezone.utc) + timedelta(seconds=int(os.environ['U1_GRACE_SECONDS']) + 60)).isoformat())")" || EXPIRES_AT=""
 
 # Last 6 chars of the request id — the code for a scoped `cancel <code>`.
 CODE="${U1_REQUEST_ID: -6}"
@@ -80,7 +82,7 @@ EOF
 # The invoking gate exports U1_NOTIFY_PY with its own resolution; the
 # fallback chain mirrors it for manual runs.
 NOTIFY_PY="${U1_NOTIFY_PY:-${U1_RUNTIME_SCRIPTS_DIR:-${HERMES_HOME:-/opt/data}/scripts}/u1_notify.py}"
-if ! python3 "${NOTIFY_PY}" "${MSG}" --cancel-button "${U1_REQUEST_ID}"; then
+if ! "${PYTHON_BIN}" "${NOTIFY_PY}" "${MSG}" --cancel-button "${U1_REQUEST_ID}"; then
     echo "grace-notify: operator send failed on all channels, skipping pending state write" >&2
     exit 1
 fi
@@ -90,7 +92,7 @@ fi
 # on filenames containing quotes/newlines, and a malformed entry is
 # silently dropped by the hook (= that request becomes uncancellable).
 mkdir -p "${PENDING_DIR}"
-EXPIRES_AT="${EXPIRES_AT}" python3 - "${PENDING_DIR}" <<'PYEOF'
+EXPIRES_AT="${EXPIRES_AT}" "${PYTHON_BIN}" - "${PENDING_DIR}" <<'PYEOF'
 import json, os, sys
 from pathlib import Path
 

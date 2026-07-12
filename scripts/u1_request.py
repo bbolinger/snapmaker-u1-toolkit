@@ -302,11 +302,25 @@ def write_request(request_id: str, **fields: Any) -> Path:
         prior['updated_at'] = now
         prior['request_revision'] = new_revision
         _ensure_schema_defaults(prior)
-        # Atomic write: write to sibling temp file, then os.replace.
-        tmp = p.with_suffix(p.suffix + f'.tmp.{os.getpid()}')
+        # Atomic write: write to sibling temp file, then os.replace. The tmp
+        # name is uuid-unique (threads share a pid) and the replace retries
+        # briefly on PermissionError: on Windows an unlocked read_request
+        # holding request.json open denies the swap for a moment, and inside
+        # _consume_stage2_nonce that transient would surface as a spurious
+        # fail-closed refusal.
+        import time as _time
+        import uuid as _uuid
+        tmp = p.with_suffix(p.suffix + f'.tmp.{_uuid.uuid4().hex}')
         try:
             tmp.write_text(json.dumps(prior, indent=2, default=str))
-            os.replace(tmp, p)
+            for attempt in range(20):
+                try:
+                    os.replace(tmp, p)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    _time.sleep(0.01)
         finally:
             if tmp.exists():
                 try: tmp.unlink()

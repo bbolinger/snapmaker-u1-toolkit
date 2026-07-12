@@ -250,6 +250,8 @@ def _sandbox_start_marker_dirs(tmp_path, monkeypatch):
     try:
         import u1_kit_workflow as _kw
         monkeypatch.setattr(_kw, "_PENDING_CONFIRM_DIR", confirm_dir)
+        monkeypatch.setattr(_kw, "_LEGACY_PENDING_CANCEL_DIR",
+                            tmp_path / "legacy_pending_cancel", raising=False)
     except Exception:
         pass
 
