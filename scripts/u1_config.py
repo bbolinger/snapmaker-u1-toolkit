@@ -176,6 +176,21 @@ def get_u1_port(default: int = FALLBACK_PORT) -> int:
     return int(raw)
 
 
+def get_orca_bin(
+        default: str = "/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer",
+) -> str:
+    """OrcaSlicer executable: ORCA_SLICER_BIN env > config 'orca_bin' > the
+    Linux deploy default. The config-file source is what makes the path
+    survive into EMITTED child commands - a one-shot shell export dies with
+    the shell that ran the first command, which is exactly how the first
+    real Windows slice failed (2026-07-12, WinError 2 on the default Linux
+    path)."""
+    _load_dotenv_if_present()
+    file_cfg = _load_file()
+    return str(os.environ.get("ORCA_SLICER_BIN")
+               or file_cfg.get("orca_bin") or default)
+
+
 def get_u1_base_url(host: str | None = None, port: int | None = None) -> str:
     return f"http://{host or get_u1_host()}:{port or get_u1_port()}"
 

@@ -228,3 +228,27 @@ def test_cron_scripts_run_main_without_crash(monkeypatch, tmp_path):
             f"{script_name}: NameError leaked from main(): {combined[:500]}"
         assert "Traceback" not in combined or "RuntimeError" in combined, \
             f"{script_name}: unexpected traceback: {combined[:500]}"
+
+
+def test_get_orca_bin_resolution_chain(tmp_path, monkeypatch):
+    """env > config-file orca_bin > Linux default. The config source is
+    what makes the Orca path survive into emitted child commands (the
+    2026-07-12 Windows run lost a one-shot shell export and sliced
+    against the nonexistent Linux default)."""
+    import json as _json
+    import u1_config
+    cfg = tmp_path / "u1_config.json"
+    monkeypatch.setattr(u1_config, "CONFIG_PATH", cfg, raising=False)
+    monkeypatch.setattr(u1_config, "get_config_path", lambda: cfg)
+    monkeypatch.setattr(u1_config, "_load_file",
+                        lambda: _json.loads(cfg.read_text()) if cfg.exists() else {})
+    monkeypatch.delenv("ORCA_SLICER_BIN", raising=False)
+
+    # 3. default
+    assert u1_config.get_orca_bin().endswith("orca-slicer")
+    # 2. config file
+    cfg.write_text(_json.dumps({"orca_bin": "C:/orca242/orca-slicer.exe"}))
+    assert u1_config.get_orca_bin() == "C:/orca242/orca-slicer.exe"
+    # 1. env wins
+    monkeypatch.setenv("ORCA_SLICER_BIN", "/elsewhere/orca")
+    assert u1_config.get_orca_bin() == "/elsewhere/orca"

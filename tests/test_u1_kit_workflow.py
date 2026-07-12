@@ -756,3 +756,22 @@ def test_plate_isometric_keeps_duplicate_copies(tmp_path):
     r = kw._render_plate_isometric_from_gcode(
         gp, tmp_path / "iso_dup.png", bed_mm=(270, 270), title="Plate 1 of 1")
     assert r["ok"] and r["part_count"] == 2  # both copies kept, not collapsed to 1
+
+
+def test_slice_failure_classification_names_missing_executable():
+    """A FileNotFoundError from the slicer spawn must name the missing file
+    and must NOT blame part size (2026-07-12 Windows run: fits_bed true,
+    error '[WinError 2]', hint said remove the oversized part)."""
+    import u1_kit_workflow as kw
+    exc = FileNotFoundError(2, "The system cannot find the file specified",
+                            "C:/nonexistent/orca-slicer.exe")
+    ev = kw._classify_slice_failure(exc, "u1_2026_0101_aaaaaa")
+    assert ev["error_class"] == "exec_missing"
+    assert "C:/nonexistent/orca-slicer.exe" in ev["error"]
+    assert "too big" not in ev["instruction"].lower()
+    assert "orca_bin" in ev["instruction"] or "ORCA_SLICER_BIN" in ev["instruction"]
+    assert ev["configured_orca"]
+
+    generic = kw._classify_slice_failure(RuntimeError("orca rc=1"), "u1_2026_0101_aaaaaa")
+    assert generic["error_class"] == "slice_failed"
+    assert "too big" in generic["instruction"]

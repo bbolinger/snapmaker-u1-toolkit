@@ -25,7 +25,12 @@ with extra care until you have run the checks below yourself.
 export ORCA_SLICER_BIN='C:/path/to/orca242/orca-slicer.exe'
 ```
 
-Everything else resolves itself:
+That export covers a single shell session (fine for the validation tests
+below). For LIVE use, configure persistently instead — see "Live workflow
+setup" further down: an env var set for one command dies with that shell,
+and the workflow's emitted follow-up commands run in fresh shells.
+
+Most path plumbing resolves itself:
 
 - The workflow scripts self-locate; emitted commands point at wherever
   the scripts actually are.
@@ -52,6 +57,38 @@ The bundled skill text shows the Linux command paths. After deploying on
 Windows, the workflow's own emitted `next_command` strings are correct
 for your install; if the model's FIRST call fails on a Linux-style path,
 update the deployed SKILL.md copy to your scripts dir.
+
+## Live workflow setup (before pointing at a real printer)
+
+A green test suite proves the code, not your configuration. The workflow
+emits follow-up commands that run in FRESH shells, so anything you set
+with a one-off `export` is gone by the second step. Live use needs
+persistent, non-secret configuration in the toolkit data dir
+(`~/.local/share/snapmaker-u1/u1_config.json` — the workflow prints the
+exact path if it can't find a host):
+
+```json
+{
+  "host": "192.168.86.34",
+  "port": 7125,
+  "orca_bin": "C:/path/to/orca242/orca-slicer.exe"
+}
+```
+
+Then, in order, before the first real job:
+
+1. Read-only preflight: `python scripts/u1_preflight.py` reaches the
+   printer and reports tool/material state.
+2. Extract the printer's own profiles (read-only):
+   `python tools/extract_profiles_from_printer.py` — they land in
+   `profiles/from-printer/`, which the picker prefers over bundled stock.
+3. Dry run a fixture STL to the readiness card WITHOUT uploading. If tool
+   options say "material unknown - Moonraker unreachable", stop and fix
+   the config: selection is allowed offline by design, but the start gate
+   will re-verify the physical material before anything prints, and an
+   unconfigured host means that verification cannot pass.
+4. Only then run a real job, and answer the bed-clear prompt looking at
+   the real bed photo.
 
 ## Validate your install
 

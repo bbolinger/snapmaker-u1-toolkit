@@ -2809,15 +2809,12 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             process_path_override=process,
         )
     except Exception as exc:
-        _emit(events_file, {
-            "stage": "kit_slice_failed", "request_id": request_id,
-            "error": str(exc)[:600],
-            "instruction": ("Slice failed. If a part is too big, re-answer the parts "
-                            "prompt without that part."),
-        }, json_events)
-        _audit(request_id, "kit_slice_failed", operator, error=str(exc)[:300])
+        ev = _classify_slice_failure(exc, request_id)
+        _emit(events_file, ev, json_events)
+        _audit(request_id, "kit_slice_failed", operator,
+               error=ev["error"][:300], error_class=ev["error_class"])
         return {"phase": "slice_failed", "request_id": request_id,
-                "error": str(exc)[:600]}
+                "error": ev["error"][:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
@@ -3730,6 +3727,38 @@ def _disarm_pending_confirm(request_id: str) -> None:
         pass
     except Exception:
         pass
+
+
+def _classify_slice_failure(exc: Exception, request_id: str,
+                            too_big_hint: str = (
+                                "Slice failed. If a part is too big, "
+                                "re-answer the parts prompt without that "
+                                "part.")) -> dict:
+    """Build the kit_slice_failed event with guidance that matches the
+    actual failure class. First real Windows run (2026-07-12): a missing
+    Orca executable surfaced as bare '[WinError 2] ...' plus a part-too-big
+    hint - the part fit fine, and the one clue (the missing filename) was
+    discarded. A misdiagnosis is worse than no diagnosis at a safety
+    boundary."""
+    if isinstance(exc, FileNotFoundError):
+        missing = getattr(exc, "filename", None) or str(exc)
+        return {
+            "stage": "kit_slice_failed", "request_id": request_id,
+            "error": f"executable or file not found: {missing}"[:600],
+            "error_class": "exec_missing",
+            "configured_orca": u1_config.get_orca_bin(),
+            "instruction": (
+                "A required executable is missing (usually the OrcaSlicer "
+                "binary). Fix the configured path - set 'orca_bin' in "
+                "u1_config.json or export ORCA_SLICER_BIN - then re-run "
+                "this command. The part selection is NOT the problem."),
+        }
+    return {
+        "stage": "kit_slice_failed", "request_id": request_id,
+        "error": str(exc)[:600],
+        "error_class": "slice_failed",
+        "instruction": too_big_hint,
+    }
 
 
 _MODEL_FREE_YES_INSTRUCTION = (
@@ -5252,13 +5281,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             process_path_override=process,
         )
     except Exception as exc:
-        _emit(events_file, {
-            "stage": "kit_slice_failed", "request_id": request_id,
-            "error": str(exc)[:600],
-            "instruction": "Slice failed. If a part is too big, deselect it and re-answer the form.",
-        }, json_events)
-        _audit(request_id, "kit_slice_failed", operator, error=str(exc)[:300])
-        return {"phase": "slice_failed", "request_id": request_id, "error": str(exc)[:600]}
+        ev = _classify_slice_failure(
+            exc, request_id,
+            too_big_hint="Slice failed. If a part is too big, deselect it and re-answer the form.")
+        _emit(events_file, ev, json_events)
+        _audit(request_id, "kit_slice_failed", operator,
+               error=ev["error"][:300], error_class=ev["error_class"])
+        return {"phase": "slice_failed", "request_id": request_id, "error": ev["error"][:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
     # quantity only appears in the audit trail when it changed the plan —

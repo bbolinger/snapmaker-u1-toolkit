@@ -85,7 +85,10 @@ def test_gate_stage1_command_uses_sibling_gate(monkeypatch):
     cmd = g.build_stage1_command(
         printer_filename="p.gcode", intended_tool="extruder",
         material="PETG", request_id="u1_2026_0101_aaaaaa")
-    assert str(_ROOT / "scripts" / "u1_print_start_gate.py") in cmd
+    # Emitted commands serialize paths with forward slashes on every
+    # platform (Git Bash eats unquoted backslashes) — compare the shell
+    # form, not str(Path) (caught on the 2026-07-12 Windows run).
+    assert (_ROOT / "scripts" / "u1_print_start_gate.py").as_posix() in cmd
     assert "/opt/data/scripts" not in cmd or str(_ROOT).startswith("/opt/data")
 
 
