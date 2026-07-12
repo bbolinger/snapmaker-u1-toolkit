@@ -14,16 +14,33 @@ raw text. Losing the bed photo means losing the visual bed-clear check.
 
 The fix (same model-free philosophy as the YES boundary)
 --------------------------------------------------------
-The workflow OWNS the real image paths in the request dir. When it emits an
-image-bearing card it drops a one-shot marker keyed by ``HERMES_SESSION_KEY``
-(the workflow subprocess inherits it; the gateway process where this hook runs
-sets it at run.py's dispatch, so both sides read the identical value). This hook
-reads that marker on the outbound turn and:
+The workflow OWNS the real image paths in the request dir. A one-shot marker
+(keyed by ``HERMES_SESSION_KEY``, kind "attach") carries the AUTHORITATIVE paths
+to this outbound hook, which:
 
   1. strips any U1 image path the model echoed (correct OR mangled) so a dead
      path can never leak into the visible reply, then
   2. appends the AUTHORITATIVE paths (that actually exist on disk) as bare
      lines, so core attaches the true images regardless of what the model typed.
+
+Who arms the marker (corrected 2026-07-12)
+------------------------------------------
+The marker MUST be keyed by the value THIS hook reads for the session. That
+value lives in the gateway's session contextvar (``get_session_env`` — see
+``_session_key``); the gateway deliberately does NOT put it in os.environ.
+
+  * PRIMARY (reliable): ``arm_from_tool_result`` runs inside the plugin's
+    ``transform_tool_result`` hook — same gateway process, same contextvar — and
+    arms the marker from the workflow's own JSON ``render``/``review_doc`` events
+    in the tool output. This works no matter how the model spawned the workflow.
+  * Legacy (unreliable, kept as belt): the workflow's ``_arm_pending_attach``
+    reads ``os.environ['HERMES_SESSION_KEY']``. But Hermes' terminal tool never
+    threads that var into the spawned command's env (it only builds a
+    ``session:<key>`` id string), so on the fresh-kit / terminal-driven path the
+    workflow is blind to the key and cannot arm. That is why attach silently fell
+    back to model echo and a fresh kit dropped its mangled-path iso image (live
+    2026-07-12); the two earlier "verified" drills were reprints, a different
+    spawn path, which masked it. The gateway-side arm above is the real fix.
 
 The marker is consumed one-shot. The safety gate is untouched — it validates
 real gcode, never an image.
