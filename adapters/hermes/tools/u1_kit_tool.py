@@ -72,30 +72,16 @@ DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "").strip() or sys.executable
 SUBPROCESS_TIMEOUT_SEC = int(os.environ.get("U1_KIT_TIMEOUT_SEC", "1500"))
 
 
-def _run_workflow(args: List[str], *, timeout: float,
-                  session_key: str = "") -> Dict[str, Any]:
+def _run_workflow(args: List[str], *, timeout: float) -> Dict[str, Any]:
     """Run u1_kit_workflow.py with --json-events; collect events + stderr.
 
     The workflow exits naturally at phase boundaries (after kit_form in the
     analyze phase, after kit_readiness_card in the slice phase), so a simple
     communicate() is enough — no need to stream while it runs.
-
-    session_key is threaded into the CHILD ENV as HERMES_SESSION_KEY. The
-    gateway keeps that value in a contextvar, NOT its own os.environ (upstream
-    concurrency fix), so a plain inherit leaves the workflow blind to it and
-    `_arm_pending_attach` refuses to arm the structural-attachment marker —
-    the fresh-kit image/review-doc attach then silently falls back to the
-    model echoing paths (live 2026-07-12: a fresh kit sent 2 of 3 photos, one
-    via a gemma-mangled path). The reprint path is spawned by the terminal
-    tool, which threads the per-command env, which is why only reprints
-    attached cleanly in prior drills.
     """
-    env = os.environ.copy()
-    if session_key:
-        env["HERMES_SESSION_KEY"] = session_key
     try:
         proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, env=env,
+            args, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return {"_error": f"u1_kit_workflow timed out after {timeout:.0f}s"}
@@ -168,7 +154,7 @@ def u1_kit_tool(
         cmd1 += ["--request-id", request_id]
     logger.info("u1_kit phase 1: %s",
                 " ".join(shlex.quote(a) for a in cmd1))
-    res1 = _run_workflow(cmd1, timeout=timeout, session_key=session_key)
+    res1 = _run_workflow(cmd1, timeout=timeout)
     if "_error" in res1:
         return json.dumps({"error": res1["_error"], "phase": "analysis"},
                           ensure_ascii=False)
@@ -236,7 +222,7 @@ def u1_kit_tool(
     ]
     logger.info("u1_kit phase 3: %s",
                 " ".join(shlex.quote(a) for a in cmd2))
-    res2 = _run_workflow(cmd2, timeout=timeout, session_key=session_key)
+    res2 = _run_workflow(cmd2, timeout=timeout)
     if "_error" in res2:
         return json.dumps({"error": res2["_error"], "phase": "slice",
                            "request_id": wf_request_id}, ensure_ascii=False)
