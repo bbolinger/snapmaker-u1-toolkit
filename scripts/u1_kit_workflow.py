@@ -2310,6 +2310,9 @@ def run_kit_workflow(args) -> dict[str, Any]:
             "model_path in request.json. Re-invoke with the kit zip path."
         )
     archive = Path(model_arg).resolve()
+    # Belt-and-suspenders for agent path-mangling: if the retyped name lost its
+    # human suffix, recover the real upload by its stable doc-hash prefix.
+    archive = u1_kit.resolve_upload_path(archive)
     if self_healed:
         # make the self-heal visible in audit
         # so the underlying agent-paraphrasing pattern is detectable later.

@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.4.2] — 2026-07-13
+
+Reliability fixes for driving the printer with a small local model that
+occasionally garbles its own output.
+
+### Fixed
+
+- **Leaked chat-template tokens are stripped from the reply.** The local models
+  this toolkit is documented to run (gemma4 over Ollama) are imported with a
+  bare passthrough template, so the model intermittently leaks its
+  reasoning-channel delimiters (`<channel|>`, `<|tool_call|>` ...) into the
+  visible message, most often as a `thought <channel|>` prefix. A new sanitizer
+  removes the known control tokens from the outbound reply on every turn, so the
+  operator sees clean text regardless of model or Ollama endpoint. It never
+  touches the safety gate, a structured tool call, or a file path, and a clean
+  reply passes through unchanged. Validated on real hardware and against the
+  live transcript store.
+- **A mistyped upload name is recovered by its stable id.** The model sometimes
+  retypes an uploaded file's name and mangles the human-readable suffix (a `+`
+  becomes `_`), so the path it passes points at nothing. The workflow then
+  mis-read the missing archive as a single model, handed the zip to the
+  single-model parser, and failed with a confusing "unsupported model file". The
+  upload's stable `doc_<hash>` prefix now recovers the real file, so the kit
+  ingests as normal. A zip that is genuinely missing or unreadable surfaces a
+  clear message instead of silently falling into the single-model path; a zip
+  holding a single object is still handled as a kit-of-one.
+
+---
+
 ## [2.4.1] — 2026-07-12
 
 Native Windows support, so the print operator runs on a Windows Hermes

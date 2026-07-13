@@ -1659,24 +1659,34 @@ def run_workflow(args)->dict[str,Any]:
     # is the gate-detection principle: the SCRIPT detects the kit; the agent
     # just runs the emitted command (one entrypoint to call, no zip-inspection
     # judgment asked of a small model).
+    _kit_err = None
     try:
         import u1_kit
+        # The agent sometimes retypes the upload path and mangles the human
+        # suffix (a '+' becomes '_'); the doc-hash prefix is stable, so recover
+        # the real file BEFORE detection (a mangled path exists as no file at
+        # all, so detection would see an empty/absent archive).
+        model = u1_kit.resolve_upload_path(model)
         _is_kit = u1_kit.is_multi_part_archive(model)
     except Exception as _kit_exc:
         _is_kit = False
-        # A zip we couldn't inspect must NOT silently fall into the
-        # single-STL flow — that flow extracts the FIRST model only and
-        # would print a fraction of the kit with no warning.
-        if str(model).lower().endswith('.zip'):
-            emit({'stage': 'kit_detection_failed',
-                  'error': f'{type(_kit_exc).__name__}: {_kit_exc}',
-                  'instruction': ('Could not inspect this zip for multiple '
-                                  'STLs. Do NOT continue with the single-STL '
-                                  'flow — it would slice only the first '
-                                  'model. Surface this error to the '
-                                  'operator.')},
-                 args.json_events)
-            return {'phase': 'kit_detection_failed', 'model': str(model)}
+        _kit_err = f'{type(_kit_exc).__name__}: {_kit_exc}'
+    # A zip that is MISSING or UNREADABLE must NOT fall into the single-STL flow
+    # (which would hand the zip itself to the single-model parser and fail with a
+    # confusing "unsupported model file"). The agent occasionally mangles the
+    # upload name so the path no longer exists; resolve_upload_path above recovers
+    # most of those, but if it still cannot be found or inspected, say so plainly.
+    # A zip that EXISTS with a single object is a valid kit-of-one and routes on.
+    if str(model).lower().endswith('.zip') and (_kit_err is not None
+                                                or not Path(model).exists()):
+        emit({'stage': 'kit_detection_failed',
+              'error': _kit_err or f'archive not found: {model}',
+              'instruction': ('Could not read this zip archive. The upload name '
+                              'may have been mistyped; check the file exists, '
+                              'then surface this to the operator. Do NOT fall '
+                              'back to the single-STL flow.')},
+             args.json_events)
+        return {'phase': 'kit_detection_failed', 'model': str(model)}
     # v2.2 UNIFIED FLOW: every model routes to the kit workflow. A single STL is
     # a kit-of-1 — the kit workflow ingests a lone STL as one part, and Phase 1
     # gave it the single-model orientation verdict — so it handles single AND
