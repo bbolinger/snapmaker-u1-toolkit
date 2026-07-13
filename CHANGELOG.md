@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [2.4.2] — 2026-07-13
 
-Cleaner operator messages when the local model leaks chat-template tokens.
+Reliability fixes for driving the printer with a small local model that
+occasionally garbles its own output.
 
 ### Fixed
 
@@ -22,6 +23,15 @@ Cleaner operator messages when the local model leaks chat-template tokens.
   touches the safety gate, a structured tool call, or a file path, and a clean
   reply passes through unchanged. Validated on real hardware and against the
   live transcript store.
+- **A mistyped upload name is recovered by its stable id.** The model sometimes
+  retypes an uploaded file's name and mangles the human-readable suffix (a `+`
+  becomes `_`), so the path it passes points at nothing. The workflow then
+  mis-read the missing archive as a single model, handed the zip to the
+  single-model parser, and failed with a confusing "unsupported model file". The
+  upload's stable `doc_<hash>` prefix now recovers the real file, so the kit
+  ingests as normal. A zip that is genuinely missing or unreadable surfaces a
+  clear message instead of silently falling into the single-model path; a zip
+  holding a single object is still handled as a kit-of-one.
 
 ---
 
