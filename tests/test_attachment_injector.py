@@ -427,3 +427,20 @@ def test_next_action_hook_arms_attach_as_side_effect(attach_dir, tmp_path):
     nad.transform(tool_name="terminal", result=json.dumps({"output": output}))
     out = ai.transform(response_text="Reply YES.", session_id="s")
     assert out is not None and preview in out and bed in out
+
+
+def test_arm_from_tool_result_is_single_use(attach_dir, tmp_path):
+    """The gateway-armed marker must be consumed exactly once, same as a
+    workflow-armed one — a second (unrelated) turn cannot re-inject stale
+    images. Explicit because arm_from_tool_result is the primary arm path now."""
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    ai.arm_from_tool_result(output)
+    first = ai.transform(response_text="Reply YES.", session_id="s")
+    second = ai.transform(response_text="Reply YES.", session_id="s")
+    assert first is not None and bed in first
+    assert second is None, "gateway-armed marker consumed exactly once"
+    assert not list(attach_dir.iterdir()), "marker removed after consume"
