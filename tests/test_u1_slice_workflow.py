@@ -1398,6 +1398,10 @@ def test_undetectable_zip_does_not_fall_into_single_flow(tmp_path, capsys, monke
 
     class _Boom:
         @staticmethod
+        def resolve_upload_path(p):
+            return p
+
+        @staticmethod
         def is_multi_part_archive(_):
             raise RuntimeError("corrupt central directory")
 

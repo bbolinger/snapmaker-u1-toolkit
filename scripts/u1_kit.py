@@ -157,6 +157,28 @@ def is_multi_part_archive(archive: Path) -> bool:
     return count_archive_stls(archive) > 1
 
 
+def resolve_upload_path(path: Path) -> Path:
+    """Map a possibly-mangled upload path back to the real file on disk.
+
+    The driving agent sometimes retypes an uploaded doc's name and mangles the
+    human-readable suffix (e.g. a '+' becomes '_'), but the ``doc_<hash>``
+    prefix is unique and stable. If ``path`` is missing, glob the parent for
+    that prefix and use the sole match; fall back to ``path`` when the basename
+    isn't a doc upload, the glob is ambiguous, or any FS access fails.
+    """
+    path = Path(path)
+    if path.exists():
+        return path
+    m = re.match(r"^(doc_[0-9a-f]{6,})_", path.name)
+    if not m:
+        return path
+    try:
+        matches = [p for p in path.parent.glob(f"{m.group(1)}_*") if p.is_file()]
+    except Exception:
+        return path
+    return matches[0] if len(matches) == 1 else path
+
+
 def part_fits_bed(
     footprint_mm: tuple[float, float] | list[float],
     bed_mm: tuple[float, float] = DEFAULT_BED_MM,
