@@ -6,6 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.4.1] — 2026-07-12
+
+Native Windows support, so the print operator runs on a Windows Hermes
+Desktop box and not only on Linux, plus a fix that makes the plate, bed
+photo, and review doc attach reliably on a brand-new kit.
+
+### Windows (experimental)
+
+- **Runs on Windows Hermes Desktop.** OrcaSlicer resource discovery, the
+  runtime script directory, and the config location all resolve per platform
+  instead of assuming a Linux layout, and the bootstrap and installer detect
+  and adapt to the Windows Hermes environment.
+- **Real cross-platform file locking.** The exclusive lock uses the native
+  primitive on each platform with no silent fallback, so two runs can never
+  slice into each other.
+- **First run guides setup.** It prompts for the printer address and warns
+  early when the operator binding is unset, instead of failing quietly later.
+  Upload transport and config precedence were corrected against real Windows
+  live runs. The docs carry a support matrix of what is validated.
+
+### Attachments
+
+- **Images attach every time on a fresh kit.** The plate previews, a fresh
+  bed photo, and the pre-print review doc used to be attached by echoing the
+  paths the model produced, so a model that dropped a digit from a path broke
+  the attachment. The gateway now arms the attachment from the workflow's own
+  output and injects the correct paths into the reply, so the operator always
+  sees the plate, a fresh bed photo, and the review document before confirming
+  a print.
+
+### Hardening
+
+- One shared resolver for the pending-print marker across every consumer.
+- Emitted shell commands use quoted, shell-safe paths.
+- Fixes to the background reaper's liveness check and a claim-read race found
+  during the Windows port.
+- Expanded regression and real-slice test coverage.
+
+The model-free print-start safety boundary (single-use confirm, a grace window
+with a working CANCEL, and fail-closed on an undeliverable prompt) is unchanged.
+
+---
+
+## [2.4.0] — 2026-07-11
+
+Card attachments now come through as real files, and the reprint CANCEL button
+works.
+
+### Reliable card attachments
+
+The readiness, bed-clear, and reprint cards used to depend on the model echoing
+the image and document paths back verbatim so Hermes would attach them. When the
+model garbled a path, the bed photo and plate previews arrived as raw text
+instead of images, and the review doc did not arrive at all. The workflow now
+hands the real file paths to a delivery hook directly, so the plate previews and
+bed photo attach as photos and the review doc attaches as a file, no matter what
+the model types.
+
+### Reprint CANCEL button fixed
+
+The countdown CANCEL button did not work on a reprint: its handler only
+registered after the session had shown an interactive form, and a reprint shows
+no form, so the button had nothing behind it and the print could not be aborted
+from it. It now registers on every incoming message, so the button is live
+before any countdown. (Also shipped on its own as v2.3.2.)
+
+### Hardening
+
+- The attachment marker is validated before anything is delivered: only a real,
+  non-symlink file with a known artifact name inside the request directory is
+  sent, so a forged marker cannot make Hermes send an arbitrary local file.
+- Marker consumption is atomic and single-use, and a marker with a missing or
+  malformed timestamp is rejected.
+
+### Install
+
+- The Hermes installer now installs the `snapmaker_u1` plugin (which carries the
+  attachment hook) alongside the `u1-form` plugin, and the README documents the
+  full install sequence. Without it, a fresh clone would not load the new hook.
+- The interpreter check probes the compiled Pillow extension rather than the
+  bare package, so a broken install is caught early instead of crashing mid-run.
+
+---
+
 ## [2.3.0] — 2026-07-07
 
 Three operator-requested features plus one structural safety change born
