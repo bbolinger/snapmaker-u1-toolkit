@@ -17,7 +17,7 @@ code is the last chars of the request_id. Anything else does NOT match;
 
 Contract with u1_kit_workflow.py:
   * When the workflow reaches the bed-clear prompt it writes
-    /tmp/u1_pending_confirm/<request_id>.json:
+    <pending-confirm dir>/<request_id>.json (u1_pending resolver):
       {
         "request_id":       "u1_2026_0707_abc123",
         "filename":         "plate1.gcode",
@@ -32,7 +32,7 @@ Contract with u1_kit_workflow.py:
     instructions to run (review finding: the old confirm_cmd field made
     anything that could write /tmp a command author, gated only by the
     word "yes"). The spawned command is exactly
-      python3 /opt/data/scripts/u1_kit_workflow.py \
+      <this gateway's own interpreter> <scripts-dir>/u1_kit_workflow.py \
           --confirm-start-for <request_id> --json-events
     with request_id validated against ^u1_[a-z0-9_]+$ first. The workflow
     resolves the persisted single-use confirm token server-side and then
@@ -73,15 +73,49 @@ import json
 import os
 import re
 import subprocess
+import sys
 import uuid
 
-PENDING_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
-                                  "/tmp/u1_pending_confirm"))
+def _pending_dir(kind: str) -> Path:
+    """KEEP IN SYNC with scripts/u1_pending.py (canonical copy + rationale).
+    This hook file deploys standalone into the gateway's hooks dir, so the
+    ~10-line rule is duplicated; test_pending_paths.py asserts identity."""
+    import tempfile
+    explicit = os.environ.get(f"U1_PENDING_{kind.upper()}_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    root = os.environ.get("U1_PENDING_STATE_DIR", "").strip()
+    if root:
+        return Path(root) / kind
+    return Path(tempfile.gettempdir()) / "u1_pending" / kind
+
+
+PENDING_DIR = _pending_dir("confirm")
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5: scan the pre-v2.4.1
+# literal location too (readers scan both, writers only write the new
+# location) so a partial upgrade cannot leave armed YES windows dead.
+LEGACY_PENDING_DIR = Path("/tmp/u1_pending_confirm")
 LOG_FILE = Path(__file__).parent / "hook.log"
+
+def _scripts_dir() -> Path:
+    """Runtime scripts dir, resolved from THIS hook's side of the boundary.
+    KEEP IN SYNC with adapters/hermes/tools/u1_kit_tool.py (same chain);
+    scripts/ consumers self-locate via u1_runtime_paths instead. Never
+    resolved from marker content — the marker contributes ONLY a request id."""
+    explicit = os.environ.get("U1_RUNTIME_SCRIPTS_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        cand = Path(hermes_home) / "scripts"
+        if (cand / "u1_kit_workflow.py").is_file():
+            return cand
+    return Path("/opt/data/scripts")
+
 
 # The ONLY thing this hook ever executes. Marker content contributes one
 # argv element — a request id that must match _REQUEST_ID_RE.
-WORKFLOW_PY = "/opt/data/scripts/u1_kit_workflow.py"
+WORKFLOW_PY = str(_scripts_dir() / "u1_kit_workflow.py")
 _REQUEST_ID_RE = re.compile(r"^u1_[a-z0-9_]+$")
 
 # A marker claiming to be valid for more than a day is not a window
@@ -107,7 +141,7 @@ def _notify_operator(text: str) -> None:
     declined something and why. Best-effort; failures only log."""
     try:
         import subprocess as _sp
-        _sp.Popen(["python3", "/opt/data/scripts/u1_notify.py", text],
+        _sp.Popen([sys.executable, str(_scripts_dir() / "u1_notify.py"), text],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                   stdin=_sp.DEVNULL, start_new_session=True)
     except Exception as exc:
@@ -181,6 +215,31 @@ _CLAIM_SPAWN_GRACE_S = 30.0
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # NEVER os.kill(pid, 0) on Windows: CPython implements any
+        # non-CTRL-event signal as OpenProcess + TerminateProcess, so
+        # "probing" a live child would KILL the in-flight confirm, and a
+        # dead pid raises an exception type the POSIX branch reads as
+        # "alive" (never reaped). Query the process state instead.
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            # ERROR_ACCESS_DENIED means the pid EXISTS but is protected
+            # (e.g. recycled to an elevated process) — treat as alive, do
+            # not reap on uncertainty. Anything else: no such process.
+            # Accepted collision: a child exiting with code 259
+            # (STILL_ACTIVE) reads as alive; the window TTL bounds it.
+            return k32.GetLastError() == 5  # ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # unknown — do not reap on uncertainty
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -270,12 +329,19 @@ def _load_pending_windows() -> list[dict]:
       * expires_at more than 24h out        -> quarantine
       * expired                             -> delete
     `.claimed.` files are in-flight spawns, not windows — skipped."""
-    if not PENDING_DIR.exists():
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: also scan the
+    # pre-v2.4.1 literal location so a partially upgraded install's YES
+    # windows are still redeemable (readers scan both, writers only write
+    # the new location; this side fails closed either way, the shim just
+    # spares the operator a dead YES during the skew).
+    scan_dirs = [PENDING_DIR] + (
+        [LEGACY_PENDING_DIR] if LEGACY_PENDING_DIR != PENDING_DIR else [])
+    if not any(d.exists() for d in scan_dirs):
         return []
     _reap_orphaned_claims()
     now = datetime.now(timezone.utc)
     out = []
-    for p in sorted(PENDING_DIR.iterdir()):
+    for p in sorted(p for d in scan_dirs if d.exists() for p in d.iterdir()):
         if not p.is_file() or p.suffix != ".json" or ".claimed." in p.name:
             continue
         try:
@@ -429,10 +495,18 @@ def _spawn_confirm(state: dict) -> bool:
         return False
     # The child releases ONLY this claim_id at its commitment point (audit #3),
     # so a concurrently re-armed generation's claim is never deleted.
-    cmd = ["python3", WORKFLOW_PY, "--confirm-start-for", rid,
+    # sys.executable, never a bare python3: this hook runs inside the
+    # gateway interpreter, which is guaranteed to exist; on stock native
+    # Windows python3 is absent or a WindowsApps stub that spawns and
+    # dies silently (claim recorded, child gone, endless reaper retries).
+    cmd = [sys.executable, WORKFLOW_PY, "--confirm-start-for", rid,
            "--confirm-claim-id", claim_id, "--json-events"]
     # Log path is DERIVED, never read from the marker.
-    log_path = Path(f"/tmp/u1_confirm_start_{rid}.log")
+    log_path = _pending_dir("log") / f"u1_confirm_start_{rid}.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass  # the open() below already tolerates a missing log
     out = None
     spawn_ok = False
     child = None
@@ -510,7 +584,11 @@ def _spawn_confirm(state: dict) -> bool:
             exp = None
     try:
         if exp is not None and datetime.now(timezone.utc) <= exp:
-            os.rename(claimed, src_path)
+            # os.replace, not os.rename: POSIX rename overwrites an existing
+            # target (a freshly re-armed marker) but Windows rename refuses
+            # (WinError 183) - replace gives the same overwrite semantics on
+            # both platforms.
+            os.replace(claimed, src_path)
             _log({"event": "confirm_spawn_failed_marker_restored",
                   "request_id": rid})
         else:

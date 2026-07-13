@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port, get_data_dir
+from u1_pending import pending_dir as _pending_dir
 
 
 # Approval-token TTL: how long after Stage 1's photo is captured can the
@@ -47,8 +48,14 @@ APPROVAL_TTL_SEC = 1800  # 30 minutes
 DARK_PHOTO_MEAN_LUMA = 12  # 0-255 scale
 
 # Canonical deployed path of this gate script — used when building the Stage-1
-# command string the workflow hands to the agent.
-GATE_SCRIPT_PATH = "/opt/data/scripts/u1_print_start_gate.py"
+# command string the workflow hands to the agent. Self-locating via
+# u1_runtime_paths (this file IS in the runtime scripts dir).
+from u1_runtime_paths import (script_shell_path as _script_shell_path,
+                              script_path as _script_path,
+                              python_cmd as _python_cmd)
+# Shell-serialized (forward slashes on Windows): its only consumer is the
+# EMITTED stage-1 command string the agent runs through Git Bash.
+GATE_SCRIPT_PATH = _script_shell_path("u1_print_start_gate.py")
 
 
 def build_stage1_command(*, printer_filename: str, intended_tool: str,
@@ -59,7 +66,7 @@ def build_stage1_command(*, printer_filename: str, intended_tool: str,
     """
     import shlex
     return (
-        f"python3 {GATE_SCRIPT_PATH} {printer_filename} "
+        f"{_python_cmd()} {GATE_SCRIPT_PATH} {printer_filename} "
         f"--intended-tool {intended_tool} --requested-material {shlex.quote(str(material))} "
         f"--request-id {request_id}"
     )
@@ -442,10 +449,9 @@ def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
     already consumed/changed (the caller must then refuse the start)."""
     import u1_request
     try:
-        import fcntl
+        from u1_lockfile import exclusive_lock
         req_dir = Path(u1_request.ensure_request_dir(request_id))
-        with open(req_dir / '.stage2_nonce.lock', 'w') as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
+        with exclusive_lock(req_dir / '.stage2_nonce.lock'):
             fresh_safety = dict((u1_request.read_request(request_id) or {}).get('safety') or {})
             if fresh_safety.get('stage2_approval_nonce') != expected_nonce:
                 return False  # already consumed / changed by a concurrent start
@@ -457,10 +463,10 @@ def _consume_stage2_nonce(request_id: str, expected_nonce: str) -> bool:
     except Exception as exc:
         # Fail CLOSED (v2.2.2): if we cannot prove the nonce was valid AND
         # durably consumed under the lock, REFUSE the start. Authorizing on a
-        # lock/read/write error (or a missing fcntl) is exactly backwards for a
-        # safety gate — the old best-effort fallback turned any such failure into
-        # an authorization. The target runtime is Linux, where fcntl is always
-        # present, so no permissive path is needed.
+        # lock/read/write error (or an unimportable lock backend) is exactly
+        # backwards for a safety gate — the old best-effort fallback turned any
+        # such failure into an authorization. u1_lockfile has no silent no-op
+        # path on any platform, so a broken lock always lands here.
         try:
             _audit_gate(request_id, 'stage2_nonce_consume_failed', 'gate',
                         error=f"{type(exc).__name__}: {exc}"[:200])
@@ -656,6 +662,18 @@ def _run_grace_notify(notify_cmd: str, *, request_id: str | None,
     env['U1_GRACE_SECONDS'] = str(grace_seconds)
     env['U1_CANCEL_MARKER'] = str(cancel_marker)
     env['U1_OPERATOR'] = operator
+    # The notify script writes the pending-cancel routing entry; the gate
+    # polls the same dir. Pass the GATE's resolution explicitly so the two
+    # sides can never disagree (the script's own fallback is for manual runs).
+    env['U1_PENDING_CANCEL_DIR'] = str(_pending_dir('cancel'))
+    # Same for the notifier path: an operator override wins, else the gate's
+    # sibling copy (self-locating, correct on any platform).
+    env['U1_NOTIFY_PY'] = (_os.environ.get('U1_NOTIFY_PY', '').strip()
+                           or _script_path('u1_notify.py'))
+    # And the interpreter itself: the notify script's bare python3 fallback
+    # does not exist on stock native Windows.
+    env['U1_PYTHON'] = (_os.environ.get('U1_PYTHON', '').strip()
+                        or sys.executable)
     try:
         proc = _sp.run(notify_cmd, shell=True, env=env,
                        capture_output=True, text=True, timeout=20)
@@ -768,14 +786,14 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                             resolved_operator,
                             stderr_tail=str(_nres.get("stderr_tail"))[:160])
                 try:
-                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                    (_pending_dir('cancel') / f'{request_id}.json').unlink()
                 except Exception:
                     pass
                 return 'notify_failed'
         else:
             # Q2 loop-guard alignment (audit 2026-07-09): the notify cap tripped,
             # so NO countdown/CANCEL DM will be delivered and no
-            # /tmp/u1_pending_cancel/<rid>.json routing entry is created. Under
+            # pending-cancel/<rid>.json routing entry is created. Under
             # Q2 we must not start a print the operator can neither see nor
             # cancel — so treat an exhausted cap exactly like a hard notify
             # failure: abort. (Previously this suppressed the DM but still ran
@@ -788,14 +806,15 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
                             'pre_start_grace_notify_loop_guard_abort',
                             resolved_operator, cap=GRACE_NOTIFY_CAP)
                 try:
-                    (Path(f'/tmp/u1_pending_cancel/{request_id}.json')).unlink()
+                    (_pending_dir('cancel') / f'{request_id}.json').unlink()
                 except Exception:
                     pass
                 return 'notify_failed'
             _audit_gate(request_id, 'pre_start_grace_notify_suppressed_loop_guard',
                         resolved_operator, cap=GRACE_NOTIFY_CAP)
     # Contract with the Hermes gateway hook + notify script: the notify
-    # script wrote /tmp/u1_pending_cancel/<request_id>.json so a
+    # script wrote pending-cancel/<request_id>.json (u1_pending resolver;
+    # the gate exports the resolved dir to the script's env) so a
     # `cancel <code>` reply in Telegram routes to the right marker.
     # Clean up our OWN entry on ANY exit path (cancel OR expire) so a
     # stale entry doesn't cause the next unrelated print to abort on
@@ -803,7 +822,7 @@ def _wait_pre_start_grace_period(cancel_marker: Path, grace_seconds: int,
     # windows don't step on each other.
     def _clear_pending_state() -> None:
         try:
-            pending = Path(f'/tmp/u1_pending_cancel/{request_id}.json')
+            pending = _pending_dir('cancel') / f'{request_id}.json'
             if pending.exists():
                 pending.unlink()
         except OSError:
@@ -1486,14 +1505,14 @@ def main(argv=None):
                     help='Either the host gcode path or the printer storage filename. '
                          'Host paths are auto-stripped to basename for the Moonraker call.')
     ap.add_argument('--bed-clear', choices=['start', 'cancel'], default='cancel',
-                    help="'cancel' (default): Stage 1 — captures real photo + writes approval token, never starts. "
-                         "'start': Stage 2 — operator's explicit approval; requires --approval-token from Stage 1.")
+                    help="'cancel' (default): Stage 1 - captures real photo + writes approval token, never starts. "
+                         "'start': Stage 2 - operator's explicit approval; requires --approval-token from Stage 1.")
     ap.add_argument('--approval-token',
                     help='Token printed by Stage 1. Required for Stage 2; ties the start to the photo the operator reviewed.')
     ap.add_argument('--stage2-approval-nonce', default=None,
                     help=('Single-use nonce minted by u1_kit_workflow._action_start() '
                           'AFTER the operator answers yes to the fresh bed_clear_start '
-                          'prompt. Kit paths REQUIRE this — without it, Stage 2 '
+                          'prompt. Kit paths REQUIRE this - without it, Stage 2 '
                           'refuses even if the approval-token is valid. Consumed '
                           'on successful start (single-use). Closes the direct-'
                           'Stage-2 attack.'))
@@ -1503,7 +1522,7 @@ def main(argv=None):
                     help='Where to write the bed snapshot + approval token. Defaults to U1 data dir.')
     ap.add_argument('--request-id', type=str, default=None,
                     help='v2.0 Phase 3b: the Print Request Object ID this Stage is acting on. '
-                         'Stage 2 REQUIRES this — without it, can_start() has no request to verify '
+                         'Stage 2 REQUIRES this - without it, can_start() has no request to verify '
                          'and the gate refuses. Stage 1 uses it to stamp safety.bed_clear_photo_captured '
                          'on the matching request.json. SKILL.md fills it in from the readiness card.')
     ap.add_argument('--operator', type=str, default=None,

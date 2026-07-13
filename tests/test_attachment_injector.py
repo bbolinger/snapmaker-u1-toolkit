@@ -193,12 +193,19 @@ def test_disallowed_name_under_root_refused(attach_dir, tmp_path):
 
 
 def test_symlinked_artifact_refused(attach_dir, tmp_path):
-    """A symlink named like an artifact but pointing outside is refused."""
+    """A symlink named like an artifact but pointing outside is refused.
+
+    Requires real symlink capability: on Windows without developer mode the
+    OS refuses creation (WinError 1314) — and an attacker on such a host
+    cannot plant one either, so skipping there does not hide exposure."""
     link = tmp_path / "requests" / _RID / "bed_snapshot.jpg"
     link.parent.mkdir(parents=True, exist_ok=True)
     target = tmp_path / "outside.jpg"
     target.write_bytes(b"x")
-    os.symlink(target, link)
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"symlink creation not permitted on this host ({exc})")
     _write_marker(_SESSION_KEY, {
         "request_id": _RID, "images": [str(link)], "documents": [],
         "operator": "op", "created_at": time.time(),
@@ -280,3 +287,160 @@ def test_corrupt_marker_never_raises(attach_dir):
 def test_arm_is_noop_with_no_images(attach_dir):
     wf._arm_pending_attach(_RID, [], "op")
     assert not list(attach_dir.iterdir()), "no marker when there's nothing to attach"
+
+
+# --------------------------------------------------------------------------- #
+# Session-key source: gateway contextvars, NOT gateway os.environ
+# --------------------------------------------------------------------------- #
+# Live 2026-07-11: the gateway never writes HERMES_SESSION_KEY into its own
+# process env (concurrent sessions would clobber it), so the env-only read
+# returned empty at transform time and the hook refused EVERY turn — the
+# marker sat unconsumed while attachment silently fell back to model echo.
+# The hook must read Hermes' session contextvar (gateway.session_context
+# .get_session_env), the same source the u1_kit tool exports to the
+# workflow subprocess that writes the marker.
+
+def _stub_gateway_session(monkeypatch, key):
+    import types
+    gw = types.ModuleType("gateway")
+    sc = types.ModuleType("gateway.session_context")
+    sc.get_session_env = lambda name, default="": (
+        key if name == "HERMES_SESSION_KEY" else default)
+    monkeypatch.setitem(sys.modules, "gateway", gw)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", sc)
+
+
+def test_contextvar_key_found_without_env(attach_dir, tmp_path, monkeypatch):
+    """The gateway-process case: no env var at all, key only in contextvars."""
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    _stub_gateway_session(monkeypatch, _SESSION_KEY)
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op", session_key=_SESSION_KEY)
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out
+    assert not list(attach_dir.iterdir()), "marker consumed via contextvar key"
+
+
+def test_contextvar_key_wins_over_env(attach_dir, tmp_path, monkeypatch):
+    """A stale env value must not shadow the turn's real session key."""
+    monkeypatch.setenv("HERMES_SESSION_KEY", "telegram:STALE:main")
+    _stub_gateway_session(monkeypatch, _SESSION_KEY)
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op", session_key=_SESSION_KEY)
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out
+
+
+def test_env_fallback_when_gateway_absent(attach_dir, tmp_path):
+    """Non-gateway callers (tests, subprocess side) keep the env path.
+    All earlier tests in this file exercise it implicitly; this pins it."""
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    wf._arm_pending_attach(_RID, [bed], "op")
+    assert ai._session_key() == _SESSION_KEY  # from the fixture's env var
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and bed in out
+
+
+# --------------------------------------------------------------------------- #
+# Gateway-side arming from the tool result (v2.4.1 fix, live 2026-07-12)
+# The workflow can't arm on the fresh-kit flow (Hermes' terminal tool doesn't
+# thread HERMES_SESSION_KEY into the command env), so the transform_tool_result
+# hook arms the marker from the workflow's authoritative render paths instead.
+# --------------------------------------------------------------------------- #
+
+def _tool_output(*events):
+    """The workflow's JSON-lines stdout as the terminal tool returns it."""
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_arm_from_tool_result_writes_marker_and_injects(attach_dir, tmp_path):
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    iso = _artifact(tmp_path, "plate_1_iso.png")
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    review = _artifact(tmp_path, "review.md")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "kind": "kit_plate_preview", "image": preview},
+        {"stage": "render", "request_id": _RID, "kind": "kit_plate_isometric", "image": iso},
+        {"stage": "review_doc", "request_id": _RID, "path": review},
+        {"stage": "render", "request_id": _RID, "kind": "bed_snapshot", "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 4
+    out = ai.transform(response_text="Reply YES to start.", session_id="s")
+    assert out is not None
+    for p in (preview, iso, bed, review):
+        assert p in out
+
+
+def test_arm_from_tool_result_overrides_gemma_mangled_echo(attach_dir, tmp_path):
+    """The exact live failure: gemma echoes a mangled iso path (u1_206 vs
+    u1_2026). Gateway-side arming + injection must strip the mangle and deliver
+    the real file from the workflow's own authoritative path."""
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    iso = _artifact(tmp_path, "plate_1_iso.png")
+    review = _artifact(tmp_path, "review.md")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "render", "request_id": _RID, "image": iso},
+        {"stage": "review_doc", "request_id": _RID, "path": review},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    ai.arm_from_tool_result(output)
+    mangled_iso = iso.replace("u1_2026", "u1_206")  # gemma dropped a digit
+    reply = f"Sliced plate below.\n{preview} {mangled_iso}\nBed clear? Reply YES."
+    out = ai.transform(response_text=reply, session_id="s")
+    assert out is not None
+    assert iso in out, "authoritative iso injected"
+    assert "u1_206" not in out, "gemma's mangled echo stripped"
+    assert review in out
+
+
+def test_arm_from_tool_result_noop_before_review_moment(attach_dir, tmp_path):
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "kit_ingested", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 0
+    assert not list(attach_dir.iterdir())
+
+
+def test_arm_from_tool_result_rejects_forged_paths(attach_dir, tmp_path):
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": "/etc/hosts"},
+        {"stage": "review_doc", "request_id": _RID, "path": "/etc/passwd"},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    assert ai.arm_from_tool_result(output) == 0
+    assert not list(attach_dir.iterdir())
+
+
+def test_next_action_hook_arms_attach_as_side_effect(attach_dir, tmp_path):
+    from snapmaker_u1.hooks import next_action_directive as nad
+    preview = _artifact(tmp_path, "plate_1_preview.png")
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": preview},
+        {"stage": "render", "request_id": _RID, "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    nad.transform(tool_name="terminal", result=json.dumps({"output": output}))
+    out = ai.transform(response_text="Reply YES.", session_id="s")
+    assert out is not None and preview in out and bed in out
+
+
+def test_arm_from_tool_result_is_single_use(attach_dir, tmp_path):
+    """The gateway-armed marker must be consumed exactly once, same as a
+    workflow-armed one — a second (unrelated) turn cannot re-inject stale
+    images. Explicit because arm_from_tool_result is the primary arm path now."""
+    bed = _artifact(tmp_path, "bed_snapshot.jpg")
+    output = _tool_output(
+        {"stage": "render", "request_id": _RID, "image": bed},
+        {"stage": "need_input", "need": "bed_clear_start", "request_id": _RID},
+    )
+    ai.arm_from_tool_result(output)
+    first = ai.transform(response_text="Reply YES.", session_id="s")
+    second = ai.transform(response_text="Reply YES.", session_id="s")
+    assert first is not None and bed in first
+    assert second is None, "gateway-armed marker consumed exactly once"
+    assert not list(attach_dir.iterdir()), "marker removed after consume"

@@ -42,15 +42,41 @@ import os, sys, subprocess, time
 from pathlib import Path
 
 
+def _bootstrap_env() -> dict:
+    """os.environ copy without PYTHONPATH/PYTHONHOME (escape hatch:
+    U1_KEEP_PYTHONPATH=1). Mirrors u1_slice_workflow's bootstrap — a foreign
+    PYTHONPATH poisoned compiled Pillow on Windows Hermes Desktop (install
+    report 2026-07-10), so every bootstrap subprocess runs sanitized."""
+    env = os.environ.copy()
+    if env.get("U1_KEEP_PYTHONPATH", "").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+    return env
+
+
 def _check_python_has_deps(python_path: str, deps: tuple = ("numpy", "PIL")) -> bool:
     try:
         proc = subprocess.run(
             [python_path, "-c", "import numpy; from PIL import Image, ImageDraw"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_bootstrap_env(),
         )
         return proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _reexec(python_path: str) -> None:
+    """Continue under `python_path` with the sanitized env. POSIX: execve.
+    Windows: subprocess + exit with the child's code (execv there abandons
+    the console mid-run). Mirrors u1_slice_workflow's bootstrap."""
+    env = _bootstrap_env()
+    env["U1_BOOTSTRAP_REEXEC"] = "1"
+    argv = [python_path, __file__, *sys.argv[1:]]
+    if os.name == "nt":
+        proc = subprocess.run(argv, env=env)
+        sys.exit(proc.returncode)
+    os.execve(python_path, argv, env)
 
 
 def _ensure_compat_python() -> None:
@@ -75,6 +101,16 @@ def _ensure_compat_python() -> None:
         from PIL import Image, ImageDraw  # noqa: F401
     except Exception:
         missing.append("pillow")
+    # A poisoned PYTHONPATH alone can produce exactly this failure while the
+    # interpreter itself is fine. Retry SELF with it cleared before hunting
+    # other interpreters (loop-guarded by the re-exec marker).
+    if (os.environ.get("U1_BOOTSTRAP_REEXEC") != "1"
+            and os.environ.get("PYTHONPATH")
+            and _check_python_has_deps(sys.executable)):
+        print(f"[env] current python lacks {', '.join(missing)} under the "
+              f"inherited PYTHONPATH; retrying with it cleared "
+              f"(U1_KEEP_PYTHONPATH=1 keeps it)", file=sys.stderr)
+        _reexec(sys.executable)
     here = Path(__file__).resolve().parent
     root = here.parent
     candidates: list[str] = []
@@ -85,6 +121,8 @@ def _ensure_compat_python() -> None:
         "/opt/hermes/.venv/bin/python",
         str(root / "venv" / "bin" / "python"),
         str(root / ".venv" / "bin" / "python"),
+        str(root / "venv" / "Scripts" / "python.exe"),   # Windows venv layout
+        str(root / ".venv" / "Scripts" / "python.exe"),
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3",
     ])
@@ -94,7 +132,7 @@ def _ensure_compat_python() -> None:
         if _check_python_has_deps(cand):
             print(f"[env] current python lacks {', '.join(missing)}; switching to {cand}",
                   file=sys.stderr)
-            os.execv(cand, [cand, __file__, *sys.argv[1:]])
+            _reexec(cand)
     msg = [
         "ERROR: u1_kit_workflow.py needs numpy + PIL (Pillow).",
         f"Missing on the current interpreter ({sys.executable}): {', '.join(missing)}",
@@ -128,6 +166,10 @@ import u1_config
 import u1_request
 import u1_review_doc
 from u1_print_start_gate import build_stage1_command
+from u1_runtime_paths import (script_path as _script_path,
+                              script_shell_path as _script_shell_path,
+                              shell_path as _shell_path,
+                              python_cmd as _python_cmd)
 from u1_slice_workflow import (
     _resolve_operator,
     _shell_quote,
@@ -258,8 +300,8 @@ def _build_next_command(archive: Path, request_id: str, *,
     if operator is None:
         operator = _CLI_OPERATOR
     parts_q = []
-    parts_q.append("python3 /opt/data/scripts/u1_kit_workflow.py")
-    parts_q.append(_shell_quote(str(archive)))
+    parts_q.append(f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')}")
+    parts_q.append(_shell_quote(_shell_path(archive)))
     parts_q.append("--json-events")
     parts_q.append(f"--request-id {request_id}")
     if nozzle:
@@ -2098,6 +2140,33 @@ def run_kit_workflow(args) -> dict[str, Any]:
     _CLI_OPERATOR = getattr(args, "operator", None) or None
     operator = _resolve_operator(args)
 
+    # --set-printer IP[:PORT]: the answer to the printer_host need_input
+    # below. Validate hard - this becomes the host every safety check
+    # talks to - then merge-persist so every later child command sees it.
+    _sp = getattr(args, "set_printer", None)
+    if _sp:
+        host, _, port_s = str(_sp).strip().partition(":")
+        port = None
+        if port_s:
+            try:
+                port = int(port_s)
+                if not (0 < port < 65536):
+                    raise ValueError
+            except ValueError:
+                _emit(None, {"stage": "error", "kind": "bad_printer_address",
+                             "message": f"not a valid port: {port_s!r}"},
+                      getattr(args, "json_events", True))
+                return {"phase": "error", "error": f"bad port {port_s!r}"}
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,253}$", host):
+            _emit(None, {"stage": "error", "kind": "bad_printer_address",
+                         "message": f"not a valid host/IP: {host!r}"},
+                  getattr(args, "json_events", True))
+            return {"phase": "error", "error": f"bad host {host!r}"}
+        cfg_path = u1_config.set_printer(host, port)
+        _emit(None, {"stage": "printer_configured", "host": host,
+                     "port": port or 7125, "config": str(cfg_path)},
+              getattr(args, "json_events", True))
+
     # --confirm-start <token>: the operator said "yes" at the bed-clear prompt.
     # The model relays ONLY this short token (it mangled the old 200-char
     # verbatim command). Resolve the request + pending nonce from persisted
@@ -2299,6 +2368,63 @@ def run_kit_workflow(args) -> dict[str, Any]:
     }, json_events)
     _audit(request_id, "kit_ingested", operator,
            part_count=kit["part_count"], oversized=kit["oversized_part_ids"])
+
+    # First-run gap caught live 2026-07-12: with NO printer configured
+    # anywhere, the flow used to fall through to "material unknown -
+    # Moonraker unreachable" tool options - indistinguishable from a
+    # printer that is merely off. Never-configured is a setup question,
+    # and the workflow already speaks need_input: ask for the address.
+    # Explicit offline mode (--no-live-material) skips the ask; a
+    # configured-but-unreachable printer keeps the offline-selection
+    # behavior (the start gate re-verifies physical state before
+    # anything prints).
+    if not getattr(args, "no_live_material", False):
+        try:
+            u1_config.get_u1_host()
+        except Exception:
+            base_cmd = _build_next_command(
+                archive, request_id, nozzle=nozzle,
+                no_live_material=False, no_live_upload=no_live_upload)
+            _emit(events_file, {
+                "stage": "need_input", "need": "printer_host",
+                "key": "printer_host", "request_id": request_id,
+                "prompt": ("No printer is configured yet. What is the "
+                           "U1's IP address? (add :port only if it is "
+                           "not 7125)"),
+                "instruction": ("Ask the operator for the address, then "
+                                "re-run the same command with "
+                                "--set-printer <their answer> appended. "
+                                "Example: --set-printer 192.168.1.50"),
+                "next_command": f"{base_cmd} --set-printer <ip[:port]>",
+            }, json_events)
+            _emit(events_file, {"stage": "awaiting_input",
+                                "need": "printer_host",
+                                "request_id": request_id}, json_events)
+            _audit(request_id, "printer_host_requested", operator)
+            return {"phase": "awaiting_printer_host",
+                    "request_id": request_id}
+
+    # Same first-run courtesy as the printer address, but as a WARNING, not
+    # an ask: the operator binding is an auth root, so it must be configured
+    # out-of-band (whoever is chatting - stranger or model - must not be able
+    # to bind themselves). Discovering this hard gate only at the bed-clear
+    # prompt, after a full flow + slice + upload, is hostile (live 2026-07-12
+    # on the first Windows E2E). Announce it at step zero instead; slicing
+    # and staging still work unbound - only the final YES refuses.
+    if u1_config.get_operator_binding() is None:
+        _emit(events_file, {
+            "stage": "warning", "kind": "operator_binding_unconfigured",
+            "request_id": request_id,
+            "message": ("No operator binding is configured, so the final "
+                        "start confirmation will be REFUSED. Slicing and "
+                        "uploading still work. To enable starts, add "
+                        "U1_OPERATOR_BINDING=telegram:<your numeric user id> "
+                        "to the .env next to the toolkit (message "
+                        "@userinfobot on Telegram to see your id), then "
+                        "restart the gateway. This must be set in the file, "
+                        "not through this chat."),
+        }, json_events)
+        _audit(request_id, "operator_binding_unconfigured_warned", operator)
 
     if kit["oversized_part_ids"]:
         _emit(events_file, {
@@ -2767,15 +2893,12 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
             process_path_override=process,
         )
     except Exception as exc:
-        _emit(events_file, {
-            "stage": "kit_slice_failed", "request_id": request_id,
-            "error": str(exc)[:600],
-            "instruction": ("Slice failed. If a part is too big, re-answer the parts "
-                            "prompt without that part."),
-        }, json_events)
-        _audit(request_id, "kit_slice_failed", operator, error=str(exc)[:300])
+        ev = _classify_slice_failure(exc, request_id)
+        _emit(events_file, ev, json_events)
+        _audit(request_id, "kit_slice_failed", operator,
+               error=ev["error"][:300], error_class=ev["error_class"])
         return {"phase": "slice_failed", "request_id": request_id,
-                "error": str(exc)[:600]}
+                "error": ev["error"][:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
     _audit(request_id, "kit_sliced", operator, plate_count=arr["plate_count"],
@@ -2898,6 +3021,10 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                     "moonraker_upload_ok": ok,
                     "post_upload_blockers": up.get("post_upload_blockers"),
                     "human_summary": up.get("human_summary"),
+                    # The helper's actual stdout tail - without it the event
+                    # tells the operator to read an error it never carried
+                    # (first Windows live upload, 2026-07-12).
+                    "output": str(up.get("output") or "")[-1500:],
                 })
             elif rc == 3:
                 # File IS on printer; post-upload blockers are state warnings
@@ -3490,8 +3617,8 @@ def _capture_bed_and_issue_token(out_dir: Path) -> dict[str, Any]:
 # the outbound reply. Keyed by HERMES_SESSION_KEY, which the workflow subprocess
 # inherits from the gateway process the hook runs in, so both sides resolve the
 # same marker (same cross-process trick the pending_confirm marker uses).
-_PENDING_ATTACH_DIR = Path(os.environ.get("U1_PENDING_ATTACH_DIR",
-                                          "/tmp/u1_pending_attach"))
+from u1_pending import pending_dir as _pending_dir  # noqa: E402
+_PENDING_ATTACH_DIR = _pending_dir("attach")
 
 
 def _arm_pending_attach(request_id: str, images: "list[str] | None",
@@ -3542,8 +3669,9 @@ def _arm_pending_attach(request_id: str, images: "list[str] | None",
 # any confirm command. The workflow arms a marker file instead; the
 # u1_confirm_start gateway hook redeems the operator's actual YES message
 # by spawning the confirm command directly. The model has nothing to fire.
-_PENDING_CONFIRM_DIR = Path(os.environ.get("U1_PENDING_CONFIRM_DIR",
-                                           "/tmp/u1_pending_confirm"))
+_PENDING_CONFIRM_DIR = _pending_dir("confirm")
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5 (see _relay grace-cancel).
+_LEGACY_PENDING_CANCEL_DIR = Path("/tmp/u1_pending_cancel")
 _PENDING_CONFIRM_TTL_S = 15 * 60
 
 
@@ -3607,9 +3735,14 @@ def _arm_pending_confirm(request_id: str, filename: str | None,
                         "the YES until it can verify who is answering."),
         }, json_events)
     _PENDING_CONFIRM_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.tmp"
+    # Unique tmp + os.replace: re-arming an existing window must OVERWRITE
+    # the old marker on every platform. Path.rename refuses an existing
+    # target on Windows (WinError 183, caught by the 2026-07-10 Windows
+    # validation), and a fixed tmp name lets two writers collide.
+    import uuid as _uuid
+    tmp = _PENDING_CONFIRM_DIR / f".{request_id}.{_uuid.uuid4().hex}.tmp"
     tmp.write_text(json.dumps(entry, indent=2))
-    tmp.rename(_PENDING_CONFIRM_DIR / f"{request_id}.json")
+    os.replace(tmp, _PENDING_CONFIRM_DIR / f"{request_id}.json")
     _spawn_confirm_expiry_watchdog(request_id, filename, generation)
 
 
@@ -3627,7 +3760,7 @@ def _spawn_confirm_expiry_watchdog(request_id: str,
     script = str(Path(__file__).resolve().parent / "u1_confirm_watchdog.py")
     try:
         import subprocess as _sp
-        _sp.Popen(["python3", script, request_id,
+        _sp.Popen([sys.executable, script, request_id,
                    str(filename or "the pending print"), marker,
                    str(_PENDING_CONFIRM_TTL_S), generation],
                   stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -3649,17 +3782,28 @@ def _release_confirm_claim(request_id: str, claim_id: str | None = None) -> None
     yet (audit finding #3). Without one (direct/legacy invocation) fall back to
     the request-wide glob."""
     try:
+        def _unlink_tolerant(path: Path) -> None:
+            # Windows share-violation window: the parent gateway holds the
+            # claim open mid-pid-record (open 'r+') exactly when the child
+            # commits. A PermissionError here must not silently strand the
+            # claim past its commitment point (the reaper would later
+            # "restore" a window whose token is spent) — retry briefly.
+            for _ in range(20):
+                try:
+                    path.unlink()
+                    return
+                except FileNotFoundError:
+                    return
+                except PermissionError:
+                    time.sleep(0.01)
+            path.unlink()  # final attempt; a real error surfaces
+
         if claim_id:
-            try:
-                (_PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json").unlink()
-            except FileNotFoundError:
-                pass
+            _unlink_tolerant(
+                _PENDING_CONFIRM_DIR / f"{request_id}.claimed.{claim_id}.json")
             return
         for c in _PENDING_CONFIRM_DIR.glob(f"{request_id}.claimed.*.json"):
-            try:
-                c.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink_tolerant(c)
     except Exception:
         pass
 
@@ -3671,6 +3815,38 @@ def _disarm_pending_confirm(request_id: str) -> None:
         pass
     except Exception:
         pass
+
+
+def _classify_slice_failure(exc: Exception, request_id: str,
+                            too_big_hint: str = (
+                                "Slice failed. If a part is too big, "
+                                "re-answer the parts prompt without that "
+                                "part.")) -> dict:
+    """Build the kit_slice_failed event with guidance that matches the
+    actual failure class. First real Windows run (2026-07-12): a missing
+    Orca executable surfaced as bare '[WinError 2] ...' plus a part-too-big
+    hint - the part fit fine, and the one clue (the missing filename) was
+    discarded. A misdiagnosis is worse than no diagnosis at a safety
+    boundary."""
+    if isinstance(exc, FileNotFoundError):
+        missing = getattr(exc, "filename", None) or str(exc)
+        return {
+            "stage": "kit_slice_failed", "request_id": request_id,
+            "error": f"executable or file not found: {missing}"[:600],
+            "error_class": "exec_missing",
+            "configured_orca": u1_config.get_orca_bin(),
+            "instruction": (
+                "A required executable is missing (usually the OrcaSlicer "
+                "binary). Fix the configured path - set 'orca_bin' in "
+                "u1_config.json or export ORCA_SLICER_BIN - then re-run "
+                "this command. The part selection is NOT the problem."),
+        }
+    return {
+        "stage": "kit_slice_failed", "request_id": request_id,
+        "error": str(exc)[:600],
+        "error_class": "slice_failed",
+        "instruction": too_big_hint,
+    }
 
 
 _MODEL_FREE_YES_INSTRUCTION = (
@@ -3691,12 +3867,18 @@ def _action_grace_cancel(json_events: bool, operator: str | None) -> dict[str, A
     relay a cancel. It can only ever stop a print with this; there is no
     start analogue by design."""
     from datetime import datetime, timezone
-    pending_dir = Path(os.environ.get("U1_PENDING_CANCEL_DIR",
-                                      "/tmp/u1_pending_cancel"))
+    pending_dir = _pending_dir("cancel")
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: also scan the
+    # pre-v2.4.1 literal location so this cancel fallback can't go dead
+    # across a partial upgrade (readers scan both, writers only write the
+    # new location).
+    scan_dirs = [pending_dir] + (
+        [_LEGACY_PENDING_CANCEL_DIR]
+        if _LEGACY_PENDING_CANCEL_DIR != pending_dir else [])
     touched: list[str] = []
     now = datetime.now(timezone.utc)
-    if pending_dir.exists():
-        for f in sorted(pending_dir.iterdir()):
+    if any(d.exists() for d in scan_dirs):
+        for f in sorted(f for d in scan_dirs if d.exists() for f in d.iterdir()):
             if not f.is_file() or f.suffix != ".json":
                 continue
             try:
@@ -3897,7 +4079,7 @@ def _action_reprint_list(events_file: Path | None, json_events: bool,
             label += " (no longer on printer)"
         options.append({
             "n": i, "label": label,
-            "next_command": (f"python3 /opt/data/scripts/u1_kit_workflow.py "
+            "next_command": (f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')} "
                              f"--reprint-start {tok}"),
         })
     _emit(events_file, {
@@ -4308,7 +4490,7 @@ def _action_start(events_file: Path | None, request_id: str,
         # touches a marker the gate polls — docs/verify-cancel-hook.md), so
         # blocking here does NOT break cancel: the operator still gets the live
         # grace DM from the gate and can abort out-of-band.
-        gate_py = "/opt/data/scripts/u1_print_start_gate.py"
+        gate_py = _script_path("u1_print_start_gate.py")
         # Equals-form for the two random values: secrets.token_urlsafe can start
         # with '-', and argparse would treat a leading-dash VALUE as a flag
         # ("expected one argument"). This bug was latent in the old agent-relayed
@@ -4709,7 +4891,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
             "next_command_on_yes": (yes_command or (
                 # Legacy fallback (state-recovery path) — should never be
                 # taken; callers always pass yes_command with full context.
-                f"python3 /opt/data/scripts/u1_kit_workflow.py "
+                f"{_python_cmd()} {_script_shell_path('u1_kit_workflow.py')} "
                 f"--request-id {request_id} --action 'start manual-bed-check' "
                 f"--bed-clear-confirmed "
                 f"--operator-text {_shell_quote(operator_text)} "
@@ -4825,7 +5007,7 @@ def _action_start_manual_bed_check(events_file: Path | None, request_id: str,
     _tidx = _tool_to_index(tool)
     extruder = "extruder" if _tidx == 0 else f"extruder{_tidx}"
     stage2_cmd = (
-        f"python3 /opt/data/scripts/u1_print_start_gate.py "
+        f"{_python_cmd()} {_script_shell_path('u1_print_start_gate.py')} "
         f"{_shell_quote(plate_filename)} "
         f"--intended-tool {extruder} --requested-material {_shell_quote(material)} "
         f"--request-id {request_id} --bed-clear start "
@@ -5187,13 +5369,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             process_path_override=process,
         )
     except Exception as exc:
-        _emit(events_file, {
-            "stage": "kit_slice_failed", "request_id": request_id,
-            "error": str(exc)[:600],
-            "instruction": "Slice failed. If a part is too big, deselect it and re-answer the form.",
-        }, json_events)
-        _audit(request_id, "kit_slice_failed", operator, error=str(exc)[:300])
-        return {"phase": "slice_failed", "request_id": request_id, "error": str(exc)[:600]}
+        ev = _classify_slice_failure(
+            exc, request_id,
+            too_big_hint="Slice failed. If a part is too big, deselect it and re-answer the form.")
+        _emit(events_file, ev, json_events)
+        _audit(request_id, "kit_slice_failed", operator,
+               error=ev["error"][:300], error_class=ev["error_class"])
+        return {"phase": "slice_failed", "request_id": request_id, "error": ev["error"][:600]}
     _emit(events_file, {"stage": "kit_sliced", "request_id": request_id,
                         "plate_count": arr["plate_count"]}, json_events)
     # quantity only appears in the audit trail when it changed the plan —
@@ -5262,6 +5444,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                     "returncode": _rc,
                     "moonraker_upload_ok": up.get("moonraker_upload_ok"),
                     "human_summary": up.get("human_summary"),
+                    # Helper stdout tail (see the staged-path twin above).
+                    "output": str(up.get("output") or "")[-1500:],
                 })
         post_inject_hash = (u1_request.compute_model_hash(named)
                             if injection.get("ok") else pl["gcode_hash"])
@@ -5556,7 +5740,7 @@ def main(argv=None) -> int:
                           "verbatim; answer content never passes through it."))
     ap.add_argument("--redeem-pending-form", action="store_true",
                     dest="redeem_pending_form", default=False,
-                    help=("Redeem the pending form WITHOUT relaying its form_id — "
+                    help=("Redeem the pending form WITHOUT relaying its form_id - "
                           "the workflow reads form_id off the request. Preferred "
                           "over --form-answers-from for model-relayed redeems: a "
                           "26B model mangled the random-hex id verbatim "
@@ -5575,7 +5759,7 @@ def main(argv=None) -> int:
                           "and then this follows the exact --confirm-start "
                           "path (same nonce/revision/hash checks). Written "
                           "for the u1_confirm_start hook, which builds this "
-                          "command from its own constants — the pending "
+                          "command from its own constants - the pending "
                           "marker carries no command and no token."))
     ap.add_argument("--confirm-claim-id", default=None, dest="confirm_claim_id",
                     help=("Q3 (audit 2026-07-09): the exact claim id the confirm "
@@ -5587,11 +5771,11 @@ def main(argv=None) -> int:
                     help=("Cancel every active pre-start grace window (touches "
                           "the same markers the gateway cancel hook does). The "
                           "ONLY start-gate command the agent may run on its own "
-                          "initiative — it can only ever STOP a print."))
+                          "initiative - it can only ever STOP a print."))
     ap.add_argument("--pending-nonce", default=None, dest="pending_nonce",
                     help=("Single-use nonce from the emitted "
                           "next_command_on_yes. The confirm call must present "
-                          "it — copy the emitted command VERBATIM; a "
+                          "it - copy the emitted command VERBATIM; a "
                           "hand-assembled confirm is refused."))
     # Layer 3 override metadata (per Brent design 2026-06-30). When the agent
     # surfaces an override option (start manual-bed-check / start
@@ -5611,8 +5795,8 @@ def main(argv=None) -> int:
     ap.add_argument("--interaction-mode", default=None,
                     choices=["text", "form"],
                     help=("Model-capability-based UX split. `text` = staged "
-                          "6-turn Q&A (parts → orient → tool → preset → "
-                          "supports → confirm), cheap intermediates, safe for "
+                          "6-turn Q&A (parts -> orient -> tool -> preset -> "
+                          "supports -> confirm), cheap intermediates, safe for "
                           "small local models. `form` = single kit_form event "
                           "with form_schema (buttons UX, requires the u1-form "
                           "Hermes plugin). Falls through to env U1_INTERACTION_MODE "
@@ -5632,6 +5816,12 @@ def main(argv=None) -> int:
                     help="LEGACY: structured JSON answer (bypasses staged Q&A)")
 
     ap.add_argument("--request-id", default=None)
+    ap.add_argument("--set-printer", default=None, dest="set_printer",
+                    metavar="IP[:PORT]",
+                    help=("Persist the printer endpoint to u1_config.json "
+                          "(merge - other keys survive) and continue. The "
+                          "workflow asks for this via a need_input when no "
+                          "printer is configured."))
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--operator", default=None)
     ap.add_argument("--nozzle", default="0.4")
@@ -5639,7 +5829,7 @@ def main(argv=None) -> int:
     ap.add_argument("--live-upload", action="store_true",
                     help=("In legacy --form-answers one-liner mode: opt IN to "
                           "the real Moonraker upload (default is dry-run for "
-                          "CLI tests). In staged mode: no-op — live upload is "
+                          "CLI tests). In staged mode: no-op - live upload is "
                           "the default; use --no-live-upload to opt out."))
     ap.add_argument("--no-live-upload", action="store_true",
                     help="Opt out of the real Moonraker upload (CLI smoke tests only)")

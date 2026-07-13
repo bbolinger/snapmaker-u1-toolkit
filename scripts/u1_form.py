@@ -743,13 +743,19 @@ def resolve_confirm_token(token: str, consume: bool = True):
     # source already gone and return None. The old read-then-unlink let two
     # callers both read the same token before either deleted it, and both
     # returned the same request_id (and unlink failures were swallowed).
-    claimed = p.with_name(f".claim.{os.getpid()}.{token}.json")
+    # Claim destination must be unique PER CLAIMANT, not per process: threads
+    # share a pid, so pid-only names sent every racer to the SAME destination
+    # (zero-winner races + PermissionError on Windows, caught by the
+    # 2026-07-10 Windows validation). The atomic single-winner property lives
+    # in os.replace on the SOURCE; the uuid just de-collides destinations.
+    import uuid as _uuid
+    claimed = p.with_name(f".claim.{_uuid.uuid4().hex}.{token}.json")
     try:
         os.replace(p, claimed)
     except OSError:
         return None  # already claimed by another caller, or never existed
     try:
-        rid = _json.loads(claimed.read_text()).get("request_id")
+        rid = _json.loads(_read_claimed_text(claimed)).get("request_id")
     except Exception:
         rid = None
     try:
@@ -759,13 +765,32 @@ def resolve_confirm_token(token: str, consume: bool = True):
     return rid
 
 
+def _read_claimed_text(path) -> str:
+    """Read a freshly-claimed file, tolerating Windows' rename-race window.
+
+    A LOSING racer's in-flight os.replace opens the source file object
+    before discovering the winner already renamed it — for a few
+    microseconds that handle can deny the winner's first read with a share
+    violation (PermissionError, observed 25/25 on the 2026-07-11 Windows
+    validation). The claim itself is already won; retry briefly. POSIX
+    never takes the except branch."""
+    import time as _time
+    for _ in range(20):
+        try:
+            return path.read_text()
+        except PermissionError:
+            _time.sleep(0.01)
+    return path.read_text()  # final attempt — let a real error raise
+
+
 def write_answers_file(form_id: str, obj: dict) -> "Path":
     """Atomically persist a structured answer set for later redemption."""
     import json as _json
     import os
     p = _answers_path(form_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(f".tmp.{os.getpid()}")
+    import uuid as _uuid
+    tmp = p.with_suffix(f".tmp.{_uuid.uuid4().hex}")
     tmp.write_text(_json.dumps(obj, indent=2))
     os.replace(tmp, p)
     return p
@@ -783,14 +808,18 @@ def read_and_consume_answers(form_id: str) -> dict:
     import json as _json
     import os
     p = _answers_path(form_id)
-    claimed = p.with_suffix(f".claimed.{os.getpid()}")
+    # Per-claimant unique destination (threads share a pid — see
+    # resolve_confirm_token); os.replace on the source stays the atomic
+    # single-winner step.
+    import uuid as _uuid
+    claimed = p.with_suffix(f".claimed.{_uuid.uuid4().hex}")
     try:
         os.replace(p, claimed)
     except OSError:
         raise FileNotFoundError(
             f"no pending answers for form {form_id!r} (missing or already used)")
     try:
-        text = claimed.read_text()
+        text = _read_claimed_text(claimed)
     finally:
         try:
             os.replace(claimed, p.with_suffix(".json.consumed"))

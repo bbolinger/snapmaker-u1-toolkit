@@ -19,13 +19,26 @@ TOOLS = Path(__file__).resolve().parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
 from _stl_render import parse_stl, bbox  # type: ignore
 
-DEFAULT_ORCA = Path(os.environ.get('ORCA_SLICER_BIN', '/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer'))
+# Resolution: env > u1_config 'orca_bin' > Linux deploy default. The config
+# source persists across emitted child commands (see u1_config.get_orca_bin).
+try:
+    from u1_config import get_orca_bin as _get_orca_bin
+    DEFAULT_ORCA = Path(_get_orca_bin())
+except Exception:
+    DEFAULT_ORCA = Path(os.environ.get('ORCA_SLICER_BIN', '/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer'))
 _VEC_RE = re.compile(r"\(?\s*([-+]?\d+(?:\.\d+)?)\s*[, ]\s*([-+]?\d+(?:\.\d+)?)\s*[, ]\s*([-+]?\d+(?:\.\d+)?)\s*\)?")
 _COST_RE = re.compile(r"cost\s*[:=]\s*([-+]?\d+(?:\.\d+)?)", re.I)
 
 def orca_env(orca_bin: Path = DEFAULT_ORCA) -> dict[str, str]:
     env=os.environ.copy()
-    root=orca_bin.resolve().parents[1]
+    # LD_LIBRARY_PATH shimming only applies to the extracted-AppImage layout;
+    # on other layouts (e.g. Windows portable, shallow paths) the lib dirs
+    # simply don't exist and env is returned unchanged. parents[1] raises
+    # IndexError for a binary sitting at filesystem root — treat as no-libs.
+    try:
+        root=orca_bin.resolve().parents[1]
+    except (OSError, IndexError):
+        return env
     lib_paths=[root.parent/'local-libs/usr/lib/x86_64-linux-gnu', root/'usr/lib', root/'usr/lib/x86_64-linux-gnu']
     existing=[str(p) for p in lib_paths if p.exists()]
     if existing:

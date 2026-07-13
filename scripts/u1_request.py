@@ -92,13 +92,14 @@ def request_dir(request_id: str) -> Path:
     return _requests_root() / request_id
 
 
-import fcntl as _fcntl
 from contextlib import contextmanager as _contextmanager
+
+from u1_lockfile import exclusive_lock as _exclusive_lock
 
 
 @_contextmanager
 def request_lock(request_id: str):
-    """Exclusive per-request advisory lock (flock on
+    """Exclusive per-request lock (u1_lockfile sidecar lock on
     ``<request_dir>/.request.lock``) held across a full read-modify-write.
 
     Cold-audit finding 2026-07-07: ``write_request`` was atomic against a
@@ -108,20 +109,13 @@ def request_lock(request_id: str):
     and RESURRECTS the consumed nonce. Serializing every request read-
     modify-write under one lock closes that race for the nonce and for the
     whole lost-update family (revision bumps, safety-block edits, plate
-    state). Linux runtime: fcntl is always present. A lock failure raises
-    rather than silently proceeding unlocked — for a safety-state file a
-    missing mutex must fail loud, not fail open."""
+    state). u1_lockfile backs this with fcntl on POSIX and msvcrt on
+    Windows — never a no-op. A lock failure raises rather than silently
+    proceeding unlocked — for a safety-state file a missing mutex must
+    fail loud, not fail open."""
     ensure_request_dir(request_id)
-    lock_path = request_dir(request_id) / ".request.lock"
-    lf = open(lock_path, "w")
-    try:
-        _fcntl.flock(lf, _fcntl.LOCK_EX)
+    with _exclusive_lock(request_dir(request_id) / ".request.lock"):
         yield
-    finally:
-        try:
-            _fcntl.flock(lf, _fcntl.LOCK_UN)
-        finally:
-            lf.close()
 
 
 def ensure_request_dir(request_id: str) -> Path:
@@ -150,7 +144,11 @@ def ensure_request_dir(request_id: str) -> Path:
         while cur != data_root and data_root in cur.parents:
             cst = cur.stat()
             if cst.st_uid != target_uid or cst.st_gid != target_gid:
-                os.chown(cur, target_uid, target_gid)
+                # POSIX-only: Windows os has no chown at all (attribute
+                # access raises AttributeError, which the except below
+                # would NOT catch — 2026-07-10 Windows validation).
+                if hasattr(os, "chown"):
+                    os.chown(cur, target_uid, target_gid)
             cur = cur.parent
     except (OSError, PermissionError):
         pass  # best-effort; not authoritative
@@ -304,11 +302,25 @@ def write_request(request_id: str, **fields: Any) -> Path:
         prior['updated_at'] = now
         prior['request_revision'] = new_revision
         _ensure_schema_defaults(prior)
-        # Atomic write: write to sibling temp file, then os.replace.
-        tmp = p.with_suffix(p.suffix + f'.tmp.{os.getpid()}')
+        # Atomic write: write to sibling temp file, then os.replace. The tmp
+        # name is uuid-unique (threads share a pid) and the replace retries
+        # briefly on PermissionError: on Windows an unlocked read_request
+        # holding request.json open denies the swap for a moment, and inside
+        # _consume_stage2_nonce that transient would surface as a spurious
+        # fail-closed refusal.
+        import time as _time
+        import uuid as _uuid
+        tmp = p.with_suffix(p.suffix + f'.tmp.{_uuid.uuid4().hex}')
         try:
             tmp.write_text(json.dumps(prior, indent=2, default=str))
-            os.replace(tmp, p)
+            for attempt in range(20):
+                try:
+                    os.replace(tmp, p)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    _time.sleep(0.01)
         finally:
             if tmp.exists():
                 try: tmp.unlink()

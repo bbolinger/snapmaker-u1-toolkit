@@ -13,8 +13,19 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # exists (the marker of a Hermes-shared dataset).
 if [[ -d /appdata/hermes/scripts ]] && [[ "$ROOT" == /appdata/hermes/* ]]; then
   _DEFAULT_ROOT="/appdata/hermes"
-else
+elif [[ -d /opt/data ]]; then
   _DEFAULT_ROOT="/opt/data"
+elif [[ -n "${HERMES_HOME:-}" ]] && [[ -d "${HERMES_HOME}" ]]; then
+  # Native Windows (Git Bash) / non-container installs: no /opt/data.
+  # Deploy into the Hermes home the gateway actually reads from.
+  _DEFAULT_ROOT="${HERMES_HOME}"
+else
+  echo "deploy: no deploy root found." >&2
+  echo "  Neither /opt/data nor \$HERMES_HOME exists on this host." >&2
+  echo "  Native Windows: run from Git Bash with HERMES_HOME set to your" >&2
+  echo "  Hermes data dir, or set U1_DEPLOY_SCRIPTS / U1_DEPLOY_TOOLS /" >&2
+  echo "  U1_DEPLOY_SKILL / U1_DEPLOY_PROFILES explicitly." >&2
+  exit 1
 fi
 SCRIPT_DST="${U1_DEPLOY_SCRIPTS:-$_DEFAULT_ROOT/scripts}"
 TOOLS_DST="${U1_DEPLOY_TOOLS:-$_DEFAULT_ROOT/tools}"
@@ -320,5 +331,35 @@ elif [[ -z "$_CANCEL_RECEIPT" ]]; then
   printf '     grace window does nothing until it is installed.\n'
   printf '     Run: bash tools/install_hermes_u1_hooks.sh\n'
 else
-  printf '\n  ✓  Both gateway hook receipts present in %s.\n' "$_HOOKS_DIR"
+  # Receipts exist — but do they match THIS workspace's hook sources? A
+  # STALE installed hook is worse than a missing one: v2.4.1 moved the
+  # pending-marker dirs, and an old loaded cancel hook reading the old
+  # location leaves the grace DM advertising a reply-CANCEL nothing hears
+  # (the legacy-dir shim in the handlers covers one release, but yell
+  # anyway so the skew gets fixed, not relied on).
+  _sha256_local() {
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$1" | awk '{print $1}'
+    else
+      shasum -a 256 "$1" | awk '{print $1}'
+    fi
+  }
+  _STALE_HOOKS=""
+  for _hook in u1_grace_cancel u1_confirm_start; do
+    _want="$(_sha256_local "$ROOT/tools/hermes_hooks/$_hook/handler.py" 2>/dev/null || true)"
+    _have="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['sha256'].get('handler.py',''))" \
+             "$_HOOKS_DIR/$_hook/.install_receipt.json" 2>/dev/null || true)"
+    if [[ -n "$_want" && -n "$_have" && "$_want" != "$_have" ]]; then
+      _STALE_HOOKS="$_STALE_HOOKS $_hook"
+    fi
+  done
+  if [[ -n "$_STALE_HOOKS" ]]; then
+    printf '\n  ⚠  STALE gateway hook(s) installed:%s\n' "$_STALE_HOOKS"
+    printf '     The installed handler.py does not match this workspace. Re-run:\n'
+    printf '         bash tools/install_hermes_u1_hooks.sh\n'
+    printf '     then restart the gateway — a stale cancel hook can miss the\n'
+    printf '     pending-marker location this deploy just shipped.\n'
+  else
+    printf '\n  ✓  Both gateway hook receipts present and current in %s.\n' "$_HOOKS_DIR"
+  fi
 fi

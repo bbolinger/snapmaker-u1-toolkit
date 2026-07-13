@@ -22,16 +22,46 @@ import os, sys, subprocess
 from pathlib import Path
 
 
+def _bootstrap_env() -> dict:
+    """os.environ copy without PYTHONPATH/PYTHONHOME (escape hatch:
+    U1_KEEP_PYTHONPATH=1). A foreign PYTHONPATH is how Hermes Desktop
+    poisoned python3=3.13 with a 3.11 venv's compiled Pillow (install
+    report 2026-07-10): bare `import PIL` passed, `from PIL import Image`
+    died in _imaging. Candidates probed or re-exec'd under the same
+    poison fail identically, so every bootstrap subprocess runs sanitized."""
+    env = os.environ.copy()
+    if env.get('U1_KEEP_PYTHONPATH', '').strip().lower() not in (
+            '1', 'true', 'yes', 'on'):
+        env.pop('PYTHONPATH', None)
+        env.pop('PYTHONHOME', None)
+    return env
+
+
 def _check_python_has_deps(python_path: str, deps: tuple = ('numpy', 'PIL')) -> bool:
     """Return True iff `python_path` can import every dep without error."""
     try:
         proc = subprocess.run(
             [python_path, '-c', 'import numpy; from PIL import Image, ImageDraw'],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_bootstrap_env(),
         )
         return proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _reexec(python_path: str) -> None:
+    """Continue under `python_path` with the sanitized env. POSIX: execve
+    (true process replacement, the caller keeps our stdout/stderr).
+    Windows: subprocess + exit with the child's code — execv there does NOT
+    replace the process, it abandons the console while the child keeps
+    writing, garbling agent-captured output."""
+    env = _bootstrap_env()
+    env['U1_BOOTSTRAP_REEXEC'] = '1'  # loop guard for the self-retry path
+    argv = [python_path, __file__, *sys.argv[1:]]
+    if os.name == 'nt':
+        proc = subprocess.run(argv, env=env)
+        sys.exit(proc.returncode)
+    os.execve(python_path, argv, env)
 
 
 def _ensure_compat_python() -> None:
@@ -63,6 +93,21 @@ def _ensure_compat_python() -> None:
     except Exception:
         missing.append('pillow')
 
+    # A poisoned PYTHONPATH alone can produce exactly this failure while the
+    # interpreter itself is fine. Retry SELF with it cleared before hunting
+    # other interpreters (skipped after one re-exec — the loop guard proves
+    # the env wasn't the problem).
+    if (os.environ.get('U1_BOOTSTRAP_REEXEC') != '1'
+            and os.environ.get('PYTHONPATH')
+            and _check_python_has_deps(sys.executable)):
+        print(
+            f'[env] current python lacks {", ".join(missing)} under the '
+            f'inherited PYTHONPATH; retrying with it cleared '
+            f'(U1_KEEP_PYTHONPATH=1 keeps it)',
+            file=sys.stderr,
+        )
+        _reexec(sys.executable)
+
     # Candidate Python paths, in priority order. The U1_TOOLKIT_PYTHON env
     # var wins so users can override on any host without code changes.
     here = Path(__file__).resolve().parent
@@ -75,6 +120,8 @@ def _ensure_compat_python() -> None:
         '/opt/hermes/.venv/bin/python',         # Hermes-bundled venv (common host)
         str(root / 'venv' / 'bin' / 'python'),  # project-local venv
         str(root / '.venv' / 'bin' / 'python'), # uv/poetry-style hidden venv
+        str(root / 'venv' / 'Scripts' / 'python.exe'),   # project venv (Windows)
+        str(root / '.venv' / 'Scripts' / 'python.exe'),  # hidden venv (Windows)
         '/opt/homebrew/bin/python3',             # macOS Homebrew (Apple Silicon — default for M-series)
         '/usr/local/bin/python3',                # macOS Homebrew (Intel) — legacy install path
     ])
@@ -83,16 +130,15 @@ def _ensure_compat_python() -> None:
         if not Path(cand).exists():
             continue
         if _check_python_has_deps(cand):
-            # Re-exec with the working interpreter. execv replaces this process,
-            # so the agent that spawned us still gets stdout/stderr of the
-            # workflow. Pass the same script + the same argv tail.
+            # Continue under the working interpreter (sanitized env — the
+            # same PYTHONPATH that broke us would break the candidate too).
+            # The agent that spawned us still gets the workflow's output.
             print(
                 f'[env] current python lacks {", ".join(missing)}; '
                 f'switching to {cand}',
                 file=sys.stderr,
             )
-            os.execv(cand, [cand, __file__, *sys.argv[1:]])
-            # execv does not return on success
+            _reexec(cand)
 
     # Nothing worked — print a clear, actionable error and exit non-zero.
     msg = [
@@ -114,6 +160,13 @@ def _ensure_compat_python() -> None:
         f'     cd {Path(__file__).resolve().parent.parent}',
         f'     python3 -m venv venv && venv/bin/pip install numpy pillow',
     ]
+    if os.environ.get('PYTHONPATH'):
+        msg += [
+            f'',
+            f'NOTE: PYTHONPATH is set ({os.environ["PYTHONPATH"][:200]}).',
+            f'A foreign PYTHONPATH can shadow working installs; the checks',
+            f'above already ran with it cleared (U1_KEEP_PYTHONPATH=1 keeps it).',
+        ]
     print('\n'.join(msg), file=sys.stderr)
     sys.exit(2)
 
@@ -580,6 +633,37 @@ def promote_to_supports_variant(profile_value: str) -> str | None:
     return None
 
 
+def orca_resources_root(orca_bin: Path) -> Path | None:
+    """Locate Orca's bundled resources/ dir from the executable location.
+
+    Two layouts exist in the wild:
+      Windows portable zip:   <dir>/orca-slicer.exe  +  <dir>/resources/
+      Linux AppImage extract: <squashfs-root>/bin/orca-slicer  +
+                              <squashfs-root>/resources/
+
+    The old lookup hardcoded orca_bin.parents[1]/resources (AppImage-only).
+    On Windows portable that reaches the directory ABOVE the Orca dir, misses
+    the bundled vendor profiles, and the inherits-chain flatteners can't
+    resolve upstream parents — Orca then silently falls back to PLA defaults
+    (reproduced on a real Windows desktop 2026-07-10: upstream PETG leaf
+    profile produced filament_type=PLA gcode; the upload gate caught it, but
+    the slice itself was wrong). Returns None when neither layout matches
+    (wrapper/shim binaries, test harnesses) so callers fall through to their
+    well-known absolute candidates."""
+    try:
+        rp = orca_bin.resolve()
+    except OSError:
+        rp = orca_bin
+    for cand in (rp.parent / 'resources',            # Windows portable
+                 rp.parent.parent / 'resources'):    # AppImage: <root>/bin/<exe>
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None) -> dict[str, Any]:
     """Walk a filament profile's inherits chain and merge into a self-contained
     dict. Same shape as _flatten_process_profile but searches the vendor
@@ -607,8 +691,10 @@ def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None)
     if orca_bin is None:
         orca_bin = DEFAULT_ORCA
     vendor_dirs: list[Path] = []
-    vendor_root_candidates = [
-        orca_bin.resolve().parents[1] / 'resources' / 'profiles' / 'Snapmaker',
+    resources = orca_resources_root(orca_bin)
+    vendor_root_candidates = (
+        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
     ]
@@ -616,7 +702,7 @@ def _flatten_filament_profile(filament_path: Path, orca_bin: Path | None = None)
         try:
             if not vendor_root.exists():
                 continue
-        except (OSError, IndexError):
+        except OSError:
             continue
         if vendor_root not in vendor_dirs:
             vendor_dirs.append(vendor_root)
@@ -729,11 +815,13 @@ def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -
     if orca_bin is None:
         orca_bin = DEFAULT_ORCA
     vendor_dirs: list[Path] = []
-    # Primary path: orca_bin's own squashfs-root tree. Works in production
-    # where orca_bin IS the real binary. Fallbacks for the test-harness/
-    # wrapper case where parents[1] isn't a squashfs-root.
-    vendor_root_candidates = [
-        orca_bin.resolve().parents[1] / 'resources' / 'profiles' / 'Snapmaker',
+    # Primary path: orca_bin's own resources tree (portable OR AppImage, via
+    # orca_resources_root). Fallbacks for the test-harness/wrapper case where
+    # the binary isn't inside a real Orca tree.
+    resources = orca_resources_root(orca_bin)
+    vendor_root_candidates = (
+        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
     ]
@@ -741,7 +829,7 @@ def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -
         try:
             if not vendor_root.exists():
                 continue
-        except (OSError, IndexError):
+        except OSError:
             continue
         if vendor_root not in vendor_dirs:
             vendor_dirs.append(vendor_root)
@@ -1202,19 +1290,22 @@ def rewrite_gcode_for_tool(gcode: Path, tool_idx: int) -> int:
 def machine_profile_for_orca(orca_bin: Path = DEFAULT_ORCA) -> Path:
     """Resolve the Snapmaker U1 (0.4 nozzle) vendor machine profile.
 
-    Primary path: orca_bin.resolve().parents[1] / resources/profiles/...
-    This works when orca_bin IS the real Orca binary inside its
-    squashfs-root tree (production slice path).
+    Primary path: orca_bin's own resources tree via orca_resources_root
+    (handles both the Linux AppImage and Windows portable layouts). Works
+    when orca_bin IS the real Orca binary (production slice path).
 
     Fallbacks: well-known absolute locations on this host. Needed when
     orca_bin is a wrapper/shim (test harness, /opt/orca-via-* style)
-    whose parents[1] isn't the Orca tree — without these, the function
+    that isn't inside a real Orca tree — without these, the function
     falls back to ROOT/'profiles/machine/snapmaker_u1_0_4_nozzle.json'
     which carries a stale 'MyToolChanger 0.4 nozzle - Copy'
     printer_settings_id that Orca then rejects as incompatible with
     stock process profiles (verified live 2026-06-26)."""
-    candidates = [
-        orca_bin.resolve().parents[1] / 'resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json',
+    resources = orca_resources_root(orca_bin)
+    candidates = (
+        [resources / 'profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json']
+        if resources is not None else []
+    ) + [
         Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json'),
         Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker/machine/Snapmaker U1 (0.4 nozzle).json'),
     ]
@@ -1594,8 +1685,11 @@ def run_workflow(args)->dict[str,Any]:
     # unconditional). --operator is baked ONLY when explicit on this CLI so a
     # test-flavored operator stays sticky across the chain (Fence 1);
     # env-resolved identity stays env-resolved (replay-safe).
-    _kit_cmd = (f'python3 /opt/data/scripts/u1_kit_workflow.py '
-                f'{_shell_quote(str(model))} --json-events')
+    from u1_runtime_paths import (script_shell_path as _script_shell_path,
+                                  shell_path as _shell_path,
+                                  python_cmd as _python_cmd)
+    _kit_cmd = (f'{_python_cmd()} {_script_shell_path("u1_kit_workflow.py")} '
+                f'{_shell_quote(_shell_path(model))} --json-events')
     _cli_op = getattr(args, 'operator', None)
     if _cli_op:
         _kit_cmd += f' --operator {_shell_quote(str(_cli_op))}'
@@ -1643,7 +1737,7 @@ def main(argv=None)->int:
                     help='Whether operator chose Stage-1 path (upload_start) or upload-only (upload).')
     ap.add_argument('--on-collision', choices=['rename', 'overwrite', 'cancel'], default=None,
                     help="Operator's resolution if the target storage filename already exists on the U1. "
-                         "Passed through to u1_upload_gcode.py. Default = unset → helper detects collision "
+                         "Passed through to u1_upload_gcode.py. Default = unset -> helper detects collision "
                          "and emits a filename_collision need_input prompt; re-run with this flag to commit.")
     ap.add_argument('--no-live-material', action='store_true', help='Do not query live material state; use supplied/headless option')
     ap.add_argument('--out-dir', type=Path,

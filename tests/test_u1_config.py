@@ -228,3 +228,83 @@ def test_cron_scripts_run_main_without_crash(monkeypatch, tmp_path):
             f"{script_name}: NameError leaked from main(): {combined[:500]}"
         assert "Traceback" not in combined or "RuntimeError" in combined, \
             f"{script_name}: unexpected traceback: {combined[:500]}"
+
+
+def test_get_orca_bin_resolution_chain(tmp_path, monkeypatch):
+    """env > config-file orca_bin > Linux default. The config source is
+    what makes the Orca path survive into emitted child commands (the
+    2026-07-12 Windows run lost a one-shot shell export and sliced
+    against the nonexistent Linux default)."""
+    import json as _json
+    import u1_config
+    cfg = tmp_path / "u1_config.json"
+    monkeypatch.setattr(u1_config, "CONFIG_PATH", cfg, raising=False)
+    monkeypatch.setattr(u1_config, "get_config_path", lambda: cfg)
+    monkeypatch.setattr(u1_config, "_load_file",
+                        lambda: _json.loads(cfg.read_text()) if cfg.exists() else {})
+    monkeypatch.delenv("ORCA_SLICER_BIN", raising=False)
+
+    # 3. default
+    assert u1_config.get_orca_bin().endswith("orca-slicer")
+    # 2. config file
+    cfg.write_text(_json.dumps({"orca_bin": "C:/orca242/orca-slicer.exe"}))
+    assert u1_config.get_orca_bin() == "C:/orca242/orca-slicer.exe"
+    # 1. env wins
+    monkeypatch.setenv("ORCA_SLICER_BIN", "/elsewhere/orca")
+    assert u1_config.get_orca_bin() == "/elsewhere/orca"
+
+
+def _fresh_config_env(tmp_path, monkeypatch):
+    """Reset the dotenv loader state and sandbox config resolution."""
+    import u1_config
+    monkeypatch.setattr(u1_config, "_DOTENV_LOADED", False)
+    monkeypatch.setattr(u1_config, "_DOTENV_VALUES", {})
+    cfg = tmp_path / "u1_config.json"
+    monkeypatch.setattr(u1_config, "get_config_path", lambda: cfg)
+    monkeypatch.setattr(
+        u1_config, "_load_file",
+        lambda: json.loads(cfg.read_text()) if cfg.exists() else {})
+    monkeypatch.delenv("SNAPMAKER_U1_HOST", raising=False)
+    monkeypatch.delenv("SNAPMAKER_U1_PORT", raising=False)
+    monkeypatch.chdir(tmp_path)  # cwd-walk finds only OUR .env
+    return cfg
+
+
+def test_saved_printer_overrides_dotenv_placeholder(tmp_path, monkeypatch):
+    """A copied .env.example host must not beat the operator's deliberately
+    persisted first-run choice (live 2026-07-12: children resolved the
+    sample 192.168.1.100 while the saved real printer sat unused)."""
+    import u1_config
+    cfg = _fresh_config_env(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text("SNAPMAKER_U1_HOST=192.168.1.100\n")
+    cfg.write_text(json.dumps({"host": "192.168.86.34"}))
+    assert u1_config.get_u1_host() == "192.168.86.34"
+
+
+def test_explicit_env_still_beats_saved_printer(tmp_path, monkeypatch):
+    """An administrator's actual process environment stays highest priority
+    - only .env-INJECTED values drop below the persisted config."""
+    import u1_config
+    cfg = _fresh_config_env(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text("SNAPMAKER_U1_HOST=192.168.1.100\n")
+    cfg.write_text(json.dumps({"host": "192.168.86.34"}))
+    monkeypatch.setenv("SNAPMAKER_U1_HOST", "10.0.0.9")
+    assert u1_config.get_u1_host() == "10.0.0.9"
+
+
+def test_dotenv_host_used_when_nothing_else_configured(tmp_path, monkeypatch):
+    import u1_config
+    _fresh_config_env(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text("SNAPMAKER_U1_HOST=192.168.5.5\n")
+    assert u1_config.get_u1_host() == "192.168.5.5"
+
+
+def test_orca_bin_saved_config_beats_dotenv(tmp_path, monkeypatch):
+    """Symmetry: the same explicit-vs-injected rule applies to the slicer
+    path, or the host fix just moves the trap."""
+    import u1_config
+    cfg = _fresh_config_env(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text("ORCA_SLICER_BIN=/example/orca\n")
+    cfg.write_text(json.dumps({"orca_bin": "C:/real/orca-slicer.exe"}))
+    monkeypatch.delenv("ORCA_SLICER_BIN", raising=False)
+    assert u1_config.get_orca_bin() == "C:/real/orca-slicer.exe"

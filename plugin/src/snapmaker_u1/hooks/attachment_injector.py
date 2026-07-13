@@ -14,16 +14,33 @@ raw text. Losing the bed photo means losing the visual bed-clear check.
 
 The fix (same model-free philosophy as the YES boundary)
 --------------------------------------------------------
-The workflow OWNS the real image paths in the request dir. When it emits an
-image-bearing card it drops a one-shot marker keyed by ``HERMES_SESSION_KEY``
-(the workflow subprocess inherits it; the gateway process where this hook runs
-sets it at run.py's dispatch, so both sides read the identical value). This hook
-reads that marker on the outbound turn and:
+The workflow OWNS the real image paths in the request dir. A one-shot marker
+(keyed by ``HERMES_SESSION_KEY``, kind "attach") carries the AUTHORITATIVE paths
+to this outbound hook, which:
 
   1. strips any U1 image path the model echoed (correct OR mangled) so a dead
      path can never leak into the visible reply, then
   2. appends the AUTHORITATIVE paths (that actually exist on disk) as bare
      lines, so core attaches the true images regardless of what the model typed.
+
+Who arms the marker (corrected 2026-07-12)
+------------------------------------------
+The marker MUST be keyed by the value THIS hook reads for the session. That
+value lives in the gateway's session contextvar (``get_session_env`` — see
+``_session_key``); the gateway deliberately does NOT put it in os.environ.
+
+  * PRIMARY (reliable): ``arm_from_tool_result`` runs inside the plugin's
+    ``transform_tool_result`` hook — same gateway process, same contextvar — and
+    arms the marker from the workflow's own JSON ``render``/``review_doc`` events
+    in the tool output. This works no matter how the model spawned the workflow.
+  * Legacy (unreliable, kept as belt): the workflow's ``_arm_pending_attach``
+    reads ``os.environ['HERMES_SESSION_KEY']``. But Hermes' terminal tool never
+    threads that var into the spawned command's env (it only builds a
+    ``session:<key>`` id string), so on the fresh-kit / terminal-driven path the
+    workflow is blind to the key and cannot arm. That is why attach silently fell
+    back to model echo and a fresh kit dropped its mangled-path iso image (live
+    2026-07-12); the two earlier "verified" drills were reprints, a different
+    spawn path, which masked it. The gateway-side arm above is the real fix.
 
 The marker is consumed one-shot. The safety gate is untouched — it validates
 real gcode, never an image.
@@ -53,12 +70,13 @@ logger = logging.getLogger(__name__)
 # Marker location + schema. Mirrors the workflow's _arm_pending_attach in
 # scripts/u1_kit_workflow.py (kept in lockstep by these two comments, the same
 # way the pending_confirm marker is shared with the u1_confirm_start hook).
-#   dir     : $U1_PENDING_ATTACH_DIR (default /tmp/u1_pending_attach)
+#   dir     : u1_pending resolver, kind "attach" (env-overridable)
 #   file    : sha256(HERMES_SESSION_KEY)[:16].json
 #   content : {"request_id": str, "images": [abs path, ...],
 #              "operator": str|None, "created_at": float}
-_PENDING_ATTACH_DIR = Path(
-    os.environ.get("U1_PENDING_ATTACH_DIR", "/tmp/u1_pending_attach"))
+from ..pending import pending_dir as _resolve_pending_dir
+
+_PENDING_ATTACH_DIR = _resolve_pending_dir("attach")
 # Images are only relevant to the immediate reply; a marker older than this is
 # stale (a crash or a non-card turn) and is discarded rather than re-attached.
 _PENDING_ATTACH_TTL_S = 120.0
@@ -100,8 +118,30 @@ _U1_SIGNATURES = (
 )
 
 
+def _session_key() -> str:
+    """The session key this hook's turn belongs to.
+
+    The gateway deliberately never writes HERMES_SESSION_KEY into its own
+    os.environ (upstream: process-global env + concurrent sessions clobber
+    each other), so at transform time the key lives in Hermes' session
+    contextvars — the same source the u1_kit tool exports into the workflow
+    subprocess that WRITES the marker. Reading anything else desyncs the
+    two sides: live 2026-07-11, the env read returned empty here, the hook
+    refused fail-closed every turn, and attachment fell back to model echo
+    (photos survived by luck, the review doc's mangled path did not).
+    os.environ stays as the fallback for tests and non-gateway callers."""
+    try:
+        from gateway.session_context import get_session_env
+        key = (get_session_env("HERMES_SESSION_KEY") or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("HERMES_SESSION_KEY", "").strip()
+
+
 def _marker_path_for_session() -> Path | None:
-    key = os.environ.get("HERMES_SESSION_KEY", "")
+    key = _session_key()
     if not key:
         # Refuse the empty-key shared slot: without a stable per-session key,
         # every session hashes to the same file and one request's marker could
@@ -225,6 +265,81 @@ def _is_safe_artifact(path_str: str) -> bool:
         return _REQUESTS_ROOT.resolve() in rp.parents
     except (OSError, ValueError, RuntimeError):
         return False
+
+
+def arm_from_tool_result(tool_output: str) -> int:
+    """Arm the attach marker from a terminal tool's workflow stdout, keyed by
+    THIS turn's session (the gateway contextvar).
+
+    This is the RELIABLE arming path. The workflow's own `_arm_pending_attach`
+    can't arm on the fresh-kit flow: Hermes' terminal tool never threads
+    HERMES_SESSION_KEY into the spawned command's env (it only builds a
+    "session:<key>" identifier), so the workflow reads an empty key and
+    refuses (live 2026-07-12: a fresh kit's iso image dropped because gemma
+    echoed a mangled path and the injector, unarmed, could not override it).
+    This function runs gateway-side inside `transform_tool_result`, where
+    `_session_key()` resolves via the same contextvar the injector reads — so
+    arming no longer depends on how gemma spawned the workflow or on gemma
+    echoing paths correctly.
+
+    Reads the AUTHORITATIVE `render`/`review_doc` paths straight from the
+    workflow's own JSON events (never gemma's reply), validates each with
+    `_is_safe_artifact`, and writes the marker only at the review moment
+    (a `bed_clear_start`/`kit_readiness_card` event present). Returns the
+    number of artifacts armed. Best-effort; never raises."""
+    try:
+        if not tool_output or '"render"' not in tool_output:
+            return 0
+        # Only arm at the operator's review moment, not on every render event.
+        if ("bed_clear_start" not in tool_output
+                and "kit_readiness_card" not in tool_output):
+            return 0
+        images: list[str] = []
+        docs: list[str] = []
+        request_id: str | None = None
+        for line in tool_output.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if not request_id and ev.get("request_id"):
+                request_id = str(ev["request_id"])
+            stage = ev.get("stage")
+            if stage == "render" and ev.get("image"):
+                images.append(str(ev["image"]))
+            elif stage == "review_doc" and ev.get("path"):
+                docs.append(str(ev["path"]))
+        safe_imgs = [p for p in dict.fromkeys(images) if _is_safe_artifact(p)]
+        safe_docs = [p for p in dict.fromkeys(docs) if _is_safe_artifact(p)]
+        if not safe_imgs and not safe_docs:
+            return 0
+        path = _marker_path_for_session()
+        if path is None:
+            return 0  # no session key even gateway-side -> can't key the marker
+        _PENDING_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "request_id": request_id,
+            "images": safe_imgs,
+            "documents": safe_docs,
+            "operator": None,
+            "created_at": time.time(),
+        }
+        tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+        logger.info(
+            "snapmaker_u1 attach: armed marker gateway-side from tool result "
+            "(%d image(s), %d doc(s), request_id=%s)",
+            len(safe_imgs), len(safe_docs), request_id,
+        )
+        return len(safe_imgs) + len(safe_docs)
+    except Exception:
+        return 0
 
 
 def transform(response_text: str = "", session_id: str = "", model: str = "",

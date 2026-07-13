@@ -72,18 +72,43 @@ def _load_renderer():
         return u1_form_telegram
 
 
+# TEMPORARY v2.4.1 upgrade shim - remove in v2.5 (see the cancel handler).
+_U1_LEGACY_CANCEL_DIR = "/tmp/u1_pending_cancel"
+
+
+def _u1_pending_dir(kind):
+    """KEEP IN SYNC with scripts/u1_pending.py (canonical copy + rationale).
+    This file deploys standalone as the u1-form plugin, so the ~10-line
+    rule is duplicated; test_pending_paths.py asserts identity."""
+    import os as _os
+    import tempfile as _tempfile
+    from pathlib import Path as _P
+    explicit = _os.environ.get(f"U1_PENDING_{kind.upper()}_DIR", "").strip()
+    if explicit:
+        return _P(explicit)
+    root = _os.environ.get("U1_PENDING_STATE_DIR", "").strip()
+    if root:
+        return _P(root) / kind
+    return _P(_tempfile.gettempdir()) / "u1_pending" / kind
+
+
 async def _u1_handle_cancel_callback(adapter, update, ctx):
     """Touch the gate's cancel marker for the tapped request. Model-free:
     pure file touch, same contract as the u1_grace_cancel message hook. The
     gate polls the marker once per second and refuses the start."""
     import json as _json
-    import os as _os
     from datetime import datetime, timezone
     from pathlib import Path as _P
     q = update.callback_query
     rid = (q.data or "").split(":", 1)[-1]
-    pending = (_P(_os.environ.get("U1_PENDING_CANCEL_DIR",
-                                  "/tmp/u1_pending_cancel")) / f"{rid}.json")
+    pending = _u1_pending_dir("cancel") / f"{rid}.json"
+    # TEMPORARY v2.4.1 upgrade shim - remove in v2.5: a pre-v2.4.1 notify
+    # script writes the routing entry to the old literal location; the
+    # button must not go dead across a partial upgrade.
+    if not pending.exists():
+        legacy = _P(_U1_LEGACY_CANCEL_DIR) / f"{rid}.json"
+        if legacy.exists():
+            pending = legacy
     touched = False
     try:
         st = _json.loads(pending.read_text())

@@ -11,10 +11,12 @@ distinct from `events.jsonl` (the workflow's chatty stage stream that
 goes to the agent). `audit.jsonl` is permanent and trimmable only via
 intentional retention policy — never rewritten in the normal path.
 
-Concurrency: `append()` uses `O_APPEND + fcntl.flock` so two processes
-hitting the same request_id interleave cleanly. The whole count→write
-sequence runs under the exclusive lock, so `seq` is monotonic and no
-two writers can interleave bytes mid-line.
+Concurrency: `append()` holds the per-request `.audit.lock` (u1_lockfile
+sidecar lock, cross-platform) across the whole count→write sequence, so
+`seq` is monotonic and no two writers can interleave bytes mid-line.
+Sidecar rather than flocking the data fd itself: Windows msvcrt locks are
+mandatory and per-handle, so holding a lock on audit.jsonl would block our
+own seq-count re-open of the same file.
 
 Public surface:
   append(request_id, event, *, operator=None, **details) -> dict
@@ -23,7 +25,6 @@ Public surface:
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
@@ -31,6 +32,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from u1_lockfile import exclusive_lock
 
 # Lazy import so this module imports cleanly even when u1_config can't
 # resolve (early-test contexts) or when called from a one-shot script.
@@ -60,9 +63,9 @@ def append(request_id: str, event: str, *, operator: str | None = None, **detail
     line as a dict so the caller can mirror it (e.g. into the workflow's
     own events.jsonl) without re-serializing.
 
-    Atomic line write via `O_APPEND + fcntl.flock` — the lock spans
-    the count→write so seq stays monotonic and bytes from concurrent
-    writers don't interleave.
+    Atomic line write via O_APPEND under the per-request `.audit.lock`
+    — the lock spans the count→write so seq stays monotonic and bytes
+    from concurrent writers don't interleave.
     """
     from u1_request import ensure_request_dir  # local import to avoid cycle
     ensure_request_dir(request_id)
@@ -81,14 +84,11 @@ def append(request_id: str, event: str, *, operator: str | None = None, **detail
     if details:
         record['details'] = details
 
-    # Open append-mode + flock the file before counting + appending. The
+    # Take the per-request sidecar lock BEFORE counting + appending. The
     # whole sequence (count → write) is under the lock so two writers can't
     # both write seq=N.
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with exclusive_lock(p.parent / '.audit.lock'):
         # Re-count under lock so seq is monotonic across concurrent writers.
-        # next_seq() reads its own way; here we count directly on the open fd.
         try:
             with open(p, 'rb') as count_f:
                 seq = sum(1 for _ in count_f) + 1
@@ -101,15 +101,14 @@ def append(request_id: str, event: str, *, operator: str | None = None, **detail
             if k in record:
                 ordered[k] = record[k]
         line = json.dumps(ordered, separators=(',', ':'), default=str) + '\n'
-        # Write happens under the exclusive flock; concurrent writers
-        # serialize cleanly and seq stays monotonic.
-        os.write(fd, line.encode('utf-8'))
-    finally:
+        # Write happens under the exclusive lock; concurrent writers
+        # serialize cleanly and seq stays monotonic. O_APPEND keeps a
+        # lock-bypassing writer from corrupting mid-line even so.
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
+            os.write(fd, line.encode('utf-8'))
+        finally:
+            os.close(fd)
     return ordered
 
 

@@ -872,7 +872,14 @@ def _fake_hermes(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
     run_py.write_text(run_py_text)
     bin_dir = venv / "bin"
     bin_dir.mkdir()
-    (bin_dir / "python3").symlink_to(sys.executable)
+    # Symlink where permitted, copy where not (Windows without developer
+    # mode raises WinError 1314). The installer only needs a python* file
+    # to exist in bin/ — every subprocess call in these tests is stubbed.
+    try:
+        (bin_dir / "python3").symlink_to(sys.executable)
+    except OSError:
+        import shutil
+        shutil.copy2(sys.executable, bin_dir / "python3")
     (bin_dir / "hermes").write_text("#!/bin/sh\nexit 0\n")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     return venv, sp, run_py
@@ -925,7 +932,8 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     # pip install -e <repo>/plugin
     assert calls[1][0] == str(venv / "bin" / "python3")
     assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
-    assert calls[1][5].endswith("/plugin")
+    # Path, not string suffix: Windows stringifies with backslashes.
+    assert Path(calls[1][5]).name == "plugin"
     # bare-composite invariant check with syntactically valid source
     assert calls[2][0] == str(venv / "bin" / "python3")
     assert calls[2][1] == "-c"
@@ -937,6 +945,45 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     assert calls[3][1] == "-c"
     compile(calls[3][2], "<hook-verify-src>", "exec")
     assert "transform_llm_output" in calls[3][2]
+
+
+def _fake_hermes_windows(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
+    """Native-Windows Hermes venv layout: Lib/site-packages +
+    Scripts/{python.exe, hermes.exe} (install report 2026-07-10). Same
+    content as _fake_hermes otherwise."""
+    venv = tmp_path / "hermes-venv-win"
+    sp = venv / "Lib" / "site-packages"
+    (sp / "tools").mkdir(parents=True)
+    (sp / "gateway").mkdir()
+    run_py = sp / "gateway" / "run.py"
+    run_py.write_text(run_py_text)
+    scripts = venv / "Scripts"
+    scripts.mkdir()
+    (scripts / "python.exe").write_text("stub")
+    (scripts / "hermes.exe").write_text("stub")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    return venv, sp, run_py
+
+
+def test_install_supports_windows_venv_layout(tmp_path, monkeypatch):
+    """install.py must discover Lib/site-packages and Scripts/*.exe — the
+    2026-07-10 desktop report died at 'no site-packages under .../lib'."""
+    venv, sp, run_py = _fake_hermes_windows(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+
+    rc = hermes_install.main(["--venv", str(venv)])
+    assert rc == 0
+
+    # Same patch outcome as the POSIX layout.
+    txt = run_py.read_text()
+    assert hermes_install.RUN_PY_MARKER in txt
+    assert (sp / "tools" / "form_gateway.py").exists()
+
+    # Subprocess steps target the Windows executables.
+    assert calls[0][0] == str(venv / "Scripts" / "hermes.exe")
+    assert calls[1][0] == str(venv / "Scripts" / "python.exe")
+    assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
 
 
 def test_install_patched_run_py_body_is_valid_python(tmp_path, monkeypatch):

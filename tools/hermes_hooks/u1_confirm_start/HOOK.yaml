@@ -1,7 +1,7 @@
 name: u1_confirm_start
 description: |
   Snapmaker U1 model-free print-start confirmation.
-  The workflow arms /tmp/u1_pending_confirm/<request_id>.json at the
+  The workflow arms the pending-confirm dir (u1_pending resolver; <tempdir>/u1_pending/confirm by default) as <request_id>.json at the
   bed-clear prompt (the emitted event carries NO confirm command — the
   agent model holds nothing it could fire). This hook watches operator
   messages: a bare YES reply redeems the single pending window by

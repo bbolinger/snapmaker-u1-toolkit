@@ -32,6 +32,34 @@ FALLBACK_PORT = 7125
 _DOTENV_LOADED = False
 
 
+# Values _load_dotenv_if_present injected into os.environ, keyed by env var.
+# Lets resolution tell an EXPLICIT process environment value apart from a
+# .env fallback: a copied .env.example placeholder host must not beat the
+# operator's deliberately persisted u1_config.json (live 2026-07-12 on the
+# first Windows workflow - children resolved the sample 192.168.1.100 while
+# the saved real printer sat unused).
+_DOTENV_VALUES: dict[str, str] = {}
+
+
+def _env_explicit(key: str) -> str | None:
+    """The process-environment value for key, ONLY if it did not come from
+    the .env fallback loader (same key, same value => dotenv-injected)."""
+    val = os.environ.get(key)
+    if val is None:
+        return None
+    if _DOTENV_VALUES.get(key) == val:
+        return None
+    return val
+
+
+def _env_dotenv(key: str) -> str | None:
+    """The .env-injected value for key, if that is what os.environ holds."""
+    val = os.environ.get(key)
+    if val is not None and _DOTENV_VALUES.get(key) == val:
+        return val
+    return None
+
+
 def _load_dotenv_if_present() -> None:
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
@@ -69,6 +97,7 @@ def _load_dotenv_if_present() -> None:
                     v = v[1:-1]
                 if k and k not in os.environ:
                     os.environ[k] = v
+                    _DOTENV_VALUES[k] = v
         except OSError:
             pass
         return  # first .env wins; don't keep walking
@@ -158,9 +187,14 @@ def _load_file() -> dict[str, Any]:
 
 
 def get_u1_host(default: str | None = None) -> str:
+    """Precedence: explicit process env > persisted u1_config.json > .env
+    fallback > caller default. The persisted config is the operator's
+    deliberate first-run choice (--set-printer); only an EXPLICIT env var
+    outranks it, never a value the .env loader injected."""
     _load_dotenv_if_present()
     file_cfg = _load_file()
-    host = os.environ.get("SNAPMAKER_U1_HOST") or file_cfg.get("host") or default
+    host = (_env_explicit("SNAPMAKER_U1_HOST") or file_cfg.get("host")
+            or _env_dotenv("SNAPMAKER_U1_HOST") or default)
     if not host:
         raise RuntimeError(
             f"Snapmaker U1 host not configured; set SNAPMAKER_U1_HOST or "
@@ -172,8 +206,42 @@ def get_u1_host(default: str | None = None) -> str:
 def get_u1_port(default: int = FALLBACK_PORT) -> int:
     _load_dotenv_if_present()
     file_cfg = _load_file()
-    raw = os.environ.get("SNAPMAKER_U1_PORT") or file_cfg.get("port") or default
+    raw = (_env_explicit("SNAPMAKER_U1_PORT") or file_cfg.get("port")
+           or _env_dotenv("SNAPMAKER_U1_PORT") or default)
     return int(raw)
+
+
+def set_printer(host: str, port: int | None = None) -> Path:
+    """Persist the printer endpoint into the config file so every future
+    process (including emitted child commands) resolves it. MERGES with
+    existing keys - orca_bin and friends survive; never a wholesale
+    replace."""
+    import uuid as _uuid
+    path = get_config_path()
+    cfg = _load_file()
+    cfg["host"] = str(host)
+    if port is not None:
+        cfg["port"] = int(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{_uuid.uuid4().hex}")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    os.replace(tmp, path)
+    return path
+
+
+def get_orca_bin(
+        default: str = "/opt/data/tools/orcaslicer/squashfs-root/bin/orca-slicer",
+) -> str:
+    """OrcaSlicer executable: ORCA_SLICER_BIN env > config 'orca_bin' > the
+    Linux deploy default. The config-file source is what makes the path
+    survive into EMITTED child commands - a one-shot shell export dies with
+    the shell that ran the first command, which is exactly how the first
+    real Windows slice failed (2026-07-12, WinError 2 on the default Linux
+    path)."""
+    _load_dotenv_if_present()
+    file_cfg = _load_file()
+    return str(_env_explicit("ORCA_SLICER_BIN") or file_cfg.get("orca_bin")
+               or _env_dotenv("ORCA_SLICER_BIN") or default)
 
 
 def get_u1_base_url(host: str | None = None, port: int | None = None) -> str:

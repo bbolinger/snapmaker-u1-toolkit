@@ -36,6 +36,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,11 +45,28 @@ from tools import form_gateway  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-# Path to the kit workflow inside the Hermes container. The snapmaker-u1
-# toolkit is deployed at /opt/data/scripts/ by deploy_to_runtime.sh.
-DEFAULT_WORKFLOW_SCRIPT = os.environ.get(
-    "U1_KIT_WORKFLOW", "/opt/data/scripts/u1_kit_workflow.py")
-DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "python3")
+# Path to the kit workflow on the runtime. KEEP IN SYNC with the chain in
+# tools/hermes_hooks/u1_confirm_start/handler.py (_scripts_dir): explicit
+# env > $HERMES_HOME/scripts (probed) > the Linux deploy default.
+def _default_workflow_script() -> str:
+    explicit = os.environ.get("U1_KIT_WORKFLOW", "").strip()
+    if explicit:
+        return explicit
+    scripts = os.environ.get("U1_RUNTIME_SCRIPTS_DIR", "").strip()
+    if scripts:
+        return str(Path(scripts) / "u1_kit_workflow.py")
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        cand = Path(hermes_home) / "scripts" / "u1_kit_workflow.py"
+        if cand.is_file():
+            return str(cand)
+    return "/opt/data/scripts/u1_kit_workflow.py"
+
+
+DEFAULT_WORKFLOW_SCRIPT = _default_workflow_script()
+# sys.executable, not a bare python3: this tool runs inside the gateway
+# interpreter (guaranteed present); stock native Windows has no python3.
+DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "").strip() or sys.executable
 
 # 25 min covers a slow multi-plate slice; analysis phase is seconds.
 SUBPROCESS_TIMEOUT_SEC = int(os.environ.get("U1_KIT_TIMEOUT_SEC", "1500"))

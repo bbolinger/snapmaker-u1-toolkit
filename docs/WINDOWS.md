@@ -1,0 +1,114 @@
+# Native Windows (experimental)
+
+The supported runtime is Linux (or WSL). Native Windows Hermes Desktop is
+**experimental**: the portability layer shipped in v2.4.1 and passed its
+test suite, but end-to-end operation on Windows has not been validated as
+far as the Linux runtime has. Treat prints started from a Windows install
+with extra care until you have run the checks below yourself.
+
+## What works, what to use
+
+- **Slicer:** use an upstream OrcaSlicer **portable** build (2.4.2 was
+  validated). Extract the zip anywhere; the toolkit finds the bundled
+  profiles next to `orca-slicer.exe` automatically. Do **not** point the
+  toolkit at the Snapmaker Orca fork on Windows — its CLI slice
+  segfaults (verified 2026-07-10).
+- **Shell:** run installs and scripts from **Git Bash** (ships with Git
+  for Windows). Raw `cmd.exe` is not supported.
+- **Python:** a plain python.org 3.11+ install with
+  `pip install numpy pillow`, or a project venv
+  (`python -m venv venv`, `venv/Scripts/pip install numpy pillow`).
+
+## Setup differences vs Linux
+
+```bash
+export ORCA_SLICER_BIN='C:/path/to/orca242/orca-slicer.exe'
+```
+
+That export covers a single shell session (fine for the validation tests
+below). For LIVE use, configure persistently instead — see "Live workflow
+setup" further down: an env var set for one command dies with that shell,
+and the workflow's emitted follow-up commands run in fresh shells.
+
+Most path plumbing resolves itself:
+
+- The workflow scripts self-locate; emitted commands point at wherever
+  the scripts actually are.
+- Pending-state markers (confirm / cancel / attach) live under the
+  native temp dir (`%TEMP%\u1_pending\...`), shared by every native
+  process. Do not mix Git Bash's `/tmp` into custom overrides.
+- If Hermes Desktop injects its own venv into `PYTHONPATH`, the
+  workflow detects the poisoned environment and relaunches itself with
+  it cleared (set `U1_KEEP_PYTHONPATH=1` if you genuinely need it kept).
+- Interpreter resolution: gateway-side components spawn their own
+  interpreter (`sys.executable`), never a bare `python3` (stock Windows
+  has none, only the WindowsApps stub). Emitted commands use `python` on
+  Windows. Overrides if you need them: `U1_KIT_PYTHON` (the u1_kit tool),
+  `U1_PYTHON` (the notify script), `U1_TOOLKIT_PYTHON` (the workflow
+  bootstrap's first candidate).
+- `adapters/hermes/install.py` understands the Windows venv layout
+  (`Lib\site-packages`, `Scripts\python.exe`). Pass
+  `--venv 'C:/Users/<you>/AppData/Local/hermes/hermes-agent/venv'`
+  (or wherever your Hermes venv lives).
+- `deploy_to_runtime.sh` deploys into `$HERMES_HOME` when `/opt/data`
+  does not exist. Set `HERMES_HOME` first.
+
+The bundled skill text shows the Linux command paths. After installing
+the skill on Windows, edit the deployed SKILL.md copy (under your Hermes
+skills dir) and change its `python3 /opt/data/scripts/...` commands to
+`python C:/path/to/checkout/scripts/...`. Everything AFTER the model's
+first call self-corrects — the workflow's own emitted commands carry the
+right interpreter and paths — but that first call comes from the skill
+text, and a Linux-shaped one dies on Windows. Automating this rewrite at
+install time is planned; for now it is a one-time manual step.
+
+## Live workflow setup (before pointing at a real printer)
+
+A green test suite proves the code, not your configuration. The workflow
+emits follow-up commands that run in FRESH shells, so anything you set
+with a one-off `export` is gone by the second step. Live use needs
+persistent, non-secret configuration in the toolkit data dir
+(`~/.local/share/snapmaker-u1/u1_config.json` — the workflow prints the
+exact path if it can't find a host):
+
+```json
+{
+  "host": "192.168.86.34",
+  "port": 7125,
+  "orca_bin": "C:/path/to/orca242/orca-slicer.exe"
+}
+```
+
+Then, in order, before the first real job:
+
+1. Read-only preflight: `python scripts/u1_preflight.py` reaches the
+   printer and reports tool/material state.
+2. Extract the printer's own profiles (read-only):
+   `python tools/extract_profiles_from_printer.py` — they land in
+   `profiles/from-printer/`, which the picker prefers over bundled stock.
+3. Dry run a fixture STL to the readiness card WITHOUT uploading. If tool
+   options say "material unknown - Moonraker unreachable", stop and fix
+   the config: selection is allowed offline by design, but the start gate
+   will re-verify the physical material before anything prints, and an
+   unconfigured host means that verification cannot pass.
+4. Only then run a real job, and answer the bed-clear prompt looking at
+   the real bed photo.
+
+## Validate your install
+
+Fetch profiles, then run the two Windows-critical checks:
+
+```bash
+python tools/fetch_snapmaker_profiles.py
+export ORCA_SLICER_BIN='C:/path/to/orca242/orca-slicer.exe'
+python -m pytest tests/test_real_orca_u1_metadata_e2e.py tests/test_u1_lockfile.py -v
+```
+
+- The metadata test slices a real cube and asserts the g-code stamps the
+  U1 machine AND real PETG values. If it fails with PLA-range values,
+  profile inheritance is not resolving — do not print from that install.
+- The lockfile test proves the Windows lock backend actually excludes
+  concurrent processes (the safety gates depend on it).
+
+Known-good full-suite runs on Windows are the bar for dropping the
+"experimental" label.

@@ -40,8 +40,13 @@ class _Query:
         self.edits.append(text)
 
 
-def _run(query, pending_dir, monkeypatch):
+def _run(query, pending_dir, monkeypatch, legacy_dir=None):
     monkeypatch.setenv("U1_PENDING_CANCEL_DIR", str(pending_dir))
+    # Sandbox the v2.4.1 legacy-dir shim away from the real /tmp; a test
+    # passes legacy_dir explicitly to exercise the fallback.
+    monkeypatch.setattr(tp, "_U1_LEGACY_CANCEL_DIR",
+                        str(legacy_dir if legacy_dir is not None
+                            else pending_dir / "no_legacy"))
     update = SimpleNamespace(callback_query=query)
     asyncio.run(tp._u1_handle_cancel_callback(None, update, None))
 
@@ -106,3 +111,14 @@ def test_double_tap_second_is_calm(tmp_path, monkeypatch):
     q2 = _Query("u1c:u1_2026_0707_abc123")
     _run(q2, tmp_path / "pending", monkeypatch)
     assert q2.answers[0][1] is True  # alert, no crash, no double effect
+
+
+def test_tap_falls_back_to_legacy_dir(tmp_path, monkeypatch):
+    """v2.4.1 upgrade shim: a routing entry written by a pre-v2.4.1 notify
+    script (old literal location) must still be cancellable by the button."""
+    marker = tmp_path / "marker.txt"
+    legacy = tmp_path / "legacy_pending"
+    _window(legacy, "u1_2026_0707_leg111", marker)
+    q = _Query("u1c:u1_2026_0707_leg111")
+    _run(q, tmp_path / "new_pending", monkeypatch, legacy_dir=legacy)
+    assert marker.exists(), "legacy-dir window must still cancel"

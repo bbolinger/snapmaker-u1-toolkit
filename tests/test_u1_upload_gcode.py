@@ -221,3 +221,119 @@ def test_inject_thumbnail_happy_path_uses_real_injector(tmp_path):
     body = g.read_text()
     assert "thumbnail begin 48x48" in body
     assert "thumbnail end" in body
+
+
+# ---------- Upload transport (v2.4.1) ----------
+# First real Windows upload (2026-07-12): the multipart POST hit a connect
+# timeout that escaped as a bare traceback and generic rc=1, with nothing
+# recorded about the URL tried or how long it waited. The transport layer
+# had zero test coverage. These tests use a local stub server / closed
+# port - never a real printer.
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def _stub_moonraker(captured):
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["path"] = self.path
+            captured["body"] = self.rfile.read(
+                int(self.headers.get("Content-Length", 0)))
+            captured["ctype"] = self.headers.get("Content-Type", "")
+            payload = json.dumps({"result": {"item": {"path": "x.gcode"}}})
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv
+
+
+def test_multipart_upload_shape_against_stub_server(tmp_path):
+    captured = {}
+    srv = _stub_moonraker(captured)
+    try:
+        gcode = tmp_path / "part plate1.gcode"
+        gcode.write_bytes(b"; gcode body\nG28\n")
+        url = f"http://127.0.0.1:{srv.server_address[1]}/server/files/upload"
+        resp = u1_upload_gcode.multipart_upload(
+            url, {"root": "gcodes", "path": "", "print": "false"},
+            "file", gcode)
+        assert resp["result"]["item"]["path"] == "x.gcode"
+        assert captured["path"] == "/server/files/upload"
+        body = captured["body"]
+        assert b'name="root"' in body and b"gcodes" in body
+        assert b'name="print"' in body and b"false" in body
+        assert b'filename="part plate1.gcode"' in body
+        assert b"G28" in body, "file bytes must ride in the multipart body"
+        assert captured["ctype"].startswith("multipart/form-data; boundary=")
+    finally:
+        srv.shutdown()
+
+
+def test_multipart_upload_raises_promptly_on_dead_port(tmp_path):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # nothing listens here now
+    gcode = tmp_path / "x.gcode"
+    gcode.write_bytes(b"G28\n")
+    with pytest.raises(Exception):
+        u1_upload_gcode.multipart_upload(
+            f"http://127.0.0.1:{port}/server/files/upload",
+            {"root": "gcodes"}, "file", gcode, timeout=3)
+
+
+def test_transport_failure_maps_to_rc4_with_diagnostics(tmp_path, monkeypatch,
+                                                        mock_http,
+                                                        moonraker_responses,
+                                                        capsys):
+    """A transport exception during the POST must return the contract's
+    rc=4 and write the granular artifact with the URL tried, the exception
+    class, and elapsed time - not escape as a traceback and rc=1."""
+    gcode = tmp_path / "part_plate1.gcode"
+    gcode.write_text(
+        "; printer_settings_id = Snapmaker U1 (0.4 nozzle)\n"
+        "; filament_type = PETG\n"
+        "; nozzle_temperature = 245\n"
+        "; first_layer_bed_temperature = 70\n"
+        "G28\n")
+    moonraker_responses["/server/files/metadata"] = {"error": "not found"}
+    moonraker_responses["/server/files/list"] = {"result": []}
+
+    def _boom(*a, **kw):
+        raise TimeoutError("connect timed out")
+
+    # Resolve the module FRESH from sys.modules: an earlier test
+    # (test_scripts_import_without_any_config) re-imports the scripts, so
+    # this file's import-time reference can be a stale module object that
+    # mock_http (string-target patching) never touches - the stale copy's
+    # real http_json then walks to the network (caught in the 2026-07-12
+    # full-suite run after passing solo).
+    import importlib
+    uug = importlib.import_module("u1_upload_gcode")
+    monkeypatch.setattr(uug, "multipart_upload", _boom)
+    monkeypatch.setenv("SNAPMAKER_U1_HOST", "192.0.2.1")
+    import sys as _sys
+    monkeypatch.setattr(_sys, "argv",
+                        ["u1_upload_gcode.py", str(gcode), "--material", "PETG"])
+    rc = uug.main()
+    assert rc == 4, capsys.readouterr().out[-800:]
+    out = capsys.readouterr().out
+    assert "transport error" in out
+    from u1_config import get_data_dir
+    art = json.loads((get_data_dir() / "latest_upload_result.json").read_text())
+    assert art["moonraker_upload_ok"] is False
+    assert "TimeoutError" in art["transport_error"]
+    assert art["upload_url"].startswith("http://192.0.2.1")
+    assert "elapsed_s" in art

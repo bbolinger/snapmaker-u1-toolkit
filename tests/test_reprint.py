@@ -241,9 +241,16 @@ def test_reprint_of_reprint_resurfaces_original_artifacts(monkeypatch, capsys, t
     tok2 = u1_form.new_confirm_token(); u1_form.persist_confirm_token(tok2, mid_rid)
     r2 = kw._action_reprint_start(None, True, "test-op", tok2)
     out = capsys.readouterr().out
-    assert str(prev) in out, "original preview not re-surfaced on 2nd-gen reprint"
-    assert str(iso) in out
-    assert str(rev) in out, "original review.md not re-surfaced on 2nd-gen reprint"
+    # Parse the events rather than substring-matching raw stdout: the paths
+    # are json-encoded there, so Windows backslashes appear escaped and a
+    # plain str(path) can never match (2026-07-11 Windows validation — the
+    # resolver itself was working; only this assertion was slash-blind).
+    events = [_json.loads(line) for line in out.splitlines() if line.strip()]
+    images = [e.get("image") for e in events if e.get("stage") == "render"]
+    docs = [e.get("path") for e in events if e.get("stage") == "review_doc"]
+    assert str(prev) in images, "original preview not re-surfaced on 2nd-gen reprint"
+    assert str(iso) in images
+    assert str(rev) in docs, "original review.md not re-surfaced on 2nd-gen reprint"
     # and the new seed carries the pointers forward
     st2 = u1_request.read_request(r2["request_id"])
     assert st2["plates"][0]["preview_path"] == str(prev)

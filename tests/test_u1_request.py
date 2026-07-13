@@ -109,7 +109,6 @@ def test_ensure_request_dir_walkup_bounded_to_data_dir(_patched_data_dir, monkey
     and assert none escape the data_dir subtree."""
     import os as _os
     seen: list[Path] = []
-    real_chown = _os.chown
 
     def spy_chown(path, uid, gid):
         seen.append(Path(path))
@@ -118,7 +117,11 @@ def test_ensure_request_dir_walkup_bounded_to_data_dir(_patched_data_dir, monkey
         # were touched.
         return None
 
-    monkeypatch.setattr(_os, 'chown', spy_chown)
+    # raising=False: Windows os has no chown attribute at all; installing the
+    # spy there both lets the test run and satisfies the production code's
+    # hasattr(os, "chown") guard, so the walk-up bound is verified on every
+    # platform.
+    monkeypatch.setattr(_os, 'chown', spy_chown, raising=False)
     rid = generate_request_id()
     d = ensure_request_dir(rid)
     data_root = _u1_request._data_dir().resolve()

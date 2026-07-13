@@ -208,7 +208,9 @@ The skill is designed to work on small local models (`gemma4-26b-64k` and below)
 
 ## Install
 
-One install path. Everything below assumes a U1 reachable on your LAN.
+One install path. Everything below assumes a U1 reachable on your LAN and a
+Linux (or WSL) host. Native Windows is experimental — see
+[docs/WINDOWS.md](docs/WINDOWS.md) for what differs and how to validate it.
 
 **Requirements:** Python 3.9+, `numpy` + `Pillow` (via `requirements.txt`), an
 [OrcaSlicer 2.4.0+](https://github.com/OrcaSlicer/OrcaSlicer) CLI binary
