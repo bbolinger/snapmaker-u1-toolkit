@@ -38,6 +38,12 @@ def test_headless_yes_upload_only_has_no_prompts(real_orca, capsys, monkeypatch)
     # Real-Orca integration via the Hermes shim (2026-06-26 cold review #4).
     # The slice is actually performed by OrcaSlicer running inside the
     # Hermes container; gcode + renders land on the bind-mounted scratch.
+    # Unified workflow (kit-of-one, task #4): u1_slice_workflow no longer
+    # slices/uploads a single STL itself — it DETECTS and hands off to
+    # u1_kit_workflow via a kit_detected event. Assert the clean dispatch and
+    # that --yes surfaces no interactive prompt. (Slice+upload coverage lives
+    # in the u1_kit_workflow tests + the real-Orca metadata e2e.) This test was
+    # stale-red asserting the retired direct-upload path.
     tmp_path = real_orca['tmp']
     _point_at_production_stock(monkeypatch)
     src = _stl(tmp_path)
@@ -47,11 +53,17 @@ def test_headless_yes_upload_only_has_no_prompts(real_orca, capsys, monkeypatch)
                '--profile', '0_20_standard_snapmaker_u1_0_4_nozzle',
                '--out-dir', str(out)])
     captured = capsys.readouterr().out
-    assert rc == 0 and 'uploaded' in captured and 'dry_run' in captured
-    assert (out / 'preview.png').exists()
+    assert rc == 0
+    assert 'kit_detected' in captured
+    assert 'u1_kit_workflow.py' in captured
+    # Headless dispatch (phase kit_redirect), NOT an interactive prompt. ("need_input"
+    # appears only as prose inside the kit_detected instruction, so don't substring it.)
+    assert 'kit_redirect' in captured
 
 
 def test_json_events_surface_questions_and_summary(real_orca, capsys, monkeypatch):
+    # Same unification: a single STL now emits a kit_detected dispatch event
+    # (not a summary — that moved into u1_kit_workflow). Stale-red before.
     tmp_path = real_orca['tmp']
     _point_at_production_stock(monkeypatch)
     src = _stl(tmp_path)
@@ -60,7 +72,7 @@ def test_json_events_surface_questions_and_summary(real_orca, capsys, monkeypatc
           '--profile', '0_20_standard_snapmaker_u1_0_4_nozzle',
           '--tool', 'T1', '--out-dir', str(tmp_path / 'o')])
     events = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith('{')]
-    assert any(e.get('stage') == 'summary' for e in events)
+    assert any(e.get('stage') == 'kit_detected' for e in events)
 
 
 def test_workflow_output_oriented_stl_matches_orca_slice_first_layer_for_ego(tmp_path):
