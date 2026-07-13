@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 #   content : {"request_id": str, "images": [abs path, ...],
 #              "operator": str|None, "created_at": float}
 from ..pending import pending_dir as _resolve_pending_dir
+from .channel_sanitizer import sanitize_channel_leak
 
 _PENDING_ATTACH_DIR = _resolve_pending_dir("attach")
 # Images are only relevant to the immediate reply; a marker older than this is
@@ -357,9 +358,24 @@ def transform(response_text: str = "", session_id: str = "", model: str = "",
     Returns a replacement string, or None to leave the reply unchanged.
     """
     try:
+        # Always clean leaked chat-template control tokens from the visible reply.
+        # Every gemma4 Ollama import ships a passthrough template and leaks
+        # <channel|> etc. into content (measured ~25-75% of turns, any turn type),
+        # so this runs independent of any U1 image card.
+        sanitized = sanitize_channel_leak(response_text or "")
+        leak_stripped = sanitized != (response_text or "")
+
         marker = _load_and_consume_marker()
         if not marker:
-            return None  # no U1 card this turn -> no-op
+            # No U1 card this turn. Still replace the reply when we removed a leaked
+            # token and readable text remains, so the operator never sees <channel|>
+            # cruft. A wholly-leaked turn sanitizes to "" (falsy -> turn_finalizer
+            # leaves it unchanged): nothing to show, and blanking is not our call.
+            if leak_stripped and sanitized:
+                logger.info("snapmaker_u1 attachment_injector: stripped leaked "
+                            "chat-template token(s) from reply")
+                return sanitized
+            return None  # clean reply, no card -> no-op
 
         # Authoritative attachments = images + documents, in that order. Every
         # path is validated (real, non-symlink, known artifact name, under the
@@ -378,7 +394,7 @@ def transform(response_text: str = "", session_id: str = "", model: str = "",
                                "that is not a known U1 artifact under the "
                                "requests root: %r", sp)
 
-        cleaned = _strip_echoed_u1_images(response_text or "")
+        cleaned = _strip_echoed_u1_images(sanitized)
 
         if not paths:
             # Marker existed but nothing survives on disk. Return the cleaned
