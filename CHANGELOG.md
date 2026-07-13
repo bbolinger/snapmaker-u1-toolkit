@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.4.2] — 2026-07-13
+
+Cleaner operator messages when the local model leaks chat-template tokens.
+
+### Fixed
+
+- **Leaked chat-template tokens are stripped from the reply.** The local models
+  this toolkit is documented to run (gemma4 over Ollama) are imported with a
+  bare passthrough template, so the model intermittently leaks its
+  reasoning-channel delimiters (`<channel|>`, `<|tool_call|>` ...) into the
+  visible message, most often as a `thought <channel|>` prefix. A new sanitizer
+  removes the known control tokens from the outbound reply on every turn, so the
+  operator sees clean text regardless of model or Ollama endpoint. It never
+  touches the safety gate, a structured tool call, or a file path, and a clean
+  reply passes through unchanged. Validated on real hardware and against the
+  live transcript store.
+
+---
+
 ## [2.4.1] — 2026-07-12
 
 Native Windows support, so the print operator runs on a Windows Hermes
