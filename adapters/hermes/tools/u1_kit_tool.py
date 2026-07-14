@@ -17,8 +17,9 @@ verified 8-piece pattern).
 Flow:
   1. LLM calls ``u1_kit(model_path="...")``.
   2. Handler invokes ``u1_kit_workflow.py --json-events`` as a subprocess.
-  3. Parses the ``kit_form`` event (need_input) from its stdout, extracts
-     ``form_schema`` + ``request_id``.
+  3. Parses the ``kit_form`` event (need_input) from its stdout, reads the
+     ``form_id`` + ``request_id`` and loads the persisted schema by id (the
+     event carries the id only, not the nested schema).
   4. Calls ``form_gateway.invoke_form(session_key, form_schema)`` — blocks
      until the operator submits via Telegram inline buttons (or the text
      fallback). The platform send + user-tap routing all happen via the
@@ -34,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -70,6 +72,30 @@ DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "").strip() or sys.executable
 
 # 25 min covers a slow multi-plate slice; analysis phase is seconds.
 SUBPROCESS_TIMEOUT_SEC = int(os.environ.get("U1_KIT_TIMEOUT_SEC", "1500"))
+
+
+_FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+
+def _load_persisted_schema(form_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Load the schema the workflow persisted for ``form_id``.
+
+    The kit_form event carries only a flat ``form_id``. A 26B local model
+    can't reproduce the nested schema in a tool call, so the workflow persists
+    it to disk and passes the id. This tool drives the form itself, so it loads
+    the schema the same way the ``form`` tool's handler does. The strict id
+    pattern (matching the workflow's own) also blocks path traversal."""
+    fid = str(form_id or "")
+    if not _FORM_ID_RE.match(fid):
+        return None
+    base = os.environ.get("U1_FORM_SCHEMAS_DIR", "").strip() \
+        or "/opt/data/snapmaker_u1/form_schemas"
+    try:
+        with open(os.path.join(base, f"{fid}.json"), "r") as fh:
+            schema = json.load(fh)
+        return schema if isinstance(schema, dict) else None
+    except Exception:
+        return None
 
 
 def _run_workflow(args: List[str], *, timeout: float) -> Dict[str, Any]:
@@ -188,10 +214,16 @@ def u1_kit_tool(
 
     form_schema = kit_form.get("form_schema") or {}
     wf_request_id = kit_form.get("request_id") or request_id
-    if not isinstance(form_schema, dict) or not form_schema.get("fields"):
+    # The workflow emits kit_form with only a form_id (the full schema is
+    # persisted to disk, never carried through the event); load it by id, the
+    # same way the `form` tool's handler does, so this tool can drive the form.
+    if not (isinstance(form_schema, dict) and form_schema.get("fields")):
+        form_schema = _load_persisted_schema(kit_form.get("form_id")) or {}
+    if not (isinstance(form_schema, dict) and form_schema.get("fields")):
         return json.dumps({
             "phase": "analysis",
-            "error": "kit_form event missing valid form_schema",
+            "error": "kit_form event carried no form_schema and no persisted "
+                     "schema was found for its form_id",
             "kit_form": kit_form,
         }, ensure_ascii=False)
 

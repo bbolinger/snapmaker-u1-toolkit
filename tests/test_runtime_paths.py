@@ -11,6 +11,7 @@ The two copies of that chain are asserted here so they can't drift.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -141,3 +142,35 @@ def test_gate_exports_notify_py_to_notify_script(monkeypatch, tmp_path):
     assert res["ok"], res
     dumped = capture.read_text()
     assert f"U1_NOTIFY_PY={_ROOT / 'scripts' / 'u1_notify.py'}" in dumped
+
+
+def test_kit_tool_loads_persisted_schema_by_id(monkeypatch, tmp_path):
+    """u1_kit must load the form schema the workflow persisted to disk by its
+    form_id.
+
+    Regression (live drill 2026-07-13): the kit_form event carries only a
+    form_id (the nested schema is persisted separately because a 26B local
+    model can't reproduce it in a tool call). The tool used to expect the
+    schema INLINE, bailed with 'missing valid form_schema', and the model fell
+    back to a hand-emitted form() call, the exact garble path this feature
+    removes. The loader must mirror the u1-form plugin's, including the strict
+    id pattern that also blocks path traversal.
+    """
+    tool = _load_kit_tool()
+    schemas = tmp_path / "form_schemas"
+    schemas.mkdir()
+    fid = "f7d010b6ce2"
+    (schemas / f"{fid}.json").write_text(
+        json.dumps({"version": 1,
+                    "fields": [{"id": "parts"}, {"id": "tool"}]}))
+    monkeypatch.setenv("U1_FORM_SCHEMAS_DIR", str(schemas))
+
+    loaded = tool._load_persisted_schema(fid)
+    assert isinstance(loaded, dict) and loaded.get("fields"), \
+        "schema persisted for a valid form_id must load"
+    # Malformed / traversal / missing ids are refused, never raise.
+    assert tool._load_persisted_schema("../../etc/passwd") is None
+    assert tool._load_persisted_schema("bad id!") is None
+    assert tool._load_persisted_schema("") is None
+    assert tool._load_persisted_schema(None) is None
+    assert tool._load_persisted_schema("fbbbbbbbbbb") is None  # valid id, no file

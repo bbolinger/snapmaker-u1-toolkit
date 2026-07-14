@@ -143,7 +143,7 @@ def _form_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 # =============================================================================
-# OpenAI Function-Calling Schema
+# Function-calling tool schema
 # =============================================================================
 
 FORM_SCHEMA = {
