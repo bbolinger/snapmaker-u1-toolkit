@@ -174,6 +174,34 @@ def test_load_head_options_missing_toolmap_returns_empty(tmp_path):
     assert u1_toolmap.load_head_options(data_dir=tmp_path) == []
 
 
+# --------------------------------------------------------------------------- #
+# refresh_toolmap — the form-build path pulls the printer's LIVE filament before
+# reading the tool map, so a spool swapped BETWEEN jobs isn't served stale. Live
+# bug 2026-07-14: the head screen showed the previous run's colour ("orange")
+# after a swap the printer already reported, because the cache was only rewritten
+# by the gate / upload CLI, never at form-build time. Could mislead an operator
+# into printing the wrong material — safety-relevant, hence the regression
+# coverage. load_head_options itself stays a pure cache read (tested above); the
+# refresh is invoked by _build_form_spec (see test_quantity).
+# --------------------------------------------------------------------------- #
+
+def test_refresh_toolmap_writes_live_snapshot_and_is_guarded(tmp_path, monkeypatch):
+    """refresh_toolmap queries the printer and rewrites the cache; on any failure
+    it returns False without raising, so load_head_options can fall back."""
+    monkeypatch.setattr(u1_toolmap, "query_u1", lambda *a, **k: _fake_printer_raw())
+    monkeypatch.setattr(u1_toolmap, "get_u1_host", lambda: "x")
+    monkeypatch.setattr(u1_toolmap, "get_u1_port", lambda: 1)
+    monkeypatch.setattr(u1_toolmap, "_default_map_path", lambda: tmp_path / "map.json")
+    assert u1_toolmap.refresh_toolmap(data_dir=tmp_path) is True
+    written = json.loads((tmp_path / "latest_toolmap.json").read_text())
+    assert "tools" in written
+    # guarded: a query failure returns False, no exception escapes
+    def _boom(*a, **k):
+        raise OSError("unreachable")
+    monkeypatch.setattr(u1_toolmap, "query_u1", _boom)
+    assert u1_toolmap.refresh_toolmap(data_dir=tmp_path) is False
+
+
 # ── Enforcement-layer tests (2026-07-05) ─────────────────────────────────────
 # The tests above verify summarize() DETECTS gates. But the live bug was that
 # main() returned exit 0 REGARDLESS of gates, and run_tool_gate() keys purely on

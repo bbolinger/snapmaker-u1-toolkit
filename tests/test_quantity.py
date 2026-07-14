@@ -56,10 +56,32 @@ def _kit(n):
 
 def test_workflow_offers_quantity_only_for_single_part():
     profs = [{"idx": 1, "value": "0_20_standard", "label": "0.20 Standard"}]
-    single = kw._build_form_spec(_kit(1), "0.4", persisted_profiles=profs)
+    # refresh=False: this exercises offer_quantity logic, not the live printer.
+    single = kw._build_form_spec(_kit(1), "0.4", persisted_profiles=profs, refresh=False)
     assert single.get("offer_quantity") is True
-    multi = kw._build_form_spec(_kit(3), "0.4", persisted_profiles=profs)
+    multi = kw._build_form_spec(_kit(3), "0.4", persisted_profiles=profs, refresh=False)
     assert "offer_quantity" not in multi
+
+
+def test_build_form_spec_refreshes_toolmap_before_render(monkeypatch):
+    """The render path must pull the printer's LIVE filament before reading the
+    tool map, so a spool swapped between jobs isn't shown stale on the head
+    screen (bug 2026-07-14). The persist / re-validate paths pass refresh=False
+    and must NOT query the printer."""
+    import u1_toolmap
+    profs = [{"idx": 1, "value": "0_20_standard", "label": "0.20 Standard"}]
+    calls = {"n": 0}
+
+    def _count(*a, **k):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(u1_toolmap, "refresh_toolmap", _count)
+    monkeypatch.setattr(u1_toolmap, "load_head_options", lambda *a, **k: [])
+    kw._build_form_spec(_kit(1), "0.4", persisted_profiles=profs)  # refresh=True default
+    assert calls["n"] == 1, "render path must refresh before reading the tool map"
+    kw._build_form_spec(_kit(1), "0.4", persisted_profiles=profs, refresh=False)
+    assert calls["n"] == 1, "refresh=False must not query the printer"
 
 
 # ---------- schema ----------

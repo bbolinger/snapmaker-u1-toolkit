@@ -33,6 +33,35 @@ CHANNEL_EXTRUDER = {v: k for k, v in EXTRUDER_CHANNEL.items()}
 _UNKNOWN_MATERIALS = {"", "UNKNOWN", "NONE"}
 
 
+def refresh_toolmap(data_dir: Path | None = None, host: str | None = None,
+                    port: int | None = None, timeout: float = 8.0) -> bool:
+    """Query the printer LIVE and rewrite ``latest_toolmap.json``.
+
+    That cache is what the form reads (via ``load_head_options``), but it is
+    otherwise only rewritten when this module runs as a CLI (the start gate +
+    upload path). So the form built at the START of a job reflects the PREVIOUS
+    run's filament snapshot: a spool swapped between jobs reads stale (live
+    2026-07-14, Brent: the head screen showed the old 'orange' after a swap
+    while the printer already reported the new spool). Refreshing here makes the
+    head screen show the CURRENT loaded filament. The declared material_map
+    overlay is preserved (summarize merges it). Fully guarded: returns True on a
+    live refresh, False if the printer is unreachable or anything fails, in
+    which case callers fall through to the existing cache / generic fields."""
+    try:
+        h = host or get_u1_host()
+        p = port if port is not None else get_u1_port()
+        outdir = data_dir or get_data_dir()
+        material_map = load_material_map(_default_map_path())
+        raw = query_u1(h, int(p), timeout)
+        summary = summarize(raw, material_map, None, None)
+        outdir.mkdir(parents=True, exist_ok=True)
+        (outdir / "latest_toolmap.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def load_head_options(data_dir: Path | None = None) -> list[dict[str, Any]]:
     """Read ``latest_toolmap.json`` → ordered list of LOADED print heads, each
     with its live material + colour, so a form can merge "which head?" and

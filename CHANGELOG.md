@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.4.4] — 2026-07-14
+
+### Fixed
+
+- **The kit options screen now shows the filament that is loaded right now.** The
+  tool and filament picker read a snapshot of the loaded spools that was only
+  refreshed when a print started or a file was uploaded. If you swapped a spool
+  (colour or material) between jobs, the next kit's picker could still show the
+  previous spool, such as an old colour, even though the printer already knew
+  about the change. The picker now reads the printer's current filament at the
+  moment it builds the screen, so what you see matches what is loaded. If the
+  printer cannot be reached for a moment, it falls back to the last known
+  snapshot rather than showing nothing. The start-time safety check already read
+  the live state and was never affected.
+
+---
+
 ## [2.4.3] — 2026-07-13
 
 The kit options form is now driven by the toolkit itself, from end to end. It is
