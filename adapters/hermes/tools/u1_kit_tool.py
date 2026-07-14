@@ -160,6 +160,22 @@ def _find_event(events: List[Dict[str, Any]], stage: str,
     return None
 
 
+def _is_passthrough_event(ev: Dict[str, Any]) -> bool:
+    """Events u1_kit re-emits in its output so the gateway attach hook and the
+    model see them: the renders (plate previews + bed photo), the review doc,
+    the readiness card, and the bed-clear approval prompt.
+
+    The bed-clear prompt is ``stage="need_input"`` with ``key="bed_clear_start"``
+    (not a stage of its own), so it must be matched by key. A stage-only filter
+    dropped it, leaving the deterministic path with a readiness card but no YES
+    prompt, so the operator could never start the print. The phase-1 form prompt
+    (``key="kit_form"``) is deliberately NOT re-surfaced here."""
+    if ev.get("stage") in ("render", "review_doc", "kit_readiness_card"):
+        return True
+    return (ev.get("stage") == "need_input"
+            and ev.get("key") == "bed_clear_start")
+
+
 def _phase3_flags(next_command: str, wf_request_id: str,
                   answer: Dict[str, Any]) -> List[str]:
     """Workflow flags that redeem the operator's submitted form answers.
@@ -341,9 +357,8 @@ def u1_kit_tool(
     # stdout); this tool captured them into res2["events"], so it must re-emit
     # them here or the plate previews + bed photo + review doc never attach.
     _passthrough = "\n".join(
-        json.dumps(ev, ensure_ascii=False) for ev in res2["events"]
-        if ev.get("stage") in ("render", "review_doc", "kit_readiness_card",
-                               "bed_clear_start"))
+        json.dumps(ev, ensure_ascii=False)
+        for ev in res2["events"] if _is_passthrough_event(ev))
     _summary = json.dumps({
         "phase": "ready",
         "request_id": wf_request_id,

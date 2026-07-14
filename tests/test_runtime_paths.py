@@ -240,3 +240,23 @@ def test_kit_tool_spawns_workflow_in_writable_cwd(monkeypatch):
     monkeypatch.setattr(tool.subprocess, "run", fake_run)
     tool._run_workflow(["x"], timeout=5)
     assert captured.get("cwd")
+
+
+def test_kit_tool_passthrough_includes_bed_clear_prompt():
+    """u1_kit must re-emit the bed-clear approval prompt in its output.
+
+    Regression (self-test, 2026-07-13): the prompt is stage=need_input,
+    key=bed_clear_start (not a stage of its own). A stage-only filter dropped
+    it, so the deterministic path returned the readiness card but no YES prompt
+    and the operator could never start the print.
+    """
+    keep = _load_kit_tool()._is_passthrough_event
+    # attach + card + the YES prompt all pass through
+    assert keep({"stage": "render"})
+    assert keep({"stage": "review_doc"})
+    assert keep({"stage": "kit_readiness_card"})
+    assert keep({"stage": "need_input", "key": "bed_clear_start"})
+    # the phase-1 form prompt must NOT re-surface, nor internal control events
+    assert not keep({"stage": "need_input", "key": "kit_form"})
+    assert not keep({"stage": "kit_slicing"})
+    assert not keep({"stage": "awaiting_input", "need": "bed_clear_start"})
