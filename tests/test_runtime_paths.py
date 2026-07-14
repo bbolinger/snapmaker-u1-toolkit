@@ -209,3 +209,34 @@ def test_kit_tool_phase3_redeems_file_submitted_answers():
     # A genuine inline answer (no file receipt) may pass through as JSON.
     inline = tool._phase3_flags("", "rid", {"parts": [1, 2], "tool": "extruder"})
     assert "--form-answers-json" in inline
+
+
+def test_kit_tool_spawns_workflow_in_writable_cwd(monkeypatch):
+    """_run_workflow must spawn the workflow with an explicit, writable cwd, not
+    inherit the gateway's.
+
+    Regression (live drill 3, 2026-07-13): Orca writes 00000.log to the process
+    CWD; the gateway CWD (/opt/hermes) is not writable, so inheriting it crashed
+    the slice with a filesystem I/O error. The spawn must set cwd to a scratch
+    dir that exists and is writable at call time.
+    """
+    import os as _os
+    tool = _load_kit_tool()
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(args, **kw):
+        captured.update(kw)
+        cwd = kw.get("cwd")
+        assert cwd, "workflow spawned without an explicit cwd"
+        assert _os.path.isdir(cwd) and _os.access(cwd, _os.W_OK), \
+            "scratch cwd must exist and be writable during the run"
+        return _Proc()
+
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+    tool._run_workflow(["x"], timeout=5)
+    assert captured.get("cwd")

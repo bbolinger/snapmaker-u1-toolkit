@@ -41,6 +41,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -106,11 +107,24 @@ def _run_workflow(args: List[str], *, timeout: float) -> Dict[str, Any]:
     The workflow exits naturally at phase boundaries (after kit_form in the
     analyze phase, after kit_readiness_card in the slice phase), so a simple
     communicate() is enough — no need to stream while it runs.
+
+    Runs in a throwaway working directory. Orca writes a log (``00000.log``) to
+    the process CWD, and this tool spawns from inside the gateway process whose
+    CWD (/opt/hermes) is not writable, so a bare spawn crashed the slice with a
+    filesystem I/O error (the terminal-driven fallback never hit this because
+    the terminal tool runs from a writable dir). The workflow resolves every
+    real path absolutely, so a scratch CWD affects nothing else. Scratch lives
+    under HERMES_HOME (guaranteed writable by the gateway uid) and is removed
+    after the run.
     """
+    scratch_base = os.environ.get("HERMES_HOME", "").strip() or None
     try:
-        proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
-        )
+        with tempfile.TemporaryDirectory(prefix=".u1_kit_scratch_",
+                                         dir=scratch_base) as scratch:
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout,
+                cwd=scratch,
+            )
     except subprocess.TimeoutExpired:
         return {"_error": f"u1_kit_workflow timed out after {timeout:.0f}s"}
     except FileNotFoundError as exc:
