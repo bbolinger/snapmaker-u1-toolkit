@@ -1684,7 +1684,9 @@ def _emit_parts_prompt(events_file: Path | None, request_id: str, archive: Path,
     try:
         _existing = u1_request.read_request(request_id) or {}
         if not _existing.get("form_profiles"):
-            _spec_for_persist = _build_form_spec(kit, nozzle)
+            # Only the profile list is used here; heads aren't rendered, so skip
+            # the live printer query (the emit path below refreshes for real).
+            _spec_for_persist = _build_form_spec(kit, nozzle, refresh=False)
             if _spec_for_persist.get("_profiles_full"):
                 u1_request.write_request(
                     request_id,
@@ -1991,7 +1993,8 @@ def _audit(request_id: str, event: str, operator: str, **details: Any):
 
 
 def _build_form_spec(kit: dict[str, Any], nozzle: str,
-                     persisted_profiles: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                     persisted_profiles: list[dict[str, Any]] | None = None,
+                     refresh: bool = True) -> dict[str, Any]:
     """Assemble the u1_form spec from analysis (parts + offered options).
 
     ``profile N`` is resolved by INDEX, and form-emit / answer-parse happen in
@@ -2023,6 +2026,15 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     # to generic T0–T3 + a Material screen (offline / tests).
     try:
         import u1_toolmap
+        # Pull the printer's CURRENT loaded filament before reading the tool map,
+        # so a spool swapped since the last gate/upload run isn't shown stale on
+        # the head screen (live 2026-07-14: the picker kept the previous run's
+        # colour after a swap the printer already reported). Guarded inside
+        # refresh_toolmap: an unreachable printer leaves the existing cache in
+        # place. Skipped (refresh=False) on the post-submit re-validate path and
+        # in unit tests, where no picker is shown and no printer is present.
+        if refresh:
+            u1_toolmap.refresh_toolmap()
         heads = u1_toolmap.load_head_options()
     except Exception:
         heads = []
@@ -5239,8 +5251,12 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     --form-answers-from <form_id> (v2.2 file handoff — the gateway wrote
     the answers; the model never carried them)."""
     existing = u1_request.read_request(request_id) or {}
+    # Post-submit re-validate: the operator already picked from the (fresh-at-
+    # emit) form, and the start gate does its own live material check, so no
+    # need to re-query the printer here.
     spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"),
-                            persisted_profiles=existing.get("form_profiles"))
+                            persisted_profiles=existing.get("form_profiles"),
+                            refresh=False)
     if not spec["profiles"]:
         _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
                             "message": "No profiles found. Run tools/fetch_snapmaker_profiles.py."},
