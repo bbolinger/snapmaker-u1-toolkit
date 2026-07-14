@@ -481,8 +481,13 @@ def test_plugin_registers_form_tool_and_dispatch_hook(monkeypatch, tmp_path):
     mod = _load_plugin_pkg(monkeypatch, tmp_path)
     ctx = _FakeCtx()
     mod.register(ctx)
-    (tool,) = ctx.tools
-    assert tool["name"] == "form"
+    # The plugin always registers `form`; it ALSO registers the deterministic
+    # `u1_kit` tool when tools.u1_kit_tool is importable (present in a full
+    # install / on-box venv, absent in CI's isolated plugin load). Select `form`
+    # explicitly rather than assuming it is the only registered tool.
+    tools_by_name = {t["name"]: t for t in ctx.tools}
+    assert set(tools_by_name) <= {"form", "u1_kit"}, tools_by_name
+    tool = tools_by_name["form"]
     assert tool["toolset"] == "form"  # own toolset — the plugin path is what
     # surfaces it; joining clarify would evict clarify via subset-inference
     assert callable(tool["handler"])
