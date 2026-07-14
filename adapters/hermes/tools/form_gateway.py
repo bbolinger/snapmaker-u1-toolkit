@@ -257,3 +257,53 @@ def get_form_callback(session_id: str = "") -> Optional[Any]:
         if key and key in _form_callbacks:
             return _form_callbacks[key]
         return _form_callbacks.get("__default__")
+
+
+# =========================================================================
+# Deterministic-tool API (used by the u1_kit tool)
+# =========================================================================
+#
+# A tool that drives the form itself (instead of the model picking the
+# `form` tool and relaying the kit_form event) needs just two things: to
+# confirm the gateway's per-turn form callback is wired for this session,
+# and to invoke it (render + block + return the answer). These wrap the
+# callback registry above so the tool never has to know the register/send/
+# wait plumbing -- that lives in the gateway's published callback
+# (_form_callback_sync, from the install.py run.py patch).
+
+def get_notify(session_id: str = "") -> Optional[Any]:
+    """The active form callback for a session, or None if none is wired.
+
+    An intent-revealing alias of ``get_form_callback`` for callers that just
+    want to check "is the form path installed for this session?" before using
+    it."""
+    return get_form_callback(session_id)
+
+
+def set_notify(session_id: str, callback: Any) -> None:
+    """Publish the form callback for a session. Alias of set_form_callback."""
+    set_form_callback(session_id, callback)
+
+
+def invoke_form(session_id: str, form_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Render ``form_schema`` to the operator and block until they submit,
+    returning the answer dict.
+
+    This is the deterministic entry point the u1_kit tool uses so the model
+    never has to emit a ``form`` tool call. It resolves the session's
+    published callback (the run.py patch's ``_form_callback_sync``) and calls
+    it; that callback registers the form, sends it through the platform
+    adapter, and waits on ``wait_for_response``. Returns ``{"_error": ...}``
+    when no callback is wired for the session, and never raises."""
+    cb = get_form_callback(session_id)
+    if cb is None:
+        return {"_error": "no form callback registered for this session "
+                          "(run adapters/hermes/install.py and restart Hermes)"}
+    try:
+        answer = cb(form_schema)
+    except Exception as exc:  # a form failure must not crash the driving tool
+        return {"_error": f"form callback raised: {exc}"}
+    if not isinstance(answer, dict):
+        return {"_error": f"form callback returned {type(answer).__name__}, "
+                          "expected an answer dict"}
+    return answer

@@ -413,7 +413,8 @@ def main(argv=None) -> int:
     # u1_form_telegram.py (the L1 pure renderer) is single-sourced from the
     # sibling adapters/telegram/ directory — the hermes tree carries no copy.
     renderer_src = here.parent / "telegram" / "u1_form_telegram.py"
-    tools_src = {"form_gateway.py": here / "tools" / "form_gateway.py"}
+    tools_src = {"form_gateway.py": here / "tools" / "form_gateway.py",
+                 "u1_kit_tool.py": here / "tools" / "u1_kit_tool.py"}
 
     print(f"venv:           {venv}")
     print(f"site-packages:  {sp}")
@@ -423,7 +424,7 @@ def main(argv=None) -> int:
     print()
 
     if a.uninstall:
-        for name in ("form_gateway.py",) + LEGACY_TOOLS_FILES:
+        for name in ("form_gateway.py", "u1_kit_tool.py") + LEGACY_TOOLS_FILES:
             tgt = tools_dir / name
             if tgt.exists():
                 if a.dry_run:

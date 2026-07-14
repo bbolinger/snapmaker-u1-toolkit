@@ -308,17 +308,10 @@ U1_KIT_SCHEMA = {
 }
 
 
-# --- Registry ----------------------------------------------------------------
-from tools.registry import registry  # type: ignore
-
-registry.register(
-    name="u1_kit",
-    toolset="u1_kit",
-    schema=U1_KIT_SCHEMA,
-    handler=lambda args, **_kw: u1_kit_tool(
-        model_path=args.get("model_path", ""),
-        request_id=args.get("request_id") or None,
-    ),
-    check_fn=check_u1_kit_requirements,
-    emoji="🖨️",
-)
+# --- Registration --------------------------------------------------------------
+# NOT self-registered here: a tool dropped into tools/ registers but is never
+# OFFERED to the model (the platform toolset allowlist resolves by subset, which
+# a runtime-registered toolset can never satisfy). The u1-form plugin registers
+# u1_kit as its own OFFERED toolset via ctx.register_tool (see
+# adapters/hermes/plugin/__init__.py register()). This module just exposes the
+# handler (u1_kit_tool) + schema (U1_KIT_SCHEMA) + check (check_u1_kit_requirements).
