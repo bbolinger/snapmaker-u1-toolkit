@@ -24,8 +24,10 @@ Flow:
      until the operator submits via Telegram inline buttons (or the text
      fallback). The platform send + user-tap routing all happen via the
      monkey-patched ``TelegramAdapter.send_form`` / ``_handle_callback_query``.
-  5. Re-invokes the workflow with ``--form-answers-json <answer>
-     --request-id <id>``.
+  5. Re-invokes the workflow to redeem the submitted answers and slice.
+     Kit forms submit in FILE mode (the gateway persists answers to disk and
+     hands back a write-receipt), so redemption reuses the workflow's own
+     next_command flags (``--redeem-pending-form`` + nozzle + ``--live-upload``).
   6. Returns the ``kit_readiness_card`` (request_id, plate count, gated
      plate, Stage 1 command) to the LLM.
 """
@@ -144,6 +146,36 @@ def _find_event(events: List[Dict[str, Any]], stage: str,
     return None
 
 
+def _phase3_flags(next_command: str, wf_request_id: str,
+                  answer: Dict[str, Any]) -> List[str]:
+    """Workflow flags that redeem the operator's submitted form answers.
+
+    U1 kit forms submit in FILE mode: on submit the gateway persists the
+    answers to disk and invoke_form hands back a write-receipt, NOT the answers
+    themselves, so they redeem via --redeem-pending-form (never the receipt as
+    JSON). The kit_form event's next_command is exactly the phase-3 command the
+    workflow authored for the (validated) model-driven path; reuse its flags
+    verbatim so the deterministic path runs the identical slice + upload,
+    carrying the detected --nozzle and --live-upload. Only python/script/model
+    paths are swapped for ours. Falls back to an explicit flag set if
+    next_command can't be parsed or carries no redemption flag."""
+    try:
+        toks = shlex.split(next_command or "")
+    except ValueError:
+        toks = []
+    # toks == [python, script.py, <model path>, <flags...>]; keep the flags.
+    flags = toks[3:] if len(toks) >= 4 else []
+    if any(f in ("--redeem-pending-form", "--form-answers-json") for f in flags):
+        return flags
+    out = ["--json-events", "--request-id", str(wf_request_id)]
+    if answer.get("_answers_file_written"):
+        out.append("--redeem-pending-form")
+    else:
+        out += ["--form-answers-json", json.dumps(answer, ensure_ascii=False)]
+    out.append("--live-upload")
+    return out
+
+
 def u1_kit_tool(
     model_path: str,
     *,
@@ -246,12 +278,13 @@ def u1_kit_tool(
         return json.dumps({"phase": "form_timeout", "request_id": wf_request_id},
                           ensure_ascii=False)
 
-    # --- Phase 3: re-invoke workflow with the answer ------------------------
-    cmd2 = [
-        python, workflow_script, str(path), "--json-events",
-        "--request-id", str(wf_request_id),
-        "--form-answers-json", json.dumps(answer, ensure_ascii=False),
-    ]
+    # --- Phase 3: redeem the operator's answers and slice -------------------
+    # File-submit forms hand back a write-receipt, not the answers, so redeem
+    # them via the flags the workflow authored in next_command (--redeem-
+    # pending-form + the detected nozzle + --live-upload), matching the
+    # validated model-driven path exactly. See _phase3_flags.
+    cmd2 = [python, workflow_script, str(path)] + _phase3_flags(
+        kit_form.get("next_command", ""), str(wf_request_id), answer)
     logger.info("u1_kit phase 3: %s",
                 " ".join(shlex.quote(a) for a in cmd2))
     res2 = _run_workflow(cmd2, timeout=timeout)

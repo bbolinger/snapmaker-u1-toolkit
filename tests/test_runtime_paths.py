@@ -174,3 +174,38 @@ def test_kit_tool_loads_persisted_schema_by_id(monkeypatch, tmp_path):
     assert tool._load_persisted_schema("") is None
     assert tool._load_persisted_schema(None) is None
     assert tool._load_persisted_schema("fbbbbbbbbbb") is None  # valid id, no file
+
+
+def test_kit_tool_phase3_redeems_file_submitted_answers():
+    """Kit forms submit in file mode: invoke_form returns a write-receipt, not
+    the answers.
+
+    Regression (live drill 2, 2026-07-13): u1_kit passed that receipt to the
+    slicer as --form-answers-json, so it validated as empty and bounced with
+    "missing required field: tool/material/profile", re-rendering the form in a
+    loop. Phase 3 must redeem the answers from disk using the workflow's own
+    next_command flags (--redeem-pending-form + detected nozzle + --live-upload),
+    never the receipt.
+    """
+    tool = _load_kit_tool()
+    receipt = {"_answers_file_written": True, "form_id": "f7d010b6ce2",
+               "path": "/opt/data/snapmaker_u1/answers/f7d010b6ce2.json"}
+    next_cmd = ("python3 /opt/data/scripts/u1_kit_workflow.py "
+                "'/opt/data/cache/documents/doc_x_stls.zip' --json-events "
+                "--request-id u1_2026_0714_a5df11 --nozzle 0.4 "
+                "--redeem-pending-form --live-upload")
+    flags = tool._phase3_flags(next_cmd, "u1_2026_0714_a5df11", receipt)
+    # the receipt must NEVER be serialized into the slice command
+    assert "--form-answers-json" not in flags
+    assert "--redeem-pending-form" in flags
+    assert "--live-upload" in flags
+    assert flags[:3] == ["--json-events", "--request-id", "u1_2026_0714_a5df11"]
+    assert "0.4" in flags  # the workflow-detected nozzle is carried through
+
+    # Fallback when next_command is unparseable: a file-receipt still redeems
+    # from disk, never as JSON.
+    fb = tool._phase3_flags("", "u1_2026_0714_a5df11", receipt)
+    assert "--redeem-pending-form" in fb and "--form-answers-json" not in fb
+    # A genuine inline answer (no file receipt) may pass through as JSON.
+    inline = tool._phase3_flags("", "rid", {"parts": [1, 2], "tool": "extruder"})
+    assert "--form-answers-json" in inline
