@@ -253,12 +253,25 @@ def u1_kit_tool(
             "events_tail": res2["events"][-5:],
         }, ensure_ascii=False)
 
-    return json.dumps({
+    # Re-surface the workflow's own render / review_doc / readiness event lines
+    # in this tool's output. The transform_tool_result attach hook
+    # (attachment_injector.arm_from_tool_result) arms the image marker by
+    # parsing render (image) + review_doc (path) JSON lines from the tool
+    # OUTPUT, gated on a bed_clear_start/kit_readiness_card marker being
+    # present. The terminal path exposes these lines directly (raw workflow
+    # stdout); this tool captured them into res2["events"], so it must re-emit
+    # them here or the plate previews + bed photo + review doc never attach.
+    _passthrough = "\n".join(
+        json.dumps(ev, ensure_ascii=False) for ev in res2["events"]
+        if ev.get("stage") in ("render", "review_doc", "kit_readiness_card",
+                               "bed_clear_start"))
+    _summary = json.dumps({
         "phase": "ready",
         "request_id": wf_request_id,
         "readiness_card": readiness,
         "user_answer": answer,
     }, ensure_ascii=False)
+    return f"{_passthrough}\n{_summary}" if _passthrough else _summary
 
 
 def check_u1_kit_requirements() -> bool:
