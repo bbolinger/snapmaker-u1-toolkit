@@ -17,14 +17,17 @@ verified 8-piece pattern).
 Flow:
   1. LLM calls ``u1_kit(model_path="...")``.
   2. Handler invokes ``u1_kit_workflow.py --json-events`` as a subprocess.
-  3. Parses the ``kit_form`` event (need_input) from its stdout, extracts
-     ``form_schema`` + ``request_id``.
+  3. Parses the ``kit_form`` event (need_input) from its stdout, reads the
+     ``form_id`` + ``request_id`` and loads the persisted schema by id (the
+     event carries the id only, not the nested schema).
   4. Calls ``form_gateway.invoke_form(session_key, form_schema)`` — blocks
      until the operator submits via Telegram inline buttons (or the text
      fallback). The platform send + user-tap routing all happen via the
      monkey-patched ``TelegramAdapter.send_form`` / ``_handle_callback_query``.
-  5. Re-invokes the workflow with ``--form-answers-json <answer>
-     --request-id <id>``.
+  5. Re-invokes the workflow to redeem the submitted answers and slice.
+     Kit forms submit in FILE mode (the gateway persists answers to disk and
+     hands back a write-receipt), so redemption reuses the workflow's own
+     next_command flags (``--redeem-pending-form`` + nozzle + ``--live-upload``).
   6. Returns the ``kit_readiness_card`` (request_id, plate count, gated
      plate, Stage 1 command) to the LLM.
 """
@@ -34,9 +37,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -72,17 +77,54 @@ DEFAULT_PYTHON = os.environ.get("U1_KIT_PYTHON", "").strip() or sys.executable
 SUBPROCESS_TIMEOUT_SEC = int(os.environ.get("U1_KIT_TIMEOUT_SEC", "1500"))
 
 
+_FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+
+def _load_persisted_schema(form_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Load the schema the workflow persisted for ``form_id``.
+
+    The kit_form event carries only a flat ``form_id``. A 26B local model
+    can't reproduce the nested schema in a tool call, so the workflow persists
+    it to disk and passes the id. This tool drives the form itself, so it loads
+    the schema the same way the ``form`` tool's handler does. The strict id
+    pattern (matching the workflow's own) also blocks path traversal."""
+    fid = str(form_id or "")
+    if not _FORM_ID_RE.match(fid):
+        return None
+    base = os.environ.get("U1_FORM_SCHEMAS_DIR", "").strip() \
+        or "/opt/data/snapmaker_u1/form_schemas"
+    try:
+        with open(os.path.join(base, f"{fid}.json"), "r") as fh:
+            schema = json.load(fh)
+        return schema if isinstance(schema, dict) else None
+    except Exception:
+        return None
+
+
 def _run_workflow(args: List[str], *, timeout: float) -> Dict[str, Any]:
     """Run u1_kit_workflow.py with --json-events; collect events + stderr.
 
     The workflow exits naturally at phase boundaries (after kit_form in the
     analyze phase, after kit_readiness_card in the slice phase), so a simple
     communicate() is enough — no need to stream while it runs.
+
+    Runs in a throwaway working directory. Orca writes a log (``00000.log``) to
+    the process CWD, and this tool spawns from inside the gateway process whose
+    CWD (/opt/hermes) is not writable, so a bare spawn crashed the slice with a
+    filesystem I/O error (the terminal-driven fallback never hit this because
+    the terminal tool runs from a writable dir). The workflow resolves every
+    real path absolutely, so a scratch CWD affects nothing else. Scratch lives
+    under HERMES_HOME (guaranteed writable by the gateway uid) and is removed
+    after the run.
     """
+    scratch_base = os.environ.get("HERMES_HOME", "").strip() or None
     try:
-        proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
-        )
+        with tempfile.TemporaryDirectory(prefix=".u1_kit_scratch_",
+                                         dir=scratch_base) as scratch:
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout,
+                cwd=scratch,
+            )
     except subprocess.TimeoutExpired:
         return {"_error": f"u1_kit_workflow timed out after {timeout:.0f}s"}
     except FileNotFoundError as exc:
@@ -118,6 +160,76 @@ def _find_event(events: List[Dict[str, Any]], stage: str,
     return None
 
 
+def _resolve_upload_path(path: Path) -> Path:
+    """Recover a model-mangled upload path by its stable ``doc_<hash>`` prefix.
+
+    The model sometimes retypes an uploaded doc's name and mangles the human-
+    readable suffix (a '+' becomes '_', etc.), but the ``doc_<hash>`` prefix the
+    Telegram adapter assigns is unique and stable. If the path is missing, glob
+    the parent for that prefix and use the sole match. Mirrors
+    scripts/u1_kit.py:resolve_upload_path (#45); duplicated here rather than
+    imported because that module pulls in numpy and does host lookups at import
+    time, which must not load into the gateway process. Without this, u1_kit's
+    existence check rejects a mangled path before the workflow (which has the
+    same recovery) ever runs."""
+    if path.exists():
+        return path
+    m = re.match(r"^(doc_[0-9a-f]{6,})_", path.name)
+    if not m:
+        return path
+    try:
+        matches = [p for p in path.parent.glob(f"{m.group(1)}_*") if p.is_file()]
+    except Exception:
+        return path
+    return matches[0] if len(matches) == 1 else path
+
+
+def _is_passthrough_event(ev: Dict[str, Any]) -> bool:
+    """Events u1_kit re-emits in its output so the gateway attach hook and the
+    model see them: the renders (plate previews + bed photo), the review doc,
+    the readiness card, and the bed-clear approval prompt.
+
+    The bed-clear prompt is ``stage="need_input"`` with ``key="bed_clear_start"``
+    (not a stage of its own), so it must be matched by key. A stage-only filter
+    dropped it, leaving the deterministic path with a readiness card but no YES
+    prompt, so the operator could never start the print. The phase-1 form prompt
+    (``key="kit_form"``) is deliberately NOT re-surfaced here."""
+    if ev.get("stage") in ("render", "review_doc", "kit_readiness_card"):
+        return True
+    return (ev.get("stage") == "need_input"
+            and ev.get("key") == "bed_clear_start")
+
+
+def _phase3_flags(next_command: str, wf_request_id: str,
+                  answer: Dict[str, Any]) -> List[str]:
+    """Workflow flags that redeem the operator's submitted form answers.
+
+    U1 kit forms submit in FILE mode: on submit the gateway persists the
+    answers to disk and invoke_form hands back a write-receipt, NOT the answers
+    themselves, so they redeem via --redeem-pending-form (never the receipt as
+    JSON). The kit_form event's next_command is exactly the phase-3 command the
+    workflow authored for the (validated) model-driven path; reuse its flags
+    verbatim so the deterministic path runs the identical slice + upload,
+    carrying the detected --nozzle and --live-upload. Only python/script/model
+    paths are swapped for ours. Falls back to an explicit flag set if
+    next_command can't be parsed or carries no redemption flag."""
+    try:
+        toks = shlex.split(next_command or "")
+    except ValueError:
+        toks = []
+    # toks == [python, script.py, <model path>, <flags...>]; keep the flags.
+    flags = toks[3:] if len(toks) >= 4 else []
+    if any(f in ("--redeem-pending-form", "--form-answers-json") for f in flags):
+        return flags
+    out = ["--json-events", "--request-id", str(wf_request_id)]
+    if answer.get("_answers_file_written"):
+        out.append("--redeem-pending-form")
+    else:
+        out += ["--form-answers-json", json.dumps(answer, ensure_ascii=False)]
+    out.append("--live-upload")
+    return out
+
+
 def u1_kit_tool(
     model_path: str,
     *,
@@ -134,6 +246,9 @@ def u1_kit_tool(
         path = path.resolve()
     except OSError as exc:
         return json.dumps({"error": f"bad model_path: {exc}"}, ensure_ascii=False)
+    # Recover a model-mangled upload name (e.g. '+' retyped as '_') by its
+    # stable doc_<hash> prefix before the existence check bails.
+    path = _resolve_upload_path(path)
     if not path.exists():
         return json.dumps({"error": f"model not found: {path}"}, ensure_ascii=False)
 
@@ -188,10 +303,16 @@ def u1_kit_tool(
 
     form_schema = kit_form.get("form_schema") or {}
     wf_request_id = kit_form.get("request_id") or request_id
-    if not isinstance(form_schema, dict) or not form_schema.get("fields"):
+    # The workflow emits kit_form with only a form_id (the full schema is
+    # persisted to disk, never carried through the event); load it by id, the
+    # same way the `form` tool's handler does, so this tool can drive the form.
+    if not (isinstance(form_schema, dict) and form_schema.get("fields")):
+        form_schema = _load_persisted_schema(kit_form.get("form_id")) or {}
+    if not (isinstance(form_schema, dict) and form_schema.get("fields")):
         return json.dumps({
             "phase": "analysis",
-            "error": "kit_form event missing valid form_schema",
+            "error": "kit_form event carried no form_schema and no persisted "
+                     "schema was found for its form_id",
             "kit_form": kit_form,
         }, ensure_ascii=False)
 
@@ -214,12 +335,13 @@ def u1_kit_tool(
         return json.dumps({"phase": "form_timeout", "request_id": wf_request_id},
                           ensure_ascii=False)
 
-    # --- Phase 3: re-invoke workflow with the answer ------------------------
-    cmd2 = [
-        python, workflow_script, str(path), "--json-events",
-        "--request-id", str(wf_request_id),
-        "--form-answers-json", json.dumps(answer, ensure_ascii=False),
-    ]
+    # --- Phase 3: redeem the operator's answers and slice -------------------
+    # File-submit forms hand back a write-receipt, not the answers, so redeem
+    # them via the flags the workflow authored in next_command (--redeem-
+    # pending-form + the detected nozzle + --live-upload), matching the
+    # validated model-driven path exactly. See _phase3_flags.
+    cmd2 = [python, workflow_script, str(path)] + _phase3_flags(
+        kit_form.get("next_command", ""), str(wf_request_id), answer)
     logger.info("u1_kit phase 3: %s",
                 " ".join(shlex.quote(a) for a in cmd2))
     res2 = _run_workflow(cmd2, timeout=timeout)
@@ -253,12 +375,24 @@ def u1_kit_tool(
             "events_tail": res2["events"][-5:],
         }, ensure_ascii=False)
 
-    return json.dumps({
+    # Re-surface the workflow's own render / review_doc / readiness event lines
+    # in this tool's output. The transform_tool_result attach hook
+    # (attachment_injector.arm_from_tool_result) arms the image marker by
+    # parsing render (image) + review_doc (path) JSON lines from the tool
+    # OUTPUT, gated on a bed_clear_start/kit_readiness_card marker being
+    # present. The terminal path exposes these lines directly (raw workflow
+    # stdout); this tool captured them into res2["events"], so it must re-emit
+    # them here or the plate previews + bed photo + review doc never attach.
+    _passthrough = "\n".join(
+        json.dumps(ev, ensure_ascii=False)
+        for ev in res2["events"] if _is_passthrough_event(ev))
+    _summary = json.dumps({
         "phase": "ready",
         "request_id": wf_request_id,
         "readiness_card": readiness,
         "user_answer": answer,
     }, ensure_ascii=False)
+    return f"{_passthrough}\n{_summary}" if _passthrough else _summary
 
 
 def check_u1_kit_requirements() -> bool:
@@ -308,17 +442,10 @@ U1_KIT_SCHEMA = {
 }
 
 
-# --- Registry ----------------------------------------------------------------
-from tools.registry import registry  # type: ignore
-
-registry.register(
-    name="u1_kit",
-    toolset="u1_kit",
-    schema=U1_KIT_SCHEMA,
-    handler=lambda args, **_kw: u1_kit_tool(
-        model_path=args.get("model_path", ""),
-        request_id=args.get("request_id") or None,
-    ),
-    check_fn=check_u1_kit_requirements,
-    emoji="🖨️",
-)
+# --- Registration --------------------------------------------------------------
+# NOT self-registered here: a tool dropped into tools/ registers but is never
+# OFFERED to the model (the platform toolset allowlist resolves by subset, which
+# a runtime-registered toolset can never satisfy). The u1-form plugin registers
+# u1_kit as its own OFFERED toolset via ctx.register_tool (see
+# adapters/hermes/plugin/__init__.py register()). This module just exposes the
+# handler (u1_kit_tool) + schema (U1_KIT_SCHEMA) + check (check_u1_kit_requirements).

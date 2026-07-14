@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.4.3] — 2026-07-13
+
+The kit options form is now driven by the toolkit itself, from end to end. It is
+one more place where getting a print started no longer depends on a small local
+model relaying a fussy detail exactly right.
+
+### Changed
+
+- **The toolkit renders and collects the kit options form directly.** When you
+  send a kit, the toolkit now shows the options form (parts, tool, orientation,
+  supports, and the advanced settings), collects your answers, slices, and
+  returns the readiness card as one deterministic step. Before this, the model
+  had to ask for the form itself, and a small local model would sometimes garble
+  that request and stall the job. The model no longer types the form step at all,
+  so it cannot garble it. The plate previews, the fresh bed photo, the review
+  document, and the final bed-clear approval prompt all reach you unchanged, and
+  the safety gate is untouched.
+
+### Fixed
+
+- **A mistyped kit upload name is recovered before the job gives up.** The model
+  occasionally retypes an uploaded file's name and mangles the suffix (a `+`
+  becomes `_`), so the path points at nothing. The kit step now recovers the real
+  file by its stable upload id before failing, the same recovery the rest of the
+  workflow already had, so the kit ingests as normal. A genuinely missing or
+  ambiguous name is left alone rather than guessed.
+- **The first taps on a freshly shown form register.** On a brand-new options
+  form, a very fast first tap could land the instant the buttons appeared, before
+  the form finished registering, and would flash without checking the box. Early
+  taps are now held for a moment and applied once the form is ready.
+
+---
+
 ## [2.4.2] — 2026-07-13
 
 Reliability fixes for driving the printer with a small local model that

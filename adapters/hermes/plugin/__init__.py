@@ -143,7 +143,7 @@ def _form_handler(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 # =============================================================================
-# OpenAI Function-Calling Schema
+# Function-calling tool schema
 # =============================================================================
 
 FORM_SCHEMA = {
@@ -243,3 +243,34 @@ def register(ctx) -> None:
         emoji="📝",
     )
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
+
+    # u1_kit: the deterministic kit entry point. The model calls this ONCE for a
+    # kit zip; the handler runs the workflow, renders the form ITSELF via
+    # form_gateway.invoke_form, collects the answer, re-invokes, and returns the
+    # readiness card -- the model never emits a mid-flow `form` tool call, so it
+    # cannot garble it. Registered on its own toolset (like `form`) so it is
+    # actually offered to the model (a bare tools/ drop registers but is never
+    # offered -- see this module's header). Lazy-imported so a non-gateway
+    # context (e.g. install.py's plugin verification) can still load the plugin.
+    try:
+        from tools.u1_kit_tool import u1_kit_tool as _kit_run, U1_KIT_SCHEMA
+
+        def _u1_kit_handler(args: Dict[str, Any], **_kw: Any) -> str:
+            return _kit_run(model_path=args.get("model_path", ""),
+                            request_id=args.get("request_id") or None)
+
+        ctx.register_tool(
+            name="u1_kit",
+            toolset="u1_kit",
+            schema=U1_KIT_SCHEMA,
+            handler=_u1_kit_handler,
+            description="Slice a multi-part 3D print kit (zip of STLs); renders "
+                        "its own operator form deterministically",
+            emoji="🖨️",
+        )
+        logger.info("snapmaker_u1 u1-form plugin: u1_kit tool registered "
+                    "(deterministic model-free form)")
+    except Exception:
+        logger.warning("snapmaker_u1 u1-form plugin: u1_kit tool NOT registered "
+                       "(kits fall back to the model-driven form path)",
+                       exc_info=True)

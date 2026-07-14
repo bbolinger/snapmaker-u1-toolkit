@@ -1,7 +1,7 @@
 ---
 name: 3d-printer-slicing-automation
-description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be: 'python3 /opt/data/scripts/u1_slice_workflow.py <attachment-path> --json-events'. The workflow handles zip inspection + slicing. Do NOT extract zips or run orca-slicer yourself. Also REQUIRED when the operator asks to reprint a recent job (no file attached) — follow the Reprint section."
-version: 2.3.4
+description: "REQUIRED for ANY .stl / .3mf / .zip 3D-model attachment. FIRST tool call MUST be the u1_kit tool: u1_kit(model_path=<attachment-path>). It slices, renders the operator's options form itself, and returns a readiness card. Do NOT extract zips, run orca-slicer, or call the form tool yourself. Also REQUIRED when the operator asks to reprint a recent job (no file attached): follow the Reprint section."
+version: 2.4.0
 author: Brent Bolinger / snapmaker-u1-toolkit
 license: MIT
 metadata:
@@ -21,27 +21,29 @@ prerequisites:
 
 This skill is a set of COMMANDS, not a description to summarize. If you catch yourself about to write a command, a plan, or JSON as your reply TEXT instead of calling a tool — stop, delete that text, call the tool instead. Printing `python3 ...` in your reply is not a tool call; it does nothing.
 
-**The moment a user gives you an STL/3MF/zip, your very next action is this tool call — no text before it:**
-```bash
-python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events
+**The moment a user gives you an STL/3MF/zip, your very next action is this tool call, no text before it:** call the **`u1_kit`** tool with the attachment path.
 ```
-(If the platform rejects raw `.stl` but accepts `.zip`, extract the STL first, then run this on the extracted path.) This one command is the entry for EVERYTHING — a single model or a multi-part kit zip alike; the workflow figures out which.
+u1_kit(model_path="<attachment path>")
+```
+This ONE call is the entry for EVERYTHING, a single model or a multi-part kit zip alike. It drives the whole job deterministically: it slices, shows the operator a native options form (inline buttons), collects the answers, and returns the readiness card. Do NOT run `u1_slice_workflow.py` or `u1_kit_workflow.py` by hand for a new job, and do NOT call the `form` tool yourself. `u1_kit` renders the form for you, so there is nothing to relay. (If the platform saved the attachment as a `.zip`, pass that path; if it saved a raw `.stl`, zip it first and pass the zip.)
 
-**Immediately after that first tool call**, your first TEXT reply (only once, not every turn) is:
-> "On it — running the Snapmaker U1 workflow. I'll surface every choice for you, show the plate preview and a fresh bed photo before anything prints, run only the commands the workflow gives me (never ones I invent), and nothing starts until you confirm at the bed-clear step."
+**Immediately after that call**, your first TEXT reply (only once, not every turn) is:
+> "On it, running the Snapmaker U1 workflow. I'll surface every choice for you, show the plate preview and a fresh bed photo before anything prints, and nothing starts until you confirm at the bed-clear step."
 
-**Then, every turn after that, follow this loop — no exceptions:**
+**`u1_kit` returns a JSON object with a `phase`. Act on it, no exceptions:**
 
-| The workflow's output has… | You do exactly this |
+| `u1_kit` `phase` | You do exactly this |
 |---|---|
-| `kit_detected` | CALL terminal with its `command` field, verbatim. That runs `u1_kit_workflow.py` (a single model = a kit of one). |
-| `kit_form` | CALL the `form` tool with its `form_id`. Nothing else — no text first. |
-| `need_input` (text fallback, no form) | Surface `prompt` + numbered options to the operator, wait for their answer, then CALL terminal with the matched option's `next_command`, verbatim. |
-| `next_action_required` | CALL terminal with its `command`, verbatim. No question, no preamble — the workflow already decided. |
+| `ready` | The kit sliced. The tool's output also carries the workflow's `render` (plate preview + isometric) and `review_doc` lines and a `kit_readiness_card`. Go to **Step 3**: surface those, then the bed-clear prompt. |
+| `form_rejected` | An answer did not validate. Call `u1_kit(model_path="...", request_id="<the id it returned>")` again to retry. |
+| `cancelled` | The operator cancelled the form. Tell them, then stop. |
+| `form_timeout` | The form expired unanswered. Tell them, and offer to re-call `u1_kit`. |
+| `setup_required` | Surface the `message` verbatim (it names a setup script). Do not proceed. |
+| any `error` | Surface the error text (and the `stderr` tail if present). Do not invent a recovery. |
 
 **Never**: edit a command before relaying it, add or drop a flag, construct a command yourself from memory of an earlier turn, or invent a magic confirmation phrase. The workflow is the only source of truth for what runs next — if it didn't hand you the string this turn, you don't have it.
 
-**Step 2 (staged text fallback) — for each `need_input` event (text fallback only; form mode is one screen).**
+**Step 2 (FALLBACK ONLY, skip this whenever `u1_kit` worked).** Use this path only if the `u1_kit` tool is not offered to you at all. Then, and only then, run the workflow yourself: `python3 /opt/data/scripts/u1_slice_workflow.py <model> --json-events`, relay each `kit_detected`/`next_action_required` `command` verbatim via terminal, and for each `need_input` text event (no native form on this platform):
 
 Order: `parts` (skipped for a single model) → `orient` → `tool` → `preset` → `supports` → `confirm`. (Follow whatever order the workflow actually emits — this is just what to expect.)
 

@@ -317,9 +317,27 @@ def ensure_patched(adapter_cls) -> bool:
         # per-chat counters, so message_id alone can collide across two
         # concurrent forms in different chats.
         st = _form_state(self)
-        slot = next((s for s in st.values()
-                     if s["chat_id"] == msg.chat_id and s["msg_id"] == msg.message_id),
-                    None)
+
+        def _find_slot():
+            return next((s for s in st.values()
+                         if s["chat_id"] == msg.chat_id
+                         and s["msg_id"] == msg.message_id), None)
+
+        slot = _find_slot()
+        if slot is None:
+            # First-render race: Telegram makes the message tappable the instant
+            # it is delivered, but _send_form records the form slot just AFTER the
+            # send call returns. A fast tap in that window would otherwise flash
+            # "Stale form" with no check (live 2026-07-13: the operator's first
+            # taps on a fresh form didn't register). Briefly retry so the tap
+            # lands once the slot registers a fraction of a second later; a
+            # genuinely stale form never appears and still falls through.
+            import asyncio as _asyncio
+            for _ in range(10):
+                await _asyncio.sleep(0.1)
+                slot = _find_slot()
+                if slot is not None:
+                    break
         if slot is None:
             await q.answer("Stale form")
             return
