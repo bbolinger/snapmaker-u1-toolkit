@@ -160,6 +160,30 @@ def _find_event(events: List[Dict[str, Any]], stage: str,
     return None
 
 
+def _resolve_upload_path(path: Path) -> Path:
+    """Recover a model-mangled upload path by its stable ``doc_<hash>`` prefix.
+
+    The model sometimes retypes an uploaded doc's name and mangles the human-
+    readable suffix (a '+' becomes '_', etc.), but the ``doc_<hash>`` prefix the
+    Telegram adapter assigns is unique and stable. If the path is missing, glob
+    the parent for that prefix and use the sole match. Mirrors
+    scripts/u1_kit.py:resolve_upload_path (#45); duplicated here rather than
+    imported because that module pulls in numpy and does host lookups at import
+    time, which must not load into the gateway process. Without this, u1_kit's
+    existence check rejects a mangled path before the workflow (which has the
+    same recovery) ever runs."""
+    if path.exists():
+        return path
+    m = re.match(r"^(doc_[0-9a-f]{6,})_", path.name)
+    if not m:
+        return path
+    try:
+        matches = [p for p in path.parent.glob(f"{m.group(1)}_*") if p.is_file()]
+    except Exception:
+        return path
+    return matches[0] if len(matches) == 1 else path
+
+
 def _is_passthrough_event(ev: Dict[str, Any]) -> bool:
     """Events u1_kit re-emits in its output so the gateway attach hook and the
     model see them: the renders (plate previews + bed photo), the review doc,
@@ -222,6 +246,9 @@ def u1_kit_tool(
         path = path.resolve()
     except OSError as exc:
         return json.dumps({"error": f"bad model_path: {exc}"}, ensure_ascii=False)
+    # Recover a model-mangled upload name (e.g. '+' retyped as '_') by its
+    # stable doc_<hash> prefix before the existence check bails.
+    path = _resolve_upload_path(path)
     if not path.exists():
         return json.dumps({"error": f"model not found: {path}"}, ensure_ascii=False)
 

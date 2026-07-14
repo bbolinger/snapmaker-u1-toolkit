@@ -260,3 +260,29 @@ def test_kit_tool_passthrough_includes_bed_clear_prompt():
     assert not keep({"stage": "need_input", "key": "kit_form"})
     assert not keep({"stage": "kit_slicing"})
     assert not keep({"stage": "awaiting_input", "need": "bed_clear_start"})
+
+
+def test_kit_tool_recovers_mangled_upload_path(tmp_path):
+    """u1_kit must recover a model-mangled upload name by its doc_<hash> prefix.
+
+    Regression (live 2026-07-13): gemma retyped the cached zip name, turning a
+    '+' into '_' (Bar+Skadis -> Bar_Skadis). u1_kit's strict existence check
+    bailed with 'model not found' before the workflow's #45 recovery could run.
+    """
+    from pathlib import Path as _P
+    tool = _load_kit_tool()
+    real = tmp_path / "doc_e26dff8c8ada_Phillips+Hue+Play+Bar+Skadis_stls.zip"
+    real.write_bytes(b"zip")
+    mangled = tmp_path / "doc_e26dff8c8ada_Phillips+Hue+Play+Bar_Skadis_stls.zip"
+    assert not mangled.exists()
+    assert tool._resolve_upload_path(_P(mangled)) == real
+    # an exact, existing path passes through untouched
+    assert tool._resolve_upload_path(_P(real)) == real
+    # a non-doc name or no match is returned unchanged (no false recovery)
+    missing = tmp_path / "random_name.zip"
+    assert tool._resolve_upload_path(_P(missing)) == missing
+    # ambiguous prefix (two files) is left alone, never guessed
+    (tmp_path / "doc_abc123_one.zip").write_bytes(b"1")
+    (tmp_path / "doc_abc123_two.zip").write_bytes(b"2")
+    amb = tmp_path / "doc_abc123_x.zip"
+    assert tool._resolve_upload_path(_P(amb)) == amb
