@@ -165,6 +165,47 @@ _ADVANCED_CATEGORY = {
     "support_style": "supports",
 }
 
+
+def _display_resolved(fid: str, raw: Any) -> str:
+    """Compress a profile's raw Orca value for an advanced key into the short
+    token shown in 'keep profile (X)'. Deliberately small — a display hint, not
+    a parse; anything unrecognized falls back to the raw string."""
+    s = "" if raw is None else str(raw).strip()
+    if fid in ("infill", "infill_pattern", "walls", "top_shell", "bottom_shell"):
+        return s
+    if fid == "brim":
+        return "off" if s in ("", "no_brim") else "on"
+    if fid == "fuzzy":
+        return "off" if s in ("", "none") else "on"
+    if fid == "one_wall_top":
+        return "on" if s in ("1", "true", "True") else "off"
+    if fid == "raft":
+        try:
+            n = int(float(s))
+        except ValueError:
+            n = 0
+        return "off" if n <= 0 else f"{n} layers"
+    if fid == "support_style":
+        return "tree" if "tree" in s else ("grid" if s else "")
+    return s
+
+
+def resolve_advanced_from_profile(flat_process: dict[str, Any]) -> dict[str, str]:
+    """Map a FLATTENED process profile to {advanced_field_id: short current
+    value} so the tweak menu can show what each control changes FROM ('Top
+    layers: keep profile (4)'). Only keys present in the profile are returned;
+    an unread key just leaves that control on the generic 'profile default'
+    label. Pair with u1_slice_workflow._flatten_process_profile to resolve the
+    inherits chain first."""
+    out: dict[str, str] = {}
+    for fid, _lbl, _opts, orca_key, _mapping in ADVANCED_FIELDS:
+        if orca_key in flat_process:
+            val = _display_resolved(fid, flat_process.get(orca_key))
+            if val != "":
+                out[fid] = val
+    return out
+
+
 # Quantity (v2.3): print N copies of a SINGLE-part job. The workflow sets
 # spec["offer_quantity"] only when the kit has one part — per-part quantities
 # on multi-part kits are out of scope (the operator picks parts instead). The
@@ -992,6 +1033,13 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         # from this + each field's "category", so it needs no form internals).
         schema["advanced_categories"] = [{"key": k, "label": l}
                                          for k, l in ADVANCED_CATEGORIES]
+        # Per-profile current values (keyed by str(profile idx)) so the tweak
+        # controls can show "keep profile (X)" for whichever profile is picked.
+        # The workflow resolves these (it holds the profile paths); absent it,
+        # the labels simply stay generic.
+        _resolved = spec.get("advanced_resolved")
+        if _resolved:
+            schema["advanced_resolved"] = {str(k): v for k, v in _resolved.items()}
     if submit:
         schema["submit"] = submit
     return schema

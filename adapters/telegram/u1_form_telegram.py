@@ -201,6 +201,21 @@ def _adv_changed_count(form: dict[str, Any], fields: list[dict[str, Any]]) -> in
     return n
 
 
+def _resolved_for_selected_profile(form: dict[str, Any]) -> dict[str, str]:
+    """{advanced_field_id: current value} for the profile currently selected in
+    the form, used to label each control's keep-profile option. Empty when the
+    schema carries no resolved values (offline / older workflow)."""
+    amap = form["schema"].get("advanced_resolved") or {}
+    if not amap:
+        return {}
+    pf = next((f for f in form["schema"]["fields"] if f["id"] == "profile"), None)
+    if pf is None:
+        return {}
+    sel = form["selections"].get("profile")
+    pid = _opt_id(pf["options"][sel]) if sel is not None else pf.get("default")
+    return amap.get(str(pid)) or {}
+
+
 def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
     """The screen (list of fields) that renders together with ``fid``."""
     for screen in _screens(form):
@@ -292,10 +307,14 @@ def _step_suffix(form: dict[str, Any], fid: str) -> str:
     return f"\n<i>Step {pos + 1} of {len(screens)}</i>"
 
 
-def _field_control_rows(form: dict[str, Any], field: dict[str, Any]) -> list[list[dict[str, str]]]:
+def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
+                        resolved_default: str | None = None) -> list[list[dict[str, str]]]:
     """Option rows (+ pagination, + multi Select-all/Clear) for ONE field.
     Shared by single-field and grouped screens. Callback field indices are
-    ABSOLUTE into schema['fields'] so apply_callback resolves them directly."""
+    ABSOLUTE into schema['fields'] so apply_callback resolves them directly.
+    ``resolved_default`` (advanced controls only): the profile's current value
+    for this field, folded into the "profile default" option so it reads
+    "keep profile (X)"."""
     fi = _field_index(form, field["id"])
     page = form["pages"][field["id"]]
     paginated = len(field["options"]) > PAGE_SIZE
@@ -314,7 +333,10 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any]) -> list[lis
         else:
             mark = "● " if sel == oi else "○ "
             cb = f"s:{fi}:{oi}"
-        btn = {"text": f"{mark}{_opt_label(opt)}", "callback_data": cb}
+        _lbl = _opt_label(opt)
+        if resolved_default and _opt_id(opt) == "default":
+            _lbl = _lbl.replace("profile default", f"keep profile ({resolved_default})")
+        btn = {"text": f"{mark}{_lbl}", "callback_data": cb}
         if compact:
             _pending.append(btn)
             if len(_pending) == 2:
@@ -484,9 +506,11 @@ def _render_adv_category(form: dict[str, Any], catkey: str) -> dict[str, Any]:
         return _render_adv_menu(form)
     _key, label, fields = entry
     lines = [f"<b>{_esc(label)}</b>", "Tap to change, then Back to tweaks."]
+    resolved = _resolved_for_selected_profile(form)
     rows: list[list[dict[str, str]]] = []
     for field in fields:
-        rows.extend(_field_control_rows(form, field))
+        rows.extend(_field_control_rows(form, field,
+                                        resolved_default=resolved.get(field["id"])))
     rows.append([
         {"text": "↩ Back to tweaks", "callback_data": "am"},
         {"text": "✖ Cancel", "callback_data": "X"},

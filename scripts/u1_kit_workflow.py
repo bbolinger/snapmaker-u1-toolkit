@@ -2030,6 +2030,10 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     calls could silently shift what ``profile 2`` means. Verified 2026-06-28:
     list_profiles order changes when history_print_settings_id changes.
     """
+    # Per-profile current advanced values for the tweak menu's "keep profile
+    # (X)" labels. Only filled on a fresh build (the persisted/answer path holds
+    # no profile paths and renders no form). Display-only; fully guarded.
+    _adv_resolved: dict[str, dict[str, str]] = {}
     if persisted_profiles:
         profiles_full = [
             {"idx": int(p["idx"]), "value": p["value"], "label": p.get("label", p["value"]),
@@ -2060,6 +2064,25 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
              "recommended": bool(o.get("recommended"))}
             for i, o in enumerate(prof_opts)
         ]
+        # Resolve each profile's CURRENT advanced values so the tweak menu can
+        # show "keep profile (X)". Uses the picker's per-profile path and
+        # flattens the inherits chain; display-only and fully guarded, so any
+        # read failure just leaves that control on the generic label.
+        try:
+            import u1_slice_workflow as _sw
+            for i, o in enumerate(prof_opts):
+                _p = o.get("path")
+                if not _p:
+                    continue
+                try:
+                    _flat = _sw._flatten_process_profile(Path(_p))
+                    _vals = u1_form.resolve_advanced_from_profile(_flat)
+                    if _vals:
+                        _adv_resolved[str(i + 1)] = _vals
+                except Exception:
+                    continue
+        except Exception:
+            pass
     parts = [
         {"id": p["part_id"], "label": f"{p['filename']} ({p['footprint_mm'][0]:.0f}x{p['footprint_mm'][1]:.0f}mm)"}
         for p in kit["parts"]
@@ -2096,6 +2119,9 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         # fuzzy skin) — reachable only from the form's Review button; the
         # default path never sees it.
         "offer_advanced": True,
+        # Per-profile current advanced values for the tweak menu (empty on the
+        # persisted/answer path, which renders no form).
+        "advanced_resolved": _adv_resolved,
     }
     # v2.3: quantity (print N copies) — offered ONLY for single-part jobs.
     # Multi-part kits keep per-part quantities out of scope; the operator

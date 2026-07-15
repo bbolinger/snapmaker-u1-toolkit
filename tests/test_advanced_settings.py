@@ -254,6 +254,74 @@ def test_tweak_menu_conditional_supports_and_reset():
     assert tg.answer_json(form)["walls"] == "default"
 
 
+# ---------- resolved profile values ("keep profile (X)") ----------
+
+def test_resolve_advanced_from_profile_maps_scalars():
+    flat = {
+        "sparse_infill_density": "15%", "sparse_infill_pattern": "grid",
+        "wall_loops": "2", "top_shell_layers": "4", "bottom_shell_layers": "3",
+        "only_one_wall_top": "0", "brim_type": "no_brim", "raft_layers": "0",
+        "fuzzy_skin": "none", "support_type": "tree(auto)",
+    }
+    r = u1_form.resolve_advanced_from_profile(flat)
+    assert r == {"infill": "15%", "infill_pattern": "grid", "walls": "2",
+                 "top_shell": "4", "bottom_shell": "3", "one_wall_top": "off",
+                 "brim": "off", "raft": "off", "fuzzy": "off",
+                 "support_style": "tree"}
+    # non-default raw values surface too; an absent key is simply omitted
+    assert u1_form.resolve_advanced_from_profile(
+        {"raft_layers": "3", "only_one_wall_top": "1", "fuzzy_skin": "external"}
+    ) == {"raft": "3 layers", "one_wall_top": "on", "fuzzy": "on"}
+    assert u1_form.resolve_advanced_from_profile({}) == {}
+
+
+def test_schema_carries_advanced_resolved_keyed_by_str_idx():
+    spec = _spec()
+    spec["profiles"] = [{"idx": 1, "label": "A"}, {"idx": 2, "label": "B"}]
+    spec["advanced_resolved"] = {1: {"walls": "2"}, 2: {"walls": "4"}}
+    schema = u1_form.build_form_schema(spec)
+    assert schema["advanced_resolved"] == {"1": {"walls": "2"}, "2": {"walls": "4"}}
+    # not offered -> key absent
+    assert "advanced_resolved" not in u1_form.build_form_schema(_spec(offer=False))
+
+
+def test_tweak_menu_keep_profile_value_follows_selected_profile():
+    spec = _spec()
+    spec["profiles"] = [{"idx": 1, "label": "0.20 Std"}, {"idx": 2, "label": "0.28 Draft"}]
+    spec["advanced_resolved"] = {"1": {"walls": "2", "infill": "15%"},
+                                 "2": {"walls": "4", "infill": "25%"}}
+    schema = u1_form.build_form_schema(spec)
+    form = tg.new_form(schema)
+    pfi = tg._field_index(form, "profile")
+
+    def _pick_profile(idx_str):
+        oi = next(i for i, o in enumerate(tg._field(form, "profile")["options"])
+                  if str(tg._opt_id(o)) == idx_str)
+        tg.apply_callback(form, f"s:{pfi}:{oi}")
+
+    _pick_profile("1")
+    form["current"] = "walls"  # a Strength & shells control
+    txts = [b["text"] for row in tg.render_screen(form)["keyboard"] for b in row]
+    assert any("keep profile (2)" in t for t in txts)
+    assert any("keep profile (15%)" in t for t in txts)
+    # switch profile -> the keep-profile values track the new selection
+    _pick_profile("2")
+    form["current"] = "walls"
+    txts2 = [b["text"] for row in tg.render_screen(form)["keyboard"] for b in row]
+    assert any("keep profile (4)" in t for t in txts2)
+    assert not any("keep profile (2)" in t for t in txts2)
+
+
+def test_tweak_menu_keep_profile_label_absent_without_resolved():
+    # No advanced_resolved in the schema -> the generic "profile default" stands.
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    form["current"] = "walls"
+    txts = [b["text"] for row in tg.render_screen(form)["keyboard"] for b in row]
+    assert any("Walls: profile default" in t for t in txts)
+    assert not any("keep profile" in t for t in txts)
+
+
 
 def test_support_style_tree_vs_grid():
     """v2.3: tree vs grid support style rides the advanced-override rail."""
