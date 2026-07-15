@@ -284,10 +284,19 @@ def summarize(raw: dict[str, Any], material_map: dict[str, Any], requested_mater
             printer_material = (tool.get("printer_reported", {}).get("material") or "unknown").upper()
             declared_material = (tool.get("declared", {}).get("material") or "unknown").upper()
             detected_material = printer_material if printer_material not in {"", "UNKNOWN", "NONE"} else declared_material
-            sensors = tool.get("filament_sensors", {})
             exists = tool.get("printer_reported", {}).get("exists")
-            if exists is False or sensors.get("motion_detected") is False or sensors.get("feed_detected") is False:
-                gates.append(f"requested material {requested_norm} blocked: {check_tool} filament presence sensor says not loaded")
+            # "Loaded" on the U1 is the per-tool `filament_exist` flag (verified
+            # against the machine 2026-07-15: filament_exist=[T,T,T,T] on loaded
+            # tools, matching the visible colour/material). The
+            # filament_motion_sensor (motion_detected / feed_detected) only reads
+            # True while filament is actively MOVING through a head; at rest —
+            # which is EVERY tool at pre-start, before the head engages the
+            # colour — it reads False. Gating on it blocked every loaded-but-idle
+            # tool (live 2026-07-15: a real print refused with exists=True,
+            # motion=feed=False). So gate on presence (exists), not motion; the
+            # motion sensor is the printer's own DURING-print runout mechanism.
+            if exists is False:
+                gates.append(f"requested material {requested_norm} blocked: {check_tool} filament not loaded (filament_exist is false)")
             elif detected_material in {"", "UNKNOWN", "NONE"}:
                 gates.append(f"requested material {requested_norm} cannot be verified: {check_tool} material is unknown")
             elif detected_material != requested_norm:

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.5.1] — 2026-07-14
+
+### Fixed
+
+- **The print-start safety check no longer refuses a loaded tool that's sitting
+  idle.** The check that confirms filament is loaded before a print starts was
+  reading the tool's filament-motion sensor, which only registers while filament
+  is actively moving. At the moment you approve a print every tool is idle, so a
+  genuinely loaded tool could read as "not loaded" and the start was refused. It
+  now reads the printer's own per-tool loaded/not-loaded status instead. A tool
+  that is actually empty still blocks the start, unchanged.
+
+---
+
 ## [2.5.0] — 2026-07-14
 
 ### Added

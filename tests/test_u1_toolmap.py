@@ -87,6 +87,31 @@ def test_no_request_means_no_gate():
     assert not blocking
 
 
+def test_idle_loaded_tool_not_blocked_by_motion_sensor():
+    """U1 (verified 2026-07-15): a LOADED tool (filament_exist True) whose motion
+    sensor reads False because it's idle/not feeding must NOT be gated. The
+    motion sensor only fires while filament is actively moving; at pre-start
+    every tool is idle, so gating on it refused every real print."""
+    raw = _fake_printer_raw(e1_material="PETG")
+    st = raw["status"]
+    # extruder1 is channel 1 (EXTRUDER_CHANNEL): load ch1 + set its material.
+    st["print_task_config"]["filament_exist"] = [False, True, False, False]
+    st["print_task_config"]["filament_type"] = ["", "PETG", "", ""]
+    st["filament_motion_sensor e1_filament"] = {"filament_detected": False, "enabled": True}
+    out = u1_toolmap.summarize(raw, _material_map(material="PETG"),
+                               requested_material="PETG", intended_tool="extruder1")
+    assert not [g for g in out.get("gates", []) if "not loaded" in g], out.get("gates")
+
+
+def test_empty_tool_still_blocked_by_filament_exist():
+    """Safety intact: a genuinely empty tool (filament_exist False) MUST block."""
+    raw = _fake_printer_raw(e1_material="PETG")
+    raw["status"]["print_task_config"]["filament_exist"] = [False, False, False, False]
+    out = u1_toolmap.summarize(raw, _material_map(material="PETG"),
+                               requested_material="PETG", intended_tool="extruder1")
+    assert [g for g in out.get("gates", []) if "not loaded" in g], out.get("gates")
+
+
 def test_case_insensitive_material_match():
     """petg vs PETG should still match — operator typing convenience."""
     raw = _fake_printer_raw(e1_material="petg")
