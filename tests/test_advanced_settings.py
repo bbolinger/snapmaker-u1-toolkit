@@ -398,6 +398,26 @@ def test_advanced_category_packs_options_not_one_per_row():
     assert packed, "advanced options must be packed two-up, not one per row"
 
 
+def test_advanced_category_uses_bare_values_under_a_header():
+    """Under each setting's full-width header, the option buttons show the BARE
+    value ("30%", "gyroid", "2") three-up, not the repeated setting name (live
+    2026-07-15: "Infill 10%" on every button doubled the text and truncated
+    wider labels). The header carries the setting name + current value."""
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    form["current"] = "infill"
+    kb = tg.render_screen(form)["keyboard"]
+    header = kb[0]
+    assert len(header) == 1 and "Infill" in header[0]["text"]  # header names the setting
+    value_rows = [r for r in kb[1:]
+                  if r and all(b["callback_data"].startswith("s:") for b in r)]
+    assert any(len(r) >= 2 for r in value_rows), "values should pack multi-up"
+    for r in value_rows:
+        assert len(r) <= 3, "at most three-up"
+        for b in r:
+            assert "Infill" not in b["text"], f"option repeats setting name: {b['text']}"
+
+
 def test_tweak_menu_keep_profile_label_absent_without_resolved():
     # No advanced_resolved in the schema -> the generic "profile default" stands.
     schema = u1_form.build_form_schema(_spec())

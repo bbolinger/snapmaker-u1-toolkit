@@ -329,26 +329,26 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
     # instead of a tall column of every option (live 2026-07-15: the flat stack
     # read as "a fat chunk of info"). Advanced fields never paginate (<=7 opts).
     if field.get("advanced"):
-        pending: list[dict[str, str]] = []
+        # A full-width HEADER (the setting name + its current value; tap = keep
+        # the profile default) followed by the alternatives as BARE values three-
+        # up. The header carries the setting name so the option buttons don't
+        # repeat it (live 2026-07-15: "Infill 10% / Infill 15% / ..." doubled the
+        # text and truncated wider labels at two-up). The default option is first
+        # in every advanced field, so the header row lands before the values.
+        alts: list[dict[str, str]] = []
         for oi, opt in enumerate(field["options"]):
-            oid = _opt_id(opt)
-            lbl = _opt_label(opt)
-            if resolved_default and oid == "default":
-                lbl = lbl.replace("profile default", f"keep profile ({resolved_default})")
-            btn = {"text": f"{'● ' if sel == oi else '○ '}{lbl}",
-                   "callback_data": f"s:{fi}:{oi}"}
-            if oid == "default":                       # headline: its own row
-                if pending:
-                    rows.append(pending)
-                    pending = []
-                rows.append([btn])
-            else:                                      # alternatives: two-up
-                pending.append(btn)
-                if len(pending) == 2:
-                    rows.append(pending)
-                    pending = []
-        if pending:
-            rows.append(pending)
+            mark = "● " if sel == oi else "○ "
+            if _opt_id(opt) == "default":
+                head = _opt_label(opt)
+                if resolved_default:
+                    head = head.replace("profile default",
+                                        f"keep profile ({resolved_default})")
+                rows.append([{"text": f"{mark}{head}", "callback_data": f"s:{fi}:{oi}"}])
+            else:
+                short = opt.get("short") or _opt_label(opt)
+                alts.append({"text": f"{mark}{short}", "callback_data": f"s:{fi}:{oi}"})
+        for i in range(0, len(alts), 3):
+            rows.append(alts[i:i + 3])
         return rows
     compact = field.get("compact") and not is_multi
     _pending: list[dict[str, str]] = []

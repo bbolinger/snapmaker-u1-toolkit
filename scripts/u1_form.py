@@ -165,6 +165,26 @@ _ADVANCED_CATEGORY = {
     "support_style": "supports",
 }
 
+# Bare option labels for the category sub-page. There, each setting has a
+# full-width HEADER (its name + current value), so the option buttons under it
+# don't repeat the setting name — they show only the value ("30%", "gyroid",
+# "3"), which fits three-up without truncation. The full self-describing label
+# is still used everywhere else (text fallback, review summary).
+_ADVANCED_SHORT = {
+    "infill": {"10": "10%", "15": "15%", "20": "20%", "30": "30%",
+               "40": "40%", "50": "50%"},
+    "infill_pattern": {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
+                       "triangles": "triangles", "cubic": "cubic"},
+    "walls": {"2": "2", "3": "3", "4": "4"},
+    "brim": {"off": "off", "auto": "auto"},
+    "fuzzy": {"off": "off", "on": "on"},
+    "top_shell": {"3": "3", "4": "4", "5": "5"},
+    "bottom_shell": {"3": "3", "4": "4"},
+    "one_wall_top": {"off": "off", "on": "on"},
+    "raft": {"off": "off", "small": "3 layers"},
+    "support_style": {"tree": "tree", "grid": "grid"},
+}
+
 
 def _display_resolved(fid: str, raw: Any) -> str:
     """Compress a profile's raw Orca value for an advanced key into the short
@@ -1008,9 +1028,11 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     # "default" = no override; skipping the screen is today's behavior.
     if spec.get("offer_advanced"):
         for _fid, _lbl, _opts, _orca_key, _mapping in ADVANCED_FIELDS:
+            _shorts = _ADVANCED_SHORT.get(_fid, {})
             fields.append({
                 "id": _fid, "type": "single_select", "label": _lbl,
-                "options": [{"id": oid, "label": olbl} for oid, olbl in _opts],
+                "options": [{"id": oid, "label": olbl,
+                             "short": _shorts.get(oid, olbl)} for oid, olbl in _opts],
                 "default": "default", "required": False,
                 "advanced": True, "group": "advanced",
                 "group_label": "Advanced settings",
