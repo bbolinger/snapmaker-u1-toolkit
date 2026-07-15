@@ -35,6 +35,7 @@ from typing import Any
 # Tunables (callers may monkey-patch for tests / different UX).
 PAGE_SIZE = 8                # buttons per screen when a field has > PAGE_SIZE options
 REVIEW_FIELD = "__review__"
+ADV_MENU = "__adv_menu__"  # the tweak category menu (level 1 of the sub-page nav)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +138,69 @@ def _advanced_fields(form: dict[str, Any]) -> list[dict[str, Any]]:
             if _is_screen_field(f) and f.get("advanced")]
 
 
+def _supports_on(form: dict[str, Any]) -> bool:
+    """Is the setup-screen Supports toggle ON? Advanced controls that Orca only
+    honours with supports enabled (support_style) hide when it's off."""
+    f = next((x for x in form["schema"]["fields"] if x["id"] == "supports"), None)
+    if not f:
+        return True  # no supports control on this form → hide nothing
+    sel = form["selections"].get(f["id"])
+    if sel is None:
+        return f.get("default") == "supports"
+    return _opt_id(f["options"][sel]) == "supports"
+
+
+def _adv_field_visible(form: dict[str, Any], field: dict[str, Any]) -> bool:
+    """Whether an advanced control applies given the rest of the form. Keeps
+    dead controls (a support style with supports off) out of the menu."""
+    if field["id"] == "support_style":
+        return _supports_on(form)
+    return True
+
+
+def _category_fields(form: dict[str, Any], catkey: str) -> list[dict[str, Any]]:
+    """Advanced fields tagged ``catkey`` that currently apply, in schema order."""
+    return [f for f in _advanced_fields(form)
+            if f.get("category") == catkey and _adv_field_visible(form, f)]
+
+
+def _adv_categories(form: dict[str, Any]) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """(key, label, fields) for each advanced category that has visible fields,
+    in the schema's declared order. Any advanced field whose category isn't
+    declared falls into a trailing bucket so nothing is silently unreachable."""
+    out: list[tuple[str, str, list[dict[str, Any]]]] = []
+    declared: set[str] = set()
+    for cat in form["schema"].get("advanced_categories", []):
+        declared.add(cat["key"])
+        fields = _category_fields(form, cat["key"])
+        if fields:
+            out.append((cat["key"], cat["label"], fields))
+    leftover = [f for f in _advanced_fields(form)
+                if f.get("category") not in declared and _adv_field_visible(form, f)]
+    if leftover:
+        out.append(("_more", "⚙ More tweaks", leftover))
+    return out
+
+
+def _adv_bucket_of(form: dict[str, Any], fid: str) -> str | None:
+    """The category-menu bucket key whose page renders field ``fid`` (or None if
+    ``fid`` is not an advanced field)."""
+    for key, _label, fields in _adv_categories(form):
+        if any(f["id"] == fid for f in fields):
+            return key
+    return None
+
+
+def _adv_changed_count(form: dict[str, Any], fields: list[dict[str, Any]]) -> int:
+    """How many of ``fields`` are set to something other than profile default."""
+    n = 0
+    for f in fields:
+        sel = form["selections"].get(f["id"])
+        if sel is not None and _opt_id(f["options"][sel]) != "default":
+            n += 1
+    return n
+
+
 def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
     """The screen (list of fields) that renders together with ``fid``."""
     for screen in _screens(form):
@@ -190,9 +254,15 @@ def render_screen(form: dict[str, Any]) -> dict[str, Any]:
 
     Returns ``{"text": str, "keyboard": list[list[{"text": str, "callback_data": str}]]}``.
     """
-    if form["current"] == REVIEW_FIELD:
+    cur = form["current"]
+    if cur == REVIEW_FIELD:
         return _render_review(form)
-    screen = _screen_of(form, form["current"])
+    if cur == ADV_MENU:
+        return _render_adv_menu(form)
+    bucket = _adv_bucket_of(form, cur)
+    if bucket is not None:
+        return _render_adv_category(form, bucket)
+    screen = _screen_of(form, cur)
     if len(screen) > 1:
         return _render_group(form, screen)
     return _render_field(form, screen[0])
@@ -356,9 +426,9 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         if changed:
             lines.append("\u2022 <b>Advanced</b>: " + _esc(", ".join(changed)))
         rows.append([{
-            "text": ("\u2699 Advanced settings"
-                     + (f" ({len(changed)} set)" if changed else "")),
-            "callback_data": f"e:{_field_index(form, adv[0]['id'])}",
+            "text": ("\u2699 Print tweaks"
+                     + (f" ({len(changed)} changed)" if changed else "")),
+            "callback_data": "am",
         }])
 
     # Action becomes the submit verbs: each option submits with that action.
@@ -380,6 +450,47 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         ])
     lines.append("")
     lines.append("<i>This only slices + uploads and shows you the plate, the review, and a fresh bed photo. Nothing prints until you confirm at the bed-clear step.</i>")
+    return {"text": "\n".join(lines), "keyboard": rows}
+
+
+def _render_adv_menu(form: dict[str, Any]) -> dict[str, Any]:
+    """Level 1 of the tweak sub-pages: the category menu, reached from Review's
+    ⚙ button. Lists only categories that have applicable fields; each shows how
+    many of its controls are set away from the profile default."""
+    lines = ["<b>⚙ Print tweaks</b>",
+             "All optional. Anything you leave alone keeps the profile's value.",
+             ""]
+    rows: list[list[dict[str, str]]] = []
+    for key, label, fields in _adv_categories(form):
+        n = _adv_changed_count(form, fields)
+        text = _esc(label) + (f"  · {n} changed" if n else "")
+        rows.append([{"text": text, "callback_data": f"cat:{key}"}])
+    if _adv_changed_count(form, _advanced_fields(form)):
+        rows.append([{"text": "↩ Reset all to profile", "callback_data": "ar"}])
+    rows.append([
+        {"text": "✅ Done", "callback_data": "ad"},
+        {"text": "✖ Cancel", "callback_data": "X"},
+    ])
+    return {"text": "\n".join(lines), "keyboard": rows}
+
+
+def _render_adv_category(form: dict[str, Any], catkey: str) -> dict[str, Any]:
+    """Level 2: one category's controls as inline radio groups, plus Back. The
+    bucket is resolved through _adv_categories so a category emptied by a
+    conditional (supports off) or a stale cursor bounces cleanly to the menu."""
+    entry = next(((k, l, fs) for k, l, fs in _adv_categories(form) if k == catkey), None)
+    if entry is None:
+        form["current"] = ADV_MENU
+        return _render_adv_menu(form)
+    _key, label, fields = entry
+    lines = [f"<b>{_esc(label)}</b>", "Tap to change, then Back to tweaks."]
+    rows: list[list[dict[str, str]]] = []
+    for field in fields:
+        rows.extend(_field_control_rows(form, field))
+    rows.append([
+        {"text": "↩ Back to tweaks", "callback_data": "am"},
+        {"text": "✖ Cancel", "callback_data": "X"},
+    ])
     return {"text": "\n".join(lines), "keyboard": rows}
 
 
@@ -448,6 +559,29 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
             return {"kind": "rerender",
                     "warning": f"Please answer: {_esc(', '.join(missing))}"}
         return {"kind": "submit", "answer": answer_json(form)}
+
+    if kind == "am":              # open / return to the tweak category menu
+        form.pop("_edit_return", None)
+        form["current"] = ADV_MENU
+        return {"kind": "rerender"}
+
+    if kind == "ad":              # Done with tweaks → back to Review
+        form["current"] = REVIEW_FIELD
+        return {"kind": "rerender"}
+
+    if kind == "ar":              # Reset every advanced control to profile default
+        for f in _advanced_fields(form):
+            di = next((i for i, o in enumerate(f["options"])
+                       if _opt_id(o) == "default"), None)
+            if di is not None:
+                form["selections"][f["id"]] = di
+        return {"kind": "rerender"}
+
+    if kind == "cat":             # open a category sub-page
+        catkey = parts[1]
+        bucket = next((fs for k, _l, fs in _adv_categories(form) if k == catkey), None)
+        form["current"] = bucket[0]["id"] if bucket else ADV_MENU
+        return {"kind": "rerender"}
 
     fi = int(parts[1])
     field = fields[fi]

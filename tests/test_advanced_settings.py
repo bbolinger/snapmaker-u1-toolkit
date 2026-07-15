@@ -132,31 +132,49 @@ def test_text_advanced_ignored_when_not_offered():
 
 # ---------- renderer ----------
 
-def test_renderer_advanced_hidden_from_linear_flow_but_reachable():
+def test_renderer_advanced_reached_via_two_level_tweak_menu():
     schema = u1_form.build_form_schema(_spec())
     form = tg.new_form(schema)
     flow_ids = [f["id"] for sc in tg._screens(form) for f in sc]
     assert "infill" not in flow_ids and "fuzzy" not in flow_ids
-    # Review shows the Advanced button; tapping it jumps to the advanced group
+    # Review shows ONE Print-tweaks button that opens the category MENU (not a
+    # flat field jump).
     form["current"] = tg.REVIEW_FIELD
     kb = tg.render_screen(form)["keyboard"]
-    adv_btn = next(b for row in kb for b in row if "Advanced" in b["text"])
-    tg.apply_callback(form, adv_btn["callback_data"])
-    assert form["current"] == "infill" and form.get("_edit_return")
-    screen = tg.render_screen(form)
-    assert "Advanced settings" in screen["text"]
-    # pick gyroid (a grouped radio: marks, doesn't advance)
+    tweak_btn = next(b for row in kb for b in row if "tweaks" in b["text"].lower())
+    assert tweak_btn["callback_data"] == "am"
+    tg.apply_callback(form, tweak_btn["callback_data"])
+    assert form["current"] == tg.ADV_MENU
+    menu = tg.render_screen(form)
+    cats = [b["callback_data"] for row in menu["keyboard"] for b in row
+            if b["callback_data"].startswith("cat:")]
+    assert "cat:strength" in cats and "cat:finish" in cats
+    # open Strength & shells -> lands on the first strength control; the page
+    # shows ONLY that category's fields, not the whole advanced list
+    tg.apply_callback(form, "cat:strength")
+    assert form["current"] == "infill"
+    page = tg.render_screen(form)
+    assert "Strength" in page["text"]
+    assert any("Pattern" in b["text"] for row in page["keyboard"] for b in row)
+    assert not any("Fuzzy" in b["text"] for row in page["keyboard"] for b in row)
+    # pick gyroid (a radio: marks, stays on the category page)
     fi = tg._field_index(form, "infill_pattern")
     gy = next(i for i, o in enumerate(tg._field(form, "infill_pattern")["options"])
               if tg._opt_id(o) == "gyroid")
     tg.apply_callback(form, f"s:{fi}:{gy}")
-    assert form["current"] == "infill"  # still on the advanced screen
-    # group Next returns to Review; summary line shows the change
-    tg.apply_callback(form, f"n:{tg._field_index(form, 'infill')}")
+    assert form["current"] == "infill"  # still on the strength page
+    # Back to the menu -> the strength row now shows its changed count
+    tg.apply_callback(form, "am")
+    assert form["current"] == tg.ADV_MENU
+    menu2 = tg.render_screen(form)
+    assert any(b["callback_data"] == "cat:strength" and "1 changed" in b["text"]
+               for row in menu2["keyboard"] for b in row)
+    # Done -> Review; the change shows in the summary line + button count
+    tg.apply_callback(form, "ad")
     assert form["current"] == tg.REVIEW_FIELD
     review = tg.render_screen(form)
     assert "Pattern: gyroid" in review["text"]
-    assert any("(1 set)" in b["text"] for row in review["keyboard"] for b in row)
+    assert any("(1 changed)" in b["text"] for row in review["keyboard"] for b in row)
 
 
 def test_renderer_answer_json_carries_advanced_ids():
@@ -190,20 +208,50 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
                "top_shell": "Top", "bottom_shell": "Bottom",
                "one_wall_top": "One wall", "raft": "Raft"}[f["id"]]
         assert all(key in tg._opt_label(o) for o in f["options"]), f["id"]
-    # Review: exactly ONE advanced-related button (the jump), no Edit rows
+    # Review: exactly ONE advanced-related button (opens the tweak menu), and
+    # NO per-advanced-field Edit rows.
     form["current"] = tg.REVIEW_FIELD
     review = tg.render_screen(form)
     adv_ids = {f["id"] for f in tg._advanced_fields(form)}
     edit_targets = []
+    menu_buttons = 0
     for row in review["keyboard"]:
         for b in row:
             cd = b.get("callback_data", "")
-            if cd.startswith("e:"):
+            if cd == "am":
+                menu_buttons += 1
+            elif cd.startswith("e:"):
                 fi = int(cd.split(":")[1])
                 edit_targets.append(form["schema"]["fields"][fi]["id"])
-    assert sum(1 for t in edit_targets if t in adv_ids) == 1  # the one jump button
-    assert not any(f"Infill" in b["text"] and "Advanced" not in b["text"]
+    assert menu_buttons == 1  # the single tweak-menu jump
+    assert not any(t in adv_ids for t in edit_targets)  # no advanced Edit rows
+    assert not any("Infill" in b["text"] and "tweaks" not in b["text"].lower()
                    for row in review["keyboard"] for b in row)
+
+
+def test_tweak_menu_conditional_supports_and_reset():
+    """The Supports category only appears when the setup Supports toggle is ON
+    (Orca ignores support_type otherwise), and Reset-all returns every advanced
+    control to profile default."""
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    # supports defaults OFF -> the Supports category has no applicable field
+    assert "supports" not in [k for k, _l, _f in tg._adv_categories(form)]
+    # turn supports ON via its setup field -> the category becomes available
+    sfi = tg._field_index(form, "supports")
+    on = next(i for i, o in enumerate(tg._field(form, "supports")["options"])
+              if tg._opt_id(o) == "supports")
+    tg.apply_callback(form, f"s:{sfi}:{on}")
+    assert "supports" in [k for k, _l, _f in tg._adv_categories(form)]
+    # set a tweak, confirm it counts, then Reset-all clears it
+    wfi = tg._field_index(form, "walls")
+    three = next(i for i, o in enumerate(tg._field(form, "walls")["options"])
+                 if tg._opt_id(o) == "3")
+    tg.apply_callback(form, f"s:{wfi}:{three}")
+    assert tg._adv_changed_count(form, tg._advanced_fields(form)) >= 1
+    tg.apply_callback(form, "ar")
+    assert tg._adv_changed_count(form, tg._advanced_fields(form)) == 0
+    assert tg.answer_json(form)["walls"] == "default"
 
 
 
