@@ -323,6 +323,33 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
     is_multi = field["type"] == "multi_select"
     page_offset = page * PAGE_SIZE
     sel = form["selections"][field["id"]]
+    # Advanced controls (the category sub-pages) get a per-setting BLOCK layout,
+    # not one button per row: the current/keep value is a full-width headline,
+    # its alternatives pack two-up beneath. Keeps each setting a scannable unit
+    # instead of a tall column of every option (live 2026-07-15: the flat stack
+    # read as "a fat chunk of info"). Advanced fields never paginate (<=7 opts).
+    if field.get("advanced"):
+        pending: list[dict[str, str]] = []
+        for oi, opt in enumerate(field["options"]):
+            oid = _opt_id(opt)
+            lbl = _opt_label(opt)
+            if resolved_default and oid == "default":
+                lbl = lbl.replace("profile default", f"keep profile ({resolved_default})")
+            btn = {"text": f"{'● ' if sel == oi else '○ '}{lbl}",
+                   "callback_data": f"s:{fi}:{oi}"}
+            if oid == "default":                       # headline: its own row
+                if pending:
+                    rows.append(pending)
+                    pending = []
+                rows.append([btn])
+            else:                                      # alternatives: two-up
+                pending.append(btn)
+                if len(pending) == 2:
+                    rows.append(pending)
+                    pending = []
+        if pending:
+            rows.append(pending)
+        return rows
     compact = field.get("compact") and not is_multi
     _pending: list[dict[str, str]] = []
     for local_oi, opt in enumerate(slice_):

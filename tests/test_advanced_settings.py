@@ -385,6 +385,19 @@ def test_build_form_spec_resolves_advanced_on_the_persisted_emit_path(monkeypatc
     assert schema["advanced_resolved"]["1"]["walls"] == "3"
 
 
+def test_advanced_category_packs_options_not_one_per_row():
+    """The category sub-page must pack options into a block, not stack one button
+    per row (live 2026-07-15: the flat one-per-row list read as "a fat chunk of
+    info, lazily stacked"). Each setting's alternatives ride multi-button rows."""
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    form["current"] = "infill"  # a Strength & shells control
+    kb = tg.render_screen(form)["keyboard"]
+    packed = [r for r in kb
+              if len(r) >= 2 and all(b["callback_data"].startswith("s:") for b in r)]
+    assert packed, "advanced options must be packed two-up, not one per row"
+
+
 def test_tweak_menu_keep_profile_label_absent_without_resolved():
     # No advanced_resolved in the schema -> the generic "profile default" stands.
     schema = u1_form.build_form_schema(_spec())
