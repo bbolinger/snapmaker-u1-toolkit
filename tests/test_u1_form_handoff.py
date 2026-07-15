@@ -85,7 +85,7 @@ def _args(model, **kw_):
 
 @pytest.fixture
 def hermetic_commit(monkeypatch):
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"}])
 
     def fake_arrange(paths, out_dir, **kwargs):

@@ -201,3 +201,69 @@ def test_main_empty_printer_returns_3(monkeypatch, capsys):
     monkeypatch.setenv("SNAPMAKER_U1_HOST", "192.168.1.100")
     rc = epfp.main(["--list"])
     assert rc == 3
+
+
+# ── head+tail range download + incremental refresh (A2, 2026-07-14) ──────────
+
+class _Resp:
+    def __init__(self, status, data):
+        self.status = status
+        self._d = data
+    def read(self, n=-1):
+        return self._d if (n is None or n < 0) else self._d[:n]
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+def test_head_tail_download_concatenates_ranges(tmp_path, monkeypatch):
+    """Fetch a head slice + a tail slice via Range and concatenate them — the
+    geometry in the middle is never pulled."""
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        rng = req.headers.get('Range', '')
+        seen.append(rng)
+        return _Resp(206, b'HEAD' + b'h' * 20) if rng.startswith('bytes=0-') \
+            else _Resp(206, b'TAIL' + b't' * 20)
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    dest = tmp_path / 'g.gcode'
+    n = epfp.http_download_head_tail('http://x/g', dest, head_bytes=64, tail_bytes=64)
+    body = dest.read_bytes()
+    assert body.startswith(b'HEAD') and b'TAIL' in body
+    assert n == len(body)
+    assert any(r.startswith('bytes=0-') for r in seen)
+    assert any(r.startswith('bytes=-') for r in seen)
+
+
+def test_head_tail_download_distrusts_ignored_range(tmp_path, monkeypatch):
+    """If the server ignores Range (200), don't treat the body as a settings
+    tail — write head-only so the caller finds no footer and skips."""
+    monkeypatch.setattr(urllib.request, 'urlopen',
+                        lambda req, timeout=None: _Resp(200, b'X' * 30))
+    dest = tmp_path / 'g.gcode'
+    epfp.http_download_head_tail('http://x/g', dest, head_bytes=16, tail_bytes=16)
+    assert dest.stat().st_size == 16  # head-only, not both slices
+
+
+def test_refresh_from_printer_incremental_skip(tmp_path, monkeypatch):
+    """Skips prints already extracted, tail-fetches only the new ones."""
+    out = tmp_path / 'from-printer'
+    out.mkdir()
+    (out / (epfp.safe_basename('g1.gcode') + '_process.json')).write_text('{}')
+    monkeypatch.setattr(epfp, 'list_gcodes',
+                        lambda h, p, timeout=12.0: [{'path': 'g1.gcode'}, {'path': 'g2.gcode'}])
+    seen = {}
+
+    def fake_extract_one(host, port, name, output_dir, *, tail_bytes=None, **k):
+        seen['tail_bytes'] = tail_bytes
+        (output_dir / (epfp.safe_basename(name) + '_process.json')).write_text('{}')
+        return {'ok': True}
+
+    monkeypatch.setattr(epfp, 'extract_one', fake_extract_one)
+    summary = epfp.refresh_from_printer(host='h', port=1, output_dir=out, limit=5)
+    assert summary['skipped'] == 1          # g1 already had a profile
+    assert summary['extracted'] == ['g2']   # only g2 fetched
+    assert seen['tail_bytes']               # fetched tail-only, not the full file

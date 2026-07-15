@@ -52,6 +52,35 @@ def test_order_independent():
     assert v["action"] == "start"
 
 
+# --------------------------------------------------------------------------- #
+# Profile pre-selection (A1, 2026-07-14): the form defaults to the picker's
+# recommended (last-used) profile instead of starting unselected, so the
+# operator isn't forced to re-pick their usual profile every run.
+# --------------------------------------------------------------------------- #
+
+def _spec_recommended(rec_idx):
+    s = _spec()
+    s["profiles"] = [
+        {"idx": 1, "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)", "recommended": rec_idx == 1},
+        {"idx": 2, "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)", "recommended": rec_idx == 2},
+    ]
+    return s
+
+
+def test_profile_field_defaults_to_recommended():
+    schema = u1_form.build_form_schema(_spec_recommended(2))
+    pf = next(f for f in schema["fields"] if f["id"] == "profile")
+    assert pf["default"] == 2, "profile field must pre-select the recommended (last-used) profile"
+
+
+def test_profile_field_no_default_without_recommendation():
+    # Back-compat: no recommended flag -> no default (starts unselected, the
+    # pre-A1 behavior), so callers/tests that never mark one are unaffected.
+    schema = u1_form.build_form_schema(_spec())
+    pf = next(f for f in schema["fields"] if f["id"] == "profile")
+    assert "default" not in pf
+
+
 def test_forgiving_separators_and_case():
     r = u1_form.parse_answers("t0 ; pla ; PROFILE 1 ; NO-SUPPORTS", _spec(n_parts=0))
     assert r["ok"], r["errors"]

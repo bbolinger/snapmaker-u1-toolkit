@@ -917,9 +917,16 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                        "default": "1", "required": False})
     profiles = spec.get("profiles", [])
     if profiles:
-        fields.append({"id": "profile", "type": "single_select", "label": "Print profile",
-                       "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
-                       "required": True})
+        _pfield = {"id": "profile", "type": "single_select", "label": "Print profile",
+                   "options": [{"id": p.get("idx"), "label": _clean_label(_strip_profile_suffix(p.get("label")))} for p in profiles],
+                   "required": True}
+        # Pre-select the picker's recommended profile (the operator's last-used,
+        # from print_history) so the form starts on it instead of unselected —
+        # the operator taps only to change it.
+        _rec = next((p for p in profiles if p.get("recommended")), None)
+        if _rec is not None and _rec.get("idx") is not None:
+            _pfield["default"] = _rec["idx"]
+        fields.append(_pfield)
     # Advanced overrides (v2.3): optional, EXCLUDED from the main screen flow —
     # the renderer only reaches them via the Review screen's Advanced button.
     # "default" = no override; skipping the screen is today's behavior.

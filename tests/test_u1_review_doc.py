@@ -305,7 +305,7 @@ def test_kit_commit_emits_review_doc_and_never_blocks(tmp_path, capsys, monkeypa
         for i in range(2):
             z.write(_cube(tmp_path / f"p{i}.stl", 20 + i), f"p{i}.stl")
 
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"}])
 
     def fake_arrange(paths, out_dir, **kwargs):

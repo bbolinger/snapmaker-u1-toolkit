@@ -175,6 +175,7 @@ from u1_slice_workflow import (
     _shell_quote,
     _real_upload,
     list_profiles,
+    last_used_print_settings_id,
     profile_path,
     apply_supports_override,
     apply_profile_overrides,
@@ -1992,9 +1993,33 @@ def _audit(request_id: str, event: str, operator: str, **details: Any):
         return None
 
 
+# How many of the printer's most-recent prints to scan for new profiles at
+# form-build. Incremental (already-extracted prints are skipped), so after the
+# first run this is usually a no-op or a single ~1 MB head+tail fetch.
+_FROM_PRINTER_SCRUB_LIMIT = 8
+
+
+def _scrub_recent_prints() -> None:
+    """Populate ``profiles/from-printer/`` from the printer's recent prints so an
+    operator's actual prints appear as selectable profiles. Fetches only each
+    G-code's head+tail (settings), never the geometry; incremental; fully
+    GUARDED — any failure (printer off, import issue) leaves existing profiles
+    untouched. Lives in tools/, reached by adding it to sys.path at call time."""
+    try:
+        import os
+        _tools = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+        if _tools not in sys.path:
+            sys.path.insert(0, _tools)
+        import extract_profiles_from_printer as _ep
+        _ep.refresh_from_printer(limit=_FROM_PRINTER_SCRUB_LIMIT)
+    except Exception:
+        pass
+
+
 def _build_form_spec(kit: dict[str, Any], nozzle: str,
                      persisted_profiles: list[dict[str, Any]] | None = None,
-                     refresh: bool = True) -> dict[str, Any]:
+                     refresh: bool = True, scrub: bool = True) -> dict[str, Any]:
     """Assemble the u1_form spec from analysis (parts + offered options).
 
     ``profile N`` is resolved by INDEX, and form-emit / answer-parse happen in
@@ -2007,13 +2032,32 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     """
     if persisted_profiles:
         profiles_full = [
-            {"idx": int(p["idx"]), "value": p["value"], "label": p.get("label", p["value"])}
+            {"idx": int(p["idx"]), "value": p["value"], "label": p.get("label", p["value"]),
+             "recommended": bool(p.get("recommended"))}
             for p in persisted_profiles
         ]
     else:
-        prof_opts = list_profiles(nozzle=nozzle)
+        # Building the profile list fresh -> first pull the operator's recent
+        # prints off the printer into profiles/from-printer/ so what they've
+        # actually printed shows up as a selectable profile (newest pre-selected
+        # below). Fetches only each G-code's head+tail (settings), never the
+        # geometry, and skips already-extracted prints, so it's cheap. Fully
+        # guarded. Skipped (scrub=False) in unit tests / the re-validate path.
+        if scrub:
+            _scrub_recent_prints()
+        # Tell the picker the operator's last-used preset (from print_history) so
+        # it marks + floats the one they actually printed with; the form then
+        # pre-selects it (build_form_schema reads "recommended"). tool=None -> the
+        # single most-recent across all tools, since the tool is chosen in this
+        # same form. Guarded: no history / unreadable -> plain scoring order.
+        try:
+            _last_used = last_used_print_settings_id(tool=None, nozzle=nozzle)
+        except Exception:
+            _last_used = None
+        prof_opts = list_profiles(nozzle=nozzle, history_print_settings_id=_last_used)
         profiles_full = [
-            {"idx": i + 1, "value": o["value"], "label": o.get("label", o["value"])}
+            {"idx": i + 1, "value": o["value"], "label": o.get("label", o["value"]),
+             "recommended": bool(o.get("recommended"))}
             for i, o in enumerate(prof_opts)
         ]
     parts = [
@@ -2042,7 +2086,8 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         "parts": parts,
         "tools": DEFAULT_TOOLS,
         "materials": DEFAULT_MATERIALS,
-        "profiles": [{"idx": p["idx"], "label": p["label"]} for p in profiles_full],
+        "profiles": [{"idx": p["idx"], "label": p["label"],
+                      "recommended": p.get("recommended", False)} for p in profiles_full],
         "supports": ["supports", "no-supports"],
         "actions": ["start", "upload-only"],
         "_prof_opts": [{"value": p["value"]} for p in profiles_full],  # idx -> resolution
@@ -5256,7 +5301,7 @@ def _run_legacy_form_answers(args, operator: str, archive: Path,
     # need to re-query the printer here.
     spec = _build_form_spec(kit, getattr(args, "nozzle", "0.4"),
                             persisted_profiles=existing.get("form_profiles"),
-                            refresh=False)
+                            refresh=False, scrub=False)
     if not spec["profiles"]:
         _emit(events_file, {"stage": "setup_required", "kind": "no_profiles",
                             "message": "No profiles found. Run tools/fetch_snapmaker_profiles.py."},
