@@ -141,17 +141,17 @@ def test_renderer_advanced_reached_via_two_level_tweak_menu():
     # flat field jump).
     form["current"] = tg.REVIEW_FIELD
     kb = tg.render_screen(form)["keyboard"]
-    tweak_btn = next(b for row in kb for b in row if "tweaks" in b["text"].lower())
-    assert tweak_btn["callback_data"] == "am"
+    tweak_btn = next(b for row in kb for b in row if "Advanced options" in b["text"])
+    assert tweak_btn["callback_data"] == "g:m"
     tg.apply_callback(form, tweak_btn["callback_data"])
     assert form["current"] == tg.ADV_MENU
     menu = tg.render_screen(form)
     cats = [b["callback_data"] for row in menu["keyboard"] for b in row
-            if b["callback_data"].startswith("cat:")]
-    assert "cat:strength" in cats and "cat:finish" in cats
+            if b["callback_data"].startswith("g:c:")]
+    assert "g:c:strength" in cats and "g:c:finish" in cats
     # open Strength & shells -> lands on the first strength control; the page
     # shows ONLY that category's fields, not the whole advanced list
-    tg.apply_callback(form, "cat:strength")
+    tg.apply_callback(form, "g:c:strength")
     assert form["current"] == "infill"
     page = tg.render_screen(form)
     assert "Strength" in page["text"]
@@ -164,13 +164,13 @@ def test_renderer_advanced_reached_via_two_level_tweak_menu():
     tg.apply_callback(form, f"s:{fi}:{gy}")
     assert form["current"] == "infill"  # still on the strength page
     # Back to the menu -> the strength row now shows its changed count
-    tg.apply_callback(form, "am")
+    tg.apply_callback(form, "g:m")
     assert form["current"] == tg.ADV_MENU
     menu2 = tg.render_screen(form)
-    assert any(b["callback_data"] == "cat:strength" and "1 changed" in b["text"]
+    assert any(b["callback_data"] == "g:c:strength" and "1 changed" in b["text"]
                for row in menu2["keyboard"] for b in row)
     # Done -> Review; the change shows in the summary line + button count
-    tg.apply_callback(form, "ad")
+    tg.apply_callback(form, "g:d")
     assert form["current"] == tg.REVIEW_FIELD
     review = tg.render_screen(form)
     assert "Pattern: gyroid" in review["text"]
@@ -218,15 +218,15 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
     for row in review["keyboard"]:
         for b in row:
             cd = b.get("callback_data", "")
-            if cd == "am":
+            if cd == "g:m":
                 menu_buttons += 1
             elif cd.startswith("e:"):
                 fi = int(cd.split(":")[1])
                 edit_targets.append(form["schema"]["fields"][fi]["id"])
-    assert menu_buttons == 1  # the single tweak-menu jump
+    assert menu_buttons == 1  # the single advanced-options jump
     assert not any(t in adv_ids for t in edit_targets)  # no advanced Edit rows
-    assert not any("Infill" in b["text"] and "tweaks" not in b["text"].lower()
-                   for row in review["keyboard"] for b in row)
+    # no raw advanced control (e.g. an "Infill" option button) leaks onto Review
+    assert not any("Infill" in b["text"] for row in review["keyboard"] for b in row)
 
 
 def test_tweak_menu_conditional_supports_and_reset():
@@ -249,9 +249,58 @@ def test_tweak_menu_conditional_supports_and_reset():
                  if tg._opt_id(o) == "3")
     tg.apply_callback(form, f"s:{wfi}:{three}")
     assert tg._adv_changed_count(form, tg._advanced_fields(form)) >= 1
-    tg.apply_callback(form, "ar")
+    tg.apply_callback(form, "g:r")
     assert tg._adv_changed_count(form, tg._advanced_fields(form)) == 0
     assert tg.answer_json(form)["walls"] == "default"
+
+
+def test_every_renderer_callback_is_routable_by_the_gateway():
+    """Guard the live gap that shipped 2026-07-15: the tweak-menu buttons used
+    callbacks (am/cat:...) the gateway's FORM_CB_PATTERN didn't route, so a tap
+    only highlighted and nothing opened. Every callback the renderer can emit
+    MUST match that pattern (or a button is dead on Telegram). Unit tests that
+    call apply_callback directly can't catch this, so assert it structurally."""
+    import re
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent
+                           / "adapters" / "hermes" / "plugin"))
+    import telegram_patch as tp  # noqa: E402
+    form_re = re.compile(tp.FORM_CB_PATTERN)
+
+    spec = _spec()
+    # >8 profiles so the profile screen paginates (exercises the page controls)
+    spec["profiles"] = [{"idx": i, "label": f"P{i}"} for i in range(1, 13)]
+    spec["advanced_resolved"] = {"1": {"walls": "2"}}
+    schema = u1_form.build_form_schema(spec)
+    form = tg.new_form(schema)
+    form["selections"]["profile"] = 0  # surfaces the single-select Continue button
+
+    seen: set[str] = set()
+
+    def _collect(screen):
+        for row in screen["keyboard"]:
+            for b in row:
+                seen.add(b["callback_data"])
+
+    # every field screen (groups + single + multi + the paginated profile pages)
+    for f in form["schema"]["fields"]:
+        if tg._is_screen_field(f):
+            form["current"] = f["id"]
+            _collect(tg.render_screen(form))
+    form["current"] = "profile"
+    for pg in range(3):
+        form["pages"]["profile"] = pg
+        _collect(tg.render_screen(form))
+    # review + advanced-options menu + every category page
+    form["current"] = tg.REVIEW_FIELD
+    _collect(tg.render_screen(form))
+    form["current"] = tg.ADV_MENU
+    _collect(tg.render_screen(form))
+    for key, _l, _f in tg._adv_categories(form):
+        tg.apply_callback(form, f"g:c:{key}")
+        _collect(tg.render_screen(form))
+
+    unrouted = sorted(cd for cd in seen if not form_re.match(cd))
+    assert not unrouted, f"gateway FORM_CB_PATTERN would not route: {unrouted}"
 
 
 # ---------- resolved profile values ("keep profile (X)") ----------

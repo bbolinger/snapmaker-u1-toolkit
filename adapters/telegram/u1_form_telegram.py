@@ -349,10 +349,10 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
     if paginated and total_pages > 1:
         nav: list[dict[str, str]] = []
         if page > 0:
-            nav.append({"text": "‹ Prev", "callback_data": f"p:{fi}:{page - 1}"})
+            nav.append({"text": "‹ Prev page", "callback_data": f"p:{fi}:{page - 1}"})
         nav.append({"text": f"{page + 1}/{total_pages}", "callback_data": f"p:{fi}:{page}"})
         if page + 1 < total_pages:
-            nav.append({"text": "Next ›", "callback_data": f"p:{fi}:{page + 1}"})
+            nav.append({"text": "More ›", "callback_data": f"p:{fi}:{page + 1}"})
         rows.append(nav)
     if is_multi:
         multi_row = [
@@ -376,12 +376,22 @@ def _multi_hint(field: dict[str, Any], sel) -> str:
 
 def _render_field(form: dict[str, Any], field: dict[str, Any]) -> dict[str, Any]:
     rows = _field_control_rows(form, field)
-    rows.append([{"text": "✖ Cancel", "callback_data": "X"}])
     label = _esc(field.get("label", field["id"]))
     hint = tip = ""
     if field["type"] == "multi_select":
         hint = _multi_hint(field, form["selections"][field["id"]])
         tip = "\n<i>Tap options to toggle ✔, then Next ➜</i>"
+    # A single-select advances when you TAP an option — but when one is already
+    # selected (a pre-selected default like the last-used profile) the operator
+    # looks for a way forward and the only forward-looking button is pagination.
+    # Give an explicit Continue so "keep this one, move on" is a real button
+    # (live 2026-07-15: the paginated profile screen's "Next" paged instead).
+    elif field.get("type") == "single_select" and not field.get("group") \
+            and form["selections"].get(field["id"]) is not None:
+        tip = "\n<i>Tap another to change, or Continue ➜</i>"
+        rows.append([{"text": "✅ Continue ➜",
+                      "callback_data": f"n:{_field_index(form, field['id'])}"}])
+    rows.append([{"text": "✖ Cancel", "callback_data": "X"}])
     text = f"<b>{label}</b>{hint}{tip}" + _step_suffix(form, field["id"])
     return {"text": text, "keyboard": rows}
 
@@ -448,9 +458,9 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
         if changed:
             lines.append("\u2022 <b>Advanced</b>: " + _esc(", ".join(changed)))
         rows.append([{
-            "text": ("\u2699 Print tweaks"
+            "text": ("\u2699 Advanced options"
                      + (f" ({len(changed)} changed)" if changed else "")),
-            "callback_data": "am",
+            "callback_data": "g:m",
         }])
 
     # Action becomes the submit verbs: each option submits with that action.
@@ -479,18 +489,18 @@ def _render_adv_menu(form: dict[str, Any]) -> dict[str, Any]:
     """Level 1 of the tweak sub-pages: the category menu, reached from Review's
     ⚙ button. Lists only categories that have applicable fields; each shows how
     many of its controls are set away from the profile default."""
-    lines = ["<b>⚙ Print tweaks</b>",
+    lines = ["<b>⚙ Advanced options</b>",
              "All optional. Anything you leave alone keeps the profile's value.",
              ""]
     rows: list[list[dict[str, str]]] = []
     for key, label, fields in _adv_categories(form):
         n = _adv_changed_count(form, fields)
         text = _esc(label) + (f"  · {n} changed" if n else "")
-        rows.append([{"text": text, "callback_data": f"cat:{key}"}])
+        rows.append([{"text": text, "callback_data": f"g:c:{key}"}])
     if _adv_changed_count(form, _advanced_fields(form)):
-        rows.append([{"text": "↩ Reset all to profile", "callback_data": "ar"}])
+        rows.append([{"text": "↩ Reset all to profile", "callback_data": "g:r"}])
     rows.append([
-        {"text": "✅ Done", "callback_data": "ad"},
+        {"text": "✅ Done", "callback_data": "g:d"},
         {"text": "✖ Cancel", "callback_data": "X"},
     ])
     return {"text": "\n".join(lines), "keyboard": rows}
@@ -505,14 +515,14 @@ def _render_adv_category(form: dict[str, Any], catkey: str) -> dict[str, Any]:
         form["current"] = ADV_MENU
         return _render_adv_menu(form)
     _key, label, fields = entry
-    lines = [f"<b>{_esc(label)}</b>", "Tap to change, then Back to tweaks."]
+    lines = [f"<b>{_esc(label)}</b>", "Tap to change, then Back to options."]
     resolved = _resolved_for_selected_profile(form)
     rows: list[list[dict[str, str]]] = []
     for field in fields:
         rows.extend(_field_control_rows(form, field,
                                         resolved_default=resolved.get(field["id"])))
     rows.append([
-        {"text": "↩ Back to tweaks", "callback_data": "am"},
+        {"text": "↩ Back to options", "callback_data": "g:m"},
         {"text": "✖ Cancel", "callback_data": "X"},
     ])
     return {"text": "\n".join(lines), "keyboard": rows}
@@ -584,28 +594,32 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
                     "warning": f"Please answer: {_esc(', '.join(missing))}"}
         return {"kind": "submit", "answer": answer_json(form)}
 
-    if kind == "am":              # open / return to the tweak category menu
-        form.pop("_edit_return", None)
-        form["current"] = ADV_MENU
-        return {"kind": "rerender"}
-
-    if kind == "ad":              # Done with tweaks → back to Review
-        form["current"] = REVIEW_FIELD
-        return {"kind": "rerender"}
-
-    if kind == "ar":              # Reset every advanced control to profile default
-        for f in _advanced_fields(form):
-            di = next((i for i, o in enumerate(f["options"])
-                       if _opt_id(o) == "default"), None)
-            if di is not None:
-                form["selections"][f["id"]] = di
-        return {"kind": "rerender"}
-
-    if kind == "cat":             # open a category sub-page
-        catkey = parts[1]
-        bucket = next((fs for k, _l, fs in _adv_categories(form) if k == catkey), None)
-        form["current"] = bucket[0]["id"] if bucket else ADV_MENU
-        return {"kind": "rerender"}
+    if kind == "g":               # Advanced-options menu navigation (g:<sub>)
+        # Namespaced under a single-char prefix so it stays inside the form's
+        # callback vocabulary and never shadows a native (multi-char + colon)
+        # Hermes callback — the gateway routes only FORM_CB_PATTERN.
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "m":            # open / return to the category menu
+            form.pop("_edit_return", None)
+            form["current"] = ADV_MENU
+            return {"kind": "rerender"}
+        if sub == "d":            # Done → back to Review
+            form["current"] = REVIEW_FIELD
+            return {"kind": "rerender"}
+        if sub == "r":            # Reset every advanced control to profile default
+            for f in _advanced_fields(form):
+                di = next((i for i, o in enumerate(f["options"])
+                           if _opt_id(o) == "default"), None)
+                if di is not None:
+                    form["selections"][f["id"]] = di
+            return {"kind": "rerender"}
+        if sub == "c":            # open a category sub-page (g:c:<catkey>)
+            catkey = parts[2] if len(parts) > 2 else ""
+            bucket = next((fs for k, _l, fs in _adv_categories(form) if k == catkey), None)
+            form["current"] = bucket[0]["id"] if bucket else ADV_MENU
+            return {"kind": "rerender"}
+        return {"kind": "rerender",
+                "warning": f"Stale or invalid button ({_esc(data)})."}
 
     fi = int(parts[1])
     field = fields[fi]
