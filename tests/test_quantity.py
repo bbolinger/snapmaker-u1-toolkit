@@ -84,6 +84,31 @@ def test_build_form_spec_refreshes_toolmap_before_render(monkeypatch):
     assert calls["n"] == 1, "refresh=False must not query the printer"
 
 
+def test_build_form_spec_marks_recommended_profile(monkeypatch):
+    """A1: the form passes the operator's last-used preset to the picker and
+    carries the recommended flag through, so the schema pre-selects it."""
+    import u1_form
+    seen = {}
+
+    def fake_list_profiles(nozzle=None, history_print_settings_id=None):
+        seen["history_id"] = history_print_settings_id
+        return [
+            {"value": "a", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"},
+            {"value": "b", "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)",
+             "recommended": True},
+        ]
+
+    monkeypatch.setattr(kw, "list_profiles", fake_list_profiles)
+    monkeypatch.setattr(kw, "last_used_print_settings_id", lambda **k: "0.16 Optimal")
+    spec = kw._build_form_spec(_kit(1), "0.4", refresh=False)
+    assert seen["history_id"] == "0.16 Optimal", "must tell the picker the last-used preset"
+    rec = [p for p in spec["profiles"] if p.get("recommended")]
+    assert len(rec) == 1 and rec[0]["idx"] == 2, "recommended profile carried into the spec"
+    schema = u1_form.build_form_schema(spec)
+    pf = next(f for f in schema["fields"] if f["id"] == "profile")
+    assert pf["default"] == 2, "schema pre-selects the recommended profile end-to-end"
+
+
 # ---------- schema ----------
 
 def test_schema_quantity_field_rides_setup_group():
@@ -277,7 +302,7 @@ def _args(model, **kw_):
 @pytest.fixture
 def hermetic_commit(monkeypatch):
     """Stub the slicer/printer boundary; capture the paths handed to arrange."""
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"}])
     captured = {"calls": []}
 

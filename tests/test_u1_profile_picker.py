@@ -279,3 +279,56 @@ def test_no_nozzle_arg_keeps_everything(tmp_path):
     _write_process_json(tmp_path / '0.06 High Quality @Snapmaker U1 (0.2 nozzle).json')
     opts = list_profiles(tmp_path)
     assert len(opts) == 2
+
+
+# --------------------------------------------------------------------------- #
+# from-printer surfacing (A2, 2026-07-14): profiles derived from recent prints
+# read by their real name (not the gcode filename), and reprints collapse.
+# --------------------------------------------------------------------------- #
+
+def _write_from_printer(path: Path, internal_name: str) -> None:
+    path.write_text(json.dumps({"type": "process", "name": internal_name}))
+
+
+def test_from_printer_profile_labeled_by_internal_name(tmp_path):
+    fp = tmp_path / 'from-printer'
+    fp.mkdir()
+    _write_from_printer(fp / 'Phillips_Hue_plate1_20260714_process.json',
+                        'Community 0.20 Strength Gyroid @Snapmaker U1 Textured PEI')
+    opts = list_profiles(sources=(('from-printer', fp),))
+    assert len(opts) == 1
+    # reads as the profile's real name, decorations stripped — NOT the gcode file
+    assert opts[0]['label'] == '0.20 Strength Gyroid'
+
+
+def test_from_printer_reprints_collapse_newest_kept(tmp_path):
+    import os
+    fp = tmp_path / 'from-printer'
+    fp.mkdir()
+    old = fp / 'hue_run1_process.json'
+    new = fp / 'hue_run2_process.json'
+    _write_from_printer(old, '0.20 Strength Gyroid')
+    _write_from_printer(new, '0.20 Strength Gyroid')
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+    opts = list_profiles(sources=(('from-printer', fp),))
+    assert len(opts) == 1, [o['value'] for o in opts]   # two reprints -> one entry
+    assert 'hue_run2' in opts[0]['value']                # the newer file survives
+
+
+def test_same_name_across_sources_collapses_highest_priority_wins(tmp_path):
+    # A captured print and a hand-saved user profile with the SAME name must
+    # show once (not "0.20 Strength Gyroid" twice), from-printer kept.
+    fp = tmp_path / 'from-printer'
+    fp.mkdir()
+    user = tmp_path / 'user'
+    user.mkdir()
+    _write_from_printer(fp / 'hue_print_process.json',
+                        'Community 0.20 Strength Gyroid @Snapmaker U1 Textured PEI')
+    (user / '0.20 Strength Gyroid.json').write_text(
+        json.dumps({"type": "process", "enable_support": "0"}))
+    opts = list_profiles(sources=(('from-printer', fp), ('user', user)))
+    labels = [o['label'] for o in opts]
+    assert labels.count('0.20 Strength Gyroid') == 1, labels
+    kept = next(o for o in opts if o['label'] == '0.20 Strength Gyroid')
+    assert kept['source'] == 'from-printer'

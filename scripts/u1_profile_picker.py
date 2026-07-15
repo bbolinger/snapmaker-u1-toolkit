@@ -98,12 +98,20 @@ def _scan_dir(source_label: str, source_dir: Path) -> list[dict]:
         if not _is_process_profile(path):
             continue
         pid = profile_id(path)
+        # from-printer profiles are named after the source G-code file; show the
+        # profile's OWN name (its print_settings_id) instead so the picker reads
+        # "0.20 Strength Gyroid", not "Phillips_Hue_..._process". `value` stays
+        # file-derived so profile resolution is unchanged.
+        label = path.stem
+        if source_label == 'from-printer':
+            label = _extracted_profile_label(path) or path.stem
         opts.append({
-            'label': path.stem,
+            'label': label,
             'value': pid,
             'path': str(path),
             'source': source_label,
             'has_supports': _read_supports_flag(path),
+            'mtime': _safe_mtime(path),
         })
     return opts
 
@@ -173,6 +181,67 @@ def _strip_decorations(s: str) -> str:
     if at_idx > 0:
         out = out[:at_idx]
     return out.strip()
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _clean_extracted_name(name: str) -> str:
+    """Human-facing form of an extracted profile's print_settings_id: strip a
+    leading Community/Hermes/Custom word and the ' @<printer>' suffix, keep case.
+    'Community 0.20 Strength Gyroid @Snapmaker U1 Textured PEI' -> '0.20 Strength
+    Gyroid'."""
+    out = name.strip()
+    low = out.lower()
+    for pfx in _HISTORY_DECORATION_PREFIXES:
+        if low.startswith(pfx):
+            out = out[len(pfx):]
+            break
+    at = out.find(' @')
+    if at > 0:
+        out = out[:at]
+    return out.strip() or name.strip()
+
+
+def _extracted_profile_label(path: Path) -> str | None:
+    """Display name for a from-printer profile: the process profile's own `name`
+    (its print_settings_id), cleaned. None if unreadable → caller falls back to
+    the file stem."""
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    name = data.get('name') or data.get('print_settings_id')
+    if isinstance(name, str) and name.strip():
+        return _clean_extracted_name(name.strip())
+    return None
+
+
+def _dedupe_by_name(opts: list[dict], source_priority: dict[str, int]) -> list[dict]:
+    """Collapse profiles that resolve to the same NAME to one entry. Covers two
+    cases: (1) from-printer reprints of the same object (many timestamps), and
+    (2) a captured print whose name matches a hand-saved user profile or a stock
+    one. Keep the highest-priority source (from-printer > user > stock), newest as
+    tiebreak — so the picker never shows the same profile twice. Distinct names
+    (e.g. '0.20 Strength' vs '0.20 Strength Gyroid') are untouched."""
+    best: dict[str, dict] = {}
+    order: list[str] = []
+    for o in opts:
+        key = _strip_decorations(str(o.get('label', '')).lower())
+        cur = best.get(key)
+        if cur is None:
+            best[key] = o
+            order.append(key)
+            continue
+        cp = (source_priority.get(o.get('source'), 99), -float(o.get('mtime', 0)))
+        pp = (source_priority.get(cur.get('source'), 99), -float(cur.get('mtime', 0)))
+        if cp < pp:
+            best[key] = o
+    return [best[k] for k in order]
 
 
 def _extract_layer_height_mm(label: str) -> float | None:
@@ -314,6 +383,13 @@ def list_profiles(profile_dir: Path | None = None,
                     continue
                 seen_values.add(opt['value'])
                 opts.append(opt)
+
+    # Collapse profiles that resolve to the same name to one entry (from-printer
+    # reprints, and a captured print matching a saved user/stock profile), with
+    # the highest-priority source kept — the picker never shows a profile twice.
+    _srcpri = {label: i for i, (label, _) in enumerate(sources or DEFAULT_SOURCES)}
+    _srcpri['legacy'] = 0
+    opts = _dedupe_by_name(opts, _srcpri)
 
     if nozzle:
         opts = [o for o in opts if _nozzle_matches(o['label'], nozzle)]

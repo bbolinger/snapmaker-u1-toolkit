@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.5.0] — 2026-07-14
+
+### Added
+
+- **Profiles from your recent prints.** The print-profile picker now offers
+  profiles pulled automatically from what you have actually printed, not just the
+  bundled Snapmaker presets. When you send a kit, the toolkit reads the settings
+  from your recent prints on the printer and offers them as selectable profiles,
+  named the way your slicer named them. It fetches only the small settings block
+  from each print, never the whole G-code, so a large print costs about a 1 MB
+  transfer instead of the full file. Reprints of the same object collapse to a
+  single entry, and a captured print that matches a profile you already have is
+  shown once.
+
+### Changed
+
+- **The kit options form pre-selects the profile you last printed with.** Instead
+  of opening with no profile chosen, the form now starts on your most recently
+  used profile, so a normal print is one tap shorter. You can still change it.
+
+---
+
 ## [2.4.4] — 2026-07-14
 
 ### Fixed

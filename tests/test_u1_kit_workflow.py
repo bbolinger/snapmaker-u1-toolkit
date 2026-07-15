@@ -70,7 +70,7 @@ def _args(model, **kw_):
 
 @pytest.fixture
 def fake_profiles(monkeypatch):
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"},
         {"value": "0_16_optimal", "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)"},
     ])
@@ -127,7 +127,7 @@ def test_turn1_form_profiles_not_clobbered_by_reinvocation(tmp_path, monkeypatch
     # survive a second no-answer invocation even if list_profiles has
     # re-sorted between them. Without the guard, `profile 1` on a later
     # --form-answers call resolves against a list the operator never saw.
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "A", "label": "A-label"},
         {"value": "B", "label": "B-label"},
     ])
@@ -138,7 +138,7 @@ def test_turn1_form_profiles_not_clobbered_by_reinvocation(tmp_path, monkeypatch
     persisted_1 = [p["value"] for p in u1_request.read_request(rid)["form_profiles"]]
     assert persisted_1 == ["A", "B"]
     # Flip the order — simulate history-driven re-sort
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "B", "label": "B-label"},
         {"value": "A", "label": "A-label"},
     ])
@@ -254,7 +254,7 @@ def test_profile_index_stable_via_persisted_list(tmp_path, fake_profiles, fake_s
     r1 = kw.run_kit_workflow(_args(zp))  # persists form_profiles = [standard, optimal]
     rid = r1["request_id"]
     # Now flip list_profiles order to simulate a history-driven re-sort.
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [
         {"value": "0_16_optimal", "label": "0.16 Optimal @Snapmaker U1 (0.4 nozzle)"},
         {"value": "0_20_standard", "label": "0.20 Standard @Snapmaker U1 (0.4 nozzle)"},
     ])
@@ -698,7 +698,7 @@ def test_resolve_operator_env_fallback_and_unknown(monkeypatch):
 def test_kit_setup_required_when_no_profiles(tmp_path, monkeypatch):
     """No profiles → the unified flow emits setup_required(no_profiles) and exits
     clean, not a crash. Migrated from the retired single-flow empty_picker test."""
-    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None: [])
+    monkeypatch.setattr(kw, "list_profiles", lambda nozzle=None, history_print_settings_id=None: [])
     res = kw.run_kit_workflow(_args(_kit_zip(tmp_path, 1), interaction_mode="form"))
     assert res["phase"] == "setup_required"
 

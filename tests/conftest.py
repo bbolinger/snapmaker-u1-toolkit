@@ -282,3 +282,19 @@ def _no_real_operator_notifications(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "u1_notify", fake)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("HERMES_BIN", "/bin/true")
+
+
+@pytest.fixture(autouse=True)
+def _no_printer_profile_scrub(monkeypatch):
+    """The from-printer profile scrub (form-build) reaches the real printer and
+    writes into the live profiles/from-printer/ dir. It must NEVER run under the
+    suite: on a box it would pollute live profiles, and the test host
+    (192.0.2.1, TEST-NET-1) is a black hole so it would hang on connect.
+    Production calls it for real; a test that wants to exercise it patches its
+    own stub (last-in wins)."""
+    try:
+        import u1_kit_workflow as _kw
+        monkeypatch.setattr(_kw, "_scrub_recent_prints",
+                            lambda *a, **k: None, raising=False)
+    except Exception:
+        pass

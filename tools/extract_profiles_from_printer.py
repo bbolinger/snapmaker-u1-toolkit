@@ -121,6 +121,39 @@ def http_download(url: str, dest: Path, timeout: float = 120.0) -> int:
     return bytes_written
 
 
+def http_download_head_tail(url: str, dest: Path, *, head_bytes: int = 262144,
+                            tail_bytes: int = 1048576, timeout: float = 30.0) -> int:
+    """Fetch only the HEAD + TAIL of a G-code via HTTP Range requests and write
+    them (concatenated) to dest — transferring ~1 MB instead of a whole print.
+
+    The geometry in the middle is never downloaded. The intended tool is a
+    T-command in the first lines (``_detect_tool_index`` scans the first 300);
+    the slicer settings are the trailing comment block
+    (``parse_gcode_metadata`` seeks the last 512 KB). So a head slice covers the
+    former and a tail slice the latter. Reads are BOUNDED, so a server that
+    ignores Range can't make us pull the whole file — we then get a head-only
+    chunk with no settings footer, which the caller skips. Returns bytes written.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    def _range(hdr: str, cap: int) -> tuple[int, bytes]:
+        req = urllib.request.Request(url, headers={"Range": hdr})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return getattr(r, "status", 200), r.read(cap)
+        except Exception:
+            return 0, b""
+
+    hs, head = _range(f"bytes=0-{head_bytes - 1}", head_bytes)
+    ts, tail = _range(f"bytes=-{tail_bytes}", tail_bytes)
+    # Only trust the tail slice when the server honored the suffix range (206);
+    # otherwise `tail` is just the file start again and carries no settings
+    # footer, so write head-only and let the caller find no metadata + skip.
+    body = ((head if hs == 206 else b"") + tail) if ts == 206 else head
+    dest.write_bytes(body)
+    return len(body)
+
+
 def list_gcodes(host: str, port: int, timeout: float = 12.0) -> list[dict[str, Any]]:
     """Return Moonraker's listing of files under root=gcodes, newest first.
 
@@ -152,16 +185,27 @@ def extract_one(
     brand_label: str | None = None,
     keep_gcode: bool = False,
     download_dir: Path | None = None,
+    head_bytes: int = 262144,
+    tail_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Download one G-code from the printer + extract its process + filament
-    profiles into output_dir. Returns a summary dict for reporting."""
+    profiles into output_dir. Returns a summary dict for reporting.
+
+    When ``tail_bytes`` is set, only the G-code's head + tail are fetched via
+    Range requests (settings live in the trailing comment block; the tool in the
+    first lines), so a 200 MB print costs a ~1 MB transfer instead of the whole
+    file. Left None (the CLI default) downloads the full file, unchanged."""
     base = f"http://{host}:{port}"
     download_dir = download_dir or output_dir / ".downloaded"
     download_dir.mkdir(parents=True, exist_ok=True)
     local = download_dir / Path(file_path).name
 
     url = f"{base}/server/files/gcodes/{urllib.parse.quote(file_path)}"
-    written = http_download(url, local)
+    if tail_bytes:
+        written = http_download_head_tail(url, local, head_bytes=head_bytes,
+                                          tail_bytes=tail_bytes)
+    else:
+        written = http_download(url, local)
 
     meta = epfg.parse_gcode_metadata(local)
     if not meta:
@@ -206,6 +250,52 @@ def extract_one(
         "filament_type": filament_meta.get("filament_type"),  # post-slice
         "layer_height": meta.get("layer_height"),
     }
+
+
+def already_extracted(output_dir: Path, file_path: str) -> bool:
+    """True if this G-code's process profile is already in output_dir — the
+    incremental-skip key so a spool of reprints doesn't re-fetch every time."""
+    return (output_dir / f"{safe_basename(file_path)}_process.json").exists()
+
+
+def refresh_from_printer(host: str | None = None, port: int | None = None,
+                         output_dir: Path | None = None, *, limit: int = 5,
+                         head_bytes: int = 262144, tail_bytes: int = 1048576,
+                         timeout: float = 30.0, vendor: str | None = None) -> dict:
+    """Incrementally populate ``profiles/from-printer/`` from the printer's most
+    recent prints, fetching ONLY each G-code's head+tail (settings), never the
+    geometry. Skips prints already extracted, so it is cheap enough to run inline
+    at form-build. Fully GUARDED: never raises; returns a summary dict
+    ``{extracted, skipped, errors}`` so a printer that's off/unreachable simply
+    leaves the existing profiles in place."""
+    summary: dict[str, Any] = {"extracted": [], "skipped": 0, "errors": []}
+    try:
+        if host is None or port is None:
+            from u1_config import get_u1_host, get_u1_port
+            host = host or get_u1_host()
+            port = port if port is not None else get_u1_port()
+        output_dir = output_dir or DEFAULT_OUTPUT_DIR
+        gcodes = list_gcodes(host, int(port), timeout=timeout)
+    except Exception as exc:
+        summary["errors"].append(f"list: {exc}")
+        return summary
+    for g in gcodes[:max(0, int(limit))]:
+        name = g.get("path") or g.get("filename") or g.get("name")
+        if not name:
+            continue
+        try:
+            if already_extracted(output_dir, name):
+                summary["skipped"] += 1
+                continue
+            res = extract_one(host, int(port), name, output_dir, vendor=vendor,
+                              head_bytes=head_bytes, tail_bytes=tail_bytes)
+            if res.get("ok"):
+                summary["extracted"].append(safe_basename(name))
+            else:
+                summary["errors"].append(f"{name}: {res.get('error')}")
+        except Exception as exc:
+            summary["errors"].append(f"{name}: {exc}")
+    return summary
 
 
 def main(argv: list[str] | None = None) -> int:
