@@ -72,7 +72,9 @@ def test_supports_override_forces_exclude_object_for_m486_previews(tmp_path):
 def test_schema_offers_advanced_fields_flagged():
     schema = u1_form.build_form_schema(_spec())
     adv = [f for f in schema["fields"] if f.get("advanced")]
-    assert [f["id"] for f in adv] == ["infill", "infill_pattern", "walls", "brim", "fuzzy", "support_style"]
+    assert [f["id"] for f in adv] == ["infill", "infill_pattern", "walls", "brim", "fuzzy",
+                                      "top_shell", "bottom_shell", "one_wall_top", "raft",
+                                      "support_style"]
     assert all(f["group"] == "advanced" and f["default"] == "default" for f in adv)
     # not offered -> absent entirely
     schema2 = u1_form.build_form_schema(_spec(offer=False))
@@ -184,7 +186,9 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
     # and each label identifies its field (no bare values)
     for f in tg._advanced_fields(form):
         key = {"infill": "Infill", "infill_pattern": "Pattern", "walls": "Walls",
-               "brim": "Brim", "fuzzy": "Fuzzy", "support_style": "Support"}[f["id"]]
+               "brim": "Brim", "fuzzy": "Fuzzy", "support_style": "Support",
+               "top_shell": "Top", "bottom_shell": "Bottom",
+               "one_wall_top": "One wall", "raft": "Raft"}[f["id"]]
         assert all(key in tg._opt_label(o) for o in f["options"]), f["id"]
     # Review: exactly ONE advanced-related button (the jump), no Edit rows
     form["current"] = tg.REVIEW_FIELD

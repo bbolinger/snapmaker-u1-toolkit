@@ -118,6 +118,24 @@ ADVANCED_FIELDS = (
      [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
       ("on", "Fuzzy skin: on (outer walls)")],
      "fuzzy_skin", {"off": "none", "on": "external"}),
+    ("top_shell", "Top layers",
+     [("default", "Top layers: profile default"), ("3", "Top layers: 3"),
+      ("4", "Top layers: 4"), ("5", "Top layers: 5")],
+     "top_shell_layers", {"3": "3", "4": "4", "5": "5"}),
+    ("bottom_shell", "Bottom layers",
+     [("default", "Bottom layers: profile default"), ("3", "Bottom layers: 3"),
+      ("4", "Bottom layers: 4")],
+     "bottom_shell_layers", {"3": "3", "4": "4"}),
+    # only_one_wall_top is Orca's dedicated top-surface control — NEVER expose a
+    # global wall_loops=1, which would weaken the whole part on a mis-tap.
+    ("one_wall_top", "One wall on top",
+     [("default", "One wall on top: profile default"),
+      ("off", "One wall on top: off"), ("on", "One wall on top: on")],
+     "only_one_wall_top", {"off": "0", "on": "1"}),
+    ("raft", "Raft",
+     [("default", "Raft: profile default"), ("off", "Raft: off"),
+      ("small", "Raft: 3 layers")],
+     "raft_layers", {"off": "0", "small": "3"}),
     # Only takes effect when Supports is ON (the setup-screen toggle);
     # Orca ignores support_type when enable_support is 0.
     ("support_style", "Support style",
@@ -129,6 +147,23 @@ ADVANCED_FIELDS = (
 
 _ADVANCED_BY_ID = {fid: (orca_key, mapping)
                    for fid, _lbl, _opts, orca_key, mapping in ADVANCED_FIELDS}
+
+# The tweak menu groups advanced controls into category sub-pages so the screen
+# isn't one long flat list. Order here is the category page order; the menu only
+# lists categories that actually have fields.
+ADVANCED_CATEGORIES = (
+    ("strength", "\U0001f9f1 Strength & shells"),
+    ("first_layer", "\U0001f321️ First layer & adhesion"),
+    ("finish", "✨ Surface finish"),
+    ("supports", "\U0001fa9c Supports"),
+)
+_ADVANCED_CATEGORY = {
+    "walls": "strength", "top_shell": "strength", "bottom_shell": "strength",
+    "one_wall_top": "strength", "infill": "strength", "infill_pattern": "strength",
+    "brim": "first_layer", "raft": "first_layer",
+    "fuzzy": "finish",
+    "support_style": "supports",
+}
 
 # Quantity (v2.3): print N copies of a SINGLE-part job. The workflow sets
 # spec["offer_quantity"] only when the kit has one part — per-part quantities
@@ -938,6 +973,7 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                 "default": "default", "required": False,
                 "advanced": True, "group": "advanced",
                 "group_label": "Advanced settings",
+                "category": _ADVANCED_CATEGORY.get(_fid, "finish"),
             })
     # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
     # The single print/keep-staged decision happens AFTER slice + a FRESH bed
@@ -951,6 +987,11 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         "text_fallback": build_form(spec),
         "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports",
     }
+    if spec.get("offer_advanced"):
+        # Category order + labels for the tweak menu (renderer builds the menu
+        # from this + each field's "category", so it needs no form internals).
+        schema["advanced_categories"] = [{"key": k, "label": l}
+                                         for k, l in ADVANCED_CATEGORIES]
     if submit:
         schema["submit"] = submit
     return schema
