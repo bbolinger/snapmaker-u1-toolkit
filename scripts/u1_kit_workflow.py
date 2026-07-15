@@ -2034,12 +2034,21 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
     # (X)" labels. Only filled on a fresh build (the persisted/answer path holds
     # no profile paths and renders no form). Display-only; fully guarded.
     _adv_resolved: dict[str, dict[str, str]] = {}
+    _slug_to_path: dict[str, str] = {}
     if persisted_profiles:
         profiles_full = [
             {"idx": int(p["idx"]), "value": p["value"], "label": p.get("label", p["value"]),
              "recommended": bool(p.get("recommended"))}
             for p in persisted_profiles
         ]
+        # Persisted profiles carry no path; re-derive slug->path for the resolve
+        # step below. History order doesn't matter here (we only need the paths),
+        # so this deliberately does NOT pass history_print_settings_id.
+        try:
+            _slug_to_path = {o["value"]: o.get("path")
+                             for o in list_profiles(nozzle=nozzle)}
+        except Exception:
+            _slug_to_path = {}
     else:
         # Building the profile list fresh -> first pull the operator's recent
         # prints off the printer into profiles/from-printer/ so what they've
@@ -2064,25 +2073,33 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
              "recommended": bool(o.get("recommended"))}
             for i, o in enumerate(prof_opts)
         ]
-        # Resolve each profile's CURRENT advanced values so the tweak menu can
-        # show "keep profile (X)". Uses the picker's per-profile path and
-        # flattens the inherits chain; display-only and fully guarded, so any
-        # read failure just leaves that control on the generic label.
-        try:
-            import u1_slice_workflow as _sw
-            for i, o in enumerate(prof_opts):
-                _p = o.get("path")
-                if not _p:
-                    continue
-                try:
-                    _flat = _sw._flatten_process_profile(Path(_p))
-                    _vals = u1_form.resolve_advanced_from_profile(_flat)
-                    if _vals:
-                        _adv_resolved[str(i + 1)] = _vals
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        # prof_opts already carries each profile's path — reuse it, no 2nd scan
+        # (a 2nd list_profiles here would also drop the history preset).
+        _slug_to_path = {o["value"]: o.get("path") for o in prof_opts}
+    # Resolve each OFFERED profile's current advanced values so the tweak menu
+    # can show "keep profile (X)". Runs for BOTH paths — the fresh build AND the
+    # persisted-profiles emit path. The form-emit call passes persisted profiles
+    # (for index stability across the emit/answer turns), so this MUST NOT live
+    # only in the fresh branch, or the emitted form loses its resolved values
+    # (live 2026-07-15: the operator's form showed "profile default" everywhere).
+    # Map each profile's slug to its process JSON exactly as the slicer does,
+    # flatten the inherits chain, and read the advanced keys. Display-only and
+    # fully guarded.
+    try:
+        import u1_slice_workflow as _sw
+        for _p in profiles_full:
+            _pth = _slug_to_path.get(_p.get("value"))
+            if not _pth:
+                continue
+            try:
+                _flat = _sw._flatten_process_profile(Path(_pth))
+                _vals = u1_form.resolve_advanced_from_profile(_flat)
+                if _vals:
+                    _adv_resolved[str(_p["idx"])] = _vals
+            except Exception:
+                continue
+    except Exception:
+        pass
     parts = [
         {"id": p["part_id"], "label": f"{p['filename']} ({p['footprint_mm'][0]:.0f}x{p['footprint_mm'][1]:.0f}mm)"}
         for p in kit["parts"]

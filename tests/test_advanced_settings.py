@@ -361,6 +361,30 @@ def test_tweak_menu_keep_profile_value_follows_selected_profile():
     assert not any("keep profile (2)" in t for t in txts2)
 
 
+def test_build_form_spec_resolves_advanced_on_the_persisted_emit_path(monkeypatch):
+    """The form-EMIT call passes persisted profiles (index stability), so the
+    resolved "keep profile (X)" values must be computed on that path too, not
+    only the fresh build. Live 2026-07-15: the emitted form showed "profile
+    default" everywhere because resolution lived only in the fresh branch."""
+    import u1_kit_workflow as kw
+    fake = [{"value": "p_a", "path": "/x/a.json", "label": "A", "recommended": True},
+            {"value": "p_b", "path": "/x/b.json", "label": "B", "recommended": False}]
+    monkeypatch.setattr(kw, "list_profiles", lambda **k: fake)
+    monkeypatch.setattr(sw, "_flatten_process_profile",
+                        lambda p, **k: {"wall_loops": "3", "sparse_infill_density": "20%"})
+    kit = {"parts": [{"part_id": "p1", "filename": "a.stl", "footprint_mm": (10, 10)}]}
+    persisted = [{"idx": 1, "value": "p_a", "label": "A", "recommended": True},
+                 {"idx": 2, "value": "p_b", "label": "B", "recommended": False}]
+    spec = kw._build_form_spec(kit, "0.4", persisted_profiles=persisted,
+                              refresh=False, scrub=False)
+    assert spec["advanced_resolved"] == {
+        "1": {"walls": "3", "infill": "20%"},
+        "2": {"walls": "3", "infill": "20%"}}
+    # and it survives into the schema
+    schema = u1_form.build_form_schema(spec)
+    assert schema["advanced_resolved"]["1"]["walls"] == "3"
+
+
 def test_tweak_menu_keep_profile_label_absent_without_resolved():
     # No advanced_resolved in the schema -> the generic "profile default" stands.
     schema = u1_form.build_form_schema(_spec())

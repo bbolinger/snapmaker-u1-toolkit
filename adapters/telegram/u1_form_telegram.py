@@ -495,7 +495,9 @@ def _render_adv_menu(form: dict[str, Any]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
     for key, label, fields in _adv_categories(form):
         n = _adv_changed_count(form, fields)
-        text = _esc(label) + (f"  · {n} changed" if n else "")
+        # Button text is NOT HTML-parsed — use the raw label so a "&" in a
+        # category name ("Strength & shells") shows as "&", not "&amp;".
+        text = label + (f"  · {n} changed" if n else "")
         rows.append([{"text": text, "callback_data": f"g:c:{key}"}])
     if _adv_changed_count(form, _advanced_fields(form)):
         rows.append([{"text": "↩ Reset all to profile", "callback_data": "g:r"}])
