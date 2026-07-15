@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.5.2] — 2026-07-14
+
+### Fixed
+
+- **Both plate images come back for profiles learned from your prints.** When you
+  sliced with a profile pulled from a recent print (new in 2.5.0), the
+  confirm-to-print card showed only one plate image and it looked different.
+  Those profiles were missing OrcaSlicer's object-labeling setting, which the
+  toolkit's plate previews (the top-down footprint and the 3D view) are built
+  from, so the 3D view dropped and the footprint fell back to a plainer render.
+  The toolkit now enables object labeling on every slice, so both plate images
+  render no matter which profile you pick.
+
 ## [2.5.0] — 2026-07-14
 
 ### Added

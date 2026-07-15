@@ -897,11 +897,25 @@ def apply_supports_override(process_path: Path, enable_support: bool, out_dir: P
     Returns the temp file path."""
     data = _flatten_process_profile(process_path)
     data['enable_support'] = '1' if enable_support else '0'
+    # The toolkit's plate previews (top-down footprint + 3D iso) are built by
+    # parsing M486 object markers out of the sliced gcode, which Orca only emits
+    # when exclude_object is on. Stock/user presets carry exclude_object=1, but a
+    # profile extracted from a print's gcode metadata (profiles/from-printer) can
+    # lack it, so slicing with one produced a gcode WITHOUT M486 -> the iso view
+    # dropped and the footprint degraded (live 2026-07-15, Brent). Force it on
+    # for every slice so the previews never depend on the picked profile carrying
+    # it. This function always runs before a slice, so it is the single
+    # materialization point. (M486 object exclusion is standard + already on for
+    # stock/user prints; enabling it universally has no downside.)
+    data['exclude_object'] = '1'
     # Audit trail — record the override so anyone inspecting the temp
     # profile knows why it exists.
     data.setdefault('_u1_workflow_notes', []).append(
         f'enable_support overridden to {"1" if enable_support else "0"} per user Supports? answer'
     )
+    data['_u1_workflow_notes'].append(
+        'exclude_object forced to 1 so the sliced gcode carries M486 object '
+        'markers (the toolkit builds its plate previews from them)')
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = process_path.stem + ('__force_supports' if enable_support else '__no_supports')
     temp = out_dir / f'{stem}.json'
