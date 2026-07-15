@@ -55,6 +55,18 @@ def test_apply_profile_overrides_noop_returns_original(tmp_path):
     assert sw.apply_profile_overrides(src, {"bogus": "1"}, tmp_path) == src
 
 
+def test_supports_override_forces_exclude_object_for_m486_previews(tmp_path):
+    """A profile WITHOUT exclude_object (e.g. an extracted from-printer profile)
+    must still slice with M486 object labels, because the toolkit's plate
+    previews (footprint + 3D iso) are parsed from those markers. apply_supports_
+    override runs before every slice, so it forces exclude_object=1 (live
+    2026-07-15: a from-printer profile dropped the iso view)."""
+    src = tmp_path / "proc.json"
+    src.write_text(json.dumps({"name": "p"}))  # no exclude_object key
+    out = sw.apply_supports_override(src, False, tmp_path)
+    assert json.loads(out.read_text())["exclude_object"] == "1"
+
+
 # ---------- schema ----------
 
 def test_schema_offers_advanced_fields_flagged():
