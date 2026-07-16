@@ -68,42 +68,54 @@ def _pick_head(form, tool_id):
     tg.apply_callback(form, f"s:{tfi}:{oi}")
 
 
-def test_temp_page_resolves_current_and_hides_out_of_range_for_material():
+def test_temp_stepper_dials_exact_value_clamped_to_material():
     form = tg.new_form(u1_form.build_form_schema(_spec()))
-    _pick_head(form, "T0")  # PLA
+    _pick_head(form, "T0")  # PLA: current 220, range 190-240
     form["current"] = "nozzle_temp"
+    nfi = tg._field_index(form, "nozzle_temp")
     kb = tg.render_screen(form)["keyboard"]
-    assert "keep profile (220°C)" in kb[0][0]["text"]           # PLA current
-    vals = [b["text"] for r in kb for b in r if b["callback_data"].startswith("s:")]
-    assert any("190°C" in t for t in vals) and any("240°C" in t for t in vals)
-    assert not any("250°C" in t or "270°C" in t for t in vals)  # above PLA range, hidden
-    # switch to PETG -> range + current follow
-    _pick_head(form, "T1")
-    form["current"] = "nozzle_temp"
-    kb2 = tg.render_screen(form)["keyboard"]
-    assert "keep profile (245°C)" in kb2[0][0]["text"]
-    vals2 = [b["text"] for r in kb2 for b in r if b["callback_data"].startswith("s:")]
-    assert any("270°C" in t for t in vals2)                     # in PETG range now
-    assert not any("190°C" in t for t in vals2)                 # below PETG range, hidden
+    assert "keep profile (220" in kb[0][0]["text"]            # header shows current
+    # the stepper is one row of exactly four steps: -5, -1, +1, +5
+    assert [b["callback_data"] for b in kb[1]] == [
+        f"T:{nfi}:-5", f"T:{nfi}:-1", f"T:{nfi}:1", f"T:{nfi}:5"]
+    # dial +5 +5 +1 -> 231 (an EXACT value the step buttons never offered)
+    tg.apply_callback(form, f"T:{nfi}:5")
+    tg.apply_callback(form, f"T:{nfi}:5")
+    tg.apply_callback(form, f"T:{nfi}:1")
+    assert form["temp"]["nozzle_temp"] == 231
+    assert "231°C" in tg.render_screen(form)["keyboard"][0][0]["text"]
+    assert tg.answer_json(form)["nozzle_temp"] == "231"
+    # can't dial past the PLA max even with many taps
+    for _ in range(20):
+        tg.apply_callback(form, f"T:{nfi}:5")
+    assert form["temp"]["nozzle_temp"] == 240
 
 
-def test_bed_control_offers_off_for_cold_plate():
+def test_temp_stepper_keep_resets_to_no_override():
     form = tg.new_form(u1_form.build_form_schema(_spec()))
     _pick_head(form, "T0")
-    form["current"] = "bed_temp"
-    kb = tg.render_screen(form)["keyboard"]
-    assert any("off" in b["text"] for r in kb for b in r)       # bed-off / cold plate
+    nfi = tg._field_index(form, "nozzle_temp")
+    tg.apply_callback(form, f"T:{nfi}:5")               # 220 -> 225
+    assert tg.answer_json(form).get("nozzle_temp") == "225"
+    tg.apply_callback(form, f"T:{nfi}:k")               # tap header -> keep
+    assert "nozzle_temp" not in tg.answer_json(form)
 
 
-def test_changing_head_resets_a_stale_temp_pick():
+def test_bed_stepper_can_reach_off_for_cold_plate():
+    form = tg.new_form(u1_form.build_form_schema(_spec()))
+    _pick_head(form, "T0")  # PLA bed 55, range 0-70
+    bfi = tg._field_index(form, "bed_temp")
+    for _ in range(20):
+        tg.apply_callback(form, f"T:{bfi}:-5")
+    assert form["temp"]["bed_temp"] == 0                # bed-off / cold plate reachable
+    assert tg.answer_json(form)["bed_temp"] == "0"
+
+
+def test_changing_head_clears_the_temp_stepper():
     form = tg.new_form(u1_form.build_form_schema(_spec()))
     _pick_head(form, "T0")  # PLA
-    # pick PLA nozzle 190 (below PETG's 230 min)
     nfi = tg._field_index(form, "nozzle_temp")
-    oi = next(i for i, o in enumerate(tg._field(form, "nozzle_temp")["options"])
-              if tg._opt_id(o) == "190")
-    tg.apply_callback(form, f"s:{nfi}:{oi}")
-    assert tg._opt_id(tg._field(form, "nozzle_temp")["options"][form["selections"]["nozzle_temp"]]) == "190"
-    # switch head to PETG -> the stale 190 pick resets to default
-    _pick_head(form, "T1")
-    assert tg._opt_id(tg._field(form, "nozzle_temp")["options"][form["selections"]["nozzle_temp"]]) == "default"
+    tg.apply_callback(form, f"T:{nfi}:5")
+    assert form.get("temp", {}).get("nozzle_temp") is not None
+    _pick_head(form, "T1")  # PETG -> stepper cleared (its range/current changed)
+    assert not form.get("temp")

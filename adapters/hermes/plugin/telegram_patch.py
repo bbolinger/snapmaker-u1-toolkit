@@ -46,9 +46,11 @@ logger = logging.getLogger(__name__)
 # a native Hermes callback (multi-char prefix + colon) can never match.
 # S:<f>:<o> is a submit-verb (sets the Action option, then submits).
 # g:<sub> is the Advanced-options menu (g:m menu, g:d done, g:r reset,
-# g:c:<category> open a category) — a SINGLE-char prefix, so it stays inside
-# the form vocabulary and never shadows a native multi-char callback.
-FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|g:(?:[mdr]|c:[a-z_]+)|[SX])$"
+# g:c:<category> open a category); T:<field>:<step|k> is the temperature stepper
+# (T:5:-5 / T:5:-1 / T:5:1 / T:5:5 step, T:5:k keep). Both SINGLE-char prefixes,
+# so they stay inside the form vocabulary and never shadow a native multi-char
+# callback.
+FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|g:(?:[mdr]|c:[a-z_]+)|T:\d+:(?:-?\d+|k)|[SX])$"
 
 # Grace-window cancel button on the countdown DM (u1c:<request_id>). Handled
 # HERE — the gateway adapter layer — because a typed CANCEL that lands while
