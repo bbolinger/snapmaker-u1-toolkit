@@ -116,3 +116,28 @@ def test_temp_override_lands_in_sliced_gcode(tmp_path):
     assert cfg, "no config block in sliced gcode"
     assert cfg.get("nozzle_temperature") == "235", cfg.get("nozzle_temperature")
     assert cfg.get("hot_plate_temp") == "60", cfg.get("hot_plate_temp")
+
+
+@pytest.mark.skipif(not DEFAULT_ORCA.exists(),
+                    reason="extracted Orca binary not present in this environment")
+def test_temp_override_lands_via_kit_arrange_slice(tmp_path):
+    """The KIT path slices through u1_arrange.arrange_slice, not real_orca_slice,
+    so prove the override lands there too (this is the path the operator's kit
+    actually takes)."""
+    import u1_arrange
+    try:
+        wf.profile_path(_PROFILE)
+        wf.filament_path("PETG", nozzle="0.4")
+    except RuntimeError as exc:
+        pytest.skip(f"runtime profiles not fetched here ({exc})")
+    out_dir = tmp_path / "slice"
+    out_dir.mkdir()
+    stl = tmp_path / "cube.stl"
+    write_binary_stl(stl, _cube_tris(15.0), name="cube")
+    res = u1_arrange.arrange_slice(
+        [stl], out_dir, tool="T0", material="PETG", profile=_PROFILE,
+        filament_overrides={"nozzle_temperature": 235, "hot_plate_temp": 60})
+    plate = Path(res["plates"][0]["gcode_path"])
+    cfg = _gcode_config(plate.read_text(errors="replace"))
+    assert cfg.get("nozzle_temperature") == "235", cfg.get("nozzle_temperature")
+    assert cfg.get("hot_plate_temp") == "60", cfg.get("hot_plate_temp")
