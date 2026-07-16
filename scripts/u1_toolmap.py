@@ -28,7 +28,6 @@ def _default_map_path() -> Path:
 
 EXTRUDER_NAMES = ["extruder", "extruder1", "extruder2", "extruder3"]
 EXTRUDER_CHANNEL = {"extruder": 0, "extruder1": 1, "extruder2": 2, "extruder3": 3}
-CHANNEL_EXTRUDER = {v: k for k, v in EXTRUDER_CHANNEL.items()}
 
 _UNKNOWN_MATERIALS = {"", "UNKNOWN", "NONE"}
 

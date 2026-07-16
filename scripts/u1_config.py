@@ -166,9 +166,6 @@ class _ConfigPathProxy:
         return repr(get_config_path())
     def __eq__(self, other: object) -> bool:
         return get_config_path() == other
-    @property
-    def exists_path(self) -> Path:
-        return get_config_path()
     def exists(self) -> bool:
         return get_config_path().exists()
     def read_text(self, *args, **kwargs) -> str:
