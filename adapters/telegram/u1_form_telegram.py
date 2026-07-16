@@ -216,6 +216,26 @@ def _resolved_for_selected_profile(form: dict[str, Any]) -> dict[str, str]:
     return amap.get(str(pid)) or {}
 
 
+def _selected_material(form: dict[str, Any]) -> str | None:
+    """The material the operator picked — from the head option (live tool map
+    carries each head's material) or the offline Material field. Drives the
+    temperature controls' current value + in-range gating."""
+    fields = form["schema"]["fields"]
+    tool = next((f for f in fields if f["id"] == "tool"), None)
+    if tool is not None:
+        sel = form["selections"].get("tool")
+        if sel is not None:
+            mat = tool["options"][sel].get("material")
+            if mat:
+                return mat
+    matf = next((f for f in fields if f["id"] == "material"), None)
+    if matf is not None:
+        sel = form["selections"].get("material")
+        if sel is not None:
+            return _opt_id(matf["options"][sel])
+    return None
+
+
 def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
     """The screen (list of fields) that renders together with ``fid``."""
     for screen in _screens(form):
@@ -335,18 +355,37 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
         # repeat it (live 2026-07-15: "Infill 10% / Infill 15% / ..." doubled the
         # text and truncated wider labels at two-up). The default option is first
         # in every advanced field, so the header row lands before the values.
+        _range = None
+        if field.get("material_dynamic"):
+            # Temperature controls: resolve the CURRENT temp + the in-range window
+            # from the loaded material (not the process profile). Options outside
+            # the material's sourced envelope are hidden so a mis-tap can't offer
+            # a dangerous temp for that filament.
+            _mat = _selected_material(form)
+            _cur = ((form["schema"].get("temp_current_by_material") or {}).get(_mat) or {}).get(field["id"])
+            if _cur is not None:
+                resolved_default = f"{_cur}°C"
+            _range = ((form["schema"].get("temp_range_by_material") or {}).get(_mat) or {}).get(field["id"])
         alts: list[dict[str, str]] = []
         for oi, opt in enumerate(field["options"]):
+            oid = _opt_id(opt)
             mark = "● " if sel == oi else "○ "
-            if _opt_id(opt) == "default":
+            if oid == "default":
                 head = _opt_label(opt)
                 if resolved_default:
                     head = head.replace("profile default",
                                         f"keep profile ({resolved_default})")
                 rows.append([{"text": f"{mark}{head}", "callback_data": f"s:{fi}:{oi}"}])
-            else:
-                short = opt.get("short") or _opt_label(opt)
-                alts.append({"text": f"{mark}{short}", "callback_data": f"s:{fi}:{oi}"})
+                continue
+            if _range is not None:
+                try:
+                    _v = int(oid)
+                except (TypeError, ValueError):
+                    _v = None
+                if _v is not None and not (_range[0] <= _v <= _range[1]):
+                    continue  # out of the material's range — hidden
+            short = opt.get("short") or _opt_label(opt)
+            alts.append({"text": f"{mark}{short}", "callback_data": f"s:{fi}:{oi}"})
         for i in range(0, len(alts), 3):
             rows.append(alts[i:i + 3])
         return rows
@@ -696,6 +735,17 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
             return {"kind": "rerender",
                     "warning": f"Stale button (option {oi} out of range for {_esc(repr(fid))})."}
         form["selections"][fid] = oi
+        # Changing the head/material re-bases the temperature controls (their
+        # valid range + current temp are per material), so a temp picked for the
+        # old filament must not silently survive — reset the material_dynamic
+        # fields to their profile default.
+        if fid in ("tool", "material"):
+            for f in fields:
+                if f.get("material_dynamic"):
+                    di = next((i for i, o in enumerate(f["options"])
+                               if _opt_id(o) == "default"), None)
+                    if di is not None:
+                        form["selections"][f["id"]] = di
         # A single-select on its own screen advances on tap; one inside a
         # group is a radio — it only marks, the shared Next advances.
         if not field.get("group"):

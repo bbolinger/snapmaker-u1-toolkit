@@ -49,6 +49,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import u1_temps  # per-material temperature envelopes (bed/nozzle override gate)
+
 REQUIRED_FIELDS = ("tool", "material", "profile")
 
 _ORIENT_AUTO = {"auto", "auto-orient", "autoorient"}
@@ -155,6 +157,7 @@ ADVANCED_CATEGORIES = (
     ("strength", "\U0001f9f1 Strength & shells"),
     ("first_layer", "\U0001f321️ First layer & adhesion"),
     ("finish", "✨ Surface finish"),
+    ("temperature", "\U0001f525 Temperature"),
     ("supports", "\U0001fa9c Supports"),
 )
 _ADVANCED_CATEGORY = {
@@ -162,6 +165,7 @@ _ADVANCED_CATEGORY = {
     "one_wall_top": "strength", "infill": "strength", "infill_pattern": "strength",
     "brim": "first_layer", "raft": "first_layer",
     "fuzzy": "finish",
+    "nozzle_temp": "temperature", "bed_temp": "temperature",
     "support_style": "supports",
 }
 
@@ -224,6 +228,36 @@ def resolve_advanced_from_profile(flat_process: dict[str, Any]) -> dict[str, str
             if val != "":
                 out[fid] = val
     return out
+
+
+# Temperature overrides (Track C). Filament nozzle + bed temps, offered as
+# ABSOLUTE values in the "temperature" category. Unlike the process ADVANCED_
+# FIELDS (static options), the CURRENT value and the in-range options depend on
+# the loaded MATERIAL, so the span here is the union across materials — u1_temps
+# decides which apply per material and the renderer hides the rest — the
+# "keep profile (X C)" header resolves per material at render time, and parse
+# validates the pick against the material's range. base_key is the filament
+# profile key the workflow maps the answer onto (see u1_slice_workflow
+# .FILAMENT_OVERRIDE_KEYS).
+_NOZZLE_SPAN = tuple(range(190, 281, 10))          # 190..280 covers every material
+_BED_SPAN = (40, 50, 60, 70, 80, 90, 100, 110)     # plus off (0) offered below
+
+TEMP_FIELDS = (
+    ("nozzle_temp", "Nozzle temperature", "nozzle_temperature",
+     (("default", "Nozzle: profile default"),)
+     + tuple((str(v), f"Nozzle {v}°C") for v in _NOZZLE_SPAN)),
+    ("bed_temp", "Bed temperature", "hot_plate_temp",
+     (("default", "Bed: profile default"), ("0", "Bed: off"))
+     + tuple((str(v), f"Bed {v}°C") for v in _BED_SPAN)),
+)
+_TEMP_BY_ID = {fid: base_key for fid, _lbl, base_key, _opts in TEMP_FIELDS}
+
+# Bare labels for the temp buttons under the per-setting header (mirrors
+# _ADVANCED_SHORT for the process controls).
+_ADVANCED_SHORT.update({
+    "nozzle_temp": {str(v): f"{v}°C" for v in _NOZZLE_SPAN},
+    "bed_temp": {"0": "off", **{str(v): f"{v}°C" for v in _BED_SPAN}},
+})
 
 
 # Quantity (v2.3): print N copies of a SINGLE-part job. The workflow sets
@@ -558,6 +592,32 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
     tool_materials = spec.get("tool_materials") or {}
     if "material" not in values and values.get("tool") in tool_materials:
         values["material"] = tool_materials[values["tool"]]
+
+    # Temperature overrides (Track C): now that the material is resolved, validate
+    # the operator's absolute nozzle/bed picks against that material's sourced
+    # envelope and map them to filament_overrides {orca_key: int C}. The parsers
+    # stash the raw picks in "_temp_answers"; bed 0 (cool/cold plate, bed off) is
+    # valid; an out-of-range pick fails loudly rather than being silently clamped.
+    _temp_raw = values.pop("_temp_answers", None) or {}
+    _t_material = values.get("material")
+    for _tfid, _traw in _temp_raw.items():
+        _tbase = _TEMP_BY_ID.get(_tfid)
+        if _tbase is None or _traw in (None, "", "default", "keep"):
+            continue
+        try:
+            _tiv = int(round(float(_traw)))
+        except (TypeError, ValueError):
+            errors.append(f"invalid {_tfid} value {_traw!r}")
+            continue
+        if _tbase == "nozzle_temperature":
+            _tok, (_tlo, _thi) = u1_temps.nozzle_in_range(_t_material, _tiv), u1_temps.nozzle_range(_t_material)
+        else:
+            _tok, (_tlo, _thi) = u1_temps.bed_in_range(_t_material, _tiv), u1_temps.bed_range(_t_material)
+        if not _tok:
+            errors.append(f"{_tfid} {_tiv}C is out of range for "
+                          f"{_t_material or 'this material'} ({_tlo}-{_thi}C)")
+        else:
+            values.setdefault("filament_overrides", {})[_tbase] = _tiv
 
     for f in REQUIRED_FIELDS:
         if f not in values:
@@ -962,7 +1022,10 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     if heads:
         fields.append({"id": "tool", "type": "single_select", "label": "Print head",
                        "group": _GROUP, "group_label": _GLABEL,
-                       "options": [{"id": h["tool"], "label": _head_label(h)} for h in heads],
+                       # carry each head's material so the temperature controls
+                       # can resolve the loaded material's range/current temp
+                       "options": [{"id": h["tool"], "label": _head_label(h),
+                                    "material": h.get("material")} for h in heads],
                        "required": True})
     else:
         tools = [str(t).upper() for t in spec.get("tools", [])]
@@ -1038,6 +1101,22 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                 "group_label": "Advanced settings",
                 "category": _ADVANCED_CATEGORY.get(_fid, "finish"),
             })
+        # Temperature controls (Track C). Advanced fields like the rest, but
+        # material_dynamic: the renderer resolves the current temp + shows only
+        # the loaded material's in-range options. base_key maps the answer to the
+        # filament-profile key the workflow overrides.
+        for _fid, _lbl, _base, _opts in TEMP_FIELDS:
+            _shorts = _ADVANCED_SHORT.get(_fid, {})
+            fields.append({
+                "id": _fid, "type": "single_select", "label": _lbl,
+                "options": [{"id": oid, "label": olbl, "short": _shorts.get(oid, olbl)}
+                            for oid, olbl in _opts],
+                "default": "default", "required": False,
+                "advanced": True, "group": "advanced",
+                "group_label": "Advanced settings",
+                "category": "temperature",
+                "material_dynamic": True, "base_key": _base,
+            })
     # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
     # The single print/keep-staged decision happens AFTER slice + a FRESH bed
     # photo (you decide with the real bed in view) — not up front, before the
@@ -1062,6 +1141,22 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         _resolved = spec.get("advanced_resolved")
         if _resolved:
             schema["advanced_resolved"] = {str(k): v for k, v in _resolved.items()}
+        # Per-material current filament temps (keyed by material) so the
+        # temperature controls can show "keep profile (X C)" and resolve the
+        # material's range for whichever head is picked. Shape:
+        # {material: {"nozzle_temp": <int C>, "bed_temp": <int C>}}.
+        _tcm = spec.get("temp_current_by_material")
+        if _tcm:
+            schema["temp_current_by_material"] = {
+                str(k): v for k, v in _tcm.items()}
+            # Per-material [min, max] so the renderer shows only in-range temp
+            # options for the loaded material (u1_temps, the sourced gate). Keeps
+            # the renderer dependency-free — it just filters to these bounds.
+            schema["temp_range_by_material"] = {
+                str(m): {"nozzle_temp": list(u1_temps.nozzle_range(m)),
+                         "bed_temp": list(u1_temps.bed_range(m))}
+                for m in _tcm
+            }
     if submit:
         schema["submit"] = submit
     return schema
@@ -1180,6 +1275,12 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
                 errors.append(f"unknown {_fid} option {raw!r}")
             else:
                 values.setdefault("overrides", {})[_orca_key] = mapped
+        # Temperature picks stash raw; _finalize validates them once the
+        # material is resolved (their valid range is per material).
+        _ta = {fid: obj.get(fid) for fid in _TEMP_BY_ID
+               if obj.get(fid) not in (None, "", "default")}
+        if _ta:
+            values["_temp_answers"] = _ta
 
     return _finalize(values, spec, errors)
 

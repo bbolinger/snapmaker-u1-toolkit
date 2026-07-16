@@ -80,7 +80,8 @@ def fake_profiles(monkeypatch):
 def fake_slice_upload(monkeypatch):
     """Mock arrange-slice (writes plate files) + upload + profile resolution."""
     def fake_arrange(paths, out_dir, *, tool, material, profile, nozzle,
-                     auto_orient, allow_rotations, process_path_override=None):
+                     auto_orient, allow_rotations, process_path_override=None,
+                     filament_overrides=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         plates = []
@@ -424,7 +425,8 @@ def recording_upload(monkeypatch):
 
 def _fake_arrange(monkeypatch, n_plates=1):
     def fake_arrange(paths, out_dir, *, tool, material, profile, nozzle,
-                     auto_orient, allow_rotations, process_path_override=None):
+                     auto_orient, allow_rotations, process_path_override=None,
+                     filament_overrides=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         plates = []
