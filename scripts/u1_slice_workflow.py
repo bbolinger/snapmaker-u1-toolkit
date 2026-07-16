@@ -21,6 +21,8 @@ from __future__ import annotations
 import os, sys, subprocess
 from pathlib import Path
 
+import u1_temps  # per-material temperature envelopes for the bed/nozzle override
+
 
 def _bootstrap_env() -> dict:
     """os.environ copy without PYTHONPATH/PYTHONHOME (escape hatch:
@@ -963,6 +965,70 @@ def apply_profile_overrides(process_path: Path, overrides: dict[str, str],
     return temp
 
 
+# Filament (temperature) overrides. Unlike the process overrides above, these
+# patch the FILAMENT profile — the U1 stores every temp as a single-element list
+# (nozzle_temperature=['220']), so each override is written as ['<value>'] across
+# the key's siblings to keep the filament self-consistent.
+FILAMENT_OVERRIDE_KEYS = ('nozzle_temperature', 'hot_plate_temp')
+
+# When bed temp is overridden, every plate variant must move together — Orca
+# stamps whichever the active bed_type selects, and _materialize_flat_filament
+# already propagates hot_plate_temp into these, so leaving one stale would emit
+# an inconsistent bed temp to the gcode metadata (bit the upload gate once).
+_BED_SIBLINGS = (
+    'hot_plate_temp', 'hot_plate_temp_initial_layer',
+    'textured_plate_temp', 'textured_plate_temp_initial_layer',
+    'eng_plate_temp', 'eng_plate_temp_initial_layer',
+    'cool_plate_temp', 'cool_plate_temp_initial_layer',
+)
+_NOZZLE_SIBLINGS = ('nozzle_temperature', 'nozzle_temperature_initial_layer')
+
+
+def apply_filament_overrides(filament_path: Path, overrides: dict[str, Any],
+                             out_dir: Path, material: str | None = None) -> Path:
+    """Materialize a temp filament profile with the operator's bed/nozzle temps.
+
+    ``overrides`` maps a base key (``nozzle_temperature`` | ``hot_plate_temp``)
+    to a target temperature in C. Each value is CLAMPED to the material's sourced
+    envelope (u1_temps) — defense in depth, since the form only offers in-range
+    values but a text/API answer could carry anything — then written across the
+    key's siblings so both layers and every bed-plate variant stay consistent.
+    Bed temp of 0 (a cool/cold plate, or bed off) is a legitimate value and is
+    written through unchanged. Values are single-element string lists to match
+    the U1 filament schema.
+
+    Returns ``filament_path`` unchanged when no honored override remains.
+    """
+    clean: dict[str, int] = {}
+    for k, v in (overrides or {}).items():
+        if k not in FILAMENT_OVERRIDE_KEYS or v in (None, '', 'default'):
+            continue
+        try:
+            iv = int(round(float(v)))
+        except (TypeError, ValueError):
+            continue
+        clean[k] = (u1_temps.clamp_nozzle(material, iv)
+                    if k == 'nozzle_temperature' else u1_temps.clamp_bed(material, iv))
+    if not clean:
+        return filament_path
+    data = _flatten_filament_profile(filament_path)
+    if 'nozzle_temperature' in clean:
+        for key in _NOZZLE_SIBLINGS:
+            data[key] = [str(clean['nozzle_temperature'])]
+    if 'hot_plate_temp' in clean:
+        for key in _BED_SIBLINGS:
+            data[key] = [str(clean['hot_plate_temp'])]
+    data.setdefault('_u1_workflow_notes', []).append(
+        'filament temperature overrides applied per operator form answers'
+        + (f' (material {material})' if material else '') + ': '
+        + ', '.join(f'{k}={v}C' for k, v in sorted(clean.items()))
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp = out_dir / f'{Path(filament_path).stem}__temp.json'
+    temp.write_text(json.dumps(data, indent=2))
+    return temp
+
+
 def last_used_per_tool(nozzle: str | None = None, history_path: Path | None = None) -> dict[str, str]:
     """Return a {tool_id: print_settings_id} map for the most recent print on
     each tool that matches the given nozzle.
@@ -1329,7 +1395,7 @@ def machine_profile_for_orca(orca_bin: Path = DEFAULT_ORCA) -> Path:
             return c
     return ROOT/'profiles/machine/snapmaker_u1_0_4_nozzle.json'
 
-def real_orca_slice(oriented_stl: Path, out_gcode: Path, tool: str, material: str, profile: str, orca_bin: Path = DEFAULT_ORCA, nozzle: str = '0.4', process_path_override: Path | None = None)->dict[str,Any]:
+def real_orca_slice(oriented_stl: Path, out_gcode: Path, tool: str, material: str, profile: str, orca_bin: Path = DEFAULT_ORCA, nozzle: str = '0.4', process_path_override: Path | None = None, filament_overrides: dict[str, Any] | None = None)->dict[str,Any]:
     out_gcode.parent.mkdir(parents=True, exist_ok=True)
     machine=machine_profile_for_orca(orca_bin)
     # process_path_override lets the caller pass an already-resolved process
@@ -1345,6 +1411,11 @@ def real_orca_slice(oriented_stl: Path, out_gcode: Path, tool: str, material: st
     # gate rejected. Caught live 2026-06-25 in round 5 of testing.
     filament_resolved = filament_path(material, nozzle=nozzle)
     filament = _materialize_flat_filament(filament_resolved, out_gcode.parent, orca_bin=orca_bin)
+    # Apply the operator's bed/nozzle temperature overrides (Track C) on top of
+    # the flattened filament, clamped to the material's sourced envelope. No-op
+    # when the form carried no temp change.
+    if filament_overrides:
+        filament = apply_filament_overrides(filament, filament_overrides, out_gcode.parent, material=material)
     cmd=[
         str(orca_bin),
         '--load-settings', f'{machine};{process}',
