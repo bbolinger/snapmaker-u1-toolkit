@@ -1129,7 +1129,7 @@ def test_merged_head_drops_material_screen_and_labels_carry_color():
     tool_field = schema["fields"][_fidx(schema, "tool")]
     assert tool_field["label"] == "Print head"
     labels = [o["label"] for o in tool_field["options"]]
-    assert labels[0] == "Head 1 (T0) — PETG ⚪ white"
+    assert labels[0] == "Head 1 (T0) · PETG ⚪ white"
     assert "🟠 orange" in labels[2]
 
 

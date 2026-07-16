@@ -2122,6 +2122,38 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         heads = u1_toolmap.load_head_options()
     except Exception:
         heads = []
+    # Track C: current filament nozzle/bed temp per material, so the temperature
+    # controls can show "keep profile (X C)" for whichever head is loaded. Each
+    # material resolves from its filament profile (flattened); fully guarded.
+    _temp_by_material: dict[str, dict[str, int]] = {}
+    try:
+        import u1_slice_workflow as _sw
+
+        def _first_int(_d, _k):
+            _v = _d.get(_k)
+            if isinstance(_v, list):
+                _v = _v[0] if _v else None
+            try:
+                return int(round(float(_v)))
+            except (TypeError, ValueError):
+                return None
+
+        for _m in DEFAULT_MATERIALS:
+            try:
+                _flat = _sw._flatten_filament_profile(_sw.filament_path(_m, nozzle=nozzle))
+            except Exception:
+                continue
+            _entry = {}
+            _n = _first_int(_flat, "nozzle_temperature")
+            _b = _first_int(_flat, "hot_plate_temp")
+            if _n is not None:
+                _entry["nozzle_temp"] = _n
+            if _b is not None:
+                _entry["bed_temp"] = _b
+            if _entry:
+                _temp_by_material[_m] = _entry
+    except Exception:
+        pass
     spec: dict[str, Any] = {
         "parts": parts,
         "tools": DEFAULT_TOOLS,
@@ -2139,6 +2171,8 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
         # Per-profile current advanced values for the tweak menu (empty on the
         # persisted/answer path, which renders no form).
         "advanced_resolved": _adv_resolved,
+        # Track C: current filament temps per material for the temperature controls.
+        "temp_current_by_material": _temp_by_material,
     }
     # v2.3: quantity (print N copies) — offered ONLY for single-part jobs.
     # Multi-part kits keep per-part quantities out of scope; the operator
@@ -5465,6 +5499,13 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         _audit(request_id, "advanced_overrides_applied", operator,
                **{k: str(v) for k, v in adv_overrides.items()})
 
+    # Track C: bed/nozzle temperature overrides ride the filament rail (clamped
+    # to the material envelope inside apply_filament_overrides), applied at slice.
+    temp_overrides = values.get("filament_overrides") or {}
+    if temp_overrides:
+        _audit(request_id, "filament_temp_overrides_applied", operator,
+               material=material, **{k: str(v) for k, v in temp_overrides.items()})
+
     slice_out = out_dir / "slice"
     _emit(events_file, {"stage": "kit_slicing", "request_id": request_id,
                         "parts": len(selected_paths), "auto_orient": auto_orient}, json_events)
@@ -5474,6 +5515,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
             tool=tool, material=material, profile=profile_slug, nozzle=nozzle,
             auto_orient=auto_orient, allow_rotations=True,
             process_path_override=process,
+            filament_overrides=temp_overrides,
         )
     except Exception as exc:
         ev = _classify_slice_failure(

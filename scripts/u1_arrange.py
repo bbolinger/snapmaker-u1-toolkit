@@ -52,6 +52,7 @@ from u1_slice_workflow import (
     profile_path,
     filament_path,
     _materialize_flat_filament,
+    apply_filament_overrides,
     rewrite_gcode_for_tool,
     _tool_to_index,
 )
@@ -418,6 +419,7 @@ def arrange_slice(
     allow_rotations: bool = True,
     orca_bin: Path = DEFAULT_ORCA,
     process_path_override: Path | None = None,
+    filament_overrides: dict[str, Any] | None = None,
     runner: Callable[[list[str], Path], subprocess.CompletedProcess] | None = None,
     bed_mm: tuple[float, float] = _BED_MM,
     bed_margin_mm: float = _BED_MARGIN_MM,
@@ -461,6 +463,10 @@ def arrange_slice(
     filament = _materialize_flat_filament(
         filament_path(material, nozzle=nozzle), out_dir, orca_bin=orca_bin
     )
+    # Bed/nozzle temperature override (Track C), clamped to the material's
+    # envelope. No-op when the form carried no temp change.
+    if filament_overrides:
+        filament = apply_filament_overrides(filament, filament_overrides, out_dir, material=material)
     tool_idx = _tool_to_index(tool)
 
     def _clean_plate_gcodes(in_dir: Path) -> None:
