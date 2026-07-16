@@ -27,7 +27,7 @@ invisible to PTB. Live v2.2 finding (2026-07-02): with the swap approach
 every button press routed to the native handler, toggles never rendered,
 and the form sat untouched until its 600s timeout. The form callback
 vocabulary is exclusively single-char prefixes (``t: s: p: a: z: n: e:
-S X``) while Hermes' own callbacks are all multi-char + colon (``cl:``,
+g: S X``) while Hermes' own callbacks are all multi-char + colon (``cl:``,
 ``ea:``, ``mp:``…), so the pattern can never shadow a native callback.
 
 File handoff: when the schema carries ``submit: {mode: "file", form_id}``,
@@ -45,7 +45,10 @@ logger = logging.getLogger(__name__)
 # The renderer's complete callback vocabulary — and nothing else. Anchored so
 # a native Hermes callback (multi-char prefix + colon) can never match.
 # S:<f>:<o> is a submit-verb (sets the Action option, then submits).
-FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|[SX])$"
+# g:<sub> is the Advanced-options menu (g:m menu, g:d done, g:r reset,
+# g:c:<category> open a category) — a SINGLE-char prefix, so it stays inside
+# the form vocabulary and never shadows a native multi-char callback.
+FORM_CB_PATTERN = r"^(?:[tsp]:\d+:\d+|S:\d+:\d+|[azne]:\d+|g:(?:[mdr]|c:[a-z_]+)|[SX])$"
 
 # Grace-window cancel button on the countdown DM (u1c:<request_id>). Handled
 # HERE — the gateway adapter layer — because a typed CANCEL that lands while

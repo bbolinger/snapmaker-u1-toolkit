@@ -118,6 +118,24 @@ ADVANCED_FIELDS = (
      [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
       ("on", "Fuzzy skin: on (outer walls)")],
      "fuzzy_skin", {"off": "none", "on": "external"}),
+    ("top_shell", "Top layers",
+     [("default", "Top layers: profile default"), ("3", "Top layers: 3"),
+      ("4", "Top layers: 4"), ("5", "Top layers: 5")],
+     "top_shell_layers", {"3": "3", "4": "4", "5": "5"}),
+    ("bottom_shell", "Bottom layers",
+     [("default", "Bottom layers: profile default"), ("3", "Bottom layers: 3"),
+      ("4", "Bottom layers: 4")],
+     "bottom_shell_layers", {"3": "3", "4": "4"}),
+    # only_one_wall_top is Orca's dedicated top-surface control — NEVER expose a
+    # global wall_loops=1, which would weaken the whole part on a mis-tap.
+    ("one_wall_top", "One wall on top",
+     [("default", "One wall on top: profile default"),
+      ("off", "One wall on top: off"), ("on", "One wall on top: on")],
+     "only_one_wall_top", {"off": "0", "on": "1"}),
+    ("raft", "Raft",
+     [("default", "Raft: profile default"), ("off", "Raft: off"),
+      ("small", "Raft: 3 layers")],
+     "raft_layers", {"off": "0", "small": "3"}),
     # Only takes effect when Supports is ON (the setup-screen toggle);
     # Orca ignores support_type when enable_support is 0.
     ("support_style", "Support style",
@@ -129,6 +147,84 @@ ADVANCED_FIELDS = (
 
 _ADVANCED_BY_ID = {fid: (orca_key, mapping)
                    for fid, _lbl, _opts, orca_key, mapping in ADVANCED_FIELDS}
+
+# The tweak menu groups advanced controls into category sub-pages so the screen
+# isn't one long flat list. Order here is the category page order; the menu only
+# lists categories that actually have fields.
+ADVANCED_CATEGORIES = (
+    ("strength", "\U0001f9f1 Strength & shells"),
+    ("first_layer", "\U0001f321️ First layer & adhesion"),
+    ("finish", "✨ Surface finish"),
+    ("supports", "\U0001fa9c Supports"),
+)
+_ADVANCED_CATEGORY = {
+    "walls": "strength", "top_shell": "strength", "bottom_shell": "strength",
+    "one_wall_top": "strength", "infill": "strength", "infill_pattern": "strength",
+    "brim": "first_layer", "raft": "first_layer",
+    "fuzzy": "finish",
+    "support_style": "supports",
+}
+
+# Bare option labels for the category sub-page. There, each setting has a
+# full-width HEADER (its name + current value), so the option buttons under it
+# don't repeat the setting name — they show only the value ("30%", "gyroid",
+# "3"), which fits three-up without truncation. The full self-describing label
+# is still used everywhere else (text fallback, review summary).
+_ADVANCED_SHORT = {
+    "infill": {"10": "10%", "15": "15%", "20": "20%", "30": "30%",
+               "40": "40%", "50": "50%"},
+    "infill_pattern": {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
+                       "triangles": "triangles", "cubic": "cubic"},
+    "walls": {"2": "2", "3": "3", "4": "4"},
+    "brim": {"off": "off", "auto": "auto"},
+    "fuzzy": {"off": "off", "on": "on"},
+    "top_shell": {"3": "3", "4": "4", "5": "5"},
+    "bottom_shell": {"3": "3", "4": "4"},
+    "one_wall_top": {"off": "off", "on": "on"},
+    "raft": {"off": "off", "small": "3 layers"},
+    "support_style": {"tree": "tree", "grid": "grid"},
+}
+
+
+def _display_resolved(fid: str, raw: Any) -> str:
+    """Compress a profile's raw Orca value for an advanced key into the short
+    token shown in 'keep profile (X)'. Deliberately small — a display hint, not
+    a parse; anything unrecognized falls back to the raw string."""
+    s = "" if raw is None else str(raw).strip()
+    if fid in ("infill", "infill_pattern", "walls", "top_shell", "bottom_shell"):
+        return s
+    if fid == "brim":
+        return "off" if s in ("", "no_brim") else "on"
+    if fid == "fuzzy":
+        return "off" if s in ("", "none") else "on"
+    if fid == "one_wall_top":
+        return "on" if s in ("1", "true", "True") else "off"
+    if fid == "raft":
+        try:
+            n = int(float(s))
+        except ValueError:
+            n = 0
+        return "off" if n <= 0 else f"{n} layers"
+    if fid == "support_style":
+        return "tree" if "tree" in s else ("grid" if s else "")
+    return s
+
+
+def resolve_advanced_from_profile(flat_process: dict[str, Any]) -> dict[str, str]:
+    """Map a FLATTENED process profile to {advanced_field_id: short current
+    value} so the tweak menu can show what each control changes FROM ('Top
+    layers: keep profile (4)'). Only keys present in the profile are returned;
+    an unread key just leaves that control on the generic 'profile default'
+    label. Pair with u1_slice_workflow._flatten_process_profile to resolve the
+    inherits chain first."""
+    out: dict[str, str] = {}
+    for fid, _lbl, _opts, orca_key, _mapping in ADVANCED_FIELDS:
+        if orca_key in flat_process:
+            val = _display_resolved(fid, flat_process.get(orca_key))
+            if val != "":
+                out[fid] = val
+    return out
+
 
 # Quantity (v2.3): print N copies of a SINGLE-part job. The workflow sets
 # spec["offer_quantity"] only when the kit has one part — per-part quantities
@@ -932,12 +1028,15 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
     # "default" = no override; skipping the screen is today's behavior.
     if spec.get("offer_advanced"):
         for _fid, _lbl, _opts, _orca_key, _mapping in ADVANCED_FIELDS:
+            _shorts = _ADVANCED_SHORT.get(_fid, {})
             fields.append({
                 "id": _fid, "type": "single_select", "label": _lbl,
-                "options": [{"id": oid, "label": olbl} for oid, olbl in _opts],
+                "options": [{"id": oid, "label": olbl,
+                             "short": _shorts.get(oid, olbl)} for oid, olbl in _opts],
                 "default": "default", "required": False,
                 "advanced": True, "group": "advanced",
                 "group_label": "Advanced settings",
+                "category": _ADVANCED_CATEGORY.get(_fid, "finish"),
             })
     # v2.2 (kit refinement): NO action field. The form only collects the PLAN.
     # The single print/keep-staged decision happens AFTER slice + a FRESH bed
@@ -951,6 +1050,18 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
         "text_fallback": build_form(spec),
         "answer_grammar": "pipe-separated one-liner: parts 1,3 | T0 | PLA | profile 2 | no-supports",
     }
+    if spec.get("offer_advanced"):
+        # Category order + labels for the tweak menu (renderer builds the menu
+        # from this + each field's "category", so it needs no form internals).
+        schema["advanced_categories"] = [{"key": k, "label": l}
+                                         for k, l in ADVANCED_CATEGORIES]
+        # Per-profile current values (keyed by str(profile idx)) so the tweak
+        # controls can show "keep profile (X)" for whichever profile is picked.
+        # The workflow resolves these (it holds the profile paths); absent it,
+        # the labels simply stay generic.
+        _resolved = spec.get("advanced_resolved")
+        if _resolved:
+            schema["advanced_resolved"] = {str(k): v for k, v in _resolved.items()}
     if submit:
         schema["submit"] = submit
     return schema

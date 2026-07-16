@@ -38,7 +38,11 @@ OVERRIDES = {
     "sparse_infill_density": "30%",
     "sparse_infill_pattern": "gyroid",
     "wall_loops": "3",
+    "top_shell_layers": "5",
+    "bottom_shell_layers": "4",
+    "only_one_wall_top": "1",
     "brim_type": "auto_brim",
+    "raft_layers": "3",
     "fuzzy_skin": "external",
     "support_type": "tree(auto)",
 }
