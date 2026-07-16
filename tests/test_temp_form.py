@@ -82,13 +82,13 @@ def test_temp_stepper_dials_exact_value_clamped_to_material():
     tg.apply_callback(form, f"T:{nfi}:5")
     tg.apply_callback(form, f"T:{nfi}:5")
     tg.apply_callback(form, f"T:{nfi}:1")
-    assert form["temp"]["nozzle_temp"] == 231
+    assert form["steps"]["nozzle_temp"] == 231
     assert "231°C" in tg.render_screen(form)["keyboard"][0][0]["text"]
     assert tg.answer_json(form)["nozzle_temp"] == "231"
     # can't dial past the PLA max even with many taps
     for _ in range(20):
         tg.apply_callback(form, f"T:{nfi}:5")
-    assert form["temp"]["nozzle_temp"] == 240
+    assert form["steps"]["nozzle_temp"] == 240
 
 
 def test_temp_stepper_keep_resets_to_no_override():
@@ -107,7 +107,7 @@ def test_bed_stepper_can_reach_off_for_cold_plate():
     bfi = tg._field_index(form, "bed_temp")
     for _ in range(20):
         tg.apply_callback(form, f"T:{bfi}:-5")
-    assert form["temp"]["bed_temp"] == 0                # bed-off / cold plate reachable
+    assert form["steps"]["bed_temp"] == 0                # bed-off / cold plate reachable
     assert tg.answer_json(form)["bed_temp"] == "0"
 
 
@@ -116,6 +116,6 @@ def test_changing_head_clears_the_temp_stepper():
     _pick_head(form, "T0")  # PLA
     nfi = tg._field_index(form, "nozzle_temp")
     tg.apply_callback(form, f"T:{nfi}:5")
-    assert form.get("temp", {}).get("nozzle_temp") is not None
-    _pick_head(form, "T1")  # PETG -> stepper cleared (its range/current changed)
-    assert not form.get("temp")
+    assert form.get("steps", {}).get("nozzle_temp") is not None
+    _pick_head(form, "T1")  # PETG -> temp stepper cleared (its range changed)
+    assert not form.get("steps")

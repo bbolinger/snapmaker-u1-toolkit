@@ -30,6 +30,7 @@ Callback data convention (well under Telegram's 64-byte cap):
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 # Tunables (callers may monkey-patch for tests / different UX).
@@ -193,11 +194,11 @@ def _adv_bucket_of(form: dict[str, Any], fid: str) -> str | None:
 
 def _adv_changed_count(form: dict[str, Any], fields: list[dict[str, Any]]) -> int:
     """How many of ``fields`` are set to something other than profile default."""
-    temp = form.get("temp") or {}
+    steps = form.get("steps") or {}
     n = 0
     for f in fields:
-        if f.get("material_dynamic"):        # temperature stepper (form["temp"])
-            if temp.get(f["id"]) is not None:
+        if f.get("stepper"):                 # dialed via form["steps"]
+            if steps.get(f["id"]) is not None:
                 n += 1
             continue
         sel = form["selections"].get(f["id"])
@@ -241,16 +242,34 @@ def _selected_material(form: dict[str, Any]) -> str | None:
     return None
 
 
-def _temp_state(form: dict[str, Any], field: dict[str, Any]):
-    """(target, profile_temp, (lo, hi)) for a material_dynamic temp control.
-    target is the operator's dialed value, or None while keeping the profile.
-    The stepper state lives in form["temp"] (keyed by field id), separate from
-    the option-index selections so nothing indexes options with a temperature."""
-    mat = _selected_material(form)
-    prof = ((form["schema"].get("temp_current_by_material") or {}).get(mat) or {}).get(field["id"])
-    rng = ((form["schema"].get("temp_range_by_material") or {}).get(mat) or {}).get(field["id"])
-    target = (form.get("temp") or {}).get(field["id"])
-    return target, prof, rng
+def _num(s: Any) -> int | None:
+    """First integer in a value string ('30%' -> 30, '4' -> 4), else None."""
+    if s is None:
+        return None
+    m = re.search(r"-?\d+", str(s))
+    return int(m.group()) if m else None
+
+
+def _stepper_state(form: dict[str, Any], field: dict[str, Any]):
+    """(target, base, (lo, hi), steps, unit) for a stepper control. ``base`` is
+    the value the dial starts from — per-material for a temperature control,
+    per-profile-resolved for a process control (infill/walls/shells). ``target``
+    is the dialed value, or None while keeping the profile. State lives in
+    form["steps"], separate from the option-index selections so nothing indexes
+    an option list with a temperature or a count."""
+    cfg = field.get("stepper") or {}
+    steps = cfg.get("steps", (1,))
+    unit = cfg.get("unit", "")
+    target = (form.get("steps") or {}).get(field["id"])
+    if field.get("material_dynamic"):
+        mat = _selected_material(form)
+        base = ((form["schema"].get("temp_current_by_material") or {}).get(mat) or {}).get(field["id"])
+        rng = ((form["schema"].get("temp_range_by_material") or {}).get(mat) or {}).get(field["id"])
+        lo, hi = (rng[0], rng[1]) if rng else (cfg.get("min", 0), cfg.get("max", 300))
+    else:
+        base = _num(_resolved_for_selected_profile(form).get(field["id"]))
+        lo, hi = cfg.get("min", 0), cfg.get("max", 999)
+    return target, base, (lo, hi), steps, unit
 
 
 def _screen_of(form: dict[str, Any], fid: str) -> list[dict[str, Any]]:
@@ -372,26 +391,25 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
         # repeat it (live 2026-07-15: "Infill 10% / Infill 15% / ..." doubled the
         # text and truncated wider labels at two-up). The default option is first
         # in every advanced field, so the header row lands before the values.
-        if field.get("material_dynamic"):
-            # Temperature: a +/- STEPPER, not option buttons, so the operator can
-            # dial ANY exact value in one row. A full-width header shows the
-            # setting and the current target (tap it to keep the profile); the row
-            # below is [-5][-][+][+5]. The dialed value is clamped to the
-            # material's sourced range. State lives in form["temp"] (see
-            # _temp_state), never in the option-index selections.
-            target, prof, rng = _temp_state(form, field)
-            name = field.get("label", field["id"]).replace(" temperature", "")
+        if field.get("stepper"):
+            # A numeric control (temperature, infill, walls, shells) renders as a
+            # +/- STEPPER so the operator dials ANY exact value in one row. A
+            # full-width header shows the setting and the current target (tap it
+            # to keep the profile); the row below is the steps ([5,1] -> -5/-/+/+5,
+            # [1] -> -/+), clamped to range. State lives in form["steps"].
+            target, base, _rng, steps, unit = _stepper_state(form, field)
+            name = (field.get("label", field["id"]).replace(" temperature", "")
+                    .replace(" density", "").replace(" loops", "").replace(" layers", ""))
             if target is None:
-                head = f"{name}: keep profile" + (f" ({prof}°C)" if prof is not None else "")
+                head = f"{name}: keep profile" + (f" ({base}{unit})" if base is not None else "")
             else:
-                head = f"{name}: {target}°C" + (f"  ·  profile {prof}" if prof is not None else "")
+                head = f"{name}: {target}{unit}" + (f"  ·  profile {base}{unit}" if base is not None else "")
             rows.append([{"text": head, "callback_data": f"T:{fi}:k"}])
-            rows.append([
-                {"text": "−5", "callback_data": f"T:{fi}:-5"},
-                {"text": "−", "callback_data": f"T:{fi}:-1"},
-                {"text": "+", "callback_data": f"T:{fi}:1"},
-                {"text": "+5", "callback_data": f"T:{fi}:5"},
-            ])
+            minus = [{"text": (f"−{s}" if s > 1 else "−"), "callback_data": f"T:{fi}:-{s}"}
+                     for s in sorted(steps, reverse=True)]
+            plus = [{"text": (f"+{s}" if s > 1 else "+"), "callback_data": f"T:{fi}:{s}"}
+                    for s in sorted(steps)]
+            rows.append(minus + plus)
             return rows
         alts: list[dict[str, str]] = []
         for oi, opt in enumerate(field["options"]):
@@ -535,14 +553,16 @@ def _render_review(form: dict[str, Any]) -> dict[str, Any]:
     # jump (e:<fi>), so the group's Next returns straight here.
     adv = _advanced_fields(form)
     if adv:
-        temp = form.get("temp") or {}
+        steps = form.get("steps") or {}
         changed = []
         for f in adv:
-            if f.get("material_dynamic"):       # temperature stepper
-                t = temp.get(f["id"])
+            if f.get("stepper"):                # dialed value (form["steps"])
+                t = steps.get(f["id"])
                 if t is not None:
-                    nm = f.get("label", f["id"]).replace(" temperature", "")
-                    changed.append(f"{nm} {t}°C")
+                    nm = (f.get("label", f["id"]).replace(" temperature", "")
+                          .replace(" density", "").replace(" loops", "").replace(" layers", ""))
+                    unit = (f.get("stepper") or {}).get("unit", "")
+                    changed.append(f"{nm} {t}{unit}")
                 continue
             sel = form["selections"].get(f["id"])
             if sel is not None and _opt_id(f["options"][sel]) != "default":
@@ -707,7 +727,7 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
                            if _opt_id(o) == "default"), None)
                 if di is not None:
                     form["selections"][f["id"]] = di
-            form["temp"] = {}     # also clear the temperature steppers
+            form["steps"] = {}    # also clear every stepper (temp + numeric)
             return {"kind": "rerender"}
         if sub == "c":            # open a category sub-page (g:c:<catkey>)
             catkey = parts[2] if len(parts) > 2 else ""
@@ -717,25 +737,22 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
         return {"kind": "rerender",
                 "warning": f"Stale or invalid button ({_esc(data)})."}
 
-    if kind == "T":               # temperature stepper (T:<fi>:<delta|k>)
+    if kind == "T":               # numeric stepper (T:<fi>:<delta|k>)
         tfi = int(parts[1])
         tfield = fields[tfi]
         tfid = tfield["id"]
         sub = parts[2] if len(parts) > 2 else ""
-        temp = form.setdefault("temp", {})
-        if sub == "k":            # tap the header -> keep the profile temp
-            temp[tfid] = None
+        steps = form.setdefault("steps", {})
+        if sub == "k":            # tap the header -> keep the profile value
+            steps[tfid] = None
             return {"kind": "rerender"}
-        target, prof, rng = _temp_state(form, tfield)
-        base = target if target is not None else (
-            prof if prof is not None else (rng[0] if rng else 0))
+        target, base, (lo, hi), _steps, _unit = _stepper_state(form, tfield)
+        cur = target if target is not None else (base if base is not None else lo)
         try:
-            base += int(sub)
+            cur += int(sub)
         except ValueError:
             return {"kind": "rerender", "warning": f"Bad step ({_esc(sub)})."}
-        if rng:
-            base = max(rng[0], min(base, rng[1]))
-        temp[tfid] = base
+        steps[tfid] = max(lo, min(cur, hi))
         return {"kind": "rerender"}
 
     fi = int(parts[1])
@@ -784,11 +801,16 @@ def _apply_callback_inner(form: dict[str, Any], data: str) -> dict[str, Any]:
             return {"kind": "rerender",
                     "warning": f"Stale button (option {oi} out of range for {_esc(repr(fid))})."}
         form["selections"][fid] = oi
-        # Changing the head/material re-bases the temperature controls (their
-        # valid range + current temp are per material), so a temp dialed for the
-        # old filament must not silently survive — clear the stepper state.
+        # Changing the head/material re-bases the TEMPERATURE steppers (their
+        # valid range is per material), so a temp dialed for the old filament
+        # must not silently survive. The numeric process steppers (infill/walls/
+        # shells) are absolute with fixed ranges, so they stay.
         if fid in ("tool", "material"):
-            form["temp"] = {}
+            _steps = form.get("steps")
+            if _steps:
+                for f in fields:
+                    if f.get("material_dynamic"):
+                        _steps.pop(f["id"], None)
         # A single-select on its own screen advances on tap; one inside a
         # group is a radio — it only marks, the shared Next advances.
         if not field.get("group"):
@@ -806,14 +828,14 @@ def answer_json(form: dict[str, Any]) -> dict[str, Any]:
     omitted so the toolkit applies its defaults / flags required ones.
     """
     out: dict[str, Any] = {}
-    temp = form.get("temp") or {}
+    steps = form.get("steps") or {}
     for field in form["schema"]["fields"]:
         fid = field["id"]
-        # Temperature steppers carry a dialed target in form["temp"], not an
-        # option index. Emit the absolute value when the operator moved it off
-        # the profile; otherwise it's a keep (no override).
-        if field.get("material_dynamic"):
-            t = temp.get(fid)
+        # Steppers carry a dialed target in form["steps"], not an option index.
+        # Emit the absolute value when the operator moved it off the profile;
+        # otherwise it's a keep (no override).
+        if field.get("stepper"):
+            t = steps.get(fid)
             if t is not None:
                 out[fid] = str(t)
             continue

@@ -102,9 +102,14 @@ def test_json_answers_default_means_no_override():
 
 
 def test_json_answers_unknown_advanced_option_fails_loudly():
+    # a categorical control rejects an unknown option id...
     res = u1_form.parse_answers_json(
-        {"tool": "T0", "material": "PLA", "profile": 1, "infill": "37"}, _spec())
-    assert not res["ok"] and any("infill" in e for e in res["errors"])
+        {"tool": "T0", "material": "PLA", "profile": 1, "infill_pattern": "spirograph"}, _spec())
+    assert not res["ok"] and any("infill_pattern" in e for e in res["errors"])
+    # ...and a numeric stepper rejects an out-of-range value (infill max 100)
+    res2 = u1_form.parse_answers_json(
+        {"tool": "T0", "material": "PLA", "profile": 1, "infill": "999"}, _spec())
+    assert not res2["ok"] and any("infill" in e for e in res2["errors"])
 
 
 # ---------- text answers ----------
@@ -180,13 +185,16 @@ def test_renderer_advanced_reached_via_two_level_tweak_menu():
 def test_renderer_answer_json_carries_advanced_ids():
     schema = u1_form.build_form_schema(_spec())
     form = tg.new_form(schema)
-    fi = tg._field_index(form, "walls")
-    three = next(i for i, o in enumerate(tg._field(form, "walls")["options"])
-                 if tg._opt_id(o) == "3")
-    tg.apply_callback(form, f"s:{fi}:{three}")
+    # walls is a stepper: dial it, and the answer carries the dialed value
+    wfi = tg._field_index(form, "walls")
+    tg.apply_callback(form, f"T:{wfi}:1")
+    tg.apply_callback(form, f"T:{wfi}:1")
     out = tg.answer_json(form)
-    assert out["walls"] == "3"
-    assert out["infill"] == "default"  # untouched advanced fields submit their default
+    assert "walls" in out and out["walls"].isdigit()
+    # an untouched categorical control still submits its default;
+    # an untouched stepper submits nothing (keep the profile)
+    assert out.get("infill_pattern") == "default"
+    assert "infill" not in out
 
 
 
@@ -244,15 +252,13 @@ def test_tweak_menu_conditional_supports_and_reset():
               if tg._opt_id(o) == "supports")
     tg.apply_callback(form, f"s:{sfi}:{on}")
     assert "supports" in [k for k, _l, _f in tg._adv_categories(form)]
-    # set a tweak, confirm it counts, then Reset-all clears it
+    # dial a stepper tweak, confirm it counts, then Reset-all clears it
     wfi = tg._field_index(form, "walls")
-    three = next(i for i, o in enumerate(tg._field(form, "walls")["options"])
-                 if tg._opt_id(o) == "3")
-    tg.apply_callback(form, f"s:{wfi}:{three}")
+    tg.apply_callback(form, f"T:{wfi}:1")
     assert tg._adv_changed_count(form, tg._advanced_fields(form)) >= 1
     tg.apply_callback(form, "g:r")
     assert tg._adv_changed_count(form, tg._advanced_fields(form)) == 0
-    assert tg.answer_json(form)["walls"] == "default"
+    assert "walls" not in tg.answer_json(form)
 
 
 def test_every_renderer_callback_is_routable_by_the_gateway():
@@ -419,14 +425,14 @@ def test_advanced_category_uses_bare_values_under_a_header():
             assert "Infill" not in b["text"], f"option repeats setting name: {b['text']}"
 
 
-def test_tweak_menu_keep_profile_label_absent_without_resolved():
-    # No advanced_resolved in the schema -> the generic "profile default" stands.
+def test_stepper_header_without_resolved_shows_no_base():
+    # No advanced_resolved in the schema -> the stepper header has no "(N)" base.
     schema = u1_form.build_form_schema(_spec())
     form = tg.new_form(schema)
     form["current"] = "walls"
     txts = [b["text"] for row in tg.render_screen(form)["keyboard"] for b in row]
-    assert any("Walls: profile default" in t for t in txts)
-    assert not any("keep profile" in t for t in txts)
+    assert any(t.startswith("Wall: keep profile") for t in txts)   # stepper header
+    assert not any("keep profile (" in t for t in txts)            # no resolved value
 
 
 
