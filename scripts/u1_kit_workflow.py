@@ -5754,10 +5754,23 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
 
     # Persist plate + plan state BEFORE any bed-clear routing so _action_start
     # (below) reads plate_filename / gcode_hash / tool / material from state.
+    #
+    # A fresh plan supersedes any bed-clear prompt armed for a PRIOR slice
+    # (request ids are content-derived, so a re-slice reuses the request). Drop
+    # that stale pending NOW, before the bed capture below: a capture failure
+    # must not leave an old prompt the operator could confirm against this new
+    # plan (live 2026-07-18: a short camera frame stranded a rev-4 prompt while
+    # the plan had advanced to rev 5, so the operator's YES redeemed the old
+    # one and the Stage-2 gate refused). On capture success _action_start
+    # re-arms a fresh one. Clearing only ever tightens the gate (a missing
+    # pending refuses), so it is safe.
+    _cleared_safety = dict((u1_request.read_request(request_id) or {}).get("safety") or {})
+    _cleared_safety.pop("pending_bed_clear_start", None)
     persist_phase = "awaiting_confirm" if action == "start" else "complete"
     u1_request.write_request(
         request_id,
         phase=persist_phase,
+        safety=_cleared_safety,
         kit={"parts": kit["parts"], "part_count": kit["part_count"],
              "selected": [p["part_id"] for p in selected], "orient_mode": values.get("orient")},
         plates=plates_state,
