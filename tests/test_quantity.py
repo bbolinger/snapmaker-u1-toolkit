@@ -111,16 +111,14 @@ def test_build_form_spec_marks_recommended_profile(monkeypatch):
 
 # ---------- schema ----------
 
-def test_schema_quantity_field_rides_setup_group():
+def test_schema_quantity_is_a_stepper_on_the_setup_group():
     schema = u1_form.build_form_schema(_spec())
     q = next(f for f in schema["fields"] if f["id"] == "quantity")
-    assert q["type"] == "single_select" and q["label"] == "Quantity"
-    assert q["group"] == "setup" and q["compact"] is True
+    assert q["label"] == "Copies" and q["group"] == "setup"
     assert q["default"] == "1" and q["required"] is False
-    assert [o["id"] for o in q["options"]] == ["1", "2", "3", "4", "6", "9"]
-    # self-describing labels — the shared setup screen shows bare buttons
-    assert q["options"][0]["label"] == "1 copy"
-    assert all("cop" in o["label"] for o in q["options"])
+    # rendered as a +/- stepper (1..50), no longer a capped 1-9 option grid
+    assert q.get("stepper") == {"steps": (5, 1), "unit": "", "min": 1, "max": 50}
+    assert not q.get("advanced")   # a plain top-level count, not a profile override
     # not offered -> absent entirely
     schema2 = u1_form.build_form_schema(_spec(offer=False))
     assert "quantity" not in [f["id"] for f in schema2["fields"]]
@@ -182,10 +180,17 @@ def test_text_repeated_same_quantity_is_harmless():
     assert r["values"]["quantity"] == 3
 
 
-def test_text_unoffered_count_rejected():
+def test_text_in_range_count_now_accepted():
+    # 5 was NOT in the old 1/2/3/4/6/9 grid; the stepper's 1..50 range accepts it
     r = u1_form.parse_answers("T0 | PLA | profile 1 | x5", _spec())
+    assert r["ok"], r["errors"]
+    assert r["values"]["quantity"] == 5
+
+
+def test_text_out_of_range_count_rejected():
+    r = u1_form.parse_answers("T0 | PLA | profile 1 | x99", _spec())
     assert not r["ok"]
-    assert any("quantity 5 not offered" in e for e in r["errors"])
+    assert any("out of range" in e for e in r["errors"])
 
 
 def test_text_quantity_ignored_when_not_offered():
@@ -212,11 +217,18 @@ def test_json_quantity_defaults_to_one():
     assert r["ok"] and r["values"]["quantity"] == 1
 
 
-def test_json_unoffered_count_fails_loudly():
+def test_json_count_past_nine_accepted():
     r = u1_form.parse_answers_json(
-        {"tool": "T0", "material": "PLA", "profile": 1, "quantity": "5"}, _spec())
+        {"tool": "T0", "material": "PLA", "profile": 1, "quantity": "12"}, _spec())
+    assert r["ok"], r["errors"]
+    assert r["values"]["quantity"] == 12
+
+
+def test_json_out_of_range_count_fails_loudly():
+    r = u1_form.parse_answers_json(
+        {"tool": "T0", "material": "PLA", "profile": 1, "quantity": "99"}, _spec())
     assert not r["ok"]
-    assert any("quantity" in e for e in r["errors"])
+    assert any("out of range" in e for e in r["errors"])
 
 
 def test_json_quantity_ignored_when_not_offered():
@@ -246,24 +258,50 @@ def test_echo_parse_shows_quantity_only_when_plural():
 
 # ---------- renderer ----------
 
-def test_renderer_quantity_shares_setup_screen_and_review_echoes():
+def test_renderer_quantity_is_a_stepper_that_dials_past_nine():
     schema = u1_form.build_form_schema(_spec())
     form = tg.new_form(schema)
-    # quantity renders on the SAME screen as orient + supports (no new step)
+    # quantity renders on the SAME screen as supports (no new step)
     screen_ids = [[f["id"] for f in sc] for sc in tg._screens(form)]
     setup = next(sc for sc in screen_ids if "supports" in sc)
     assert "quantity" in setup
-    # default review line reads "1 copy"
-    form["current"] = tg.REVIEW_FIELD
-    assert "1 copy" in tg.render_screen(form)["text"]
-    # pick 3 copies (grouped radio: marks, group Next advances)
     fi = tg._field_index(form, "quantity")
-    three = next(i for i, o in enumerate(tg._field(form, "quantity")["options"])
-                 if tg._opt_id(o) == "3")
-    tg.apply_callback(form, f"s:{fi}:{three}")
+    form["current"] = "quantity"
+    kb = tg.render_screen(form)["keyboard"]
+    # a header showing the current count (tap = reset) + one step row -5/-/+/+5
+    assert any(b.get("callback_data") == f"T:{fi}:k" and "Copies: 1" in b["text"]
+               for row in kb for b in row)
+    step_cbs = [b["callback_data"] for row in kb for b in row
+                if b.get("callback_data", "").startswith(f"T:{fi}:")
+                and b["callback_data"] != f"T:{fi}:k"]
+    assert step_cbs == [f"T:{fi}:-5", f"T:{fi}:-1", f"T:{fi}:1", f"T:{fi}:5"]
+    # dial PAST the old 9 cap: +5 +5 +1 -> 12 (the whole point)
+    tg.apply_callback(form, f"T:{fi}:5")
+    tg.apply_callback(form, f"T:{fi}:5")
+    tg.apply_callback(form, f"T:{fi}:1")
+    assert form["steps"]["quantity"] == 12
+    assert tg.answer_json(form)["quantity"] == "12"
+    # review echoes the dialed count
     form["current"] = tg.REVIEW_FIELD
-    assert "3 copies" in tg.render_screen(form)["text"]
-    assert tg.answer_json(form)["quantity"] == "3"
+    assert "12" in tg.render_screen(form)["text"]
+
+
+def test_renderer_quantity_clamps_and_resets():
+    schema = u1_form.build_form_schema(_spec())
+    form = tg.new_form(schema)
+    fi = tg._field_index(form, "quantity")
+    # can't dial below the floor of 1
+    for _ in range(5):
+        tg.apply_callback(form, f"T:{fi}:-5")
+    assert form["steps"]["quantity"] == 1
+    # clamps at the 50 ceiling
+    for _ in range(20):
+        tg.apply_callback(form, f"T:{fi}:5")
+    assert form["steps"]["quantity"] == 50
+    assert tg.answer_json(form)["quantity"] == "50"
+    # tap the header -> reset to default (omitted from answers -> workflow uses 1)
+    tg.apply_callback(form, f"T:{fi}:k")
+    assert "quantity" not in tg.answer_json(form)
 
 
 # ---------- commit path (workflow) ----------

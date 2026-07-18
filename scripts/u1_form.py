@@ -252,12 +252,14 @@ TEMP_FIELDS = (
 )
 _TEMP_BY_ID = {fid: base_key for fid, _lbl, base_key, _opts in TEMP_FIELDS}
 
-# Numeric advanced controls render as a +/- STEPPER (not an option grid) so the
-# operator dials any exact value. steps = the step buttons offered ([5, 1] gives
+# Numeric controls render as a +/- STEPPER (not an option grid) so the operator
+# dials any exact value. steps = the step buttons offered ([5, 1] gives
 # -5/-/+/+5; [1] gives -/+). unit is the display suffix; for a process override
 # it's also the value suffix ("%" for infill, "" for counts). min/max bound the
 # dial. Temperature fields override their bound per material via
-# temp_range_by_material; the process fields use these fixed bounds.
+# temp_range_by_material; the process fields use these fixed bounds. "quantity"
+# is the odd one out: a plain top-level count (copies), not a profile override,
+# so it dials from the field default (1) with no "keep profile" language.
 _STEPPER = {
     "nozzle_temp":  {"steps": (5, 1), "unit": "°C", "min": 0, "max": 300},
     "bed_temp":     {"steps": (5, 1), "unit": "°C", "min": 0, "max": 120},
@@ -265,6 +267,7 @@ _STEPPER = {
     "walls":        {"steps": (1,),   "unit": "",   "min": 1, "max": 8},
     "top_shell":    {"steps": (1,),   "unit": "",   "min": 0, "max": 15},
     "bottom_shell": {"steps": (1,),   "unit": "",   "min": 0, "max": 15},
+    "quantity":     {"steps": (5, 1), "unit": "",   "min": 1, "max": 50},
 }
 
 # Bare labels for the temp buttons under the per-setting header (mirrors
@@ -285,7 +288,6 @@ QUANTITY_OPTIONS = (
     ("1", "1 copy"), ("2", "2 copies"), ("3", "3 copies"),
     ("4", "4 copies"), ("6", "6 copies"), ("9", "9 copies"),
 )
-_QUANTITY_IDS = {qid for qid, _ in QUANTITY_OPTIONS}
 
 
 _TOOL_RE = re.compile(r"^t([0-9])$", re.IGNORECASE)
@@ -459,12 +461,13 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             m = _QTY_RE.match(tok)
             if m:
                 q = int(next(g for g in m.groups() if g))
-                if str(q) not in _QUANTITY_IDS:
-                    errors.append(
-                        f"quantity {q} not offered "
-                        f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
-                else:
+                _qcfg = _STEPPER["quantity"]
+                if _qcfg["min"] <= q <= _qcfg["max"]:
                     _set(values, "quantity", q, errors, tok)
+                else:
+                    errors.append(
+                        f"quantity {q} out of range "
+                        f"({_qcfg['min']}-{_qcfg['max']})")
                 continue
 
         # Advanced overrides (v2.3), only when the spec offers them. Each maps
@@ -1082,13 +1085,15 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                    "options": [{"id": s, "label": _sup_lbl.get(s, s)} for s in _sup_ordered],
                    "default": "no-supports"})
     # Quantity (v2.3): copies of the lone part — only when the workflow
-    # offered it (single-part jobs). Rides the setup group so it doesn't add
-    # a screen; compact packs the six options two per row.
+    # offered it (single-part jobs). Rides the setup group so it doesn't add a
+    # screen. Renders as a +/- stepper (the old 1-9 option grid capped too low);
+    # options are kept inert so the default resolves and text mode still parses.
     if spec.get("offer_quantity"):
         fields.append({"id": "quantity", "type": "single_select",
-                       "label": "Quantity", "group": _GROUP, "compact": True,
+                       "label": "Copies", "group": _GROUP,
                        "options": [{"id": i, "label": l} for i, l in QUANTITY_OPTIONS],
-                       "default": "1", "required": False})
+                       "default": "1", "required": False,
+                       "stepper": _STEPPER["quantity"]})
     profiles = spec.get("profiles", [])
     if profiles:
         _pfield = {"id": "profile", "type": "single_select", "label": "Print profile",
@@ -1272,16 +1277,21 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
             errors.append(f"unknown action {obj['action']!r}")
 
     # quantity (v2.3) — honored only when the spec offered it (single-part
-    # jobs). Option ids are strings ("1".."9"); a widget can only send an
-    # offered id, so anything else fails loudly.
+    # jobs). The stepper sends an absolute count, so validate against the
+    # control's range rather than a fixed option list.
     if spec.get("offer_quantity") and obj.get("quantity") not in (None, ""):
-        q = str(obj["quantity"]).strip()
-        if q in _QUANTITY_IDS:
-            values["quantity"] = int(q)
+        _qcfg = _STEPPER["quantity"]
+        try:
+            q = int(round(float(str(obj["quantity"]).strip())))
+        except (TypeError, ValueError):
+            errors.append(f"invalid quantity {obj['quantity']!r}")
         else:
-            errors.append(
-                f"quantity {obj['quantity']!r} not offered "
-                f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
+            if _qcfg["min"] <= q <= _qcfg["max"]:
+                values["quantity"] = q
+            else:
+                errors.append(
+                    f"quantity {q} out of range "
+                    f"({_qcfg['min']}-{_qcfg['max']})")
 
     # Advanced overrides (v2.3) — honored only when the spec offered them.
     # "default" (or absent) = no override; anything else must be an offered
