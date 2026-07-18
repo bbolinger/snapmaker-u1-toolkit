@@ -2145,9 +2145,12 @@ def _build_form_spec(kit: dict[str, Any], nozzle: str,
                 continue
             _entry = {}
             _n = _first_int(_flat, "nozzle_temperature")
+            _nf = _first_int(_flat, "nozzle_temperature_initial_layer")
             _b = _first_int(_flat, "hot_plate_temp")
             if _n is not None:
                 _entry["nozzle_temp"] = _n
+            if _nf is not None:
+                _entry["nozzle_temp_first"] = _nf
             if _b is not None:
                 _entry["bed_temp"] = _b
             if _entry:

@@ -114,8 +114,10 @@ ADVANCED_FIELDS = (
      "wall_loops", {"2": "2", "3": "3", "4": "4"}),
     ("brim", "Brim",
      [("default", "Brim: profile default"), ("off", "Brim: off"),
-      ("auto", "Brim: auto")],
-     "brim_type", {"off": "no_brim", "auto": "auto_brim"}),
+      ("outer", "Brim: outer"), ("auto", "Brim: auto"),
+      ("ears", "Brim: mouse ears")],
+     "brim_type", {"off": "no_brim", "outer": "outer_only",
+                   "auto": "auto_brim", "ears": "brim_ears"}),
     ("fuzzy", "Fuzzy skin",
      [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
       ("on", "Fuzzy skin: on (outer walls)")],
@@ -180,7 +182,7 @@ _ADVANCED_SHORT = {
     "infill_pattern": {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
                        "triangles": "triangles", "cubic": "cubic"},
     "walls": {"2": "2", "3": "3", "4": "4"},
-    "brim": {"off": "off", "auto": "auto"},
+    "brim": {"off": "off", "outer": "outer", "auto": "auto", "ears": "mouse ears"},
     "fuzzy": {"off": "off", "on": "on"},
     "top_shell": {"3": "3", "4": "4", "5": "5"},
     "bottom_shell": {"3": "3", "4": "4"},
@@ -198,7 +200,8 @@ def _display_resolved(fid: str, raw: Any) -> str:
     if fid in ("infill", "infill_pattern", "walls", "top_shell", "bottom_shell"):
         return s
     if fid == "brim":
-        return "off" if s in ("", "no_brim") else "on"
+        return {"no_brim": "off", "outer_only": "outer", "auto_brim": "auto",
+                "brim_ears": "mouse ears"}.get(s, "off" if s == "" else s)
     if fid == "fuzzy":
         return "off" if s in ("", "none") else "on"
     if fid == "one_wall_top":
@@ -246,6 +249,9 @@ TEMP_FIELDS = (
     ("nozzle_temp", "Nozzle temperature", "nozzle_temperature",
      (("default", "Nozzle: profile default"),)
      + tuple((str(v), f"Nozzle {v}°C") for v in _NOZZLE_SPAN)),
+    ("nozzle_temp_first", "First-layer nozzle", "nozzle_temperature_initial_layer",
+     (("default", "First-layer nozzle: profile default"),)
+     + tuple((str(v), f"First layer {v}°C") for v in _NOZZLE_SPAN)),
     ("bed_temp", "Bed temperature", "hot_plate_temp",
      (("default", "Bed: profile default"), ("0", "Bed: off"))
      + tuple((str(v), f"Bed {v}°C") for v in _BED_SPAN)),
@@ -262,6 +268,7 @@ _TEMP_BY_ID = {fid: base_key for fid, _lbl, base_key, _opts in TEMP_FIELDS}
 # so it dials from the field default (1) with no "keep profile" language.
 _STEPPER = {
     "nozzle_temp":  {"steps": (5, 1), "unit": "°C", "min": 0, "max": 300},
+    "nozzle_temp_first": {"steps": (5, 1), "unit": "°C", "min": 0, "max": 300},
     "bed_temp":     {"steps": (5, 1), "unit": "°C", "min": 0, "max": 120},
     "infill":       {"steps": (5, 1), "unit": "%",  "min": 5, "max": 100},
     "walls":        {"steps": (1,),   "unit": "",   "min": 1, "max": 8},
@@ -274,6 +281,7 @@ _STEPPER = {
 # _ADVANCED_SHORT for the process controls).
 _ADVANCED_SHORT.update({
     "nozzle_temp": {str(v): f"{v}°C" for v in _NOZZLE_SPAN},
+    "nozzle_temp_first": {str(v): f"{v}°C" for v in _NOZZLE_SPAN},
     "bed_temp": {"0": "off", **{str(v): f"{v}°C" for v in _BED_SPAN}},
 })
 
@@ -298,7 +306,7 @@ _PROFILE_PREFIX_RE = re.compile(r"^(?:profile|preset)\s+(.+)$", re.IGNORECASE)
 # collide with parts/profile numbers.
 _ADV_INFILL_RE = re.compile(r"^infill\s*(\d{1,3})\s*%?$", re.IGNORECASE)
 _ADV_WALLS_RE = re.compile(r"^walls?\s*(\d)$", re.IGNORECASE)
-_ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on)$", re.IGNORECASE)
+_ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on|outer|ears|mouse\s*ears?)$", re.IGNORECASE)
 _ADV_FUZZY_RE = re.compile(r"^fuzzy(?:[\s-]*skin)?(?:\s+(on|off))?$", re.IGNORECASE)
 # NOTE: bare "grid" stays an infill-pattern token (pre-existing grammar);
 # support style needs the word: "tree supports" / "grid supports" / "tree".
@@ -503,8 +511,9 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
                 continue
             m = _ADV_BRIM_RE.match(tok)
             if m:
-                _adv_set("brim", "auto" if m.group(1).lower() == "on"
-                         else m.group(1).lower())
+                _g = m.group(1).lower().replace(" ", "")
+                _adv_set("brim", {"on": "outer", "mouseears": "ears",
+                                  "mouseear": "ears"}.get(_g, _g))
                 continue
             m = _ADV_FUZZY_RE.match(tok)
             if m:
@@ -627,7 +636,7 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
         except (TypeError, ValueError):
             errors.append(f"invalid {_tfid} value {_traw!r}")
             continue
-        if _tbase == "nozzle_temperature":
+        if _tbase in ("nozzle_temperature", "nozzle_temperature_initial_layer"):
             _tok, (_tlo, _thi) = u1_temps.nozzle_in_range(_t_material, _tiv), u1_temps.nozzle_range(_t_material)
         else:
             _tok, (_tlo, _thi) = u1_temps.bed_in_range(_t_material, _tiv), u1_temps.bed_range(_t_material)
@@ -1180,6 +1189,7 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
             # the renderer dependency-free — it just filters to these bounds.
             schema["temp_range_by_material"] = {
                 str(m): {"nozzle_temp": list(u1_temps.nozzle_range(m)),
+                         "nozzle_temp_first": list(u1_temps.nozzle_range(m)),
                          "bed_temp": list(u1_temps.bed_range(m))}
                 for m in _tcm
             }

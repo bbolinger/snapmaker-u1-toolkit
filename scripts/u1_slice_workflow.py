@@ -924,7 +924,8 @@ def apply_profile_overrides(process_path: Path, overrides: dict[str, str],
 # patch the FILAMENT profile — the U1 stores every temp as a single-element list
 # (nozzle_temperature=['220']), so each override is written as ['<value>'] across
 # the key's siblings to keep the filament self-consistent.
-FILAMENT_OVERRIDE_KEYS = ('nozzle_temperature', 'hot_plate_temp')
+FILAMENT_OVERRIDE_KEYS = ('nozzle_temperature', 'nozzle_temperature_initial_layer',
+                          'hot_plate_temp')
 
 # When bed temp is overridden, every plate variant must move together — Orca
 # stamps whichever the active bed_type selects, and _materialize_flat_filament
@@ -963,13 +964,21 @@ def apply_filament_overrides(filament_path: Path, overrides: dict[str, Any],
         except (TypeError, ValueError):
             continue
         clean[k] = (u1_temps.clamp_nozzle(material, iv)
-                    if k == 'nozzle_temperature' else u1_temps.clamp_bed(material, iv))
+                    if k in ('nozzle_temperature', 'nozzle_temperature_initial_layer')
+                    else u1_temps.clamp_bed(material, iv))
     if not clean:
         return filament_path
     data = _flatten_filament_profile(filament_path)
     if 'nozzle_temperature' in clean:
         for key in _NOZZLE_SIBLINGS:
             data[key] = [str(clean['nozzle_temperature'])]
+    if 'nozzle_temperature_initial_layer' in clean:
+        # First-layer nozzle overrides ONLY the initial layer. The main-nozzle
+        # write above set both siblings, so this lets the operator dial a hotter
+        # (or cooler) first layer for adhesion without changing the rest of the
+        # print. Applied after the sibling write so it wins.
+        data['nozzle_temperature_initial_layer'] = [
+            str(clean['nozzle_temperature_initial_layer'])]
     if 'hot_plate_temp' in clean:
         for key in _BED_SIBLINGS:
             data[key] = [str(clean['hot_plate_temp'])]

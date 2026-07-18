@@ -30,10 +30,11 @@ def _spec():
 def test_schema_offers_temperature_fields_and_ranges():
     sch = u1_form.build_form_schema(_spec())
     temp = [f for f in sch["fields"] if f.get("category") == "temperature"]
-    assert [f["id"] for f in temp] == ["nozzle_temp", "bed_temp"]
+    assert [f["id"] for f in temp] == ["nozzle_temp", "nozzle_temp_first", "bed_temp"]
     assert all(f.get("material_dynamic") and f.get("advanced") for f in temp)
     assert {"key": "temperature", "label": "\U0001f525 Temperature"} in sch["advanced_categories"]
     assert sch["temp_range_by_material"]["PLA"]["nozzle_temp"] == [190, 240]
+    assert sch["temp_range_by_material"]["PLA"]["nozzle_temp_first"] == [190, 240]
     assert sch["temp_range_by_material"]["PLA"]["bed_temp"] == [0, 70]
 
 
@@ -44,6 +45,21 @@ def test_parse_in_range_temp_becomes_filament_override():
         {"tool": "T0", "profile": 1, "nozzle_temp": "230", "bed_temp": "0"}, _spec())
     assert res["ok"], res["errors"]
     assert res["values"]["filament_overrides"] == {"nozzle_temperature": 230, "hot_plate_temp": 0}
+
+
+def test_parse_first_layer_nozzle_maps_to_initial_layer_key():
+    res = u1_form.parse_answers_json(
+        {"tool": "T0", "profile": 1, "nozzle_temp": "230", "nozzle_temp_first": "235"}, _spec())
+    assert res["ok"], res["errors"]
+    assert res["values"]["filament_overrides"] == {
+        "nozzle_temperature": 230, "nozzle_temperature_initial_layer": 235}
+
+
+def test_parse_first_layer_nozzle_out_of_range_fails_for_material():
+    res = u1_form.parse_answers_json(
+        {"tool": "T0", "profile": 1, "nozzle_temp_first": "280"}, _spec())  # PLA max 240
+    assert not res["ok"]
+    assert any("out of range for PLA" in e for e in res["errors"])
 
 
 def test_parse_out_of_range_temp_fails_loudly():
