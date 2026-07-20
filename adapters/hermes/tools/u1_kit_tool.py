@@ -395,11 +395,6 @@ def u1_kit_tool(
     return f"{_passthrough}\n{_summary}" if _passthrough else _summary
 
 
-def check_u1_kit_requirements() -> bool:
-    """u1_kit needs the workflow script at the expected deploy path."""
-    return Path(DEFAULT_WORKFLOW_SCRIPT).exists()
-
-
 # =============================================================================
 # Function-calling tool schema
 # =============================================================================
@@ -448,4 +443,4 @@ U1_KIT_SCHEMA = {
 # a runtime-registered toolset can never satisfy). The u1-form plugin registers
 # u1_kit as its own OFFERED toolset via ctx.register_tool (see
 # adapters/hermes/plugin/__init__.py register()). This module just exposes the
-# handler (u1_kit_tool) + schema (U1_KIT_SCHEMA) + check (check_u1_kit_requirements).
+# handler (u1_kit_tool) + schema (U1_KIT_SCHEMA).

@@ -231,8 +231,6 @@ def _audit(request_id: str, event: str, operator: str, **details):
         return None
 
 
-DEFAULT_OUT_BASE=ROOT/'artifacts'/'slice_workflow'
-
 # Mirrored events file for harness/recovery. Set by run_workflow once out_dir
 # is known. Both --json-events stdout AND the human-readable mode write to
 # this file, so the file is always a complete audit trail regardless of how
@@ -568,49 +566,6 @@ def _shell_quote(s: str) -> str:
     if all(c.isalnum() or c in '@/.,_-:=' for c in s):
         return s
     return "'" + s.replace("'", "'\\''") + "'"
-
-
-def _cmd_prefix(script_path: str, model_path: str, args) -> str:
-    """Build the cumulative invocation prefix from args that are already set.
-    Each subsequent need_input's next_command extends this prefix with one
-    more flag + the option's value.
-
-    v2.0 Phase 2: includes --request-id so agent re-invocations pin to the
-    same on-disk request. Recovery via content hash still works without it
-    but explicit --request-id is more robust against context loss + faster
-    (no hash recompute, no directory scan)."""
-    parts = ['python3', script_path, _shell_quote(model_path), '--json-events']
-    # Pin request_id so chained next_command invocations all hit the same
-    # request folder. This is what makes the agent's flow context-loss-resistant.
-    if getattr(args, 'request_id', None):
-        parts += ['--request-id', args.request_id]
-    if getattr(args, 'orient', None):
-        parts += ['--orient', args.orient]
-    if getattr(args, 'tool', None):
-        parts += ['--tool', args.tool]
-    if getattr(args, 'material', None):
-        parts += ['--material', _shell_quote(args.material)]
-    if getattr(args, 'profile', None):
-        parts += ['--profile', _shell_quote(args.profile)]
-    if getattr(args, 'supports', None):
-        parts += ['--supports', args.supports]
-    if getattr(args, 'nozzle', None) and args.nozzle != '0.4':
-        parts += ['--nozzle', args.nozzle]
-    return ' '.join(parts)
-
-def triage_stl(stl: Path)->dict[str,Any]:
-    tris=parse_stl(stl); xmin,xmax,ymin,ymax,zmin,zmax=bbox(tris)
-    vol=(xmax-xmin)*(ymax-ymin)*(zmax-zmin)/1000.0
-    return {'dims_mm':[round(xmax-xmin,2), round(ymax-ymin,2), round(zmax-zmin,2)], 'tris': int(tris.shape[0]), 'bbox_volume_cm3': round(vol,2)}
-
-def choose_default(options: list[dict[str,Any]], supplied: str|None=None):
-    if supplied:
-        for o in options:
-            if supplied == o.get('value') or supplied.lower() in str(o.get('label','')).lower(): return o.get('value')
-        return supplied
-    for o in options:
-        if o.get('recommended'): return o.get('value')
-    return options[0].get('value') if options else None
 
 
 def promote_to_supports_variant(profile_value: str) -> str | None:
@@ -969,7 +924,8 @@ def apply_profile_overrides(process_path: Path, overrides: dict[str, str],
 # patch the FILAMENT profile — the U1 stores every temp as a single-element list
 # (nozzle_temperature=['220']), so each override is written as ['<value>'] across
 # the key's siblings to keep the filament self-consistent.
-FILAMENT_OVERRIDE_KEYS = ('nozzle_temperature', 'hot_plate_temp')
+FILAMENT_OVERRIDE_KEYS = ('nozzle_temperature', 'nozzle_temperature_initial_layer',
+                          'hot_plate_temp')
 
 # When bed temp is overridden, every plate variant must move together — Orca
 # stamps whichever the active bed_type selects, and _materialize_flat_filament
@@ -1008,13 +964,21 @@ def apply_filament_overrides(filament_path: Path, overrides: dict[str, Any],
         except (TypeError, ValueError):
             continue
         clean[k] = (u1_temps.clamp_nozzle(material, iv)
-                    if k == 'nozzle_temperature' else u1_temps.clamp_bed(material, iv))
+                    if k in ('nozzle_temperature', 'nozzle_temperature_initial_layer')
+                    else u1_temps.clamp_bed(material, iv))
     if not clean:
         return filament_path
     data = _flatten_filament_profile(filament_path)
     if 'nozzle_temperature' in clean:
         for key in _NOZZLE_SIBLINGS:
             data[key] = [str(clean['nozzle_temperature'])]
+    if 'nozzle_temperature_initial_layer' in clean:
+        # First-layer nozzle overrides ONLY the initial layer. The main-nozzle
+        # write above set both siblings, so this lets the operator dial a hotter
+        # (or cooler) first layer for adhesion without changing the rest of the
+        # print. Applied after the sibling write so it wins.
+        data['nozzle_temperature_initial_layer'] = [
+            str(clean['nozzle_temperature_initial_layer'])]
     if 'hot_plate_temp' in clean:
         for key in _BED_SIBLINGS:
             data[key] = [str(clean['hot_plate_temp'])]
@@ -1692,36 +1656,6 @@ def _bboxes_differ(stl_a: Path, stl_b: Path, tol_mm: float = 0.5) -> bool:
         return any(abs(a[i] - b[i]) > tol_mm for i in range(3))
     except Exception:
         return True  # if we can't compare, err toward "show both"
-
-def _trim_option_payload(opts: list[dict[str, Any]], keep_keys: tuple[str, ...] = ('label', 'value', 'recommended', 'material', 'loaded', 'supports_status', 'source', 'has_supports')) -> list[dict[str, Any]]:
-    """Strip large/internal fields from need_input option payloads. Notably
-    drops 'path' from profile options (multi-KB file paths the agent doesn't
-    need — workflow resolves by value internally). Token-saving for --json-events
-    consumers; reduces typical preset event from ~3KB to ~500B."""
-    return [{k: v for k, v in o.items() if k in keep_keys} for o in opts]
-
-def write_slice_summary(out_dir: Path, slice_res: dict[str, Any]) -> Path:
-    """Write a terse text summary alongside the gcode. Agents should read this
-    instead of re-parsing the gcode (gcode reads inline 12KB of base64 thumbnail
-    data on every read; this is ~300 bytes)."""
-    meta = slice_res.get('metadata', {})
-    moonraker = (slice_res.get('moonraker_metadata') or {}) if isinstance(slice_res.get('moonraker_metadata'), dict) else {}
-    summary_path = out_dir / 'slice_summary.txt'
-    lines = [
-        f"time         = {slice_res.get('time', '?')}",
-        f"weight_g     = {slice_res.get('weight_g', '?')}",
-        f"layer_count  = {moonraker.get('layer_count', '?')}",
-        f"layer_height = {meta.get('layer_height', '?')}",
-        f"profile      = {meta.get('print_settings_id', '?')}",
-        f"material     = {meta.get('filament_type', '?')}",
-        f"tool_idx     = {slice_res.get('tool_idx', '?')}",
-        f"tool_rewrites= {slice_res.get('tool_rewrites', 0)}",
-        f"thumbnails   = {slice_res.get('thumbnails', {}).get('ok', False)}",
-        f"warnings     = {', '.join(slice_res.get('warnings', [])) or 'none'}",
-        f"gcode        = {slice_res.get('gcode', '?')}",
-    ]
-    summary_path.write_text('\n'.join(lines) + '\n')
-    return summary_path
 
 def run_workflow(args)->dict[str,Any]:
     """v1.4.6 flow: dual-render (source + auto-oriented if different) BEFORE

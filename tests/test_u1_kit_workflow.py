@@ -874,3 +874,44 @@ def test_configured_binding_does_not_warn(tmp_path, monkeypatch, capsys, fake_pr
     events = [json.loads(l) for l in out.splitlines() if l.strip().startswith("{")]
     assert not any(e.get("kind") == "operator_binding_unconfigured"
                    for e in events)
+
+
+def test_reslice_clears_stale_pending_when_bed_capture_fails(
+        tmp_path, monkeypatch, fake_profiles, fake_slice_upload):
+    """A re-slice must invalidate a bed-clear prompt armed for the PRIOR plan.
+
+    Regression (live 2026-07-18): the printer camera returned a truncated frame
+    on a re-slice, so _capture_bed_and_issue_token failed and the start path
+    bailed to the upload-only fallback WITHOUT re-arming, stranding the previous
+    slice's pending. The operator's YES then redeemed that stale prompt against
+    the new plan and the Stage-2 gate refused. Clearing the pending at
+    plan-persist (before the capture) fixes it: after a failed re-slice there is
+    simply NO pending to confirm.
+    """
+    import u1_request
+    zp = _kit_zip(tmp_path, 1)
+    rid = kw.run_kit_workflow(_args(zp))["request_id"]        # create the request
+    # plant a bed-clear prompt as if a PRIOR slice had armed it
+    u1_request.write_request(rid, safety={"pending_bed_clear_start": {
+        "prompt_key": "bed_clear_start", "request_revision": 1,
+        "gcode_hash": "sha256:OLD_PLAN", "nonce": "stale-nonce",
+        "confirm_token": "stale-token"}})
+    assert (u1_request.read_request(rid)["safety"]
+            .get("pending_bed_clear_start")), "planted pending should be present"
+
+    # re-slice with action=start, but the bed camera fails (truncated frame)
+    monkeypatch.setattr(kw, "_capture_bed_and_issue_token", lambda out_dir: {
+        "ok": False, "snapshot_path": None, "token": None,
+        "approval_ttl_seconds": None, "approval_expires_at": None,
+        "captured_at_utc": None,
+        "reason": "IncompleteRead(94992 bytes read, 487 more expected)"})
+    res = kw.run_kit_workflow(_args(
+        zp, request_id=rid, live_upload=True,
+        form_answers="all | T0 | PLA | profile 1 | no-supports | start"))
+
+    # capture failed -> upload-only fallback, NOT a gated start
+    assert res["phase"] == "awaiting_confirm"
+    # ...and the stale pending is GONE, so a YES can't redeem the old plan
+    safety = u1_request.read_request(rid).get("safety") or {}
+    assert "pending_bed_clear_start" not in safety, (
+        "a failed re-slice must not leave the prior slice's pending prompt")

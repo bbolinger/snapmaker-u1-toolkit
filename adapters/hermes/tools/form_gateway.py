@@ -10,11 +10,9 @@ Two paths from the platform adapter:
   1. **Native UI** (button-driven): adapter renders the schema as inline
      keyboards, handles taps in-place, and on Submit calls
      ``resolve_gateway_form(form_id, answer_dict)`` to unblock the agent.
-  2. **Text fallback**: adapter shows the schema's ``text_fallback`` field
-     and the user types the one-line answer; the gateway's
-     ``_handle_message`` intercept resolves with the typed line (sets
-     ``answer = {"_text": "<line>"}``); the form tool can route through
-     ``u1_form.parse_answers`` itself.
+  2. **Text fallback**: the schema also carries a ``text_fallback`` field so
+     an adapter without native UI can present a typed one-line path to the
+     same answer.
 
 Module-level state (same shape as ``clarify_gateway``) so platform adapters
 call ``resolve_gateway_form`` without holding a back-reference to the
@@ -49,15 +47,6 @@ class _FormEntry:
     schema: Dict[str, Any]
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[Dict[str, Any]] = None
-    awaiting_text: bool = False  # set when adapter falls back to text intake
-
-    def signature(self) -> Dict[str, object]:
-        return {
-            "form_id": self.form_id,
-            "session_key": self.session_key,
-            "schema_version": self.schema.get("version"),
-            "fields": [f.get("id") for f in self.schema.get("fields", [])],
-        }
 
 
 _lock = threading.RLock()
@@ -149,41 +138,6 @@ def resolve_gateway_form(form_id: str, answer: Dict[str, Any]) -> bool:
 def cancel_gateway_form(form_id: str) -> bool:
     """Resolve the form with an empty dict — agent treats as 'user cancelled'."""
     return resolve_gateway_form(form_id, {"_cancelled": True})
-
-
-def get_pending_for_session(session_key: str) -> Optional[_FormEntry]:
-    """Return the OLDEST pending form entry for a session, or None.
-
-    Used by the text-fallback intercept in ``_handle_message`` — when a form
-    is awaiting a free-form text response (operator typed instead of
-    tapping), the next user message in that session is captured.
-    """
-    with _lock:
-        ids = _session_index.get(session_key) or []
-        for fid in ids:
-            entry = _entries.get(fid)
-            if entry is None:
-                continue
-            if entry.awaiting_text:
-                return entry
-        return None
-
-
-def mark_awaiting_text(form_id: str) -> bool:
-    """Flip an entry into text-capture mode (operator typed instead of tapping)."""
-    with _lock:
-        entry = _entries.get(form_id)
-        if entry is None:
-            return False
-        entry.awaiting_text = True
-        return True
-
-
-def has_pending(session_key: str) -> bool:
-    """True when this session has at least one pending form entry."""
-    with _lock:
-        ids = _session_index.get(session_key) or []
-        return any(_entries.get(fid) is not None for fid in ids)
 
 
 def clear_session(session_key: str) -> int:
@@ -278,11 +232,6 @@ def get_notify(session_id: str = "") -> Optional[Any]:
     want to check "is the form path installed for this session?" before using
     it."""
     return get_form_callback(session_id)
-
-
-def set_notify(session_id: str, callback: Any) -> None:
-    """Publish the form callback for a session. Alias of set_form_callback."""
-    set_form_callback(session_id, callback)
 
 
 def invoke_form(session_id: str, form_schema: Dict[str, Any]) -> Dict[str, Any]:

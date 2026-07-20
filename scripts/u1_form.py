@@ -114,8 +114,10 @@ ADVANCED_FIELDS = (
      "wall_loops", {"2": "2", "3": "3", "4": "4"}),
     ("brim", "Brim",
      [("default", "Brim: profile default"), ("off", "Brim: off"),
-      ("auto", "Brim: auto")],
-     "brim_type", {"off": "no_brim", "auto": "auto_brim"}),
+      ("outer", "Brim: outer"), ("auto", "Brim: auto"),
+      ("ears", "Brim: mouse ears")],
+     "brim_type", {"off": "no_brim", "outer": "outer_only",
+                   "auto": "auto_brim", "ears": "brim_ears"}),
     ("fuzzy", "Fuzzy skin",
      [("default", "Fuzzy skin: profile default"), ("off", "Fuzzy skin: off"),
       ("on", "Fuzzy skin: on (outer walls)")],
@@ -180,7 +182,7 @@ _ADVANCED_SHORT = {
     "infill_pattern": {"grid": "grid", "gyroid": "gyroid", "honeycomb": "honeycomb",
                        "triangles": "triangles", "cubic": "cubic"},
     "walls": {"2": "2", "3": "3", "4": "4"},
-    "brim": {"off": "off", "auto": "auto"},
+    "brim": {"off": "off", "outer": "outer", "auto": "auto", "ears": "mouse ears"},
     "fuzzy": {"off": "off", "on": "on"},
     "top_shell": {"3": "3", "4": "4", "5": "5"},
     "bottom_shell": {"3": "3", "4": "4"},
@@ -198,7 +200,8 @@ def _display_resolved(fid: str, raw: Any) -> str:
     if fid in ("infill", "infill_pattern", "walls", "top_shell", "bottom_shell"):
         return s
     if fid == "brim":
-        return "off" if s in ("", "no_brim") else "on"
+        return {"no_brim": "off", "outer_only": "outer", "auto_brim": "auto",
+                "brim_ears": "mouse ears"}.get(s, "off" if s == "" else s)
     if fid == "fuzzy":
         return "off" if s in ("", "none") else "on"
     if fid == "one_wall_top":
@@ -246,31 +249,39 @@ TEMP_FIELDS = (
     ("nozzle_temp", "Nozzle temperature", "nozzle_temperature",
      (("default", "Nozzle: profile default"),)
      + tuple((str(v), f"Nozzle {v}°C") for v in _NOZZLE_SPAN)),
+    ("nozzle_temp_first", "First-layer nozzle", "nozzle_temperature_initial_layer",
+     (("default", "First-layer nozzle: profile default"),)
+     + tuple((str(v), f"First layer {v}°C") for v in _NOZZLE_SPAN)),
     ("bed_temp", "Bed temperature", "hot_plate_temp",
      (("default", "Bed: profile default"), ("0", "Bed: off"))
      + tuple((str(v), f"Bed {v}°C") for v in _BED_SPAN)),
 )
 _TEMP_BY_ID = {fid: base_key for fid, _lbl, base_key, _opts in TEMP_FIELDS}
 
-# Numeric advanced controls render as a +/- STEPPER (not an option grid) so the
-# operator dials any exact value. steps = the step buttons offered ([5, 1] gives
+# Numeric controls render as a +/- STEPPER (not an option grid) so the operator
+# dials any exact value. steps = the step buttons offered ([5, 1] gives
 # -5/-/+/+5; [1] gives -/+). unit is the display suffix; for a process override
 # it's also the value suffix ("%" for infill, "" for counts). min/max bound the
 # dial. Temperature fields override their bound per material via
-# temp_range_by_material; the process fields use these fixed bounds.
+# temp_range_by_material; the process fields use these fixed bounds. "quantity"
+# is the odd one out: a plain top-level count (copies), not a profile override,
+# so it dials from the field default (1) with no "keep profile" language.
 _STEPPER = {
     "nozzle_temp":  {"steps": (5, 1), "unit": "°C", "min": 0, "max": 300},
+    "nozzle_temp_first": {"steps": (5, 1), "unit": "°C", "min": 0, "max": 300},
     "bed_temp":     {"steps": (5, 1), "unit": "°C", "min": 0, "max": 120},
     "infill":       {"steps": (5, 1), "unit": "%",  "min": 5, "max": 100},
     "walls":        {"steps": (1,),   "unit": "",   "min": 1, "max": 8},
     "top_shell":    {"steps": (1,),   "unit": "",   "min": 0, "max": 15},
     "bottom_shell": {"steps": (1,),   "unit": "",   "min": 0, "max": 15},
+    "quantity":     {"steps": (5, 1), "unit": "",   "min": 1, "max": 50},
 }
 
 # Bare labels for the temp buttons under the per-setting header (mirrors
 # _ADVANCED_SHORT for the process controls).
 _ADVANCED_SHORT.update({
     "nozzle_temp": {str(v): f"{v}°C" for v in _NOZZLE_SPAN},
+    "nozzle_temp_first": {str(v): f"{v}°C" for v in _NOZZLE_SPAN},
     "bed_temp": {"0": "off", **{str(v): f"{v}°C" for v in _BED_SPAN}},
 })
 
@@ -285,7 +296,6 @@ QUANTITY_OPTIONS = (
     ("1", "1 copy"), ("2", "2 copies"), ("3", "3 copies"),
     ("4", "4 copies"), ("6", "6 copies"), ("9", "9 copies"),
 )
-_QUANTITY_IDS = {qid for qid, _ in QUANTITY_OPTIONS}
 
 
 _TOOL_RE = re.compile(r"^t([0-9])$", re.IGNORECASE)
@@ -296,7 +306,7 @@ _PROFILE_PREFIX_RE = re.compile(r"^(?:profile|preset)\s+(.+)$", re.IGNORECASE)
 # collide with parts/profile numbers.
 _ADV_INFILL_RE = re.compile(r"^infill\s*(\d{1,3})\s*%?$", re.IGNORECASE)
 _ADV_WALLS_RE = re.compile(r"^walls?\s*(\d)$", re.IGNORECASE)
-_ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on)$", re.IGNORECASE)
+_ADV_BRIM_RE = re.compile(r"^brim\s*(off|auto|on|outer|ears|mouse\s*ears?)$", re.IGNORECASE)
 _ADV_FUZZY_RE = re.compile(r"^fuzzy(?:[\s-]*skin)?(?:\s+(on|off))?$", re.IGNORECASE)
 # NOTE: bare "grid" stays an infill-pattern token (pre-existing grammar);
 # support style needs the word: "tree supports" / "grid supports" / "tree".
@@ -459,12 +469,13 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
             m = _QTY_RE.match(tok)
             if m:
                 q = int(next(g for g in m.groups() if g))
-                if str(q) not in _QUANTITY_IDS:
-                    errors.append(
-                        f"quantity {q} not offered "
-                        f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
-                else:
+                _qcfg = _STEPPER["quantity"]
+                if _qcfg["min"] <= q <= _qcfg["max"]:
                     _set(values, "quantity", q, errors, tok)
+                else:
+                    errors.append(
+                        f"quantity {q} out of range "
+                        f"({_qcfg['min']}-{_qcfg['max']})")
                 continue
 
         # Advanced overrides (v2.3), only when the spec offers them. Each maps
@@ -500,8 +511,9 @@ def parse_answers(line: str, spec: dict[str, Any]) -> dict[str, Any]:
                 continue
             m = _ADV_BRIM_RE.match(tok)
             if m:
-                _adv_set("brim", "auto" if m.group(1).lower() == "on"
-                         else m.group(1).lower())
+                _g = m.group(1).lower().replace(" ", "")
+                _adv_set("brim", {"on": "outer", "mouseears": "ears",
+                                  "mouseear": "ears"}.get(_g, _g))
                 continue
             m = _ADV_FUZZY_RE.match(tok)
             if m:
@@ -624,7 +636,7 @@ def _finalize(values: dict[str, Any], spec: dict[str, Any], errors: list[str],
         except (TypeError, ValueError):
             errors.append(f"invalid {_tfid} value {_traw!r}")
             continue
-        if _tbase == "nozzle_temperature":
+        if _tbase in ("nozzle_temperature", "nozzle_temperature_initial_layer"):
             _tok, (_tlo, _thi) = u1_temps.nozzle_in_range(_t_material, _tiv), u1_temps.nozzle_range(_t_material)
         else:
             _tok, (_tlo, _thi) = u1_temps.bed_in_range(_t_material, _tiv), u1_temps.bed_range(_t_material)
@@ -1082,13 +1094,15 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
                    "options": [{"id": s, "label": _sup_lbl.get(s, s)} for s in _sup_ordered],
                    "default": "no-supports"})
     # Quantity (v2.3): copies of the lone part — only when the workflow
-    # offered it (single-part jobs). Rides the setup group so it doesn't add
-    # a screen; compact packs the six options two per row.
+    # offered it (single-part jobs). Rides the setup group so it doesn't add a
+    # screen. Renders as a +/- stepper (the old 1-9 option grid capped too low);
+    # options are kept inert so the default resolves and text mode still parses.
     if spec.get("offer_quantity"):
         fields.append({"id": "quantity", "type": "single_select",
-                       "label": "Quantity", "group": _GROUP, "compact": True,
+                       "label": "Copies", "group": _GROUP,
                        "options": [{"id": i, "label": l} for i, l in QUANTITY_OPTIONS],
-                       "default": "1", "required": False})
+                       "default": "1", "required": False,
+                       "stepper": _STEPPER["quantity"]})
     profiles = spec.get("profiles", [])
     if profiles:
         _pfield = {"id": "profile", "type": "single_select", "label": "Print profile",
@@ -1175,6 +1189,7 @@ def build_form_schema(spec: dict[str, Any], *, submit: dict[str, str] | None = N
             # the renderer dependency-free — it just filters to these bounds.
             schema["temp_range_by_material"] = {
                 str(m): {"nozzle_temp": list(u1_temps.nozzle_range(m)),
+                         "nozzle_temp_first": list(u1_temps.nozzle_range(m)),
                          "bed_temp": list(u1_temps.bed_range(m))}
                 for m in _tcm
             }
@@ -1272,16 +1287,21 @@ def parse_answers_json(obj: dict[str, Any], spec: dict[str, Any]) -> dict[str, A
             errors.append(f"unknown action {obj['action']!r}")
 
     # quantity (v2.3) — honored only when the spec offered it (single-part
-    # jobs). Option ids are strings ("1".."9"); a widget can only send an
-    # offered id, so anything else fails loudly.
+    # jobs). The stepper sends an absolute count, so validate against the
+    # control's range rather than a fixed option list.
     if spec.get("offer_quantity") and obj.get("quantity") not in (None, ""):
-        q = str(obj["quantity"]).strip()
-        if q in _QUANTITY_IDS:
-            values["quantity"] = int(q)
+        _qcfg = _STEPPER["quantity"]
+        try:
+            q = int(round(float(str(obj["quantity"]).strip())))
+        except (TypeError, ValueError):
+            errors.append(f"invalid quantity {obj['quantity']!r}")
         else:
-            errors.append(
-                f"quantity {obj['quantity']!r} not offered "
-                f"(have {', '.join(i for i, _ in QUANTITY_OPTIONS)})")
+            if _qcfg["min"] <= q <= _qcfg["max"]:
+                values["quantity"] = q
+            else:
+                errors.append(
+                    f"quantity {q} out of range "
+                    f"({_qcfg['min']}-{_qcfg['max']})")
 
     # Advanced overrides (v2.3) — honored only when the spec offered them.
     # "default" (or absent) = no override; anything else must be an offered

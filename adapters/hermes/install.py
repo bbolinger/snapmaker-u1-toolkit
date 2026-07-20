@@ -473,16 +473,18 @@ def main(argv=None) -> int:
         return 0
 
     # Install.
-    # Pre-flight (read-only): verify the run.py anchor BEFORE copying any
-    # files. Hermes auto-imports tools/*, so copying first and then failing
-    # the anchor check would leave a partial install — the form tool would
-    # register while run.py stays unwired.
+    # Pre-flight (read-only): note whether the run.py FALLBACK anchor is
+    # present. It no longer gates the install. The u1-form plugin publishes
+    # the form callback itself from its pre_gateway_dispatch hook (the primary,
+    # upgrade-durable path), so a missing anchor only means the belt-and-
+    # suspenders run.py patch is skipped, not a broken form.
     run_txt = run_py.read_text()
-    if RUN_PY_MARKER not in run_txt and RUN_PY_ANCHOR not in run_txt:
-        print(f"ERROR: anchor {RUN_PY_ANCHOR!r} not found in gateway/run.py.")
-        print("       Hermes may have changed the clarify wiring layout. Aborting")
-        print("       before copying anything — no files were modified.")
-        return 2
+    _run_anchor_present = (RUN_PY_MARKER in run_txt or RUN_PY_ANCHOR in run_txt)
+    if not _run_anchor_present:
+        print(f"note: run.py anchor {RUN_PY_ANCHOR!r} not found; skipping the")
+        print("      optional run.py fallback patch. The u1-form plugin publishes")
+        print("      the form callback itself, so the form still works.")
+        print()
 
     print("[1/6] copy tools/ (form_gateway) + remove pre-plugin layout files")
     for name, src in tools_src.items():
@@ -528,22 +530,25 @@ def main(argv=None) -> int:
     print(f"  {_install_hook_plugin(venv_python, hook_plugin_src, dry_run=a.dry_run)}")
 
     print()
-    print("[5/6] patch gateway/run.py (anchor-based, marker-guarded)")
-    status = _patch_run_py(run_py, dry_run=a.dry_run)
-    print(f"  {status}: {run_py}")
-    if status == "anchor-not-found":
-        # Unreachable in practice (pre-flight above checks the same strings),
-        # kept as a belt-and-braces guard against races.
-        print()
-        print(f"  ERROR: anchor {RUN_PY_ANCHOR!r} not found in gateway/run.py.")
-        print("         Hermes may have changed the clarify wiring layout. Aborting.")
-        return 2
-    if status == "malformed-block":
-        print()
-        print("  ERROR: found the u1 begin marker without its end marker in run.py.")
-        print("         Refusing to edit a half-present block — inspect run.py, then")
-        print("         restore the .u1-bak backup or remove the block manually.")
-        return 2
+    print("[5/6] patch gateway/run.py (OPTIONAL fallback; anchor-based, marker-guarded)")
+    if not _run_anchor_present:
+        print("  skipped: no anchor in this Hermes build; the plugin publish covers it")
+    else:
+        status = _patch_run_py(run_py, dry_run=a.dry_run)
+        print(f"  {status}: {run_py}")
+        if status == "anchor-not-found":
+            # Anchor vanished between pre-flight and here (a race). Non-fatal:
+            # the plugin's pre_gateway_dispatch publish carries the form.
+            print("  note: anchor vanished since pre-flight; skipping the fallback")
+            print("        patch. The u1-form plugin publish covers the form.")
+        elif status == "malformed-block":
+            # A half-present prior block (begin marker, no end). _patch_run_py
+            # refused to write it. Non-fatal now that the plugin carries the
+            # form; flag it so the operator can tidy run.py.
+            print("  WARNING: found the u1 begin marker without its end marker in")
+            print("           run.py; left it untouched. Inspect run.py and restore")
+            print("           the .u1-bak backup or remove the block manually. The")
+            print("           plugin publish still carries the form regardless.")
 
     if a.dry_run:
         print()
@@ -556,9 +561,11 @@ def main(argv=None) -> int:
     print(" ", _verify_hook_plugin(venv_python))
 
     print()
-    print("Done. Restart the Hermes gateway so both plugins load and the patched")
-    print("gateway/run.py takes effect. First inbound Telegram message installs")
-    print("send_form on the live adapter class (watch for the")
+    print("Done. Restart the Hermes gateway so the plugins load (and any run.py")
+    print("fallback patch takes effect). Each inbound Telegram message installs")
+    print("send_form on the live adapter class AND publishes the form callback")
+    print("from the plugin, so the form keeps working across Hermes upgrades even")
+    print("if the run.py fallback is absent (watch for the")
     print("'u1-form: TelegramAdapter.send_form installed' log line).")
     return 0
 

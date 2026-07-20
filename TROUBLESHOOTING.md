@@ -95,7 +95,7 @@ You can also pass the original human-readable name; `normalize_value()` canonica
 
 3. **Handwrite a flattened version** of the stock profile. Open the stock JSON, manually copy every field from the inherited parent into the child JSON, drop the `inherits` field. Use `examples/profiles/community_merged_*.json` as the shape reference. Save in `profiles/user/`.
 
-After v1.4.2 the workflow **surfaces** `slice.metadata.print_settings_id` in `slice_summary.txt` (next to the gcode); the **agent** (or you, if you're driving the CLI) should inspect it and compare against the preset you requested. If the names don't match, treat the slice as authoritative about what Orca actually did — Orca silently fell back to a different profile.
+The workflow **surfaces** `slice.metadata.print_settings_id` in the slice result, and it is stamped into the gcode's own metadata next to the file; the **agent** (or you, if you're driving the CLI) should inspect it and compare against the preset you requested. If the names don't match, treat the slice as authoritative about what Orca actually did; it silently fell back to a different profile.
 
 ### `warning` event with `kind:"no_supports_variant"`
 

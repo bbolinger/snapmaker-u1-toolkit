@@ -146,12 +146,46 @@ def start_monitor(host: str, port: int, interval: float) -> list[dict]:
     )
 
 
-def fetch_monitor(host: str, port: int, output: str) -> dict:
-    image = http_get(f"{moonraker_base(host, port)}/server/files/camera/monitor.jpg", timeout=10)
+def _looks_complete_jpeg(image: bytes) -> bool:
+    """A full JPEG starts with SOI (FFD8FF) and ends with EOI (FFD9). The U1
+    camera occasionally returns a frame truncated a few hundred bytes short of
+    the declared length, which passes the SOI check but is missing the EOI."""
+    return (len(image) > 1024 and image[:3] == b"\xff\xd8\xff"
+            and b"\xff\xd9" in image[-16:])
+
+
+def fetch_monitor(host: str, port: int, output: str, attempts: int = 3) -> dict:
+    """Fetch monitor.jpg, retrying on a truncated / transient read.
+
+    The U1's MJPEG endpoint intermittently closes the connection a few hundred
+    bytes short of the declared Content-Length (http.client.IncompleteRead) or
+    hands back a JPEG missing its end-of-image marker. A single short frame must
+    NOT abort a gated start (live 2026-07-18: a 487-byte-short frame refused a
+    real print), so re-GET a few times before giving up. Persistent failure
+    still raises so the caller stays fail-closed."""
+    url = f"{moonraker_base(host, port)}/server/files/camera/monitor.jpg"
+    last_exc: Exception | None = None
+    image = b""
+    for attempt in range(1, attempts + 1):
+        try:
+            image = http_get(url, timeout=10)
+        except Exception as exc:  # IncompleteRead, timeout, connection reset
+            last_exc, image = exc, b""
+        if _looks_complete_jpeg(image):
+            break
+        if attempt < attempts:
+            time.sleep(0.5 * attempt)
+    else:
+        if last_exc is not None:
+            raise last_exc
+        raise ValueError(
+            f"camera returned {len(image)} bytes but never a complete JPEG "
+            f"in {attempts} attempts (truncated frame)")
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(image)
-    return {"output": str(out), "bytes": len(image), "jpeg_magic": image[:3] == b"\xff\xd8\xff"}
+    return {"output": str(out), "bytes": len(image),
+            "jpeg_magic": image[:3] == b"\xff\xd8\xff"}
 
 
 def capture_photo(host: str, port: int, output: str,

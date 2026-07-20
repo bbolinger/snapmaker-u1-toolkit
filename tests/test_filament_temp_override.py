@@ -46,6 +46,34 @@ def test_override_patches_both_layers_and_all_bed_plates(tmp_path):
     assert out != src
 
 
+def test_first_layer_nozzle_overrides_only_the_initial_layer(tmp_path):
+    src = _write_filament(tmp_path)   # profile nozzle 245, initial 250
+    # main nozzle sets both siblings, then the separate first-layer value wins
+    # on the initial-layer key
+    out = wf.apply_filament_overrides(
+        src, {"nozzle_temperature": 235, "nozzle_temperature_initial_layer": 245},
+        tmp_path, material="PETG")
+    d = json.loads(out.read_text())
+    assert d["nozzle_temperature"] == ["235"]                  # main layer
+    assert d["nozzle_temperature_initial_layer"] == ["245"]    # first layer, independent
+
+
+def test_first_layer_nozzle_alone_leaves_main_at_profile(tmp_path):
+    src = _write_filament(tmp_path)   # profile nozzle 245, initial 250
+    out = wf.apply_filament_overrides(
+        src, {"nozzle_temperature_initial_layer": 240}, tmp_path, material="PETG")
+    d = json.loads(out.read_text())
+    assert d["nozzle_temperature"] == ["245"]                  # untouched profile value
+    assert d["nozzle_temperature_initial_layer"] == ["240"]    # only the first layer moved
+
+
+def test_first_layer_nozzle_clamps_to_material_envelope(tmp_path):
+    src = _write_filament(tmp_path)
+    out = wf.apply_filament_overrides(
+        src, {"nozzle_temperature_initial_layer": 999}, tmp_path, material="PETG")
+    assert json.loads(out.read_text())["nozzle_temperature_initial_layer"] == ["270"]  # PETG max
+
+
 def test_override_clamps_out_of_range_to_material_envelope(tmp_path):
     src = _write_filament(tmp_path)
     # PETG nozzle max is 270, bed max 90 (u1_temps)

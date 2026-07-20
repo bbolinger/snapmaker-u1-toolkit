@@ -74,7 +74,8 @@ def test_schema_offers_advanced_fields_flagged():
     adv = [f for f in schema["fields"] if f.get("advanced")]
     assert [f["id"] for f in adv] == ["infill", "infill_pattern", "walls", "brim", "fuzzy",
                                       "top_shell", "bottom_shell", "one_wall_top", "raft",
-                                      "support_style", "nozzle_temp", "bed_temp"]
+                                      "support_style", "nozzle_temp", "nozzle_temp_first",
+                                      "bed_temp"]
     assert all(f["group"] == "advanced" and f["default"] == "default" for f in adv)
     # not offered -> absent entirely
     schema2 = u1_form.build_form_schema(_spec(offer=False))
@@ -99,6 +100,26 @@ def test_json_answers_default_means_no_override():
         {"parts": "all", "tool": "T0", "material": "PLA", "profile": 1,
          "infill": "default", "brim": "default"}, _spec())
     assert res["ok"] and "overrides" not in res["values"]
+
+
+def test_brim_types_map_to_all_orca_values():
+    # the U1 Orca fork has exactly these four brim_type values
+    for pick, orca in (("off", "no_brim"), ("outer", "outer_only"),
+                       ("auto", "auto_brim"), ("ears", "brim_ears")):
+        res = u1_form.parse_answers_json(
+            {"parts": "all", "tool": "T0", "material": "PLA", "profile": 1,
+             "brim": pick}, _spec())
+        assert res["ok"], (pick, res["errors"])
+        assert res["values"]["overrides"]["brim_type"] == orca, pick
+
+
+def test_brim_text_tokens_cover_the_types():
+    for tok, orca in (("brim off", "no_brim"), ("brim outer", "outer_only"),
+                      ("brim on", "outer_only"), ("brim ears", "brim_ears"),
+                      ("brim mouse ears", "brim_ears"), ("brim auto", "auto_brim")):
+        res = u1_form.parse_answers(f"all | T0 | PLA | profile 1 | {tok}", _spec())
+        assert res["ok"], (tok, res["errors"])
+        assert res["values"]["overrides"]["brim_type"] == orca, tok
 
 
 def test_json_answers_unknown_advanced_option_fails_loudly():
@@ -215,7 +236,8 @@ def test_advanced_buttons_self_describing_and_review_not_duplicated():
                "brim": "Brim", "fuzzy": "Fuzzy", "support_style": "Support",
                "top_shell": "Top", "bottom_shell": "Bottom",
                "one_wall_top": "One wall", "raft": "Raft",
-               "nozzle_temp": "Nozzle", "bed_temp": "Bed"}[f["id"]]
+               "nozzle_temp": "Nozzle", "nozzle_temp_first": "First",
+               "bed_temp": "Bed"}[f["id"]]
         assert all(key in tg._opt_label(o) for o in f["options"]), f["id"]
     # Review: exactly ONE advanced-related button (opens the tweak menu), and
     # NO per-advanced-field Edit rows.

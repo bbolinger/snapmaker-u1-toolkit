@@ -266,8 +266,13 @@ def _stepper_state(form: dict[str, Any], field: dict[str, Any]):
         base = ((form["schema"].get("temp_current_by_material") or {}).get(mat) or {}).get(field["id"])
         rng = ((form["schema"].get("temp_range_by_material") or {}).get(mat) or {}).get(field["id"])
         lo, hi = (rng[0], rng[1]) if rng else (cfg.get("min", 0), cfg.get("max", 300))
-    else:
+    elif field.get("advanced"):
         base = _num(_resolved_for_selected_profile(form).get(field["id"]))
+        lo, hi = cfg.get("min", 0), cfg.get("max", 999)
+    else:
+        # A plain top-level count (e.g. Copies): the dial starts at the field's
+        # own default; there is no profile to resolve against.
+        base = _num(field.get("default"))
         lo, hi = cfg.get("min", 0), cfg.get("max", 999)
     return target, base, (lo, hi), steps, unit
 
@@ -304,6 +309,14 @@ def _paginate(opts: list, page: int, size: int) -> tuple[list, int, int]:
 
 def _selection_label_for(form: dict[str, Any], field: dict[str, Any]) -> str:
     """Human-readable echo of a field's current selection (for the review card)."""
+    if field.get("stepper"):
+        # A stepper carries its value in form["steps"], not an option index.
+        t = (form.get("steps") or {}).get(field["id"])
+        unit = (field.get("stepper") or {}).get("unit", "")
+        if t is not None:
+            return f"{t}{unit}"
+        d = field.get("default")
+        return f"{d}{unit} (default)" if d not in (None, "") else "not set"
     val = form["selections"].get(field["id"])
     opts = field["options"]
     if field["type"] == "multi_select":
@@ -384,6 +397,32 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
     # its alternatives pack two-up beneath. Keeps each setting a scannable unit
     # instead of a tall column of every option (live 2026-07-15: the flat stack
     # read as "a fat chunk of info"). Advanced fields never paginate (<=7 opts).
+    # Numeric controls render as a +/- STEPPER so the operator dials ANY exact
+    # value in one row. A full-width header shows the current value; the row
+    # below is the steps ([5,1] -> -5/-/+/+5, [1] -> -/+), clamped to range.
+    # State lives in form["steps"]. This handles both an advanced override
+    # (base = the profile's resolved value, tap the header to keep it) and a
+    # plain top-level count like Copies (base = the field default, no profile
+    # language, tap the header to reset to the default). Works on a grouped
+    # screen too, so Copies sits inline with the other setup questions.
+    if field.get("stepper"):
+        target, base, _rng, steps, unit = _stepper_state(form, field)
+        name = (field.get("label", field["id"]).replace(" temperature", "")
+                .replace(" density", "").replace(" loops", "").replace(" layers", ""))
+        if not field.get("advanced"):
+            val = target if target is not None else base
+            head = f"{name}: {val}{unit}"
+        elif target is None:
+            head = f"{name}: keep profile" + (f" ({base}{unit})" if base is not None else "")
+        else:
+            head = f"{name}: {target}{unit}" + (f"  ·  profile {base}{unit}" if base is not None else "")
+        rows.append([{"text": head, "callback_data": f"T:{fi}:k"}])
+        minus = [{"text": (f"−{s}" if s > 1 else "−"), "callback_data": f"T:{fi}:-{s}"}
+                 for s in sorted(steps, reverse=True)]
+        plus = [{"text": (f"+{s}" if s > 1 else "+"), "callback_data": f"T:{fi}:{s}"}
+                for s in sorted(steps)]
+        rows.append(minus + plus)
+        return rows
     if field.get("advanced"):
         # A full-width HEADER (the setting name + its current value; tap = keep
         # the profile default) followed by the alternatives as BARE values three-
@@ -391,26 +430,6 @@ def _field_control_rows(form: dict[str, Any], field: dict[str, Any],
         # repeat it (live 2026-07-15: "Infill 10% / Infill 15% / ..." doubled the
         # text and truncated wider labels at two-up). The default option is first
         # in every advanced field, so the header row lands before the values.
-        if field.get("stepper"):
-            # A numeric control (temperature, infill, walls, shells) renders as a
-            # +/- STEPPER so the operator dials ANY exact value in one row. A
-            # full-width header shows the setting and the current target (tap it
-            # to keep the profile); the row below is the steps ([5,1] -> -5/-/+/+5,
-            # [1] -> -/+), clamped to range. State lives in form["steps"].
-            target, base, _rng, steps, unit = _stepper_state(form, field)
-            name = (field.get("label", field["id"]).replace(" temperature", "")
-                    .replace(" density", "").replace(" loops", "").replace(" layers", ""))
-            if target is None:
-                head = f"{name}: keep profile" + (f" ({base}{unit})" if base is not None else "")
-            else:
-                head = f"{name}: {target}{unit}" + (f"  ·  profile {base}{unit}" if base is not None else "")
-            rows.append([{"text": head, "callback_data": f"T:{fi}:k"}])
-            minus = [{"text": (f"−{s}" if s > 1 else "−"), "callback_data": f"T:{fi}:-{s}"}
-                     for s in sorted(steps, reverse=True)]
-            plus = [{"text": (f"+{s}" if s > 1 else "+"), "callback_data": f"T:{fi}:{s}"}
-                    for s in sorted(steps)]
-            rows.append(minus + plus)
-            return rows
         alts: list[dict[str, str]] = []
         for oi, opt in enumerate(field["options"]):
             oid = _opt_id(opt)
