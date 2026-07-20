@@ -17,17 +17,29 @@ Delivery pieces:
     hook that patches ``send_form`` onto the LIVE Telegram adapter class.
   * ``telegram_patch.py`` — the class-level patch (inline-keyboard
     renderer, callback router, answers-file writer).
-  * The gateway's ``run.py`` anchor patch (applied by ``install.py``)
-    publishes a per-turn form callback into ``tools.form_gateway`` keyed
-    by ``agent.session_id`` — the same value Hermes' registry dispatch
-    passes to tool handlers. That bridge exists because generic dispatch
-    hands handlers only (task_id, session_id, user_task): there is no
-    callback kwarg and no agent reference, so an ``agent.form_callback``
-    attribute alone is unreachable from a registered tool.
+  * The per-turn form callback published into ``tools.form_gateway``.
+    A registered tool cannot reach it any other way: generic dispatch
+    hands handlers only (task_id, session_id, user_task), with no callback
+    kwarg and no agent reference, so an ``agent.form_callback`` attribute
+    alone is unreachable. Two publishers, primary + fallback:
+      1. PRIMARY (upgrade-durable): ``_pre_gateway_dispatch`` builds the
+         callback from its own context (live adapter + inbound chat_id +
+         gateway loop) and publishes it every inbound message. The plugin
+         lives on the persistent volume, so this survives a Hermes package
+         upgrade that replaces ``gateway/run.py``.
+      2. FALLBACK (older Hermes): the ``run.py`` anchor patch applied by
+         ``install.py`` publishes the same callback from the gateway's
+         per-turn locals. Kept for Hermes builds whose dispatch context is
+         thinner than the primary path needs. Last-writer-wins per turn;
+         both build an equivalent callback, so they coexist safely.
+    Publishing only renders the operator FORM; it is not the print-start
+    boundary (that stays in ``u1_print_start_gate.py``, untouched), so
+    where the callback is wired has no bearing on model-free confirm.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Callable, Dict, Optional
@@ -196,6 +208,104 @@ FORM_SCHEMA = {
 # fires before agent dispatch on every inbound message, so send_form exists
 # before any form callback can run.
 
+def _acquire_loop():
+    """The gateway event loop, captured while we are ON it.
+
+    ``pre_gateway_dispatch`` runs synchronously inside the gateway's async
+    dispatch coroutine, so ``get_running_loop()`` returns the loop the
+    adapter's ``send_form`` coroutine must be scheduled on. Returns None when
+    no loop runs in this thread (e.g. unit tests, or a future Hermes that
+    dispatches hooks off-loop) so the caller skips the plugin publish and
+    lets the run.py fallback carry the turn."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _make_form_callback(adapter, chat_id, session_key, loop):
+    """Build the per-turn form callback the u1_kit / form tool invokes.
+
+    Same contract as the gateway run.py patch's ``_form_callback_sync``, but
+    sourced from the plugin's own dispatch context so it survives a Hermes
+    upgrade that replaces run.py: render ``form_schema`` via the patched
+    adapter's ``send_form``, block on the form_gateway primitive, return the
+    answer dict. Fail-soft: every failure path returns an ``{"_error": ...}``
+    dict (the driving tool surfaces it) and never raises."""
+    def _callback(form_schema):
+        import uuid
+        from tools import form_gateway as _fmod
+        if not hasattr(adapter, "send_form"):
+            return {"_error": "active adapter has no send_form (plugin not loaded?)"}
+        form_id = uuid.uuid4().hex[:10]
+        _fmod.register(form_id, session_key or "", form_schema)
+        try:
+            adapter.pause_typing_for_chat(chat_id)
+        except Exception:
+            pass
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                adapter.send_form(
+                    chat_id=chat_id, form_schema=form_schema,
+                    form_id=form_id, session_key=session_key or "",
+                    metadata=None,
+                ),
+                loop,
+            )
+        except Exception as exc:
+            _fmod.clear_session(session_key or "")
+            return {"_error": f"form prompt could not be scheduled: {exc}"}
+        try:
+            send_result = fut.result(timeout=15)
+            if not getattr(send_result, "success", False):
+                _fmod.clear_session(session_key or "")
+                return {"_error": "form prompt send failed"}
+        except Exception as exc:
+            logger.warning("u1-form: form send failed: %s", exc)
+            _fmod.clear_session(session_key or "")
+            return {"_error": f"form send exception: {exc}"}
+        response = _fmod.wait_for_response(
+            form_id, timeout=float(_fmod.get_form_timeout()))
+        if response is None:
+            return {"_timeout": True}
+        return response
+    return _callback
+
+
+def _publish_form_callback(adapter, event, session_store) -> bool:
+    """Publish a per-turn form callback into tools.form_gateway from the
+    plugin's own dispatch context (the upgrade-durable primary path).
+
+    Best-effort and fail-soft: any missing ingredient (no addressable chat,
+    not on the gateway loop, form_gateway absent) just returns False and
+    leaves the run.py fallback, where present, to carry the turn. Returns
+    True when a callback was published."""
+    source = getattr(event, "source", None)
+    chat_id = getattr(source, "chat_id", None)
+    if source is None or chat_id is None:
+        return False  # internal / None event; no chat to address
+    loop = _acquire_loop()
+    if loop is None:
+        return False  # not on the gateway loop; run.py fallback carries it
+    try:
+        from tools import form_gateway
+    except ImportError:
+        return False
+    session_key = ""
+    try:
+        gen = getattr(session_store, "_generate_session_key", None)
+        if gen is not None:
+            session_key = gen(source) or ""
+    except Exception:
+        # A private-API drift just means we key on "" -> form_gateway's
+        # __default__ (latest registration) resolves it for a single
+        # operator, exactly as the run.py path already relies on.
+        session_key = ""
+    form_gateway.set_form_callback(
+        session_key, _make_form_callback(adapter, chat_id, session_key, loop))
+    return True
+
+
 def _pre_gateway_dispatch(**kwargs: Any) -> None:
     try:
         from . import telegram_patch
@@ -223,6 +333,19 @@ def _pre_gateway_dispatch(**kwargs: Any) -> None:
                         except Exception:
                             logger.warning("u1-form: proactive callback-handler "
                                            "registration failed", exc_info=True)
+                    # PRIMARY form-callback publish (upgrade-durable). Builds
+                    # the callback from this dispatch context and publishes it
+                    # into form_gateway so the form works even when a Hermes
+                    # upgrade has wiped the run.py fallback patch. Fail-soft:
+                    # a False return (no chat / off-loop) just leaves the
+                    # run.py fallback to carry the turn where it is present.
+                    try:
+                        _publish_form_callback(
+                            adapter, kwargs.get("event"),
+                            kwargs.get("session_store"))
+                    except Exception:
+                        logger.warning("u1-form: form-callback publish failed",
+                                       exc_info=True)
     except Exception:
         logger.warning("u1-form: pre_gateway_dispatch patch attempt failed",
                        exc_info=True)

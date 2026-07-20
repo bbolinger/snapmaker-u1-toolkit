@@ -564,6 +564,186 @@ def test_pre_dispatch_survives_registration_error(monkeypatch, tmp_path):
     assert mod._pre_gateway_dispatch(gateway=_Gw(), event=None) is None
 
 
+# --------------------------------------------------------------------------- #
+# PRIMARY (upgrade-durable) form-callback publish. The plugin publishes the
+# form callback from pre_gateway_dispatch itself, from its own dispatch
+# context (live adapter + inbound chat_id + gateway loop), so the form keeps
+# working after a Hermes package upgrade wipes the run.py fallback patch.
+# These prove the publish happens with NO run.py involvement.
+# --------------------------------------------------------------------------- #
+
+class _Src:
+    def __init__(self, chat_id="c1"):
+        self.chat_id = chat_id
+
+
+class _Event:
+    def __init__(self, chat_id="c1"):
+        self.source = _Src(chat_id)
+
+
+class _SessionStore:
+    def _generate_session_key(self, source):
+        return "sess-" + str(getattr(source, "chat_id", "?"))
+
+
+def _telegram_gw(adapter):
+    class _Gw:
+        adapters = {"telegram": adapter}
+    return _Gw()
+
+
+def test_pre_dispatch_publishes_form_callback_without_run_py(monkeypatch, tmp_path):
+    """After an inbound message, form_gateway resolves a callback for the
+    session, wired by the plugin, not by any run.py patch."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+    fg = _fake_form_gateway(monkeypatch)
+    monkeypatch.setattr(mod, "_acquire_loop", lambda: object())  # sentinel loop
+
+    class _Adapter:
+        def send_form(self, **kw):
+            return None
+
+        def _u1_ensure_cb_handler(self):
+            pass
+
+    mod._pre_gateway_dispatch(gateway=_telegram_gw(_Adapter()),
+                              event=_Event("c1"), session_store=_SessionStore())
+    assert fg.get_form_callback("sess-c1") is not None, (
+        "pre_gateway_dispatch must publish the form callback keyed by session")
+    # __default__ also set, so the kit path (which resolves via the contextvar
+    # session key, not agent.session_id) keeps working on a mismatch.
+    assert fg.get_form_callback("some-other-session") is not None
+
+
+def test_pre_dispatch_publish_noop_for_internal_event(monkeypatch, tmp_path):
+    """event=None (internal / non-addressable) publishes nothing and never
+    crashes; the existing cancel-handler path still runs."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+    fg = _fake_form_gateway(monkeypatch)
+    monkeypatch.setattr(mod, "_acquire_loop", lambda: object())
+
+    class _Adapter:
+        def send_form(self, **kw):
+            return None
+
+        def _u1_ensure_cb_handler(self):
+            pass
+
+    mod._pre_gateway_dispatch(gateway=_telegram_gw(_Adapter()),
+                              event=None, session_store=_SessionStore())
+    assert fg.get_form_callback("") is None  # registry stays empty
+
+
+def test_pre_dispatch_publish_skipped_off_loop(monkeypatch, tmp_path):
+    """With no running gateway loop (older Hermes / off-loop dispatch) the
+    plugin skips its publish and leaves the run.py fallback to carry it."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _patch_ensure(monkeypatch)
+    fg = _fake_form_gateway(monkeypatch)
+    monkeypatch.setattr(mod, "_acquire_loop", lambda: None)
+
+    class _Adapter:
+        def send_form(self, **kw):
+            return None
+
+        def _u1_ensure_cb_handler(self):
+            pass
+
+    mod._pre_gateway_dispatch(gateway=_telegram_gw(_Adapter()),
+                              event=_Event("c1"), session_store=_SessionStore())
+    assert fg.get_form_callback("sess-c1") is None
+
+
+def _rich_form_gateway(monkeypatch):
+    """tools.form_gateway fake with the full deterministic surface the
+    published callback drives (register/wait/clear/timeout)."""
+    fg = types.ModuleType("tools.form_gateway")
+    fg.events = []
+    fg.register = lambda fid, sk, sch: fg.events.append(("register", fid, sk))
+    fg.clear_session = lambda sk: fg.events.append(("clear", sk))
+    fg.get_form_timeout = lambda: 1.0
+    fg.wait_for_response = lambda fid, timeout: {"tool": "T0"}
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.form_gateway = fg
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.form_gateway", fg)
+    return fg
+
+
+def test_make_form_callback_renders_and_returns_answer(monkeypatch, tmp_path):
+    """The published callback: register -> schedule send_form on the loop ->
+    confirm the send succeeded -> block for the operator's answer -> return."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _rich_form_gateway(monkeypatch)
+    sent = {}
+
+    class _Adapter:
+        def send_form(self, **kw):
+            sent.update(kw)
+            return "coro"  # only handed to the (faked) scheduler; never awaited
+
+        def pause_typing_for_chat(self, chat_id):
+            sent["paused"] = chat_id
+
+    class _Fut:
+        def result(self, timeout):
+            return types.SimpleNamespace(success=True, message_id="m1")
+
+    monkeypatch.setattr(mod.asyncio, "run_coroutine_threadsafe",
+                        lambda coro, loop: _Fut())
+
+    cb = mod._make_form_callback(_Adapter(), "chatX", "sessX", object())
+    ans = cb({"version": 1, "fields": [{"id": "tool"}]})
+    assert ans == {"tool": "T0"}
+    assert sent["chat_id"] == "chatX" and sent["session_key"] == "sessX"
+    assert sent["metadata"] is None            # single-operator DM; no topic
+    assert sent.get("paused") == "chatX"
+    assert any(e[0] == "register" for e in fg.events)
+
+
+def test_make_form_callback_reports_send_failure(monkeypatch, tmp_path):
+    """A failed send returns an _error dict and clears the pending form; the
+    driving tool surfaces it, and nothing hangs."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    fg = _rich_form_gateway(monkeypatch)
+
+    class _Adapter:
+        def send_form(self, **kw):
+            return "coro"
+
+        def pause_typing_for_chat(self, chat_id):
+            pass
+
+    class _Fut:
+        def result(self, timeout):
+            return types.SimpleNamespace(success=False)
+
+    monkeypatch.setattr(mod.asyncio, "run_coroutine_threadsafe",
+                        lambda coro, loop: _Fut())
+
+    cb = mod._make_form_callback(_Adapter(), "chatX", "sessX", object())
+    out = cb({"version": 1, "fields": [{"id": "tool"}]})
+    assert "_error" in out
+    assert any(e[0] == "clear" for e in fg.events)
+
+
+def test_make_form_callback_errors_without_send_form(monkeypatch, tmp_path):
+    """An adapter that never got send_form patched yields a clean error, not a
+    crash (plugin-not-loaded guard)."""
+    mod = _load_plugin_pkg(monkeypatch, tmp_path)
+    _rich_form_gateway(monkeypatch)
+
+    class _Adapter:
+        pass  # no send_form
+
+    cb = mod._make_form_callback(_Adapter(), "chatX", "sessX", object())
+    out = cb({"version": 1, "fields": [{"id": "tool"}]})
+    assert "_error" in out and "send_form" in out["_error"]
+
+
 def _fake_form_gateway(monkeypatch):
     """Stand-in for tools.form_gateway with the callback registry surface."""
     fg = types.ModuleType("tools.form_gateway")
@@ -1042,28 +1222,35 @@ def test_install_removes_pre_plugin_layout_files(tmp_path, monkeypatch):
     assert not (sp / "tools" / "u1_form_telegram.py").exists()
 
 
-def test_install_aborts_before_copying_when_anchor_missing(tmp_path, monkeypatch):
-    """Unrecognized Hermes: the (read-only) anchor check must run BEFORE any
-    file copy — otherwise Hermes auto-imports an orphaned half-install."""
+def test_install_continues_when_anchor_missing(tmp_path, monkeypatch):
+    """Unrecognized Hermes (no clarify anchor): the run.py FALLBACK patch is
+    skipped, but the install still SUCCEEDS and deploys the plugin. The plugin
+    publishes the form callback itself, so the form works without the run.py
+    edit (that is the whole upgrade-durability point)."""
     venv, sp, run_py = _fake_hermes(
         tmp_path, monkeypatch,
         run_py_text="def start():\n    pass  # layout changed upstream\n")
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
     rc = hermes_install.main(["--venv", str(venv)])
-    assert rc == 2
-    assert list((sp / "tools").iterdir()) == []          # nothing copied
-    assert not (tmp_path / "hermes-home").exists()       # no plugin deployed
-    assert run_py.read_text().startswith("def start()")  # untouched
+    assert rc == 0                                        # non-fatal now
+    assert (sp / "tools" / "form_gateway.py").exists()    # tools copied
+    assert (tmp_path / "hermes-home" / "plugins" / "u1-form").exists()  # plugin deployed
+    assert run_py.read_text().startswith("def start()")   # untouched (no anchor)
     assert not run_py.with_suffix(run_py.suffix + ".u1-bak").exists()
 
 
-def test_install_refuses_malformed_marker_block(tmp_path, monkeypatch):
-    """Begin marker without end marker: never edit blind."""
+def test_install_warns_but_continues_on_malformed_marker_block(tmp_path, monkeypatch):
+    """Begin marker without end marker: never edit blind, but no longer fatal.
+    The plugin publish carries the form, so the install completes and leaves
+    the malformed run.py untouched for the operator to tidy."""
     venv, sp, run_py = _fake_hermes(tmp_path, monkeypatch)
-    run_py.write_text(_STOCK_RUN_PY + "\n" + hermes_install.RUN_PY_MARKER + "\n")
+    original = _STOCK_RUN_PY + "\n" + hermes_install.RUN_PY_MARKER + "\n"
+    run_py.write_text(original)
     monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
     rc = hermes_install.main(["--venv", str(venv)])
-    assert rc == 2
+    assert rc == 0
+    assert run_py.read_text() == original                 # left untouched, never edited blind
+    assert (tmp_path / "hermes-home" / "plugins" / "u1-form").exists()  # plugin still deployed
 
 
 def test_uninstall_restores_backup_removes_plugin_and_disables(tmp_path, monkeypatch):
