@@ -6,6 +6,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.8.0] — 2026-07-20
+
+### Added
+
+- **Print multiple copies, dialed exactly.** The copies question is now a +/-
+  stepper you dial from 1 to 50, with +5 and -5 buttons to jump in fives,
+  instead of a fixed list that stopped at 9.
+- **First-layer nozzle temperature.** A separate control sets a hotter or cooler
+  first layer for bed adhesion without changing the rest of the print. It uses
+  the same per-material safe range as the main nozzle, and only the initial
+  layer moves when you touch it.
+- **Full brim options.** The brim control expands from off/auto to the U1
+  slicer's complete set: off, outer, auto, and mouse ears.
+
+### Fixed
+
+- **The kit form keeps working after a Hermes update.** Updating Hermes could
+  silently break the form with a "callback not registered" error, because the
+  update replaced a gateway file the form depended on. The form now re-wires
+  itself on every message from the toolkit's own plugin, so an update no longer
+  takes it down. The print-start safety flow is unchanged.
+- **A flaky bed photo no longer aborts a print start.** The printer's camera
+  occasionally returns a truncated or incomplete frame; the toolkit now retries
+  and accepts only a complete image. If it genuinely cannot get one, it still
+  refuses to start rather than proceed blind.
+- **Re-slicing a kit no longer strands an old confirm prompt.** When a re-slice
+  reused the same request and its bed photo failed, an earlier bed-clear prompt
+  could linger and reject your next "yes". A fresh slice now clears any pending
+  prompt, which only tightens the gate.
+
+## [2.7.0] — 2026-07-16
+
+### Added
+
+- **Bed and nozzle temperature per print.** Running custom filament on a stock
+  profile, you can now dial the nozzle and bed temperature in the kit form. Each
+  value is gated to a per-material safe range sourced from Snapmaker's own U1
+  presets and the printer's hardware limits, and a low or off bed is always
+  allowed for a cool or cold plate.
+- **A +/- stepper for every numeric control.** Temperature, infill, walls, and
+  top and bottom shells are one-row steppers you dial to an exact value instead
+  of picking from a fixed list. The header shows the profile's current value;
+  tap it to keep it.
+
+### Changed
+
+- Pattern and the on/off controls stay as buttons, since they are not numbers.
+  Cleaned up the print-head label. The filament override is applied at slice
+  time and the print-start safety flow is unchanged.
+
+## [2.6.0] — 2026-07-15
+
+### Added
+
+- **Advanced options, organized by category.** From Review, "Advanced options"
+  opens a short menu (Strength & shells, First layer & adhesion, Surface finish,
+  Supports), and each category opens a page with just its controls instead of
+  one long screen. The Supports category appears only when supports are on.
+- **New slicing controls.** Separate top and bottom shell layers,
+  one-wall-on-top, and raft, alongside the existing infill, pattern, walls,
+  brim, and fuzzy skin.
+
+### Changed
+
+- **Each setting shows the profile's current value.** A header reads "Infill:
+  keep profile (25%)" so you know what you would be changing, and the value
+  follows whichever profile you pick.
+- **Compact layout.** Each setting is a titled header with its options laid out
+  three across, with no repeated labels and no truncation.
+- **Reset and review.** "Reset all to profile" clears every tweak at once, and
+  Review shows a one-line summary of what changed. The profile step gained a
+  Continue button, so a pre-selected profile confirms with a tap instead of
+  paging to the next set.
+
 ## [2.5.2] — 2026-07-14
 
 ### Fixed
