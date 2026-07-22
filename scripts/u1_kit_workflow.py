@@ -1454,6 +1454,16 @@ def _inject_plate_thumbnail(gcode_path: Path, preview_png_path: Path,
     for (w, h) in sizes:
         try:
             scaled = base.resize((w, h))
+            # Palette-quantize before encoding: the toolpath renders are
+            # dense texture that defeats RGB PNG compression (a 300 px
+            # thumb ran 50 KB encoded vs 12 KB quantized, with no visible
+            # cost on these flat-color images). Smaller header blocks parse
+            # faster everywhere and shrink the window where the printer's
+            # screen asks for a preview mid-scan. Fail-open to RGB.
+            try:
+                scaled = scaled.quantize(colors=64)
+            except Exception:
+                pass
             blocks.append(encode_thumbnail_block(scaled))
             sizes_used.append((w, h))
         except Exception:
