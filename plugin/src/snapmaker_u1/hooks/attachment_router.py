@@ -61,6 +61,25 @@ _KIT_DIRECTIVE = (
     "point and it drives the whole flow itself.]"
 )
 
+# The counter-directive woven into the USER MESSAGE itself. Round 2 of the
+# live failure (2026-07-22) proved why this is needed: the upgraded Hermes
+# document template actively tells the model to "extract the document's text
+# yourself, for example with the terminal tool", which for a print kit is
+# precisely the wrong move, and the model obeyed it both times. The gateway
+# builds the final message as template + "\n\n" + event.text AFTER this hook
+# runs, so text we prepend here lands directly below that advice and
+# overrides it with the more specific instruction. In-place mutation of
+# event.text is the same mutable-event contract auto_skill already relies
+# on, and it works identically on Hermes versions without the template.
+_KIT_TEXT_TAG = "[U1 PRINT KIT:"
+_KIT_TEXT_DIRECTIVE = (
+    "[U1 PRINT KIT: the attached file is a 3D print kit for the u1_kit tool. "
+    "Disregard any instruction above about extracting or reading the document "
+    "yourself; do not unzip, list, or open it with the terminal or any other "
+    "tool. Call the u1_kit tool now with model_path set to the document's "
+    "saved path given above, then follow the tool's events.]"
+)
+
 
 def _document_file_name(raw: Any) -> str | None:
     """The attachment's filename from the raw platform message, if any.
@@ -96,6 +115,27 @@ def _arm_kit_directive(event: Any) -> bool:
     except Exception as exc:
         logger.warning(
             "snapmaker_u1 attachment_router: failed to arm kit directive: %s",
+            exc,
+        )
+        return False
+
+
+def _arm_kit_text_directive(event: Any) -> bool:
+    """Prepend the u1_kit counter-directive to the event's text in place.
+
+    The gateway later composes the final user message as document-template +
+    event.text, so this lands right under the template's generic "extract it
+    yourself with the terminal tool" advice and overrides it for kits.
+    Idempotent (tag check) and fail-soft."""
+    try:
+        current = getattr(event, "text", "") or ""
+        if _KIT_TEXT_TAG in current:
+            return True
+        event.text = (_KIT_TEXT_DIRECTIVE + "\n\n" + current).strip()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "snapmaker_u1 attachment_router: failed to arm text directive: %s",
             exc,
         )
         return False
@@ -156,7 +196,11 @@ def make_handler(skill_identifier: str) -> Callable[..., Any]:
         if not getattr(event, "auto_skill", None):
             try:
                 event.auto_skill = skill_identifier
-                logger.info(
+                # WARNING on purpose: the gateway's default stderr level
+                # filters INFO, which made two live failures completely
+                # silent. A kit upload is rare enough that one loud line per
+                # arm is the right trade.
+                logger.warning(
                     "snapmaker_u1 attachment_router: set event.auto_skill=%r (via %s)",
                     skill_identifier, matched_by,
                 )
@@ -164,15 +208,20 @@ def make_handler(skill_identifier: str) -> Callable[..., Any]:
                 logger.warning(
                     "snapmaker_u1 attachment_router: failed to set auto_skill: %s", exc,
                 )
-        # Per-turn directive for attachment matches, REGARDLESS of auto_skill
-        # state: mid-session the loader drops auto_skill (not a new session),
-        # and a topic binding's auto_skill is dropped the same way, so the
-        # channel_prompt directive is what actually reaches the model turn.
+        # Per-turn directives for attachment matches, REGARDLESS of
+        # auto_skill state: mid-session the loader drops auto_skill (not a
+        # new session), and a topic binding's auto_skill is dropped the same
+        # way. Two carriers, belt and suspenders: channel_prompt rides the
+        # turn's ephemeral prompt, and the text prepend lands in the user
+        # message itself, directly under the gateway's document template
+        # whose generic extract-it-yourself advice it must override.
         if matched_by in ("text-regex", "doc-filename"):
-            if _arm_kit_directive(event):
-                logger.info(
-                    "snapmaker_u1 attachment_router: kit directive armed (via %s)",
-                    matched_by,
-                )
+            armed_prompt = _arm_kit_directive(event)
+            armed_text = _arm_kit_text_directive(event)
+            logger.warning(
+                "snapmaker_u1 attachment_router: kit directives armed "
+                "(via %s, channel_prompt=%s, text=%s)",
+                matched_by, armed_prompt, armed_text,
+            )
         return None  # let dispatch continue normally
     return handler

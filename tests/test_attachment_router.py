@@ -36,12 +36,16 @@ def _event(text="", doc_name=None, raw_shape="object", auto_skill=None,
 
 # ---------- detection ----------
 
-def test_zip_document_sets_skill_and_arms_directive():
+def test_zip_document_sets_skill_and_arms_directives():
     ev = _event(doc_name="angles-teaching-aid-model_files.zip")
     _handler()(event=ev)
     assert ev.auto_skill == SKILL
     assert ar._KIT_DIRECTIVE_TAG in (ev.channel_prompt or "")
     assert "u1_kit" in ev.channel_prompt
+    # The text counter-directive is the piece that beats the gateway's
+    # document template ("extract it yourself with the terminal tool").
+    assert ev.text.startswith(ar._KIT_TEXT_TAG)
+    assert "u1_kit" in ev.text
 
 
 def test_dict_shaped_raw_message_is_detected():
@@ -51,6 +55,7 @@ def test_dict_shaped_raw_message_is_detected():
     _handler()(event=ev)
     assert ev.auto_skill == SKILL
     assert ar._KIT_DIRECTIVE_TAG in ev.channel_prompt
+    assert ev.text.startswith(ar._KIT_TEXT_TAG)
 
 
 def test_text_path_mention_is_detected():
@@ -58,6 +63,16 @@ def test_text_path_mention_is_detected():
     _handler()(event=ev)
     assert ev.auto_skill == SKILL
     assert ar._KIT_DIRECTIVE_TAG in ev.channel_prompt
+
+
+def test_text_directive_prepends_and_keeps_the_caption():
+    """The gateway composes template + event.text AFTER the hook, so the
+    prepend puts the counter-directive under the template's bad advice and
+    above the operator's own caption."""
+    ev = _event(text="print this one for me", doc_name="kit.zip")
+    _handler()(event=ev)
+    assert ev.text.index(ar._KIT_TEXT_TAG) == 0
+    assert ev.text.endswith("print this one for me")
 
 
 def test_non_model_document_matches_nothing_and_warns(caplog):
@@ -103,12 +118,13 @@ def test_directive_appends_to_existing_channel_prompt():
     assert ar._KIT_DIRECTIVE_TAG in ev.channel_prompt
 
 
-def test_directive_is_idempotent():
+def test_directives_are_idempotent():
     ev = _event(doc_name="kit.zip")
     _handler()(event=ev)
-    once = ev.channel_prompt
+    once_prompt, once_text = ev.channel_prompt, ev.text
     _handler()(event=ev)
-    assert ev.channel_prompt == once
+    assert ev.channel_prompt == once_prompt
+    assert ev.text == once_text
 
 
 # ---------- reprint keeps its existing behavior ----------
