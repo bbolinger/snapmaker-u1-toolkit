@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.0.1] — 2026-07-22
+
+### Fixed
+
+- **Large plates now show their preview on the printer's screen and in the
+  app reliably.** On big files the printer's UI could ask for the thumbnail
+  while the file was still being scanned after upload, and the miss stuck as
+  a generic icon. The embedded previews are now palette-compressed to about
+  a quarter of their size, and the upload step waits for the printer's
+  metadata scan to finish before the workflow reports the file ready.
+
 ## [3.0.0] — 2026-07-22
 
 No breaking changes and nothing to migrate; existing installs just get
