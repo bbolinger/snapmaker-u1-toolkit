@@ -1042,6 +1042,11 @@ def _render_plate_layout_from_m486_outer_walls(
 
     wall_px = max(2, int(wall_mm * ppm))
     names = sorted(objects.keys())
+    # n feeds the part_count in BOTH return paths below. The shared-colors
+    # change briefly left it bound only in the import-fallback branch, which
+    # made every successful render die at the return (live 2026-07-22, took
+    # the whole kit flow down); bind it before any branching.
+    n = len(names)
     # Shared part-to-color map (u1_gcode_preview.part_colors is the promoted
     # copy of this renderer's original formula) so the footprint and the 3D
     # toolpath view color the same part the same way. Inline fallback keeps
@@ -1050,7 +1055,6 @@ def _render_plate_layout_from_m486_outer_walls(
         from u1_gcode_preview import part_colors as _shared_part_colors
         color_map = _shared_part_colors(names)
     except Exception:
-        n = len(names)
         color_map = {}
         for i, name in enumerate(names):
             r, g, b = colorsys.hsv_to_rgb(i / n, 0.55, 0.9)

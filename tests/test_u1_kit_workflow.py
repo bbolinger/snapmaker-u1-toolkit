@@ -915,3 +915,74 @@ def test_reslice_clears_stale_pending_when_bed_capture_fails(
     safety = u1_request.read_request(rid).get("safety") or {}
     assert "pending_bed_clear_start" not in safety, (
         "a failed re-slice must not leave the prior slice's pending prompt")
+
+
+# --------------------------------------------------------------------------- #
+# The review renderers must actually EXECUTE in tests. The shared-colors
+# change left the top-down's part_count variable bound only in an import
+# fallback, so every successful render died at its return statement and took
+# the whole kit flow down after kit_sliced (live 2026-07-22). Nothing in the
+# suite ran the function, so 1093 tests stayed green around a crash on the
+# happy path. These render a real (synthetic) plate gcode end to end.
+# --------------------------------------------------------------------------- #
+
+_RENDER_GCODE = """\
+M486 S0
+M486 Aobj_1_left.stl_id_0_copy_0
+M486 S1
+M486 Aobj_2_right.stl_id_1_copy_0
+M486 S-1
+M486 S0
+G1 X50 Y50 F3000
+G1 Z0.2
+;TYPE:Outer wall
+G1 X70 Y50 E1
+G1 X70 Y70 E1
+G1 X50 Y70 E1
+G1 X50 Y50 E1
+M486 S-1
+M486 S1
+G1 X150 Y150 F3000
+G1 Z0.2
+;TYPE:Outer wall
+G1 X170 Y150 E1
+G1 X170 Y170 E1
+G1 X150 Y170 E1
+G1 X150 Y150 E1
+M486 S-1
+"""
+
+
+def _plate_gcode(tmp_path):
+    p = tmp_path / "plate_1.gcode"
+    p.write_text(_RENDER_GCODE)
+    return p
+
+
+def test_m486_top_down_renderer_runs_end_to_end(tmp_path):
+    out = tmp_path / "top.png"
+    res = kw._render_plate_layout_from_m486_outer_walls(
+        _plate_gcode(tmp_path), out, title="2 parts")
+    assert res["ok"], res
+    assert res["part_count"] == 2
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_m486_top_down_renderer_survives_missing_shared_colors(tmp_path, monkeypatch):
+    """The shared color import must stay optional: with u1_gcode_preview
+    unimportable the inline fallback colors the parts and the render still
+    succeeds with the same part_count."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_preview(name, *a, **k):
+        if name == "u1_gcode_preview":
+            raise ImportError("simulated missing module")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_preview)
+    out = tmp_path / "top.png"
+    res = kw._render_plate_layout_from_m486_outer_walls(
+        _plate_gcode(tmp_path), out)
+    assert res["ok"], res
+    assert res["part_count"] == 2
