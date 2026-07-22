@@ -184,3 +184,22 @@ def test_chrome_free_render_for_thumbnails(tmp_path):
     assert out.exists() and out.stat().st_size > 0
     from PIL import Image
     assert Image.open(out).size == (600, 600)
+
+
+def test_top_view_renders_full_bed_with_shared_styling(tmp_path):
+    """The top-down placement view draws the same toolpaths with the same
+    part colors as the 3D view, over the full bed."""
+    out = tmp_path / "top.png"
+    res = gp.render_top_preview(_gcode(tmp_path, _TWO_PART_GCODE), out,
+                                title="Plate 1 of 1",
+                                label_below="2 parts, T0 PETG")
+    assert res["ok"], res
+    assert res["part_count"] == 2
+    assert res["support_segments"] == 1
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_top_view_fails_soft_on_empty_gcode(tmp_path):
+    res = gp.render_top_preview(_gcode(tmp_path, "; nothing\n"),
+                                tmp_path / "top.png")
+    assert not res["ok"]

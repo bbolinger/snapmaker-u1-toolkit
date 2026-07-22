@@ -211,6 +211,23 @@ _BED_EDGE = (66, 76, 90)
 _BG = (22, 26, 31)
 
 
+def _style_for(cat: str, base: tuple[int, int, int],
+               ) -> tuple[tuple[int, int, int], int]:
+    """(fill, width) for a feature category. One place, so the isometric and
+    top-down views can never drift apart on what a support looks like."""
+    if cat == "support":
+        return _SUPPORT_COLOR, 2
+    if cat == "brim":
+        return _BRIM_COLOR, 1
+    if cat == "inner":
+        return _dim(base, 0.45), 1
+    if cat == "bottom":
+        return _dim(base, 0.70), 1
+    if cat == "top":
+        return _lift(base, 0.35), 2
+    return base, 2  # outer and friends
+
+
 def render_iso_preview(
     gcode_path: Path,
     out_path: Path,
@@ -290,19 +307,7 @@ def render_iso_preview(
     # within a layer back-to-front category order keeps part edges crisp.
     segs.sort(key=lambda s: (s[0], _CAT_ORDER[s[2]], s[1]))
     for z, _seq, cat, part, x0, y0, x1, y1 in segs:
-        base = colors.get(part, (150, 160, 170))
-        if cat == "support":
-            fill, width = _SUPPORT_COLOR, 2
-        elif cat == "brim":
-            fill, width = _BRIM_COLOR, 1
-        elif cat == "inner":
-            fill, width = _dim(base, 0.45), 1
-        elif cat == "bottom":
-            fill, width = _dim(base, 0.70), 1
-        elif cat == "top":
-            fill, width = _lift(base, 0.35), 2
-        else:  # outer
-            fill, width = base, 2
+        fill, width = _style_for(cat, colors.get(part, (150, 160, 170)))
         draw.line([to_px(x0, y0, z), to_px(x1, y1, z)], fill=fill, width=width)
 
     # Header / footer text with the DejaVu fallback the workflow uses.
@@ -338,6 +343,104 @@ def render_iso_preview(
     return {"ok": True, "path": str(out_path), "segments": len(segs),
             "support_segments": support_segs, "parts": parsed["parts"],
             "meta": parsed["meta"]}
+
+
+def render_top_preview(
+    gcode_path: Path,
+    out_path: Path,
+    *,
+    bed_mm: tuple[float, float] = (270.0, 270.0),
+    canvas_px: int = 1000,
+    title: str | None = None,
+    label_below: str | None = None,
+    chrome: bool = True,
+) -> dict[str, Any]:
+    """Top-down plate view from the same toolpaths as the isometric.
+
+    Replaces the outer-wall-silhouette footprint: straight-down orthographic
+    over the FULL bed (this view's job is placement), but drawing the real
+    geometry with the shared category styling, so the part actually looks
+    like itself from above, supports show in orange, and the colors match
+    the 3D view segment for segment. Best-effort like every renderer here.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as exc:  # pragma: no cover - deps guard
+        return {"ok": False, "path": None, "error": f"deps: {exc}"}
+    try:
+        parsed = parse_toolpaths(gcode_path)
+    except Exception as exc:
+        return {"ok": False, "path": None, "error": f"gcode parse: {exc}"}
+    segs = parsed["segments"]
+    if not segs:
+        return {"ok": False, "path": None, "error": "no extrusion segments found"}
+
+    colors = part_colors(parsed["parts"])
+    support_segs = sum(1 for s in segs if s[2] == "support")
+    bed_w, bed_h = bed_mm
+
+    title_h = 50 if (title and chrome) else 0
+    footer_h = (30 if label_below else 0) + (26 if chrome else 0)
+    pad = 16
+    plot = canvas_px
+    img = Image.new("RGB", (plot + pad * 2, plot + pad * 2 + title_h + footer_h),
+                    _BG)
+    draw = ImageDraw.Draw(img)
+    x0, y0 = pad, pad + title_h
+    x1, y1 = x0 + plot, y0 + plot
+    draw.rectangle([x0, y0, x1, y1], fill=(30, 34, 40))
+    ppm = plot / max(bed_w, bed_h)
+
+    def to_px(mx: float, my: float) -> tuple[float, float]:
+        return x0 + mx * ppm, y1 - my * ppm  # bed origin bottom-left, y up
+
+    # Grid + mm labels every 50 mm, matching the placement view operators
+    # already read.
+    try:
+        from PIL import ImageFont
+        try:
+            f_big = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+            f_small = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
+        except Exception:
+            f_big = f_small = ImageFont.load_default()
+    except Exception:
+        f_big = f_small = None
+    for mm in range(0, int(bed_w) + 1, 50):
+        gx = x0 + mm * ppm
+        if gx <= x1 + 0.5:
+            draw.line([(gx, y0), (gx, y1)], fill=_BED_GRID)
+            if chrome and f_small is not None:
+                draw.text((gx + 3, y1 - 18), str(mm), fill=(120, 130, 142),
+                          font=f_small)
+    for mm in range(0, int(bed_h) + 1, 50):
+        gy = y1 - mm * ppm
+        if gy >= y0 - 0.5:
+            draw.line([(x0, gy), (x1, gy)], fill=_BED_GRID)
+
+    segs.sort(key=lambda s: (s[0], _CAT_ORDER[s[2]], s[1]))
+    for z, _seq, cat, part, sx0, sy0, sx1, sy1 in segs:
+        fill, width = _style_for(cat, colors.get(part, (150, 160, 170)))
+        draw.line([to_px(sx0, sy0), to_px(sx1, sy1)], fill=fill, width=width)
+
+    if chrome and f_big is not None:
+        if title:
+            draw.text((pad, 14), title, fill=(235, 238, 242), font=f_big)
+        foot_y = y1 + 8
+        if label_below:
+            draw.text((pad, foot_y), label_below, fill=(235, 238, 242),
+                      font=f_small)
+            foot_y += 26
+        note = ("supports shown in orange" if support_segs
+                else "toolpaths from the sliced gcode")
+        draw.text((pad, foot_y), note, fill=(140, 150, 160), font=f_small)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return {"ok": True, "path": str(out_path), "part_count": len(parsed["parts"]),
+            "segments": len(segs), "support_segments": support_segs,
+            "parts": parsed["parts"], "meta": parsed["meta"]}
 
 
 def main(argv: list[str] | None = None) -> int:

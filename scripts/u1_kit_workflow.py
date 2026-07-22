@@ -1340,10 +1340,22 @@ def _render_and_inject_plate_preview(
     # needed): _render_plate_layout_from_3mf (--export-3mf uses the same
     # buggy packer as --export-stl) and _render_plate_layout_from_gcode_m486
     # (M486 rotation matching under-constrained, visible overlaps).
-    layout = _render_plate_layout_from_m486_outer_walls(
-        plate_gcode_path, plate_preview_path,
-        bed_mm=bed_mm, title=title, label_below=label_below,
-    )
+    # Primary: top-down TOOLPATH view (same geometry, styling, and part
+    # colors as the 3D view, full bed for placement). The silhouette chain
+    # below stays as the fallback so the review never loses its footprint.
+    layout: dict[str, Any] = {"ok": False}
+    try:
+        from u1_gcode_preview import render_top_preview
+        layout = render_top_preview(
+            plate_gcode_path, plate_preview_path,
+            bed_mm=bed_mm, title=title, label_below=label_below)
+    except Exception as _top_exc:
+        layout = {"ok": False, "error": f"toolpath top view: {_top_exc}"}
+    if not layout.get("ok"):
+        layout = _render_plate_layout_from_m486_outer_walls(
+            plate_gcode_path, plate_preview_path,
+            bed_mm=bed_mm, title=title, label_below=label_below,
+        )
     if not layout.get("ok"):
         layout = _render_plate_layout_from_gcode_layers(
             plate_gcode_path, plate_preview_path,
