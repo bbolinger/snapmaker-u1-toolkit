@@ -166,8 +166,14 @@ _SIN30 = math.sin(math.radians(30))
 
 
 def _iso(x: float, y: float, z: float) -> tuple[float, float]:
-    """Project bed-space mm to isometric plane units (y grows downward later)."""
-    return (x - y) * _COS30, (x + y) * _SIN30 - z
+    """Project bed-space mm to isometric plane units.
+
+    ``v`` is height-on-screen before the raster flip: both distance from the
+    viewer corner (x + y) and physical height (z) raise a point. The first
+    cut subtracted z here, which drew every print upside down (base at the
+    top); an operator caught it on the first review image.
+    """
+    return (x - y) * _COS30, (x + y) * _SIN30 + z
 
 
 def _part_colors(parts: list[str]) -> dict[str, tuple[int, int, int]]:
