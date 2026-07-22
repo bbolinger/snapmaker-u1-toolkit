@@ -1022,3 +1022,33 @@ def test_injected_thumbnail_falls_back_to_top_down(tmp_path, monkeypatch):
     assert layout["ok"], layout
     assert injection["ok"], injection
     assert injection["thumbnail_source"].endswith("plate_1_preview.png")
+
+
+def test_injected_thumbnails_are_palette_quantized(tmp_path):
+    """Dense toolpath renders defeat RGB PNG compression; the injected
+    blocks must be palette-quantized so header size stays in the range the
+    printer's screen parses promptly (live 2026-07-22: 50KB headers on a
+    50MB file raced the metadata scan and the app cached a missing
+    preview)."""
+    import io, base64, re as _re
+    from PIL import Image
+    import random
+    rng = random.Random(7)
+    noisy = Image.new("RGB", (600, 600))
+    noisy.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+                   for _ in range(600 * 600)])
+    png = tmp_path / "thumb.png"
+    noisy.save(png)
+    gcode = tmp_path / "plate.gcode"
+    gcode.write_text("; HEADER_BLOCK_START\nG28\n")
+    res = kw._inject_plate_thumbnail(gcode, png)
+    assert res["ok"], res
+    text = gcode.read_text()
+    m = _re.search(r"; thumbnail begin 300x300 (\d+)", text)
+    assert m, "300px block missing"
+    quant_len = int(m.group(1))
+    # The same image encoded RGB for comparison.
+    buf = io.BytesIO()
+    noisy.resize((300, 300)).save(buf, format="PNG", optimize=True)
+    rgb_len = len(base64.b64encode(buf.getvalue()))
+    assert quant_len < rgb_len * 0.6, (quant_len, rgb_len)

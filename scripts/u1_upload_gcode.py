@@ -45,6 +45,37 @@ def http_json(url: str, timeout: float = 12.0) -> dict[str, Any]:
         return json.loads(r.read().decode("utf-8"))
 
 
+def fetch_remote_metadata(host: str, port: int, filename: str) -> dict[str, Any]:
+    """Post-upload metadata, scanned to completion when the printer allows.
+
+    Moonraker parses a large file's metadata (thumbnails included)
+    asynchronously after upload; the touchscreen and app can ask for the
+    preview in that window, get nothing, and cache the miss for that
+    filename (live 2026-07-22 on 50 MB plates: generic icons that never
+    healed). POST /server/files/metascan forces the scan and BLOCKS until
+    it finishes, so by the time the workflow announces the upload the
+    thumbnails are queryable. Older Moonraker builds without the endpoint
+    fall back to the plain metadata GET, which is the previous behavior.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{base_url(host, port)}/server/files/metascan",
+            data=json.dumps({"filename": filename}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=90.0) as r:
+            meta = json.loads(r.read().decode("utf-8")).get("result", {})
+        if meta:
+            return meta
+    except Exception:
+        pass  # endpoint absent or scan failed; the GET below still answers
+    try:
+        return http_json(
+            f"{base_url(host, port)}/server/files/metadata?filename="
+            f"{urllib.parse.quote(filename)}").get("result", {})
+    except Exception:
+        return {}
+
+
 def base_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
@@ -534,7 +565,7 @@ def main() -> int:
         after_blockers.append(f"Moonraker indicated print start/queue: {response}")
 
     remote_name = uploaded_filename
-    metadata = http_json(f"{base_url(host,port)}/server/files/metadata?filename={urllib.parse.quote(remote_name)}").get("result", {})
+    metadata = fetch_remote_metadata(host, port, remote_name)
     remote_metadata_ok = bool(metadata)
     # Moonraker's /server/files/upload response can be EITHER wrapped (with
     # a top-level "result" key, Moonraker JSON-RPC convention) OR unwrapped
