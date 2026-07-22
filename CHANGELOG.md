@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.0.0] — 2026-07-22
+
+No breaking changes and nothing to migrate; existing installs just get
+better. The major marks two step changes: review images now show the ground
+truth of what will print, and the toolkit's Hermes integration survives
+Hermes upgrades.
+
+### Added
+
+- **Review images drawn from the real toolpaths.** Both the top-down plate
+  view and the 3D view are now rendered straight from the sliced G-code the
+  printer will run: supports in their own color, the true print pose, real
+  per-layer geometry, and matching part colors across both images. Nothing
+  is re-sliced or re-arranged to make the picture, so the images cannot
+  drift from the plan. The old silhouette renderers remain as automatic
+  fallbacks.
+- **The printer's screen shows the 3D view.** The thumbnail embedded in
+  each plate's G-code (what the U1 touchscreen and app display for the
+  file) is now a clean render of the 3D toolpath view instead of the flat
+  footprint.
+- **Filament and time on the confirm card.** The readiness card now leads
+  with the estimate ("Estimated: 5h 48m, 66g filament") pulled from the
+  sliced G-code's own metadata, and the 3D image's footer carries the same
+  numbers.
+
+### Fixed
+
+- **Sending a kit mid-conversation works reliably.** A kit uploaded after
+  the first message of a session could leave the assistant without its U1
+  instructions, and a newer Hermes attachment note actively steered it
+  toward unpacking the file by hand. Kit detection now rides the message
+  itself as well as the session plumbing, states that the file must go to
+  the kit tool untouched, and logs loudly when a document matches nothing.
+- **The kit form survives Hermes upgrades.** The form callback is now
+  published by the plugin on every message instead of relying on a patched
+  Hermes file that package upgrades silently replace. The old patch remains
+  as a fallback for older Hermes builds, and the installer no longer aborts
+  when it cannot apply it.
+- **A renderer crash that could stop a kit after slicing.** A variable in
+  the top-down renderer went unbound on the successful path; the flow now
+  has tests that execute the renderers for real, plus a full end-to-end
+  slice test that runs wherever the runtime OrcaSlicer exists.
+
 ## [2.8.0] — 2026-07-20
 
 ### Added
