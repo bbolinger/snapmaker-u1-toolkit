@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Isometric toolpath preview rendered straight from sliced gcode.
+
+Experiment (feature/gcode-truth-previews): the shipped 3D review image keeps
+only each part's outer-wall silhouette, so supports are invisible and a part
+lying on its side can read like one standing up. This renders the actual
+toolpaths instead: every extrusion move, grouped by Orca's ``;TYPE:`` labels
+and ``M486`` part markers, drawn bottom-up in a true isometric projection.
+Supports get their own color, so "where are the supports" is answered by the
+image the operator already receives, and the silhouette of the real layers
+shows the true print pose. The gcode is the ground truth the printer runs,
+so nothing is re-sliced or re-arranged to make the picture.
+
+Standalone CLI for experimentation:
+
+    python3 u1_gcode_preview.py plate_1.gcode out.png [--title "Plate 1"]
+"""
+from __future__ import annotations
+
+import math
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+# --------------------------------------------------------------------------- #
+# Parsing: extrusion segments tagged with part + feature type
+# --------------------------------------------------------------------------- #
+
+_NUM = r"(-?\d*\.?\d+)"
+_G_RE = re.compile(r"^G[0123]\b")
+_G23_RE = re.compile(r"^G[23]\b")
+_X_RE = re.compile(r"\bX" + _NUM)
+_Y_RE = re.compile(r"\bY" + _NUM)
+_Z_RE = re.compile(r"\bZ" + _NUM)
+_E_RE = re.compile(r"\bE" + _NUM)
+_I_RE = re.compile(r"\bI" + _NUM)
+_J_RE = re.compile(r"\bJ" + _NUM)
+_M486_A = re.compile(r"^M486 A(.+?)\s*$")
+_M486_S = re.compile(r"^M486 S(-?\d+)")
+
+# Feature categories, in back-to-front draw order within a layer. Everything
+# supports-ish shares one bucket so the operator reads one color as "support".
+_TYPE_TO_CAT = {
+    "Brim": "brim",
+    "Skirt": "brim",
+    "Support": "support",
+    "Support interface": "support",
+    "Support transition": "support",
+    "Bottom surface": "bottom",
+    "Internal solid infill": None,       # interior noise at preview scale
+    "Sparse infill": None,
+    "Internal Bridge": None,
+    "Inner wall": "inner",
+    "Outer wall": "outer",
+    "Overhang wall": "outer",
+    "Bridge": "outer",
+    "Gap infill": None,
+    "Top surface": "top",
+    "Custom": None,                      # start/end/purge blocks
+}
+_CAT_ORDER = {"brim": 0, "support": 1, "bottom": 2, "inner": 3, "outer": 4, "top": 5}
+
+_META_RE = {
+    "filament_g": re.compile(r"^; total filament used \[g\] = " + _NUM),
+    "time": re.compile(r"^; estimated printing time \(normal mode\) = (.+)$"),
+}
+
+
+def parse_toolpaths(gcode_path: Path) -> dict[str, Any]:
+    """Extract every extrusion segment from ``gcode_path``.
+
+    Returns ``{"segments": [(z, seq, cat, part, x0, y0, x1, y1), ...],
+    "parts": [base names in first-seen order], "meta": {...}}``. Arc moves
+    (G2/G3) are flattened to chords the same way the shipped M486 renderer
+    does, so both previews corroborate. Extrusion is any G move with E > 0,
+    which holds for the relative-E gcode the U1 profiles emit.
+    """
+    segments: list[tuple] = []
+    id_to_name: dict[int, str] = {}
+    part_order: list[str] = []
+    meta: dict[str, Any] = {}
+    cid: int | None = None
+    cbase: str | None = None
+    ctype: str | None = None
+    prevx = prevy = None
+    cz = 0.0
+    seq = 0
+
+    for ln in Path(gcode_path).read_text(errors="replace").splitlines():
+        if ln.startswith(";"):
+            if ln.startswith(";TYPE:"):
+                ctype = ln[6:].strip()
+                continue
+            for key, rx in _META_RE.items():
+                if key not in meta:
+                    m = rx.match(ln)
+                    if m:
+                        meta[key] = m.group(1)
+            continue
+        ma = _M486_A.match(ln)
+        if ma:
+            if cid is not None:
+                id_to_name[cid] = ma.group(1).strip()
+            continue
+        ms = _M486_S.match(ln)
+        if ms:
+            nid = int(ms.group(1))
+            cid = None if nid < 0 else nid
+            # Key by the FULL M486 instance name, exactly like the top-down
+            # footprint renderer: each copy of a model keeps its own identity,
+            # and the shared sorted-name color map lines both images up.
+            cbase = (id_to_name.get(cid, "") if cid is not None else "") or None
+            if cbase and cbase not in part_order:
+                part_order.append(cbase)
+            continue
+        if not _G_RE.match(ln):
+            continue
+        zm = _Z_RE.search(ln)
+        if zm:
+            cz = float(zm.group(1))
+        xm = _X_RE.search(ln)
+        ym = _Y_RE.search(ln)
+        em = _E_RE.search(ln)
+        nx = float(xm.group(1)) if xm else prevx
+        ny = float(ym.group(1)) if ym else prevy
+        cat = _TYPE_TO_CAT.get(ctype or "", None)
+        if (em and float(em.group(1)) > 0 and cat and prevx is not None
+                and nx is not None and ny is not None):
+            if _G23_RE.match(ln):
+                im = _I_RE.search(ln)
+                jm = _J_RE.search(ln)
+                cx = prevx + (float(im.group(1)) if im else 0.0)
+                cy = prevy + (float(jm.group(1)) if jm else 0.0)
+                r = math.hypot(prevx - cx, prevy - cy)
+                sa = math.atan2(prevy - cy, prevx - cx)
+                ea = math.atan2(ny - cy, nx - cx)
+                if ln.startswith("G2"):
+                    if ea > sa:
+                        ea -= 2 * math.pi
+                    sweep = sa - ea
+                else:
+                    if ea < sa:
+                        ea += 2 * math.pi
+                    sweep = ea - sa
+                nseg = max(2, int(abs(sweep) * r / 1.0))
+                px, py = prevx, prevy
+                for k in range(1, nseg + 1):
+                    a = sa - sweep * k / nseg if ln.startswith("G2") else sa + sweep * k / nseg
+                    qx, qy = cx + r * math.cos(a), cy + r * math.sin(a)
+                    segments.append((cz, seq, cat, cbase, px, py, qx, qy))
+                    seq += 1
+                    px, py = qx, qy
+            else:
+                segments.append((cz, seq, cat, cbase, prevx, prevy, nx, ny))
+                seq += 1
+        prevx, prevy = nx, ny
+
+    return {"segments": segments, "parts": part_order, "meta": meta}
+
+
+# --------------------------------------------------------------------------- #
+# Rendering: true isometric, painter's algorithm bottom-up
+# --------------------------------------------------------------------------- #
+
+_COS30 = math.cos(math.radians(30))
+_SIN30 = math.sin(math.radians(30))
+
+
+def _iso(x: float, y: float, z: float) -> tuple[float, float]:
+    """Project bed-space mm to isometric plane units.
+
+    ``v`` is height-on-screen before the raster flip: both distance from the
+    viewer corner (x + y) and physical height (z) raise a point. The first
+    cut subtracted z here, which drew every print upside down (base at the
+    top); an operator caught it on the first review image.
+    """
+    return (x - y) * _COS30, (x + y) * _SIN30 + z
+
+
+def part_colors(names: list[str]) -> dict[str, tuple[int, int, int]]:
+    """One part-to-color map for every review image.
+
+    Same formula the top-down footprint has always used (sorted M486 names,
+    evenly spaced hues at s=0.55 v=0.9), promoted here so the isometric view
+    and the footprint color the SAME part the SAME way. Two images that
+    disagree on which part is magenta are worse than one image.
+    """
+    import colorsys
+    ordered = sorted(names)
+    n = max(len(ordered), 1)
+    colors: dict[str, tuple[int, int, int]] = {}
+    for i, name in enumerate(ordered):
+        r, g, b = colorsys.hsv_to_rgb(i / n, 0.55, 0.9)
+        colors[name] = (int(r * 255), int(g * 255), int(b * 255))
+    return colors
+
+
+def _dim(c: tuple[int, int, int], f: float) -> tuple[int, int, int]:
+    return tuple(int(v * f) for v in c)  # type: ignore[return-value]
+
+
+def _lift(c: tuple[int, int, int], f: float) -> tuple[int, int, int]:
+    return tuple(int(v + (255 - v) * f) for v in c)  # type: ignore[return-value]
+
+
+_SUPPORT_COLOR = (255, 158, 60)
+_BRIM_COLOR = (88, 99, 112)
+_BED_GRID = (43, 50, 60)
+_BED_EDGE = (66, 76, 90)
+_BG = (22, 26, 31)
+
+
+def _style_for(cat: str, base: tuple[int, int, int],
+               ) -> tuple[tuple[int, int, int], int]:
+    """(fill, width) for a feature category. One place, so the isometric and
+    top-down views can never drift apart on what a support looks like."""
+    if cat == "support":
+        return _SUPPORT_COLOR, 2
+    if cat == "brim":
+        return _BRIM_COLOR, 1
+    if cat == "inner":
+        return _dim(base, 0.45), 1
+    if cat == "bottom":
+        return _dim(base, 0.70), 1
+    if cat == "top":
+        return _lift(base, 0.35), 2
+    return base, 2  # outer and friends
+
+
+def render_iso_preview(
+    gcode_path: Path,
+    out_path: Path,
+    *,
+    bed_mm: tuple[float, float] = (270.0, 270.0),
+    canvas_px: int = 1200,
+    title: str | None = None,
+    chrome: bool = True,
+) -> dict[str, Any]:
+    """Render ``gcode_path`` to ``out_path`` as an isometric toolpath preview.
+
+    ``chrome=False`` drops the title header and footer text entirely: text
+    turns to noise at the printer touchscreen's 48/300 px thumbnail sizes,
+    so the injected thumbnail wants pure geometry.
+
+    Best-effort like the shipped renderers: every failure returns
+    ``{"ok": False, "error": ...}`` so a caller can fall back to the old view.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as exc:  # pragma: no cover - deps guard
+        return {"ok": False, "path": None, "error": f"deps: {exc}"}
+    try:
+        parsed = parse_toolpaths(gcode_path)
+    except Exception as exc:
+        return {"ok": False, "path": None, "error": f"gcode parse: {exc}"}
+    segs = parsed["segments"]
+    if not segs:
+        return {"ok": False, "path": None, "error": "no extrusion segments found"}
+
+    colors = part_colors(parsed["parts"])
+    support_segs = sum(1 for s in segs if s[2] == "support")
+
+    # Frame on the printed material, not the whole bed: orientation and
+    # supports are this view's job, placement is the top-down's.
+    pts = []
+    for z, _seq, _cat, _part, x0, y0, x1, y1 in segs:
+        pts.append(_iso(x0, y0, z))
+        pts.append(_iso(x1, y1, z))
+    us = [p[0] for p in pts]
+    vs = [p[1] for p in pts]
+    umin, umax = min(us), max(us)
+    vmin, vmax = min(vs), max(vs)
+    span = max(umax - umin, vmax - vmin, 1.0)
+    pad = span * 0.10
+    umin -= pad
+    umax += pad
+    vmin -= pad
+    vmax += pad
+    header = 56 if (title and chrome) else 0
+    footer = 44 if chrome else 0
+    draw_h = canvas_px - header - footer
+    scale = min(canvas_px / (umax - umin), draw_h / (vmax - vmin))
+
+    def to_px(x: float, y: float, z: float) -> tuple[float, float]:
+        u, v = _iso(x, y, z)
+        return ((u - umin) * scale, header + (vmax - v) * scale)
+
+    img = Image.new("RGB", (canvas_px, canvas_px), _BG)
+    draw = ImageDraw.Draw(img)
+
+    # Bed grid at z=0 under the model, clipped by the frame automatically.
+    bx, by = bed_mm
+    step = 50.0
+    x = 0.0
+    while x <= bx + 1e-6:
+        draw.line([to_px(x, 0, 0), to_px(x, by, 0)],
+                  fill=_BED_EDGE if x in (0.0, bx) else _BED_GRID, width=1)
+        x += step
+    y = 0.0
+    while y <= by + 1e-6:
+        draw.line([to_px(0, y, 0), to_px(bx, y, 0)],
+                  fill=_BED_EDGE if y in (0.0, by) else _BED_GRID, width=1)
+        y += step
+
+    # Painter's algorithm: strict layer order carries the depth story, and
+    # within a layer back-to-front category order keeps part edges crisp.
+    segs.sort(key=lambda s: (s[0], _CAT_ORDER[s[2]], s[1]))
+    for z, _seq, cat, part, x0, y0, x1, y1 in segs:
+        fill, width = _style_for(cat, colors.get(part, (150, 160, 170)))
+        draw.line([to_px(x0, y0, z), to_px(x1, y1, z)], fill=fill, width=width)
+
+    # Header / footer text with the DejaVu fallback the workflow uses.
+    # Skipped entirely for chrome-free thumbnail renders: text turns to
+    # noise at touchscreen thumbnail sizes.
+    if chrome:
+        try:
+            from PIL import ImageFont
+            try:
+                f_big = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+                f_small = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
+            except Exception:
+                f_big = f_small = ImageFont.load_default()
+            if title:
+                draw.text((16, 14), title, fill=(235, 238, 242), font=f_big)
+            meta = parsed["meta"]
+            bits = []
+            if meta.get("filament_g"):
+                bits.append(f"{meta['filament_g']} g filament")
+            if meta.get("time"):
+                bits.append(meta["time"])
+            bits.append("supports shown in orange" if support_segs
+                        else "no supports in this plate")
+            draw.text((16, canvas_px - 32), "  ·  ".join(bits),
+                      fill=(170, 178, 188), font=f_small)
+        except Exception:
+            pass  # text is garnish; the geometry is the payload
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return {"ok": True, "path": str(out_path), "segments": len(segs),
+            "support_segments": support_segs, "parts": parsed["parts"],
+            "meta": parsed["meta"]}
+
+
+def render_top_preview(
+    gcode_path: Path,
+    out_path: Path,
+    *,
+    bed_mm: tuple[float, float] = (270.0, 270.0),
+    canvas_px: int = 1000,
+    title: str | None = None,
+    label_below: str | None = None,
+    chrome: bool = True,
+) -> dict[str, Any]:
+    """Top-down plate view from the same toolpaths as the isometric.
+
+    Replaces the outer-wall-silhouette footprint: straight-down orthographic
+    over the FULL bed (this view's job is placement), but drawing the real
+    geometry with the shared category styling, so the part actually looks
+    like itself from above, supports show in orange, and the colors match
+    the 3D view segment for segment. Best-effort like every renderer here.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as exc:  # pragma: no cover - deps guard
+        return {"ok": False, "path": None, "error": f"deps: {exc}"}
+    try:
+        parsed = parse_toolpaths(gcode_path)
+    except Exception as exc:
+        return {"ok": False, "path": None, "error": f"gcode parse: {exc}"}
+    segs = parsed["segments"]
+    if not segs:
+        return {"ok": False, "path": None, "error": "no extrusion segments found"}
+
+    colors = part_colors(parsed["parts"])
+    support_segs = sum(1 for s in segs if s[2] == "support")
+    bed_w, bed_h = bed_mm
+
+    title_h = 50 if (title and chrome) else 0
+    footer_h = (30 if label_below else 0) + (26 if chrome else 0)
+    pad = 16
+    plot = canvas_px
+    img = Image.new("RGB", (plot + pad * 2, plot + pad * 2 + title_h + footer_h),
+                    _BG)
+    draw = ImageDraw.Draw(img)
+    x0, y0 = pad, pad + title_h
+    x1, y1 = x0 + plot, y0 + plot
+    draw.rectangle([x0, y0, x1, y1], fill=(30, 34, 40))
+    ppm = plot / max(bed_w, bed_h)
+
+    def to_px(mx: float, my: float) -> tuple[float, float]:
+        return x0 + mx * ppm, y1 - my * ppm  # bed origin bottom-left, y up
+
+    # Grid + mm labels every 50 mm, matching the placement view operators
+    # already read.
+    try:
+        from PIL import ImageFont
+        try:
+            f_big = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+            f_small = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
+        except Exception:
+            f_big = f_small = ImageFont.load_default()
+    except Exception:
+        f_big = f_small = None
+    for mm in range(0, int(bed_w) + 1, 50):
+        gx = x0 + mm * ppm
+        if gx <= x1 + 0.5:
+            draw.line([(gx, y0), (gx, y1)], fill=_BED_GRID)
+            if chrome and f_small is not None:
+                draw.text((gx + 3, y1 - 18), str(mm), fill=(120, 130, 142),
+                          font=f_small)
+    for mm in range(0, int(bed_h) + 1, 50):
+        gy = y1 - mm * ppm
+        if gy >= y0 - 0.5:
+            draw.line([(x0, gy), (x1, gy)], fill=_BED_GRID)
+
+    segs.sort(key=lambda s: (s[0], _CAT_ORDER[s[2]], s[1]))
+    for z, _seq, cat, part, sx0, sy0, sx1, sy1 in segs:
+        fill, width = _style_for(cat, colors.get(part, (150, 160, 170)))
+        draw.line([to_px(sx0, sy0), to_px(sx1, sy1)], fill=fill, width=width)
+
+    if chrome and f_big is not None:
+        if title:
+            draw.text((pad, 14), title, fill=(235, 238, 242), font=f_big)
+        foot_y = y1 + 8
+        if label_below:
+            draw.text((pad, foot_y), label_below, fill=(235, 238, 242),
+                      font=f_small)
+            foot_y += 26
+        note = ("supports shown in orange" if support_segs
+                else "toolpaths from the sliced gcode")
+        draw.text((pad, foot_y), note, fill=(140, 150, 160), font=f_small)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return {"ok": True, "path": str(out_path), "part_count": len(parsed["parts"]),
+            "segments": len(segs), "support_segments": support_segs,
+            "parts": parsed["parts"], "meta": parsed["meta"]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("gcode", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--title", default=None)
+    ap.add_argument("--bed", default="270x270",
+                    help="bed size in mm, WIDTHxDEPTH (default 270x270)")
+    a = ap.parse_args(argv)
+    bw, _, bd = a.bed.partition("x")
+    res = render_iso_preview(a.gcode, a.out, title=a.title,
+                             bed_mm=(float(bw), float(bd or bw)))
+    print(res)
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
