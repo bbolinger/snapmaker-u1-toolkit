@@ -218,8 +218,13 @@ def render_iso_preview(
     bed_mm: tuple[float, float] = (270.0, 270.0),
     canvas_px: int = 1200,
     title: str | None = None,
+    chrome: bool = True,
 ) -> dict[str, Any]:
     """Render ``gcode_path`` to ``out_path`` as an isometric toolpath preview.
+
+    ``chrome=False`` drops the title header and footer text entirely: text
+    turns to noise at the printer touchscreen's 48/300 px thumbnail sizes,
+    so the injected thumbnail wants pure geometry.
 
     Best-effort like the shipped renderers: every failure returns
     ``{"ok": False, "error": ...}`` so a caller can fall back to the old view.
@@ -255,8 +260,8 @@ def render_iso_preview(
     umax += pad
     vmin -= pad
     vmax += pad
-    header = 56 if title else 0
-    footer = 44
+    header = 56 if (title and chrome) else 0
+    footer = 44 if chrome else 0
     draw_h = canvas_px - header - footer
     scale = min(canvas_px / (umax - umin), draw_h / (vmax - vmin))
 
@@ -301,29 +306,32 @@ def render_iso_preview(
         draw.line([to_px(x0, y0, z), to_px(x1, y1, z)], fill=fill, width=width)
 
     # Header / footer text with the DejaVu fallback the workflow uses.
-    try:
-        from PIL import ImageFont
+    # Skipped entirely for chrome-free thumbnail renders: text turns to
+    # noise at touchscreen thumbnail sizes.
+    if chrome:
         try:
-            f_big = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-            f_small = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
+            from PIL import ImageFont
+            try:
+                f_big = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+                f_small = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
+            except Exception:
+                f_big = f_small = ImageFont.load_default()
+            if title:
+                draw.text((16, 14), title, fill=(235, 238, 242), font=f_big)
+            meta = parsed["meta"]
+            bits = []
+            if meta.get("filament_g"):
+                bits.append(f"{meta['filament_g']} g filament")
+            if meta.get("time"):
+                bits.append(meta["time"])
+            bits.append("supports shown in orange" if support_segs
+                        else "no supports in this plate")
+            draw.text((16, canvas_px - 32), "  ·  ".join(bits),
+                      fill=(170, 178, 188), font=f_small)
         except Exception:
-            f_big = f_small = ImageFont.load_default()
-        if title:
-            draw.text((16, 14), title, fill=(235, 238, 242), font=f_big)
-        meta = parsed["meta"]
-        bits = []
-        if meta.get("filament_g"):
-            bits.append(f"{meta['filament_g']} g filament")
-        if meta.get("time"):
-            bits.append(meta["time"])
-        bits.append("supports shown in orange" if support_segs
-                    else "no supports in this plate")
-        draw.text((16, canvas_px - 32), "  ·  ".join(bits),
-                  fill=(170, 178, 188), font=f_small)
-    except Exception:
-        pass  # text is garnish; the geometry is the payload
+            pass  # text is garnish; the geometry is the payload
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path)

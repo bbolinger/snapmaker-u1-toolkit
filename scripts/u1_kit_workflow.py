@@ -1380,11 +1380,30 @@ def _render_and_inject_plate_preview(
             bed_mm=bed_mm, title=iso_title, label_below=label_below)
     if iso.get("ok"):
         layout["iso_path"] = iso["path"]
+    # Printer touchscreen thumbnail: prefer a chrome-free render of the 3D
+    # toolpath view (operator request 2026-07-22: the machine's screen should
+    # show the real print pose with supports, not the flat footprint). Text
+    # chrome turns to noise at the 48/300 px thumbnail sizes, so this is a
+    # separate geometry-only render. The top-down stays the fallback so
+    # injection never regresses when the toolpath render fails.
+    thumb_src: Path | None = None
+    if iso.get("ok"):
+        try:
+            from u1_gcode_preview import render_iso_preview as _iso_render
+            _thumb = _iso_render(
+                plate_gcode_path, out_dir / f"plate_{plate_idx}_iso_thumb.png",
+                bed_mm=bed_mm, canvas_px=600, chrome=False)
+            if _thumb.get("ok"):
+                thumb_src = Path(_thumb["path"])
+        except Exception:
+            thumb_src = None
+    if thumb_src is None and layout.get("ok"):
+        thumb_src = Path(layout["path"])
     injection = {"ok": False, "sizes": [],
                  "error": "render failed; nothing to inject"}
-    if layout.get("ok"):
-        injection = _inject_plate_thumbnail(plate_gcode_path,
-                                            Path(layout["path"]))
+    if thumb_src is not None:
+        injection = _inject_plate_thumbnail(plate_gcode_path, thumb_src)
+        injection["thumbnail_source"] = str(thumb_src)
     return layout, injection
 
 

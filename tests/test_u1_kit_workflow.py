@@ -986,3 +986,39 @@ def test_m486_top_down_renderer_survives_missing_shared_colors(tmp_path, monkeyp
         _plate_gcode(tmp_path), out)
     assert res["ok"], res
     assert res["part_count"] == 2
+
+
+def test_injected_thumbnail_prefers_the_3d_toolpath_view(tmp_path):
+    """The printer touchscreen thumbnail comes from the chrome-free 3D
+    toolpath render, with the top-down as fallback (operator request:
+    the machine's screen shows the print pose with supports)."""
+    gcode = _plate_gcode(tmp_path)
+    layout, injection = kw._render_and_inject_plate_preview(
+        gcode, 1, 1, tmp_path, arranged_stls=[], selected_count=2,
+        tool_choice="T0", material="PETG", bed_mm=(270.0, 270.0))
+    assert layout["ok"], layout
+    assert injection["ok"], injection
+    assert injection["thumbnail_source"].endswith("plate_1_iso_thumb.png")
+    assert "; thumbnail begin" in gcode.read_text()[:6000]
+    assert (tmp_path / "plate_1_iso.png").exists()
+
+
+def test_injected_thumbnail_falls_back_to_top_down(tmp_path, monkeypatch):
+    """When the toolpath render is unavailable the top-down still gets
+    injected, so the printer never loses its file preview."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_preview(name, *a, **k):
+        if name == "u1_gcode_preview":
+            raise ImportError("simulated missing module")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_preview)
+    gcode = _plate_gcode(tmp_path)
+    layout, injection = kw._render_and_inject_plate_preview(
+        gcode, 1, 1, tmp_path, arranged_stls=[], selected_count=2,
+        tool_choice="T0", material="PETG", bed_mm=(270.0, 270.0))
+    assert layout["ok"], layout
+    assert injection["ok"], injection
+    assert injection["thumbnail_source"].endswith("plate_1_preview.png")

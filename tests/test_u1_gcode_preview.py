@@ -171,3 +171,16 @@ def test_render_fails_soft_on_empty_gcode(tmp_path):
     res = gp.render_iso_preview(_gcode(tmp_path, "; nothing here\n"), out)
     assert not res["ok"]
     assert not out.exists()
+
+
+def test_chrome_free_render_for_thumbnails(tmp_path):
+    """chrome=False drops the header and footer text: the printer
+    touchscreen shows this at 48 and 300 px, where text is just noise."""
+    out = tmp_path / "thumb.png"
+    res = gp.render_iso_preview(_gcode(tmp_path, _TWO_PART_GCODE), out,
+                                canvas_px=600, chrome=False,
+                                title="ignored when chrome is off")
+    assert res["ok"], res
+    assert out.exists() and out.stat().st_size > 0
+    from PIL import Image
+    assert Image.open(out).size == (600, 600)
