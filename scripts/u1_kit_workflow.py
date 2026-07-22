@@ -1042,11 +1042,21 @@ def _render_plate_layout_from_m486_outer_walls(
 
     wall_px = max(2, int(wall_mm * ppm))
     names = sorted(objects.keys())
-    n = len(names)
-    for i, name in enumerate(names):
-        hue = i / n
-        r, g, b = colorsys.hsv_to_rgb(hue, 0.55, 0.9)
-        color = (int(r * 255), int(g * 255), int(b * 255))
+    # Shared part-to-color map (u1_gcode_preview.part_colors is the promoted
+    # copy of this renderer's original formula) so the footprint and the 3D
+    # toolpath view color the same part the same way. Inline fallback keeps
+    # this renderer standalone if the preview module is missing on a deploy.
+    try:
+        from u1_gcode_preview import part_colors as _shared_part_colors
+        color_map = _shared_part_colors(names)
+    except Exception:
+        n = len(names)
+        color_map = {}
+        for i, name in enumerate(names):
+            r, g, b = colorsys.hsv_to_rgb(i / n, 0.55, 0.9)
+            color_map[name] = (int(r * 255), int(g * 255), int(b * 255))
+    for name in names:
+        color = color_map[name]
         for poly in objects[name]:
             pts = [to_px(x, y) for (x, y) in poly]
             if len(pts) >= 2:
@@ -1346,15 +1356,24 @@ def _render_and_inject_plate_preview(
             bed_mm=bed_mm, title=title, label_below=label_below,
         )
     # Isometric 3D companion view built from the SAME sliced gcode as the
-    # footprint above (v2.2.1: the old arranged-STL source used Orca's buggy
-    # --export-stl packer and produced a garbled layout that disagreed with the
-    # footprint). Corroborates by construction + shows height/orientation.
-    # Best-effort: if it fails we skip it (the footprint still shows).
-    iso = _render_plate_isometric_from_gcode(
-        plate_gcode_path, out_dir / f"plate_{plate_idx}_iso.png",
-        bed_mm=bed_mm,
-        title=f"Plate {plate_idx} of {plate_count}  -  3D view",
-        label_below=label_below)
+    # footprint above, so they corroborate by construction. Primary renderer
+    # draws the actual toolpaths (u1_gcode_preview): supports in their own
+    # color, real per-layer silhouettes for the print pose, shared part
+    # colors with the footprint. The outer-wall-prism renderer stays as the
+    # fallback, and if both fail we skip the 3D (the footprint still shows).
+    iso_out = out_dir / f"plate_{plate_idx}_iso.png"
+    iso_title = f"Plate {plate_idx} of {plate_count}  -  3D view"
+    iso: dict[str, Any] = {"ok": False}
+    try:
+        from u1_gcode_preview import render_iso_preview
+        iso = render_iso_preview(plate_gcode_path, iso_out,
+                                 bed_mm=bed_mm, title=iso_title)
+    except Exception as _iso_exc:
+        iso = {"ok": False, "error": f"toolpath preview: {_iso_exc}"}
+    if not iso.get("ok"):
+        iso = _render_plate_isometric_from_gcode(
+            plate_gcode_path, iso_out,
+            bed_mm=bed_mm, title=iso_title, label_below=label_below)
     if iso.get("ok"):
         layout["iso_path"] = iso["path"]
     injection = {"ok": False, "sizes": [],
@@ -5724,6 +5743,12 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
         _audit(request_id, "review_doc_failed", operator,
                error=f"{type(_rd_exc).__name__}: {_rd_exc}"[:200])
 
+    # Filament weight + print time from the sliced gcode's own metadata.
+    # The kit path's card has carried this since the aggregator landed; the
+    # form path built its card before that and never picked it up, so the
+    # operator had to open the laptop to learn a print was 66 g / 5h 48m.
+    _form_estimates = _aggregate_plate_estimates(plates_state)
+
     readiness = {
         "stage": "kit_readiness_card",
         "review_doc_path": review_doc_path,
@@ -5736,6 +5761,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                     "gcode_hash": p["gcode_hash"]} for p in plates_state],
         "tool": tool, "material": material, "profile": profile_slug,
         "orient": values.get("orient"), "supports": supports,
+        "estimates": _form_estimates,
+        "estimated": _form_estimates.get("summary_line"),
         "parsed_echo": u1_form.echo_parse(values, spec),
         "gated_plate": plate1["printer_storage_filename"],
         # start_gate_stage1_command is deliberately NOT surfaced here — a

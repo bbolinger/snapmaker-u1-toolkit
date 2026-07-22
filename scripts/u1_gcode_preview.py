@@ -107,8 +107,10 @@ def parse_toolpaths(gcode_path: Path) -> dict[str, Any]:
         if ms:
             nid = int(ms.group(1))
             cid = None if nid < 0 else nid
-            nm = id_to_name.get(cid, "") if cid is not None else ""
-            cbase = re.sub(r"_id_\d+_copy_\d+$", "", nm) or (nm or None)
+            # Key by the FULL M486 instance name, exactly like the top-down
+            # footprint renderer: each copy of a model keeps its own identity,
+            # and the shared sorted-name color map lines both images up.
+            cbase = (id_to_name.get(cid, "") if cid is not None else "") or None
             if cbase and cbase not in part_order:
                 part_order.append(cbase)
             continue
@@ -176,13 +178,21 @@ def _iso(x: float, y: float, z: float) -> tuple[float, float]:
     return (x - y) * _COS30, (x + y) * _SIN30 + z
 
 
-def _part_colors(parts: list[str]) -> dict[str, tuple[int, int, int]]:
+def part_colors(names: list[str]) -> dict[str, tuple[int, int, int]]:
+    """One part-to-color map for every review image.
+
+    Same formula the top-down footprint has always used (sorted M486 names,
+    evenly spaced hues at s=0.55 v=0.9), promoted here so the isometric view
+    and the footprint color the SAME part the SAME way. Two images that
+    disagree on which part is magenta are worse than one image.
+    """
     import colorsys
+    ordered = sorted(names)
+    n = max(len(ordered), 1)
     colors: dict[str, tuple[int, int, int]] = {}
-    for i, p in enumerate(parts):
-        h = (i * 0.618034) % 1.0
-        r, g, b = colorsys.hsv_to_rgb(h, 0.55, 0.88)
-        colors[p] = (int(r * 255), int(g * 255), int(b * 255))
+    for i, name in enumerate(ordered):
+        r, g, b = colorsys.hsv_to_rgb(i / n, 0.55, 0.9)
+        colors[name] = (int(r * 255), int(g * 255), int(b * 255))
     return colors
 
 
@@ -226,7 +236,7 @@ def render_iso_preview(
     if not segs:
         return {"ok": False, "path": None, "error": "no extrusion segments found"}
 
-    colors = _part_colors(parsed["parts"])
+    colors = part_colors(parsed["parts"])
     support_segs = sum(1 for s in segs if s[2] == "support")
 
     # Frame on the printed material, not the whole bed: orientation and
