@@ -1,24 +1,35 @@
-# Snapmaker U1 Toolkit
-
-### Safe AI Print Operator — Snapmaker U1 first
-
-![Hermes Agent + Snapmaker U1 — safety-staged print automation](docs/images/hero-hermes-snapmaker.png)
+# Snapmaker U1 Toolkit — Print From Your Phone with Telegram
 
 [![tests](https://github.com/bbolinger/snapmaker-u1-toolkit/actions/workflows/tests.yml/badge.svg)](https://github.com/bbolinger/snapmaker-u1-toolkit/actions/workflows/tests.yml)
 
-> Inspired by safety-staged agent workflows, this project applies the pattern specifically to the [Snapmaker U1](https://snapmaker.com/snapmaker-u1) — local slicing, visual previews, camera-gated checks, and explicit operator approval. Useful from the command line on its own; an AI agent like Hermes is the optional remote-control layer on top.
+Safely slice, preview, upload, monitor, and start [Snapmaker U1](https://snapmaker.com/snapmaker-u1) prints remotely through Telegram, OrcaSlicer, Moonraker, and an optional local AI agent.
+
+Send an STL, 3MF, or ZIP from your phone. The toolkit analyzes the model, recommends print settings, slices it locally with OrcaSlicer, generates plate previews, verifies the loaded filament and toolhead, photographs the print bed, and asks for explicit approval before starting.
+
+![Snapmaker U1 remote printing workflow from a phone through Telegram, OrcaSlicer, camera verification, and human-approved print start](docs/images/snapmaker-u1-print-from-phone-telegram-flow.png)
+
+## What you can do
+
+- Print to a Snapmaker U1 from your phone through Telegram.
+- Slice STL and 3MF files with headless OrcaSlicer on Linux, WSL, or Windows.
+- Preview model orientation, plate layout, toolpaths, and important print settings.
+- Upload G-code through the U1's Moonraker/Klipper LAN interface.
+- Verify toolheads and filament before heating or motion.
+- Receive first-layer, final-layer, and completed-print camera photos.
+- Require a fresh bed-camera image and human approval before every toolkit-started print.
+- Run the deterministic CLI tools without AI, or add Hermes with a local LLM for the phone workflow.
+
+The AI does not receive unrestricted printer control. Deterministic scripts own slicing, verification, uploading, monitoring, and the single-use print-start approval gate. See the [safety model](docs/SAFETY.md) for the exact boundary.
 
 This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
 
----
-
 ## See it in action
 
-A single local model takes a zip of eight STLs all the way to a printing plate in
-about 160 seconds (with local LLM), entirely over Telegram and entirely on local hardware.
-Nothing starts until a human replies "yes."
+A local model takes a ZIP of eight STLs from Telegram to a reviewed printing plate in about 160 seconds, entirely on local hardware. Nothing starts until a human approves the fresh bed photo.
 
 https://github.com/user-attachments/assets/f3acea60-4ebe-4059-8158-92abd207f4ec
+
+**Start here:** [print from your phone](docs/PRINT-FROM-PHONE.md) · [install the toolkit](#install) · [set up Telegram](docs/TELEGRAM-SETUP.md) · [run headless OrcaSlicer](docs/HEADLESS.md) · [troubleshoot](TROUBLESHOOTING.md)
 
 ---
 

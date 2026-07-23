@@ -1,0 +1,10 @@
+title: Snapmaker U1 Toolkit
+description: Print to your Snapmaker U1 from your phone through Telegram, headless OrcaSlicer, Moonraker, camera verification, and a human-approved start gate.
+url: https://bbolinger.github.io
+baseurl: /snapmaker-u1-toolkit
+repository: bbolinger/snapmaker-u1-toolkit
+theme: jekyll-theme-cayman
+show_downloads: true
+plugins:
+  - jekyll-seo-tag
+
