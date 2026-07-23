@@ -21,6 +21,8 @@ Send an STL, 3MF, or ZIP from your phone. The toolkit analyzes the model, recomm
 
 The AI does not receive unrestricted printer control. Deterministic scripts own slicing, verification, uploading, monitoring, and the single-use print-start approval gate. See the [safety model](docs/SAFETY.md) for the exact boundary.
 
+This is how AI should touch physical machines: **plan, explain, preview, ask, verify, then act only within a narrow approved boundary.**
+
 ## See it in action
 
 A local model takes a ZIP of eight STLs from Telegram to a reviewed printing plate in about 160 seconds, entirely on local hardware. Nothing starts until a human approves the fresh bed photo.
