@@ -1,6 +1,6 @@
-# Headless OrcaSlicer setup
+# Headless OrcaSlicer Setup for Snapmaker U1
 
-How to slice from the CLI with no GUI (containers, CI pipelines, agent workflows): which OrcaSlicer build to use, the 3-profile load order, a real inheritance pitfall and its workaround, plus the orientation-review and thumbnail-injection tools.
+Use OrcaSlicer from the command line to slice STL and 3MF files for a Snapmaker U1 with no GUI. This guide covers the correct upstream build, the three-profile load order, Linux and Windows setup, profile-inheritance pitfalls, orientation review, thumbnail injection, and G-code validation.
 
 [← Back to the README](../README.md)
 
