@@ -387,8 +387,8 @@ def register(ctx) -> None:
             toolset="u1_kit",
             schema=U1_KIT_SCHEMA,
             handler=_u1_kit_handler,
-            description="Slice a multi-part 3D print kit (zip of STLs); renders "
-                        "its own operator form deterministically",
+            description="Slice a 3D print job (.zip of STLs, .3mf, or bare "
+                        ".stl); renders its own operator form deterministically",
             emoji="🖨️",
         )
         logger.info("snapmaker_u1 u1-form plugin: u1_kit tool registered "
