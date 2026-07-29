@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-u1_kit Tool — slice a multi-part 3D-print kit (.zip of STLs) for Snapmaker U1.
+u1_kit Tool — slice a 3D-print job (.zip of STLs, .3mf, or bare .stl) for
+Snapmaker U1.
 
-The OUTER tool for kit prints. The LLM picks this ONCE when the operator
-supplies a kit zip; everything downstream — form rendering, answer
+The OUTER tool for print jobs. The LLM picks this ONCE when the operator
+supplies a model file; everything downstream — form rendering, answer
 collection, re-invocation, readiness card — happens deterministically inside
 this handler.
 
@@ -402,9 +403,11 @@ def u1_kit_tool(
 U1_KIT_SCHEMA = {
     "name": "u1_kit",
     "description": (
-        "Slice a multi-part 3D PRINT KIT (a .zip of STLs intended to print "
-        "together) for the Snapmaker U1 3D printer.\n\n"
-        "Call this ONCE when the operator supplies a kit zip — everything "
+        "Slice a 3D PRINT JOB for the Snapmaker U1 3D printer. Accepts a "
+        ".zip of STLs (a kit intended to print together), a .3mf project "
+        "(multi-object files are split into their parts), a single .stl, or "
+        "a .zip wrapping any of those.\n\n"
+        "Call this ONCE when the operator supplies a model file — everything "
         "after (form rendering with native inline buttons, operator answer "
         "collection, slice, readiness card) happens deterministically inside "
         "this tool. The native form is shown automatically; do NOT also "
@@ -419,7 +422,8 @@ U1_KIT_SCHEMA = {
             "model_path": {
                 "type": "string",
                 "description": (
-                    "Absolute path to the kit .zip on the Hermes filesystem "
+                    "Absolute path to the model file on the Hermes "
+                    "filesystem: a .zip of STLs, a .3mf, or a bare .stl "
                     "(e.g. an attachment saved to /tmp/parts.zip)."
                 ),
             },

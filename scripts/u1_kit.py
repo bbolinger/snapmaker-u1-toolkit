@@ -24,6 +24,7 @@ Spike-verified facts this serves (§2 of the plan):
 from __future__ import annotations
 
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,9 @@ from u1_orient import (
     parse_stl,
     bbox,
     extract_first_stl_from_3mf,
+    extract_3mf_parts,
+    count_3mf_build_items,
+    TooManyPartsError,
 )
 import u1_request
 
@@ -91,16 +95,47 @@ def _sanitize(stem: str) -> str:
     return s or "part"
 
 
+def _split_3mf_parts(archive: Path, out_dir: Path) -> list[Path]:
+    """Per-part STLs from a multi-object 3MF — the archive itself (a bare
+    ``.3mf`` IS a zip) or the first ``.3mf`` nested inside a plain zip.
+
+    Returns [] when there is nothing splittable so the caller keeps the fused
+    single-mesh fallback: a parse surprise degrades to the old one-blob
+    behavior instead of failing the kit. The one exception is a build section
+    past MAX_KIT_PARTS, which must reject cleanly — falling back there would
+    silently fuse a deliberate over-limit file into one giant part.
+    """
+    try:
+        parts = extract_3mf_parts(archive, out_dir, max_parts=MAX_KIT_PARTS)
+        if parts:
+            return parts
+        with zipfile.ZipFile(archive) as z:
+            nested = [n for n in z.namelist() if n.lower().endswith(".3mf")]
+            if not nested:
+                return []
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td) / Path(nested[0].replace("\\", "/")).name
+                tmp.write_bytes(z.read(nested[0]))
+                return extract_3mf_parts(tmp, out_dir,
+                                         max_parts=MAX_KIT_PARTS)
+    except TooManyPartsError as exc:
+        raise KitIngestError(str(exc)) from exc
+    except Exception:
+        return []
+
+
 def extract_all_stls(archive: Path, out_dir: Path) -> list[Path]:
-    """Return every STL inside ``archive`` (archive order, deterministic).
+    """Return every part STL inside ``archive`` (archive order, deterministic).
 
     - A zip containing ``.stl`` entries → one extracted file per entry.
       Identical basenames from different folders are de-duplicated by suffix so
       no extraction clobbers another.
-    - A zip with no direct STLs (nested 3MF/.model only) → falls back to the
-      single-extract path (one part); a multi-object 3MF is sliced directly by
-      Orca from embedded positions, so splitting it here is unnecessary in v2.1.
-    - A bare ``.stl`` / ``.3mf`` (not a zip) → a kit of one part.
+    - A multi-object ``.3mf`` (bare, or nested in a zip with no direct STLs) →
+      one world-space STL per build item, named from the authored object names,
+      so each part routes through selection/orient/arrange like a zip kit.
+    - A zip with only a single-object 3MF / bare ``.model`` → the fused
+      single-extract path (one part), today's long-validated behavior.
+    - A bare ``.stl`` (not a zip) → a kit of one part.
     """
     archive = Path(archive)
     out_dir = Path(out_dir)
@@ -113,7 +148,10 @@ def extract_all_stls(archive: Path, out_dir: Path) -> list[Path]:
         stl_infos = [i for i in z.infolist()
                      if i.filename.lower().endswith(".stl")]
         if not stl_infos:
-            # Defer to single-extract: handles nested .3mf / .model archives.
+            parts = _split_3mf_parts(archive, out_dir)
+            if parts:
+                return parts
+            # Defer to single-extract: handles single-object .3mf / .model.
             return [extract_first_stl_from_3mf(archive, out_dir)]
         _check_archive_limits(stl_infos)
 
@@ -152,9 +190,11 @@ def count_archive_stls(archive: Path) -> int:
 
 
 def is_multi_part_archive(archive: Path) -> bool:
-    """True if the archive holds more than one STL — i.e. a kit that should be
-    routed to the kit workflow rather than the single-STL workflow."""
-    return count_archive_stls(archive) > 1
+    """True if the archive holds more than one part — multiple STL entries or
+    a multi-object 3MF build — i.e. a kit that should be routed to the kit
+    workflow rather than the single-STL workflow."""
+    return (count_archive_stls(archive) > 1
+            or count_3mf_build_items(archive) > 1)
 
 
 def resolve_upload_path(path: Path) -> Path:

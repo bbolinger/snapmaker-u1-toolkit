@@ -147,6 +147,203 @@ def _triangles_from_3mf_model(data: bytes) -> np.ndarray:
         raise ValueError('3MF model contains no triangles')
     return np.asarray(all_tris, dtype=np.float32)
 
+class TooManyPartsError(ValueError):
+    """A 3MF build section exceeds the caller's part limit."""
+
+def _localname(tag: str) -> str:
+    """Tag/attribute name with any ``{namespace}`` prefix stripped."""
+    return tag.rsplit('}', 1)[-1]
+
+def _attr_path(el: ET.Element) -> str | None:
+    """The production-extension ``p:path`` attribute (cross-file object refs),
+    matched namespace-agnostically — MakerWorld/Bambu 3MFs keep each object in
+    its own ``3D/Objects/*.model`` and reference it this way."""
+    for k, v in el.attrib.items():
+        if _localname(k) == 'path':
+            return v
+    return None
+
+def _transform_from_3mf(attr: str | None) -> tuple[np.ndarray, np.ndarray]:
+    """3MF ``transform`` attribute → (R 3x3, t 3), row-vector convention.
+
+    The spec's 12 numbers are the three rotation/scale rows m00..m22 followed
+    by the translation m30 m31 m32; a vertex maps as ``v @ R + t``. An absent
+    attribute is the identity. Malformed input raises ValueError so callers
+    fall back to the fused-mesh path instead of silently misplacing a part.
+    """
+    if not attr:
+        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+    vals=[float(x) for x in attr.replace(',', ' ').split()]
+    if len(vals) != 12:
+        raise ValueError(f'3MF transform needs 12 numbers, got {len(vals)}')
+    m=np.asarray(vals, dtype=np.float64)
+    return m[:9].reshape(3, 3), m[9:]
+
+def _parse_3mf_model(data: bytes) -> dict[str, object]:
+    """One ``*.model`` XML → {'objects': {id: {...}}, 'build': [items]}."""
+    root=ET.fromstring(data)
+    objects: dict[str, dict]={}
+    build: list[dict]=[]
+    for el in root.iter():
+        name=_localname(el.tag)
+        if name == 'object':
+            oid=el.attrib.get('id')
+            if oid is None: continue
+            entry: dict[str, object]={'name': el.attrib.get('name'), 'type': el.attrib.get('type', 'model'), 'mesh': None, 'components': []}
+            for child in el:
+                cname=_localname(child.tag)
+                if cname == 'mesh':
+                    entry['mesh']=child
+                elif cname == 'components':
+                    for comp in child:
+                        if _localname(comp.tag) != 'component': continue
+                        entry['components'].append({'objectid': comp.attrib.get('objectid'), 'path': _attr_path(comp), 'transform': comp.attrib.get('transform')})
+            objects[oid]=entry
+        elif name == 'item':
+            build.append({'objectid': el.attrib.get('objectid'), 'path': _attr_path(el), 'transform': el.attrib.get('transform')})
+    return {'objects': objects, 'build': build}
+
+def _mesh_triangles(mesh_el: ET.Element) -> np.ndarray | None:
+    """A ``<mesh>`` element → (n,3,3) float64 triangle array, None if empty."""
+    verts=[]; faces=[]
+    for el in mesh_el.iter():
+        n=_localname(el.tag)
+        if n == 'vertex':
+            verts.append([float(el.attrib.get('x', '0')), float(el.attrib.get('y', '0')), float(el.attrib.get('z', '0'))])
+        elif n == 'triangle':
+            faces.append([int(el.attrib[k]) for k in ('v1', 'v2', 'v3')])
+    if not verts or not faces:
+        return None
+    return np.asarray(verts, dtype=np.float64)[np.asarray(faces, dtype=np.int64)]
+
+def _norm_zip_path(p: str) -> str:
+    """p:path values are archive-absolute (``/3D/Objects/x.model``); zip entry
+    names are not."""
+    return p.replace('\\', '/').lstrip('/')
+
+def _root_model_name(names: list[str]) -> str | None:
+    models=[n for n in names if n.lower().endswith('.model')]
+    if not models:
+        return None
+    for n in models:
+        if _norm_zip_path(n).lower() == '3d/3dmodel.model':
+            return n
+    for n in models:
+        if n.lower().endswith('3dmodel.model'):
+            return n
+    return models[0]
+
+def _model_for(models: dict[str, dict], z: zipfile.ZipFile, name: str) -> dict:
+    """Parsed model for an archive entry, cached per normalized path."""
+    key=_norm_zip_path(name)
+    if key in models:
+        return models[key]
+    try:
+        data=z.read(name)
+    except KeyError:
+        match=next((n for n in z.namelist() if _norm_zip_path(n).lower() == key.lower()), None)
+        if match is None:
+            raise ValueError(f'3MF references missing model file {name}')
+        data=z.read(match)
+    models[key]=_parse_3mf_model(data)
+    return models[key]
+
+def _resolve_object_tris(models: dict[str, dict], z: zipfile.ZipFile, model_path: str, oid: str, R: np.ndarray, t: np.ndarray, depth: int, seen: frozenset) -> list[np.ndarray]:
+    """World-space triangles for one object, recursing through its component
+    tree. Transforms compose child-first: v' = v @ (C @ P) + (ct @ P + pt)."""
+    if depth > 8:
+        raise ValueError('3MF component nesting deeper than 8 levels')
+    key=(model_path, oid)
+    if key in seen:
+        raise ValueError(f'3MF component cycle at object {oid}')
+    obj=_model_for(models, z, model_path)['objects'].get(oid)
+    if obj is None:
+        raise ValueError(f'3MF object {oid} missing from {model_path}')
+    out: list[np.ndarray]=[]
+    if obj['mesh'] is not None:
+        tris=_mesh_triangles(obj['mesh'])
+        if tris is not None:
+            out.append(tris @ R + t)
+    for comp in obj['components']:
+        cR, ct=_transform_from_3mf(comp['transform'])
+        cpath=_norm_zip_path(comp['path']) if comp['path'] else model_path
+        out.extend(_resolve_object_tris(models, z, cpath, comp['objectid'], cR @ R, ct @ R + t, depth + 1, seen | {key}))
+    return out
+
+def _safe_stem(s: str) -> str:
+    s=re.sub(r'[^A-Za-z0-9_-]+', '_', s).strip('_')
+    return s[:60] or 'part'
+
+def extract_3mf_parts(path: Path, out_dir: Path, *, max_parts: int | None = None) -> list[Path]:
+    """Split a 3MF into one world-space binary STL per build item.
+
+    Returns [] when the file is not a 3MF or its build section has fewer than
+    two items — the fused single-mesh path is already correct there and stays
+    untouched. Per-item and per-component transforms, component trees, and
+    production-extension p:path references into sibling ``*.model`` files are
+    all resolved; two build items referencing the same object stay two parts
+    (an authored plate with two copies is a kit of two). Raises
+    TooManyPartsError past ``max_parts`` so ingest can reject cleanly instead
+    of silently dropping parts.
+    """
+    path=Path(path); out_dir=Path(out_dir)
+    if not zipfile.is_zipfile(path):
+        return []
+    with zipfile.ZipFile(path) as z:
+        root_name=_root_model_name(z.namelist())
+        if root_name is None:
+            return []
+        models: dict[str, dict]={}
+        root=_model_for(models, z, root_name)
+        items=[it for it in root['build'] if it.get('objectid')]
+        if len(items) < 2:
+            return []
+        if max_parts is not None and len(items) > max_parts:
+            raise TooManyPartsError(f'3MF build has {len(items)} items; the kit limit is {max_parts}')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        used: set[str]=set(); written: list[Path]=[]
+        for i, it in enumerate(items):
+            R, t=_transform_from_3mf(it.get('transform'))
+            ipath=_norm_zip_path(it['path']) if it.get('path') else _norm_zip_path(root_name)
+            tris_list=_resolve_object_tris(models, z, ipath, it['objectid'], R, t, 0, frozenset())
+            if not tris_list:
+                continue
+            tris=np.concatenate(tris_list).astype(np.float32)
+            obj=models[ipath]['objects'].get(it['objectid']) or {}
+            stem=_safe_stem(str(obj.get('name') or f'{path.stem}_part{i + 1}'))
+            base=stem; k=1
+            while base in used:
+                base=f'{stem}__{k}'; k += 1
+            used.add(base)
+            out=out_dir / f'{base}.stl'
+            write_binary_stl(out, tris, name=base)
+            written.append(out)
+        return written
+
+def count_3mf_build_items(path: Path) -> int:
+    """Build items in an archive's root 3MF model, following one nesting level
+    of ``.3mf``-inside-zip. 0 on anything unparseable. Cheap — XML only, no
+    mesh resolution — so routing can call it on every upload."""
+    try:
+        path=Path(path)
+        if not zipfile.is_zipfile(path):
+            return 0
+        with zipfile.ZipFile(path) as z:
+            names=z.namelist()
+            root_name=_root_model_name(names)
+            if root_name is None:
+                nested=[n for n in names if n.lower().endswith('.3mf')]
+                if not nested:
+                    return 0
+                with tempfile.TemporaryDirectory() as td:
+                    tmp=Path(td) / Path(_norm_zip_path(nested[0])).name
+                    tmp.write_bytes(z.read(nested[0]))
+                    return count_3mf_build_items(tmp)
+            root=_parse_3mf_model(z.read(root_name))
+            return sum(1 for it in root['build'] if it.get('objectid'))
+    except Exception:
+        return 0
+
 def _extract_from_zip(path: Path, out_dir: Path) -> Path:
     with zipfile.ZipFile(path) as z:
         names=z.namelist()
