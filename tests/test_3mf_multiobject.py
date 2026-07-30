@@ -226,6 +226,55 @@ def test_malformed_transform_falls_back_fused(tmp_path):
     assert len(stls) == 1
 
 
+def test_mirror_transform_keeps_outward_winding(tmp_path):
+    # 3MF allows mirroring transforms (negative determinant). Without a
+    # winding flip the mirrored part's STL is inside out — signed volume
+    # goes negative. Both parts must come out solid.
+    objects = (
+        f'<object id="1" name="P">{_mesh_xml()}</object>'
+        f'<object id="2" name="M">{_mesh_xml()}</object>'
+    )
+    build = (
+        '<item objectid="1"/>'
+        '<item objectid="2" transform="-1 0 0 0 1 0 0 0 1 40 0 0"/>'
+    )
+    src = _write_3mf(tmp_path / "mir.3mf", _model_xml(objects, build))
+    parts = extract_3mf_parts(src, tmp_path / "parts")
+
+    def signed_volume(stl):
+        t = parse_stl(stl).astype(np.float64)
+        return float(np.einsum("ij,ij->i", t[:, 0],
+                               np.cross(t[:, 1], t[:, 2])).sum() / 6.0)
+
+    assert signed_volume(parts[0]) > 0
+    assert signed_volume(parts[1]) > 0
+
+
+def test_oversized_model_entry_rejected_before_read(tmp_path, monkeypatch):
+    import u1_orient
+    monkeypatch.setattr(u1_orient, "MAX_3MF_MODEL_BYTES", 64)
+    src = _write_3mf(tmp_path / "big.3mf", _two_cube_model())
+    with pytest.raises(ValueError):
+        extract_3mf_parts(src, tmp_path / "p")
+    assert count_3mf_build_items(src) == 0
+    # The fused fallback hits the same cap, so ingest rejects cleanly
+    # instead of loading the oversized entry into RAM.
+    with pytest.raises(ValueError):
+        u1_kit.extract_all_stls(src, tmp_path / "parts")
+
+
+def test_failed_item_leaves_no_orphan_stls(tmp_path):
+    # Item 2's object is missing: resolution fails AFTER item 1 succeeded.
+    # Nothing may be written — the fused fallback owns the out_dir then.
+    objects = f'<object id="1" name="Good">{_mesh_xml()}</object>'
+    build = '<item objectid="1"/><item objectid="99"/>'
+    src = _write_3mf(tmp_path / "orphan.3mf", _model_xml(objects, build))
+    parts_dir = tmp_path / "parts"
+    with pytest.raises(ValueError):
+        extract_3mf_parts(src, parts_dir)
+    assert not (parts_dir.exists() and list(parts_dir.glob("*.stl")))
+
+
 def test_component_cycle_is_caught_not_hung(tmp_path):
     objects = (
         '<object id="1"><components><component objectid="2"/></components></object>'

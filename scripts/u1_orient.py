@@ -150,6 +150,19 @@ def _triangles_from_3mf_model(data: bytes) -> np.ndarray:
 class TooManyPartsError(ValueError):
     """A 3MF build section exceeds the caller's part limit."""
 
+# Cap for any single OPC model-XML entry parsed out of a 3MF/zip. Mirrors the
+# kit extractor's per-part cap (u1_kit.MAX_PART_BYTES — not importable here
+# without a cycle): zip entries are read wholly into RAM, so a tiny crafted
+# archive declaring a multi-GB model entry would otherwise OOM the workflow
+# before any human gate. zipfile enforces the declared size on read.
+MAX_3MF_MODEL_BYTES = 200 * 1024 * 1024
+
+def _read_model_entry(z: zipfile.ZipFile, name: str) -> bytes:
+    info=z.getinfo(name)
+    if info.file_size > MAX_3MF_MODEL_BYTES:
+        raise ValueError(f'3MF model entry {name} is {info.file_size / 1e6:.0f}MB; the limit is {MAX_3MF_MODEL_BYTES / 1e6:.0f}MB')
+    return z.read(name)
+
 def _localname(tag: str) -> str:
     """Tag/attribute name with any ``{namespace}`` prefix stripped."""
     return tag.rsplit('}', 1)[-1]
@@ -239,12 +252,12 @@ def _model_for(models: dict[str, dict], z: zipfile.ZipFile, name: str) -> dict:
     if key in models:
         return models[key]
     try:
-        data=z.read(name)
+        data=_read_model_entry(z, name)
     except KeyError:
         match=next((n for n in z.namelist() if _norm_zip_path(n).lower() == key.lower()), None)
         if match is None:
             raise ValueError(f'3MF references missing model file {name}')
-        data=z.read(match)
+        data=_read_model_entry(z, match)
     models[key]=_parse_3mf_model(data)
     return models[key]
 
@@ -263,7 +276,13 @@ def _resolve_object_tris(models: dict[str, dict], z: zipfile.ZipFile, model_path
     if obj['mesh'] is not None:
         tris=_mesh_triangles(obj['mesh'])
         if tris is not None:
-            out.append(tris @ R + t)
+            world=tris @ R + t
+            # A mirroring transform (negative determinant — 3MF allows it)
+            # flips triangle winding, which turns the STL inside out. Restore
+            # outward orientation by reversing each triangle's vertex order.
+            if np.linalg.det(R) < 0:
+                world=world[:, ::-1, :]
+            out.append(world)
     for comp in obj['components']:
         cR, ct=_transform_from_3mf(comp['transform'])
         cpath=_norm_zip_path(comp['path']) if comp['path'] else model_path
@@ -300,8 +319,11 @@ def extract_3mf_parts(path: Path, out_dir: Path, *, max_parts: int | None = None
             return []
         if max_parts is not None and len(items) > max_parts:
             raise TooManyPartsError(f'3MF build has {len(items)} items; the kit limit is {max_parts}')
-        out_dir.mkdir(parents=True, exist_ok=True)
-        used: set[str]=set(); written: list[Path]=[]
+        # Resolve EVERY item before writing anything: an exception on item N
+        # must not leave items 1..N-1 as orphan STLs next to the fused
+        # fallback's output.
+        resolved: list[tuple[str, np.ndarray]]=[]
+        used: set[str]=set()
         for i, it in enumerate(items):
             R, t=_transform_from_3mf(it.get('transform'))
             ipath=_norm_zip_path(it['path']) if it.get('path') else _norm_zip_path(root_name)
@@ -315,6 +337,12 @@ def extract_3mf_parts(path: Path, out_dir: Path, *, max_parts: int | None = None
             while base in used:
                 base=f'{stem}__{k}'; k += 1
             used.add(base)
+            resolved.append((base, tris))
+        if not resolved:
+            return []
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written: list[Path]=[]
+        for base, tris in resolved:
             out=out_dir / f'{base}.stl'
             write_binary_stl(out, tris, name=base)
             written.append(out)
@@ -333,13 +361,13 @@ def count_3mf_build_items(path: Path) -> int:
             root_name=_root_model_name(names)
             if root_name is None:
                 nested=[n for n in names if n.lower().endswith('.3mf')]
-                if not nested:
+                if not nested or z.getinfo(nested[0]).file_size > MAX_3MF_MODEL_BYTES:
                     return 0
                 with tempfile.TemporaryDirectory() as td:
                     tmp=Path(td) / Path(_norm_zip_path(nested[0])).name
                     tmp.write_bytes(z.read(nested[0]))
                     return count_3mf_build_items(tmp)
-            root=_parse_3mf_model(z.read(root_name))
+            root=_parse_3mf_model(_read_model_entry(z, root_name))
             return sum(1 for it in root['build'] if it.get('objectid'))
     except Exception:
         return 0
@@ -352,12 +380,15 @@ def _extract_from_zip(path: Path, out_dir: Path) -> Path:
             name=stls[0]; out=out_dir / Path(name).name; out.write_bytes(z.read(name)); return out
         nested=[n for n in names if n.lower().endswith(('.3mf','.zip'))]
         if nested:
+            info=z.getinfo(nested[0])
+            if info.file_size > MAX_3MF_MODEL_BYTES:
+                raise ValueError(f'nested archive {nested[0]} is {info.file_size / 1e6:.0f}MB; the limit is {MAX_3MF_MODEL_BYTES / 1e6:.0f}MB')
             tmp=out_dir / Path(nested[0]).name
             tmp.write_bytes(z.read(nested[0]))
             return extract_first_stl_from_3mf(tmp, out_dir)
         models=[n for n in names if n.lower().endswith('.model') or n.lower().endswith('3dmodel.model')]
         if models:
-            tris=_triangles_from_3mf_model(z.read(models[0]))
+            tris=_triangles_from_3mf_model(_read_model_entry(z, models[0]))
             out=out_dir / (path.stem + '_from_3mf.stl')
             write_binary_stl(out, tris, name=f'extracted from {path.name}')
             return out

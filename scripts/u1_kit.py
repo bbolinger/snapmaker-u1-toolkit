@@ -111,7 +111,9 @@ def _split_3mf_parts(archive: Path, out_dir: Path) -> list[Path]:
             return parts
         with zipfile.ZipFile(archive) as z:
             nested = [n for n in z.namelist() if n.lower().endswith(".3mf")]
-            if not nested:
+            # Oversized nested archives fall through to the fused path, whose
+            # own size cap rejects them cleanly BEFORE the bytes are read.
+            if not nested or z.getinfo(nested[0]).file_size > MAX_PART_BYTES:
                 return []
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td) / Path(nested[0].replace("\\", "/")).name
