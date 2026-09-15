@@ -40,9 +40,11 @@ model is just a kit of one**, auto-detected, same entrypoint, same safety
 boundary:
 
 1. **Send a model.** A `.stl`/`.3mf`, or a zip of STLs (the common Printables
-   shape). The workflow ingests every part: footprints measured, oversized
-   parts flagged, hostile archives refused with a clean error instead of a
-   crash.
+   shape). A multi-object `.3mf` (the MakerWorld/Printables project format)
+   is split into its named parts, so each one shows up in the form
+   individually. The workflow ingests every part: footprints measured,
+   oversized parts flagged, hostile archives refused with a clean error
+   instead of a crash.
 2. **Answer one decision form** — parts, print head, orientation, supports,
    profile. On a tool-capable model it renders as **native buttons** (one
    submit); on a small local model it falls back to a typed one-liner, or a

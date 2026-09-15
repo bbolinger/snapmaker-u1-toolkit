@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Multi-object 3MF projects now arrive as real kits.** A `.3mf` holding
+  several objects (the MakerWorld/Printables project shape, including files
+  that keep each object in its own internal model file) used to be fused
+  into one un-arrangeable blob. Each build item is now extracted as its own
+  part in true world-space position, named from the names authored in the
+  file, so part selection, orientation, arrangement, and per-part previews
+  all work exactly like a zip of STLs. Two copies of the same object on the
+  authored plate stay two parts.
+
+### Changed
+
+- The `u1_kit` tool contract now names every accepted input (`.stl`, `.3mf`,
+  or a `.zip` of either) instead of only "a .zip of STLs"; 3MF uploads no
+  longer depend on the driving model improvising.
+
 ## [3.0.1] — 2026-07-22
 
 ### Fixed
