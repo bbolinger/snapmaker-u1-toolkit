@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`install.py` now copies into the Hermes tree that is actually imported.**
+  It asks the venv interpreter where Hermes's own `tools/` and `gateway/`
+  packages live instead of assuming `site-packages`. Hermes installed from a
+  source checkout or as an editable package (the only layout since the PyPI
+  releases stopped) keeps them in the checkout, which moves on every upgrade;
+  a copy left in the old tree was never imported, so the `u1_kit` tool
+  silently dropped out of the model's tool list and `form` answered "no
+  gateway callback wired", pushing every kit into the one-question-per-turn
+  text fallback. The `site-packages` scan stays as the fallback, and the probe
+  runs from a neutral working directory so a `tools/` folder in `HERMES_HOME`
+  cannot pose as the package.
+
 ## [3.1.0] — 2026-09-15
 
 ### Added

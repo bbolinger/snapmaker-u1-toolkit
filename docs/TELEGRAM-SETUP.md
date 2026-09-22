@@ -76,7 +76,7 @@ Developers integrating a different bot can use the SDK-free reference renderer i
 
 ## Troubleshooting
 
-- **No form buttons:** rerun `python3 adapters/hermes/install.py`, then restart the gateway externally.
+- **No form buttons, or the form tool answers "no gateway callback wired":** the copied gateway module is not in the live Hermes tree (a Hermes upgrade from source moves it). Rerun `python3 adapters/hermes/install.py`, then restart the gateway externally.
 - **Attachments do not appear:** verify the `snapmaker_u1` hook plugin loaded after the restart.
 - **YES has no effect:** rerun `bash tools/install_hermes_u1_hooks.sh --verify`.
 - **Wrong user is refused:** check `TELEGRAM_ALLOWED_USERS` and `U1_OPERATOR_BINDING`.

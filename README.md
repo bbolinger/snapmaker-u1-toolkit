@@ -350,6 +350,13 @@ auto-skill trigger, and the image/review-doc attachments do not load. Watch for
 its `[4/6] install the snapmaker_u1 hook plugin` and a `[6/6]` verify ending
 `OK: hooks=...transform_llm_output`.
 
+`install.py` asks the venv interpreter where Hermes's own `tools/` and
+`gateway/` packages live, so it works for a PyPI install and for a source
+checkout alike. Re-run it after any Hermes upgrade that moves the source tree:
+a copy left in the old tree is never imported, the `u1_kit` tool drops out of
+the model's tool list, and the `form` tool answers "no gateway callback wired",
+which pushes every kit into the one-question-per-turn text fallback.
+
 **4. Install both gateway hooks** (the operator YES that starts a print and the
 reply/tap CANCEL that stops one), restart the gateway, and verify:
 

@@ -4,8 +4,11 @@ Install the u1 form flow into a Hermes deployment.
 
 What this does (idempotent, re-run safe):
 
-  1. Detects the Hermes ``site-packages`` (auto-finds ``gateway/`` and
-     ``tools/`` under the given venv) and copies in:
+  1. Finds the live Hermes ``tools/`` and ``gateway/`` packages by asking
+     the venv interpreter where it imports them from (``site-packages`` for
+     a PyPI install; the source checkout for an editable install, which
+     moves on every upgrade), falling back to a ``site-packages`` scan, and
+     copies in:
        - form_gateway.py   (blocking primitive; mirrors clarify_gateway;
                             plus the session-keyed form-callback registry;
                             from ``adapters/hermes/tools/``)
@@ -53,6 +56,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,44 @@ def _venv_python(venv: Path) -> Path | None:
         return cand
     win = venv / "Scripts" / "python.exe"
     return win if win.exists() else None
+
+
+def _live_package_dirs(venv_python: Path | None) -> tuple[Path, Path] | None:
+    """Where the venv's ``tools`` and ``gateway`` packages really live.
+
+    Hermes from PyPI keeps them under site-packages. A source checkout or
+    editable install (the only layout since the PyPI releases stopped) keeps
+    them in the checkout, and that directory changes on every upgrade. A copy
+    left in an old tree is never imported: the ``u1_kit`` tool silently drops
+    out of the model's tool list and ``form`` answers "no gateway callback
+    wired". Asking the interpreter is the one answer that is right for every
+    layout. Runs from a neutral working directory so a ``tools/`` folder in
+    the caller's cwd (HERMES_HOME has one) cannot pose as the package.
+    Returns None when the interpreter cannot answer, leaving the
+    site-packages scan as the fallback.
+    """
+    if venv_python is None or not venv_python.exists():
+        return None
+    src = (
+        "import os, tools, gateway\n"
+        "print(os.path.dirname(os.path.abspath(tools.__file__)))\n"
+        "print(os.path.dirname(os.path.abspath(gateway.__file__)))\n"
+    )
+    try:
+        proc = subprocess.run([str(venv_python), "-c", src], text=True,
+                              capture_output=True, timeout=60,
+                              cwd=tempfile.gettempdir())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if len(lines) != 2:
+        return None
+    tools_dir, gateway_dir = Path(lines[0]), Path(lines[1])
+    if not tools_dir.is_dir() or not (gateway_dir / "run.py").exists():
+        return None
+    return tools_dir, gateway_dir
 
 
 def _venv_hermes_bin(venv: Path) -> Path:
@@ -320,7 +362,8 @@ def _verify(venv_python: Path, tools_dir: Path) -> str:
         "print('OK: clarify held, form resolves; toolsets=' + repr(sorted(ts)))\n"
     ).format(tools_dir=str(tools_dir))
     proc = subprocess.run([str(venv_python), "-c", src],
-                          text=True, capture_output=True, timeout=60)
+                          text=True, capture_output=True, timeout=60,
+                          cwd=tempfile.gettempdir())
     if proc.returncode != 0:
         return f"FAIL\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
     return proc.stdout.strip()
@@ -392,13 +435,19 @@ def main(argv=None) -> int:
     venv = a.venv.resolve()
     if not venv.is_dir():
         raise SystemExit(f"venv not found: {venv}")
-    sp = _site_packages(venv)
-    tools_dir = sp / "tools"
-    gateway_dir = sp / "gateway"
+    venv_python = _venv_python(venv)
+    live = _live_package_dirs(venv_python)
+    if live is not None:
+        tools_dir, gateway_dir = live
+        layout = "live packages, as imported by the venv interpreter"
+    else:
+        sp = _site_packages(venv)
+        tools_dir = sp / "tools"
+        gateway_dir = sp / "gateway"
+        layout = f"site-packages scan under {sp}"
     run_py = gateway_dir / "run.py"
     if not tools_dir.is_dir() or not run_py.exists():
-        raise SystemExit(f"unexpected layout under {sp}: tools/ or gateway/run.py missing")
-    venv_python = _venv_python(venv)
+        raise SystemExit(f"unexpected layout ({layout}): {tools_dir} or {run_py} missing")
     if venv_python is None:
         raise SystemExit(
             f"no python under {venv} (tried bin/python* and Scripts/python.exe)")
@@ -417,7 +466,9 @@ def main(argv=None) -> int:
                  "u1_kit_tool.py": here / "tools" / "u1_kit_tool.py"}
 
     print(f"venv:           {venv}")
-    print(f"site-packages:  {sp}")
+    print(f"tools dir:      {tools_dir}")
+    print(f"gateway dir:    {gateway_dir}")
+    print(f"layout:         {layout}")
     print(f"python:         {venv_python}")
     print(f"plugin dest:    {plugin_dst}")
     print(f"action:         {'uninstall' if a.uninstall else 'install'}{' (dry-run)' if a.dry_run else ''}")

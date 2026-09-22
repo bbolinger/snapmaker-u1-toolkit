@@ -1109,27 +1109,31 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
     assert bak.read_text() == _STOCK_RUN_PY
 
-    # Four subprocess steps now run, in order: enable u1-form, pip-install the
-    # snapmaker_u1 hook plugin, the bare-composite toolset invariant verify, and
-    # the hook-plugin registration verify.
-    assert len(calls) == 4
-    assert calls[0][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
+    # Five subprocess steps run, in order: the live-package probe (the stub
+    # answers nonsense, so the site-packages scan carries this test), enable
+    # u1-form, pip-install the snapmaker_u1 hook plugin, the bare-composite
+    # toolset invariant verify, and the hook-plugin registration verify.
+    assert len(calls) == 5
+    assert calls[0][0] == str(venv / "bin" / "python3")
+    assert calls[0][1] == "-c"
+    assert "tools.__file__" in calls[0][2]
+    assert calls[1][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
     # pip install -e <repo>/plugin
-    assert calls[1][0] == str(venv / "bin" / "python3")
-    assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
-    # Path, not string suffix: Windows stringifies with backslashes.
-    assert Path(calls[1][5]).name == "plugin"
-    # bare-composite invariant check with syntactically valid source
     assert calls[2][0] == str(venv / "bin" / "python3")
-    assert calls[2][1] == "-c"
-    compile(calls[2][2], "<verify-src>", "exec")
-    assert "'clarify' in ts" in calls[2][2]  # the eviction regression check
-    assert "'form' in ts" in calls[2][2]
-    # hook-plugin registration verify must assert transform_llm_output loads
+    assert calls[2][1:5] == ["-m", "pip", "install", "-e"]
+    # Path, not string suffix: Windows stringifies with backslashes.
+    assert Path(calls[2][5]).name == "plugin"
+    # bare-composite invariant check with syntactically valid source
     assert calls[3][0] == str(venv / "bin" / "python3")
     assert calls[3][1] == "-c"
-    compile(calls[3][2], "<hook-verify-src>", "exec")
-    assert "transform_llm_output" in calls[3][2]
+    compile(calls[3][2], "<verify-src>", "exec")
+    assert "'clarify' in ts" in calls[3][2]  # the eviction regression check
+    assert "'form' in ts" in calls[3][2]
+    # hook-plugin registration verify must assert transform_llm_output loads
+    assert calls[4][0] == str(venv / "bin" / "python3")
+    assert calls[4][1] == "-c"
+    compile(calls[4][2], "<hook-verify-src>", "exec")
+    assert "transform_llm_output" in calls[4][2]
 
 
 def _fake_hermes_windows(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
@@ -1166,9 +1170,45 @@ def test_install_supports_windows_venv_layout(tmp_path, monkeypatch):
     assert (sp / "tools" / "form_gateway.py").exists()
 
     # Subprocess steps target the Windows executables.
-    assert calls[0][0] == str(venv / "Scripts" / "hermes.exe")
-    assert calls[1][0] == str(venv / "Scripts" / "python.exe")
-    assert calls[1][1:5] == ["-m", "pip", "install", "-e"]
+    assert calls[0][0] == str(venv / "Scripts" / "python.exe")  # live-package probe
+    assert calls[1][0] == str(venv / "Scripts" / "hermes.exe")
+    assert calls[2][0] == str(venv / "Scripts" / "python.exe")
+    assert calls[2][1:5] == ["-m", "pip", "install", "-e"]
+
+
+def test_install_targets_the_tree_the_interpreter_imports_from(tmp_path, monkeypatch):
+    """An editable / source-checkout Hermes keeps tools/ and gateway/ outside
+    site-packages, in a tree that moves on every upgrade. install.py must copy
+    into the tree the venv interpreter actually imports, not into a
+    site-packages folder that happens to exist (2026-09-22: a copy left in the
+    old tree was never imported, u1_kit vanished and form answered "no gateway
+    callback wired")."""
+    venv, sp, _stale_run_py = _fake_hermes(tmp_path, monkeypatch)
+    src = tmp_path / "hermes-src"
+    (src / "tools").mkdir(parents=True)
+    (src / "gateway").mkdir()
+    live_run_py = src / "gateway" / "run.py"
+    live_run_py.write_text(_STOCK_RUN_PY)
+
+    calls = []
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "-c" and "tools.__file__" in cmd[2]:
+            assert kwargs.get("cwd"), "probe must run from a neutral cwd"
+            return types.SimpleNamespace(
+                returncode=0, stderr="",
+                stdout=f"{src / 'tools'}\n{src / 'gateway'}\n")
+        return types.SimpleNamespace(returncode=0, stdout="OK: stubbed\n", stderr="")
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+
+    assert (src / "tools" / "form_gateway.py").read_bytes() == \
+        (_ADAPTERS / "hermes" / "tools" / "form_gateway.py").read_bytes()
+    assert (src / "tools" / "u1_kit_tool.py").exists()
+    assert not (sp / "tools" / "form_gateway.py").exists()
+    assert hermes_install.RUN_PY_MARKER in live_run_py.read_text()
+    assert hermes_install.RUN_PY_MARKER not in _stale_run_py.read_text()
 
 
 def test_install_patched_run_py_body_is_valid_python(tmp_path, monkeypatch):
