@@ -180,7 +180,7 @@ The start decision needs an LLM + your explicit approval. **Watching the print o
 
 | Job | Cadence | What it does |
 |---|---|---|
-| `u1_last_layer_watch.py` | every 1 min | Snaps a photo at **first-layer** (layers 2–5, the bed-adhesion check), at **last-layer** (final ~6 layers), and after a **pause/resume** (an extra confidence check). Delivers each straight to Telegram. Auto-dims the cavity LED a few minutes after the job completes/errors/cancels. |
+| `u1_last_layer_watch.py` | every 1 min | Snaps a photo at **first-layer** (layers 2–5, the bed-adhesion check), at **last-layer** (about 5 minutes before the slicer estimate says it ends), and after a **pause/resume** (an extra confidence check). Delivers each straight to Telegram. Auto-dims the cavity LED a few minutes after the job completes/errors/cancels. |
 | `u1_print_watchdog.py` | every 5 min | Silent health poll across *any* active U1 print, not just Hermes-started ones. Alerts once per distinct issue, with cooldown so it never spams. |
 | `u1_print_history.py` | every 5 min | Appends to a durable print ledger. |
 
@@ -463,7 +463,7 @@ This caught me out during the first live test — the agent kept claiming it wou
 | `u1_upload_gcode.py` | Upload-only (`print_started=false`) with gates: idle state + tool/material match |
 | `u1_slice_workflow.py` | Canonical end-to-end STL/3MF entry point: orient → render → slice → preview → upload-only/start gate |
 | `u1_kit_workflow.py` | The unified kit workflow behind it — ingest, one decision form, arrange, slice, previews, bed-clear gate |
-| `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and "last ~6 layers" milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
+| `u1_last_layer_watch.py` | Watch active print for first-layer (2–5) and last-layer (about 5 minutes left by the slicer estimate, never more than 6 layers out) milestones, snap photos; also auto-dims the cavity LED 5 minutes after `complete`/`error`/`cancelled` (`U1_LED_OFF_DELAY_SEC` overrides) |
 | `u1_print_watchdog.py` | Quiet cron-driven health watcher with per-issue cooldown to avoid notification spam |
 | `u1_print_history.py` | Append-only JSONL print ledger + canonical upserted JSON |
 | `snapmaker_u1_status.py` | Read-only status probe |

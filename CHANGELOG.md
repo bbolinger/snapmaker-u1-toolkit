@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The last-layer photo no longer arrives an hour early on prints with slow
+  layers.** It used to fire six layers from the end, which is seconds on a
+  900-layer figure but over an hour on a 20-layer print whose layers take ten
+  minutes each. It now fires when the slicer's time estimate says about five
+  minutes are left, and never more than six layers from the end. Files with
+  no estimate get it on the final or next-to-final layer.
+- **Cancelled or failed prints no longer get a "finished" photo.** The
+  catch-up photo for prints that finish between two checks now fires only
+  for prints that actually completed.
+
 ## [3.1.1] — 2026-09-22
 
 ### Fixed

@@ -7,7 +7,8 @@ Telegram-ready notification with MEDIA:<path>.
 
 Milestones:
 - first-layer/bed-adhesion check: first observed layer 2 through 5, once per job
-- last-layer check: final or next-to-final layer, once per job
+- last-layer check: about five minutes of printing left by the slicer
+  estimate (final or next-to-final layer when there is no estimate), once per job
 
 No movement/heating/G-code/start/cancel commands.
 """
@@ -17,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -43,15 +45,21 @@ def _watchdog_state_path() -> Path:
 def _camera_helper() -> str:
     return str(Path(__file__).resolve().parent / "u1_camera.py")
 
-# Polling once per minute can miss an exact layer boundary, so use narrow windows.
-# LAST_LAYER_WINDOW was previously 1 — too tight for fast finishing prints. A
-# 1-layer window often missed against 60-second cron jitter and the watcher
-# refuses to fire after print_stats.state leaves "printing" (bed may be
-# dropping/dropped already). 6 layers is a generous "we're basically done"
-# zone that still triggers exactly once per print via the job_key dedup.
+# "Basically done" is measured in time, not layers. A fixed layer count was
+# wrong in both directions: 6 layers is seconds on a 900-layer figure but over
+# an hour on a 20-layer print with slow layers (live 2026-09-27: three
+# pumpkin plates were announced as done 65-101 minutes before they finished).
+# The last-layer photo fires once the slicer estimate says
+# LAST_LAYER_SECONDS_LEFT or less remains. LAST_LAYER_WINDOW stays as a
+# ceiling so a bad estimate can never fire it early on a tall print. With no
+# estimate it falls back to the final or next-to-final layer. A print that
+# finishes between two 1-minute polls is still caught by the post-complete
+# fallback in main().
 FIRST_LAYER_TARGET = 2
 FIRST_LAYER_MAX = 5
 LAST_LAYER_WINDOW = 6
+LAST_LAYER_SECONDS_LEFT = 300
+LAST_LAYER_NO_ESTIMATE_LAYERS = 1
 
 # Auto-off cavity LED after a print finishes. Default 300s grace so the
 # operator can inspect the bed before the cavity goes dark. Override with
@@ -115,6 +123,39 @@ def http_json(path: str, timeout: float = 8.0) -> dict[str, Any]:
 def query_status() -> dict[str, Any]:
     q = "print_stats&display_status&virtual_sdcard&pause_resume&heater_bed&toolhead&extruder&extruder1&extruder2&extruder3"
     return http_json(f"/printer/objects/query?{q}")["result"]["status"]
+
+
+def fetch_estimated_time(filename: str) -> float | None:
+    """Slicer's whole-print estimate in seconds, from Moonraker file metadata."""
+    try:
+        meta = http_json(f"/server/files/metadata?filename={urllib.parse.quote(filename)}")
+    except Exception:
+        return None
+    est = (meta.get("result") or {}).get("estimated_time")
+    return float(est) if isinstance(est, (int, float)) and est > 0 else None
+
+
+def estimated_seconds_left(state: dict[str, Any], job_key: str, filename: str, ps: dict[str, Any]) -> float | None:
+    """Slicer estimate minus time spent printing, or None when either is unknown.
+    The estimate is cached per job so the metadata is fetched once, not every tick."""
+    elapsed = ps.get("print_duration")
+    if not isinstance(elapsed, (int, float)):
+        return None
+    if state.get("estimated_time_job_key") != job_key:
+        est = fetch_estimated_time(filename)
+        if est is None:
+            return None
+        state["estimated_time_job_key"] = job_key
+        state["estimated_time_s"] = est
+    return state["estimated_time_s"] - elapsed
+
+
+def last_layer_due(remaining_layers: int, seconds_left: float | None) -> bool:
+    if remaining_layers > LAST_LAYER_WINDOW:
+        return False
+    if seconds_left is None:
+        return remaining_layers <= LAST_LAYER_NO_ESTIMATE_LAYERS
+    return seconds_left <= LAST_LAYER_SECONDS_LEFT
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -285,7 +326,10 @@ def main() -> int:
                         if prev_filename and prev_total_layer else None)
         if (
             prev_state_recorded == "printing"
-            and print_state in LED_FINISHED_STATES
+            # Completed prints only: a cancelled or failed job did not reach
+            # its last layer (live 2026-09-22: a print cancelled at layer 2 of
+            # 495 was announced as finished).
+            and print_state == "complete"
             and prev_job_key
             # SAME job only: the U1 persists print_stats.filename through the
             # terminal state (verified 2026-07-05), so a mismatched non-empty
@@ -344,7 +388,9 @@ def main() -> int:
 
     remaining_layers = total_layer - current_layer
     if state.get("last_layer_fired_job_key") != job_key and remaining_layers <= LAST_LAYER_WINDOW:
-        milestones.append("last_layer")
+        seconds_left = estimated_seconds_left(state, job_key, filename, ps)
+        if last_layer_due(remaining_layers, seconds_left):
+            milestones.append("last_layer")
 
     if not milestones:
         save_state(state)
