@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.1.3] — 2026-10-08
+
+### Fixed
+
+- **The print-head screen now names dark filament colors correctly.** Colors
+  were matched to the nearest of a few fixed swatches by raw RGB distance,
+  which mixes up "darker" with "a different color": a deep orange spool
+  (#E65100) showed as red, and some pinks read as red, deep purples as blue,
+  lime as gray and dark green as brown. Colors are now named by hue, with
+  lightness and saturation deciding white, silver, gray, black, beige, brown
+  and pink. Only the button labels change; which head prints is unaffected.
+
 ## [3.1.2] — 2026-09-28
 
 ### Fixed
