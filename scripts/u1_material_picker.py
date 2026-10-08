@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, urllib.request
+import argparse, colorsys, json, urllib.request
 from pathlib import Path
 from typing import Any
 from u1_config import get_u1_host, get_u1_port
 TOOLS=[('T0','extruder',1),('T1','extruder1',2),('T2','extruder2',3),('T3','extruder3',4)]
-_COLOR_PALETTE={'white':(255,255,255),'black':(0,0,0),'gray':(128,128,128),'silver':(192,192,192),'beige':(226,222,219),'red':(224,40,46),'orange':(255,140,0),'yellow':(255,213,0),'green':(0,168,89),'cyan':(0,188,212),'blue':(27,92,176),'purple':(138,63,188),'pink':(245,160,197),'brown':(123,78,46)}
+# Name by hue, not by nearest RGB swatch: the printer's dark shades (#E65100
+# deep orange, #1B5E20 dark green) sat closer to the darker red swatch than to
+# the bright orange one, so an orange spool read as "red" on the head screen.
+# Upper hue bound (degrees) -> name; lightness and saturation decide
+# white/silver/gray/black, beige, brown and pink below.
+_HUE_NAMES=((11,'red'),(42,'orange'),(70,'yellow'),(160,'green'),(200,'cyan'),(245,'blue'),(300,'purple'),(345,'pink'),(361,'red'))
 def rgba_to_color_name(rgba: Any) -> str:
     if not isinstance(rgba, str) or not rgba: return 'unknown'
     h=rgba.strip().lstrip('#').upper()
     if len(h) not in (6,8) or any(c not in '0123456789ABCDEF' for c in h): return rgba
-    r,g,b=int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
-    return min(_COLOR_PALETTE.items(), key=lambda kv:(r-kv[1][0])**2+(g-kv[1][1])**2+(b-kv[1][2])**2)[0]
+    r,g,b=int(h[0:2],16)/255,int(h[2:4],16)/255,int(h[4:6],16)/255
+    hue,light,_=colorsys.rgb_to_hls(r,g,b)
+    hi=max(r,g,b); chroma=hi-min(r,g,b); sat=chroma/hi if hi else 0.0
+    if hi<0.15: return 'black'
+    if chroma<0.2 and sat<0.35:
+        if chroma>=0.02 and r>=g>=b and light>0.7: return 'beige'
+        return 'white' if hi>0.92 else 'silver' if hi>0.65 else 'gray' if hi>0.2 else 'black'
+    name=next(n for top,n in _HUE_NAMES if hue*360<top)
+    if hi<0.65 and (name=='orange' or (name=='red' and sat<0.6)): return 'brown'
+    if name in ('orange','yellow') and light>0.8 and chroma<0.3: return 'beige'
+    if name=='red' and light>0.7: return 'pink'
+    return name
 def http_json(url: str, timeout: float=8.0)->dict[str,Any]:
     with urllib.request.urlopen(url, timeout=timeout) as r: return json.loads(r.read().decode())
 def _get(v, i, default=None): return v[i] if isinstance(v, list) and i < len(v) else default
