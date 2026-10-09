@@ -7,8 +7,8 @@ Telegram-ready notification with MEDIA:<path>.
 
 Milestones:
 - first-layer/bed-adhesion check: first observed layer 2 through 5, once per job
-- last-layer check: about five minutes of printing left by the slicer
-  estimate (final or next-to-final layer when there is no estimate), once per job
+- last-layer check: about five minutes of printing left at this print's real
+  pace (final or next-to-final layer when there is no estimate), once per job
 
 No movement/heating/G-code/start/cancel commands.
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -49,17 +50,27 @@ def _camera_helper() -> str:
 # wrong in both directions: 6 layers is seconds on a 900-layer figure but over
 # an hour on a 20-layer print with slow layers (live 2026-09-27: three
 # pumpkin plates were announced as done 65-101 minutes before they finished).
-# The last-layer photo fires once the slicer estimate says
-# LAST_LAYER_SECONDS_LEFT or less remains. LAST_LAYER_WINDOW stays as a
-# ceiling so a bad estimate can never fire it early on a tall print. With no
-# estimate it falls back to the final or next-to-final layer. A print that
-# finishes between two 1-minute polls is still caught by the post-complete
+#
+# The time has to be this print's, not the slicer's. Estimate minus elapsed
+# never reaches five minutes when a print runs faster than sliced (live
+# 2026-10-08: a 5h56m estimate finished in 5h49m, so the photo came after the
+# print). The watcher reads the slicer's own time-left mark (M73 R) at the
+# printer's spot in the file and scales it by this print's pace so far. With
+# no estimate or no marks it falls back to the final or next-to-final layer. A
+# print that finishes between two polls is still caught by the post-complete
 # fallback in main().
+
 FIRST_LAYER_TARGET = 2
 FIRST_LAYER_MAX = 5
-LAST_LAYER_WINDOW = 6
 LAST_LAYER_SECONDS_LEFT = 300
 LAST_LAYER_NO_ESTIMATE_LAYERS = 1
+# Pace is trusted only once the slicer itself counts this little time left, so
+# an odd pace early in a print can never announce it as done.
+LAST_LAYER_PACE_FROM_SECONDS = 1800
+# Start reading the file for time-left marks once half of it has been printed.
+LAST_LAYER_CHECK_FROM_PROGRESS = 0.5
+# Slicer marks sit at most ~220 KB apart (5h56m print); read back this far.
+SLICER_MARK_READ_BYTES = (256 * 1024, 1024 * 1024)
 
 # Auto-off cavity LED after a print finishes. Default 300s grace so the
 # operator can inspect the bed before the cavity goes dark. Override with
@@ -120,6 +131,14 @@ def http_json(path: str, timeout: float = 8.0) -> dict[str, Any]:
         return json.loads(r.read().decode("utf-8"))
 
 
+def http_range(path: str, start: int, end: int, timeout: float = 8.0) -> bytes | None:
+    """Bytes start..end (inclusive) of a file Moonraker serves, or None when the
+    server answers anything but a partial response (never pull a whole file)."""
+    req = urllib.request.Request(f"{_base_url()}{path}", headers={"Range": f"bytes={start}-{end}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read() if r.status == 206 else None
+
+
 def query_status() -> dict[str, Any]:
     q = "print_stats&display_status&virtual_sdcard&pause_resume&heater_bed&toolhead&extruder&extruder1&extruder2&extruder3"
     return http_json(f"/printer/objects/query?{q}")["result"]["status"]
@@ -135,11 +154,43 @@ def fetch_estimated_time(filename: str) -> float | None:
     return float(est) if isinstance(est, (int, float)) and est > 0 else None
 
 
-def estimated_seconds_left(state: dict[str, Any], job_key: str, filename: str, ps: dict[str, Any]) -> float | None:
-    """Slicer estimate minus time spent printing, or None when either is unknown.
-    The estimate is cached per job so the metadata is fetched once, not every tick."""
+def fetch_slicer_seconds_left(filename: str, file_position: int) -> float | None:
+    """The slicer's time-left mark (``M73 ... R<minutes>``) last passed before
+    ``file_position``, read with ranged requests instead of fetching the file."""
+    path = f"/server/files/gcodes/{urllib.parse.quote(filename, safe='/')}"
+    for span in SLICER_MARK_READ_BYTES:
+        start = max(0, file_position - span)
+        try:
+            chunk = http_range(path, start, file_position - 1)
+        except Exception:
+            return None
+        if chunk is None:
+            return None
+        lines = chunk.split(b"\n")
+        if start > 0:
+            lines = lines[1:]  # cut mid-line
+        if not chunk.endswith(b"\n"):
+            lines = lines[:-1]
+        for line in reversed(lines):
+            if line.startswith(b"M73 "):
+                m = re.search(rb"\bR(\d+)", line)
+                if m:
+                    return int(m.group(1)) * 60.0
+        if start == 0:
+            return None
+    return None
+
+
+def estimated_seconds_left(state: dict[str, Any], job_key: str, filename: str, ps: dict[str, Any],
+                           vsd: dict[str, Any]) -> float | None:
+    """Time left at this print's real pace, or None when it cannot be worked out.
+
+    The slicer's time left at the printer's spot in the file, scaled by how this
+    print has run against the slicer so far (elapsed / slicer time done). The
+    whole-print estimate is cached per job so the metadata is fetched once."""
     elapsed = ps.get("print_duration")
-    if not isinstance(elapsed, (int, float)):
+    position = vsd.get("file_position")
+    if not isinstance(elapsed, (int, float)) or not isinstance(position, int) or position <= 0:
         return None
     if state.get("estimated_time_job_key") != job_key:
         est = fetch_estimated_time(filename)
@@ -147,12 +198,16 @@ def estimated_seconds_left(state: dict[str, Any], job_key: str, filename: str, p
             return None
         state["estimated_time_job_key"] = job_key
         state["estimated_time_s"] = est
-    return state["estimated_time_s"] - elapsed
+    slicer_left = fetch_slicer_seconds_left(filename, position)
+    if slicer_left is None:
+        return None
+    slicer_done = state["estimated_time_s"] - slicer_left
+    if slicer_left > LAST_LAYER_PACE_FROM_SECONDS or slicer_done <= 0:
+        return slicer_left
+    return slicer_left * elapsed / slicer_done
 
 
 def last_layer_due(remaining_layers: int, seconds_left: float | None) -> bool:
-    if remaining_layers > LAST_LAYER_WINDOW:
-        return False
     if seconds_left is None:
         return remaining_layers <= LAST_LAYER_NO_ESTIMATE_LAYERS
     return seconds_left <= LAST_LAYER_SECONDS_LEFT
@@ -314,7 +369,7 @@ def main() -> int:
 
     active = bool(vsd.get("is_active")) and print_state == "printing" and not pause.get("is_paused")
     if not active or not filename or not isinstance(current_layer, int) or not isinstance(total_layer, int) or total_layer <= 0:
-        # Fallback: catch a job that finished so fast its LAST_LAYER_WINDOW never
+        # Fallback: catch a job that finished so fast its last-layer window never
         # overlapped a poll tick while print_state was still "printing" (live
         # 2026-07-05: a 48-layer/43-min print went printing -> complete between
         # two 1-minute ticks, so the in-progress branch below never fired).
@@ -387,8 +442,11 @@ def main() -> int:
         milestones.append("first_layer_check")
 
     remaining_layers = total_layer - current_layer
-    if state.get("last_layer_fired_job_key") != job_key and remaining_layers <= LAST_LAYER_WINDOW:
-        seconds_left = estimated_seconds_left(state, job_key, filename, ps)
+    file_progress = vsd.get("progress")
+    near_end = (remaining_layers <= LAST_LAYER_NO_ESTIMATE_LAYERS
+                or (isinstance(file_progress, (int, float)) and file_progress >= LAST_LAYER_CHECK_FROM_PROGRESS))
+    if state.get("last_layer_fired_job_key") != job_key and near_end:
+        seconds_left = estimated_seconds_left(state, job_key, filename, ps, vsd)
         if last_layer_due(remaining_layers, seconds_left):
             milestones.append("last_layer")
 

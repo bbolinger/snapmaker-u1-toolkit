@@ -18,6 +18,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import u1_last_layer_watch as w  # noqa: E402
 
+read_mark = w.fetch_slicer_seconds_left  # the real reader; the autouse fake replaces it
+
 
 @pytest.fixture(autouse=True)
 def _isolated_data_dir(tmp_path, monkeypatch):
@@ -53,13 +55,29 @@ def _estimate(monkeypatch):
     return est
 
 
+@pytest.fixture(autouse=True)
+def _mark(monkeypatch):
+    """Slicer time-left mark (M73 R, seconds) at the printer's file position.
+    None by default (no network); tests set mark["seconds"]."""
+    mark = {"seconds": None, "positions": []}
+
+    def _fetch(filename, file_position):
+        mark["positions"].append(file_position)
+        return mark["seconds"]
+
+    monkeypatch.setattr(w, "fetch_slicer_seconds_left", _fetch)
+    return mark
+
+
 def _status(print_state, current_layer, total_layer, filename="test.gcode",
-            is_active=True, is_paused=False, progress=0.5, print_duration=None):
+            is_active=True, is_paused=False, progress=0.5, print_duration=None,
+            file_position=1000):
     return {
         "print_stats": {"filename": filename, "state": print_state,
                         "print_duration": print_duration,
                         "info": {"current_layer": current_layer, "total_layer": total_layer}},
-        "virtual_sdcard": {"is_active": is_active, "progress": progress},
+        "virtual_sdcard": {"is_active": is_active, "progress": progress,
+                           "file_position": file_position},
         "display_status": {"progress": progress},
         "pause_resume": {"is_paused": is_paused},
     }
@@ -70,10 +88,11 @@ def _run(monkeypatch, status):
     return w.main()
 
 
-def test_live_in_window_catch_still_fires_normally(monkeypatch, _fake_camera, _estimate):
+def test_live_in_window_catch_still_fires_normally(monkeypatch, _fake_camera, _estimate, _mark):
     """Regression: the in-progress last-layer catch while still 'printing'
     must keep working when the estimate says the print is nearly done."""
     _estimate["seconds"] = 3000
+    _mark["seconds"] = 200
     _run(monkeypatch, _status("printing", 44, 48, print_duration=2800))  # 200s left
     state = w.load_state()
     assert state["last_layer_fired_job_key"] == "test.gcode|48"
@@ -97,10 +116,11 @@ def test_fast_finish_missed_window_caught_by_fallback(monkeypatch, _fake_camera)
     assert _fake_camera[0][1] == "last_layer_post_complete"
 
 
-def test_fallback_does_not_double_fire_after_live_catch(monkeypatch, _fake_camera, _estimate):
+def test_fallback_does_not_double_fire_after_live_catch(monkeypatch, _fake_camera, _estimate, _mark):
     """If last_layer already fired live (in-window), the printing->complete
     transition must NOT capture a second photo for the same job."""
     _estimate["seconds"] = 3000
+    _mark["seconds"] = 200
     _run(monkeypatch, _status("printing", 44, 48, print_duration=2800))
     _run(monkeypatch, _status("complete", 48, 48, is_active=False))
     assert len(_fake_camera) == 1  # only the live catch, no fallback duplicate
@@ -142,15 +162,18 @@ def test_fallback_does_not_fire_for_different_job_appearing_complete(monkeypatch
     assert state.get("last_layer_fired_job_key") != "plateA.gcode|48"
 
 
-def test_slow_layers_wait_for_time_not_layer_count(monkeypatch, _fake_camera, _estimate):
+def test_slow_layers_wait_for_time_not_layer_count(monkeypatch, _fake_camera, _estimate, _mark):
     """Live bug 2026-09-27: 20-layer pumpkin plates with ~10-minute layers
     were announced as done at layer 14 of 20, 65-101 minutes early. Six
     layers from the end must not fire while the estimate says an hour is left."""
     _estimate["seconds"] = 12960  # 3h36m
+    _mark["seconds"] = 5940
     _run(monkeypatch, _status("printing", 14, 20, filename="pumpkin.gcode", print_duration=7000))
+    _mark["seconds"] = 960
     _run(monkeypatch, _status("printing", 19, 20, filename="pumpkin.gcode", print_duration=12000))
     assert _fake_camera == []
 
+    _mark["seconds"] = 240
     _run(monkeypatch, _status("printing", 20, 20, filename="pumpkin.gcode", print_duration=12700))
     assert [c[1] for c in _fake_camera] == ["last_layer"]
     assert w.load_state()["last_layer_fired_layer"] == 20
@@ -163,14 +186,107 @@ def test_estimate_fetched_once_per_job(monkeypatch, _estimate):
     assert _estimate["fetches"] == 1
 
 
-def test_short_estimate_cannot_fire_early_on_tall_print(monkeypatch, _fake_camera, _estimate):
-    """A print running far slower than sliced must still not be announced
-    more than LAST_LAYER_WINDOW layers from the end."""
+def test_slow_print_waits_for_its_own_pace(monkeypatch, _fake_camera, _estimate, _mark):
+    """A print running slower than sliced: estimate minus elapsed says 100 s
+    left, but at this pace 700 s remain, so it must wait."""
     _estimate["seconds"] = 3600
-    _run(monkeypatch, _status("printing", 880, 900, print_duration=3500))  # 20 layers left
+    _mark["seconds"] = 600  # slicer: 3000 s done, 600 s left
+    _run(monkeypatch, _status("printing", 880, 900, print_duration=3500))
     assert _fake_camera == []
-    _run(monkeypatch, _status("printing", 895, 900, print_duration=4000))
+    _mark["seconds"] = 180
+    _run(monkeypatch, _status("printing", 899, 900, print_duration=4150))
     assert len(_fake_camera) == 1
+
+
+def test_fast_print_fires_before_it_finishes(monkeypatch, _fake_camera, _estimate, _mark):
+    """Live bug 2026-10-08: Pumpkin_Brace_Foot was sliced at 21365 s and
+    finished in 20924 s. Estimate minus elapsed never got under 300 s, so the
+    photo only came after the print. At its real pace 4 minutes are left."""
+    _estimate["seconds"] = 21365
+    _mark["seconds"] = 240  # slicer: 21125 s done
+    _run(monkeypatch, _status("printing", 419, 421, filename="brace.gcode", print_duration=20684))
+    assert [c[1] for c in _fake_camera] == ["last_layer"]
+
+
+def test_tapered_top_fires_more_than_six_layers_out(monkeypatch, _fake_camera, _estimate, _mark):
+    """The old six-layer ceiling shut the window on parts whose last layers
+    take seconds: 21 layers out can already be the last 4 minutes."""
+    _estimate["seconds"] = 5000
+    _mark["seconds"] = 240
+    _run(monkeypatch, _status("printing", 194, 215, print_duration=4760))
+    assert len(_fake_camera) == 1
+
+
+def test_pace_ignored_while_slicer_counts_much_time_left(monkeypatch, _fake_camera, _estimate, _mark):
+    """An odd pace early on (here elapsed far below the slicer's time done)
+    must not announce a print the slicer still has 40 minutes left on."""
+    _estimate["seconds"] = 10000
+    _mark["seconds"] = 2400
+    _run(monkeypatch, _status("printing", 300, 421, print_duration=500))
+    assert _fake_camera == []
+
+
+def test_file_not_read_in_the_first_half(monkeypatch, _fake_camera, _estimate, _mark):
+    _estimate["seconds"] = 10000
+    _mark["seconds"] = 240
+    _run(monkeypatch, _status("printing", 100, 421, progress=0.3, print_duration=9700))
+    assert _mark["positions"] == [] and _fake_camera == []
+
+
+def test_no_marks_in_file_falls_back_to_final_layers(monkeypatch, _fake_camera, _estimate):
+    _estimate["seconds"] = 3000
+    _run(monkeypatch, _status("printing", 44, 48, print_duration=2800))
+    assert _fake_camera == []
+    _run(monkeypatch, _status("printing", 47, 48, print_duration=2990))
+    assert len(_fake_camera) == 1
+
+
+def _gcode(n_lines=20000):
+    body = []
+    for i in range(n_lines):
+        if i % 1000 == 0:
+            body.append(f"M73 P{i // 1000} R{(n_lines - i) // 1000}")
+        body.append(f"G1 X{i % 200} Y10 E0.01")
+    return ("\n".join(body) + "\n").encode()
+
+
+def _serve(monkeypatch, data, status=206):
+    calls = []
+
+    def _range(path, start, end, timeout=8.0):
+        calls.append((path, start, end))
+        return data[start:end + 1] if status == 206 else None
+
+    monkeypatch.setattr(w, "http_range", _range)
+    return calls
+
+
+def test_reads_last_mark_before_position(monkeypatch):
+    data = _gcode()
+    pos = data.index(b"M73 P15 ") + 200  # just past the P15 mark
+    calls = _serve(monkeypatch, data)
+    assert read_mark("sub dir/part.gcode", pos) == 5 * 60
+    assert calls[0][0] == "/server/files/gcodes/sub%20dir/part.gcode"
+    assert calls[0][2] == pos - 1
+
+
+def test_reads_further_back_when_mark_is_far(monkeypatch):
+    data = b"M73 P0 R9\n" + b"G1 X1 Y1 E0.01\n" * 40000  # ~600 KB after the mark
+    calls = _serve(monkeypatch, data)
+    assert read_mark("a.gcode", len(data)) == 9 * 60
+    assert len(calls) == 2
+
+
+def test_partial_line_at_chunk_edge_is_not_misread(monkeypatch):
+    data = b"M73 P1 R7\nG1 X1\nM73 P2 R12\nG1 X2\n"
+    _serve(monkeypatch, data)
+    cut = data.index(b"M73 P2 R12") + len(b"M73 P2 R1")  # mid-line: would read R1
+    assert read_mark("a.gcode", cut) == 7 * 60
+
+
+def test_no_partial_response_means_no_mark(monkeypatch):
+    _serve(monkeypatch, _gcode(), status=200)
+    assert read_mark("a.gcode", 5000) is None
 
 
 def test_no_estimate_falls_back_to_final_layers(monkeypatch, _fake_camera):
