@@ -304,3 +304,24 @@ def test_fallback_skips_prints_that_did_not_complete(monkeypatch, _fake_camera, 
     _run(monkeypatch, _status(final_state, 10, 495, is_active=False))
     assert _fake_camera == []
     assert "last_layer_fired_job_key" not in w.load_state()
+
+
+@pytest.mark.parametrize("seconds,text", [(267, "about 4 minutes left"), (90, "about 2 minutes left"),
+                                          (70, "about 1 minute left"), (20, "under a minute left")])
+def test_time_left_text(seconds, text):
+    assert w.time_left_text(seconds) == text
+
+
+def test_last_layer_message_leads_with_time_left(monkeypatch, capsys, _estimate, _mark):
+    """Live 2026-10-09: 'Layer 403 / 421' read as an hour early when it was
+    4.5 minutes from the end, so the headline says how long is left."""
+    _estimate["seconds"] = 21365
+    _mark["seconds"] = 300  # slicer: 21065 s done
+    _run(monkeypatch, _status("printing", 403, 421, filename="brace.gcode", print_duration=20340))
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == "U1 has about 5 minutes left — last-layer photo captured."
+
+
+def test_final_layer_fallback_message_unchanged(monkeypatch, capsys):
+    _run(monkeypatch, _status("printing", 47, 48, print_duration=3000))
+    assert capsys.readouterr().out.splitlines()[0] == "U1 is basically done — last-layer photo captured."

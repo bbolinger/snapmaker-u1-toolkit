@@ -252,7 +252,17 @@ def active_extruder_name(st: dict[str, Any]) -> str:
     return (st.get("toolhead") or {}).get("extruder") or "extruder"
 
 
-def print_photo_message(milestone: str, filename: str, current_layer: int, total_layer: int, progress: Any, st: dict[str, Any], image: Path) -> None:
+def time_left_text(seconds_left: float) -> str:
+    """'about 4 minutes left' — leads the last-layer message, because a layer
+    count like 403 / 421 reads as early on parts whose last layers take seconds."""
+    minutes = round(seconds_left / 60)
+    if minutes < 1:
+        return "under a minute left"
+    return f"about {minutes} minute{'s' if minutes != 1 else ''} left"
+
+
+def print_photo_message(milestone: str, filename: str, current_layer: int, total_layer: int, progress: Any,
+                        st: dict[str, Any], image: Path, seconds_left: float | None = None) -> None:
     ext_name = active_extruder_name(st)
     ext = st.get(ext_name, {}) or st.get("extruder", {})
     bed = st.get("heater_bed", {})
@@ -261,6 +271,8 @@ def print_photo_message(milestone: str, filename: str, current_layer: int, total
         headline = "U1 first-layer / bed-adhesion photo captured."
     elif milestone == "post_resume_check":
         headline = "U1 post-resume layer photo captured."
+    elif seconds_left is not None:
+        headline = f"U1 has {time_left_text(seconds_left)} — last-layer photo captured."
     else:
         headline = "U1 is basically done — last-layer photo captured."
     print(
@@ -442,6 +454,7 @@ def main() -> int:
         milestones.append("first_layer_check")
 
     remaining_layers = total_layer - current_layer
+    seconds_left = None
     file_progress = vsd.get("progress")
     near_end = (remaining_layers <= LAST_LAYER_NO_ESTIMATE_LAYERS
                 or (isinstance(file_progress, (int, float)) and file_progress >= LAST_LAYER_CHECK_FROM_PROGRESS))
@@ -505,7 +518,8 @@ def main() -> int:
             "last_layer_camera_changed": bool((cam.get("result") or {}).get("changed")),
         })
     save_state(state)
-    print_photo_message(milestone, filename, current_layer, total_layer, progress, st, image)
+    print_photo_message(milestone, filename, current_layer, total_layer, progress, st, image,
+                        seconds_left if milestone == "last_layer" else None)
     return 0
 
 
