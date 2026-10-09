@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.1.4] — 2026-10-09
+
+### Fixed
+
+- **The last-layer photo arrives before the print ends again, even when a
+  print runs faster than sliced.** 3.1.2 fired when the slicer's whole-print
+  estimate minus the time spent said five minutes were left. A print that ran
+  more than five minutes ahead of its estimate never got there, so the photo
+  only came after it finished (a 5h56m estimate that printed in 5h49m). The
+  watcher now reads the slicer's own time-left mark at the printer's place in
+  the file, with small ranged reads instead of the whole file, and scales it
+  by how fast this print has actually run. On the last three real prints,
+  replayed at their real pace and at 20% faster and slower, it fires 2 to 5
+  minutes before the end.
+- **Parts that taper at the top no longer miss the photo.** The six-layer
+  limit is gone: on a tapered top the last six layers can take less time than
+  one check, so the window often closed between two checks.
+
+### Changed
+
+- **The last-layer message leads with the time left** ("U1 has about 4
+  minutes left"). A layer count like 403 of 421 read as an hour early on a
+  part whose last 18 layers took four and a half minutes.
+
 ## [3.1.3] — 2026-10-08
 
 ### Fixed
