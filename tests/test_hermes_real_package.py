@@ -169,6 +169,65 @@ out = {
     assert out["hooks"] == ["pre_gateway_dispatch"]
 
 
+def _load_installer():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "u1_hermes_install_real_hook", _REPO / "adapters" / "hermes" / "install.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _deploy_hook_plugin(hermes_home: Path) -> Path:
+    """Deploy the snapmaker_u1 hook plugin with install.py's own helpers
+    (3.2.0+: a folder plugin, no pip) and enable it."""
+    inst = _load_installer()
+    hdir = hermes_home / "plugins" / "snapmaker_u1"
+    inst._deploy_hook_plugin(inst._hook_plugin_files(_REPO / "plugin"), hdir,
+                             dry_run=False)
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - snapmaker_u1\n")
+    return hdir
+
+
+def test_hook_plugin_folder_loads_under_real_plugin_manager(tmp_path):
+    """Hermes's own discovery must load the folder deploy as a user plugin,
+    enabled, with no error, registering all three hooks. Before 3.2.0 this
+    plugin was a pip entry point; Hermes 0.21.6+ runs from a package-manager
+    environment that drops undeclared pip installs on every rebuild."""
+    home = tmp_path / "home-hook"
+    hdir = _deploy_hook_plugin(home)
+    out = _run_probe(home, """
+from hermes_cli.plugins import discover_plugins, get_plugin_manager
+discover_plugins()
+lp = get_plugin_manager()._plugins.get('snapmaker_u1')
+out = {
+    'found': lp is not None,
+    'enabled': bool(lp and lp.enabled),
+    'error': getattr(lp, 'error', None),
+    'hooks': sorted(getattr(lp, 'hooks_registered', [])),
+    'path': str(getattr(getattr(lp, 'manifest', None), 'path', '')),
+}
+""")
+    assert out["found"] and out["enabled"], out
+    assert out["error"] is None, out
+    assert out["hooks"] == ["pre_gateway_dispatch", "transform_llm_output",
+                            "transform_tool_result"]
+    assert Path(out["path"]).resolve() == hdir.resolve()
+
+
+def test_installer_hook_verify_against_real_plugin_manager(tmp_path, monkeypatch):
+    """install.py's [7/7] hook check, run for real: the folder registers all
+    three hooks and Hermes reports loading it from the deployed folder."""
+    home = tmp_path / "home-verify"
+    hdir = _deploy_hook_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PYTHONPATH", HERMES_SRC)
+    result = _load_installer()._verify_hook_plugin(Path(sys.executable), hdir)
+    assert result.startswith("OK: hooks="), result
+    assert f"Hermes loads it from {hdir}" in result and "(enabled)" in result, result
+
+
 def test_run_py_patcher_against_real_gateway_run_py(tmp_path):
     """The anchor exists in the real run.py, the patched file compiles, and
     strip-and-reinsert round-trips (idempotent re-runs, in-place upgrades)."""

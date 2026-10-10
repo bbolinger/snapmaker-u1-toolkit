@@ -28,11 +28,26 @@ What this does (idempotent, re-run safe):
      composite, which a runtime-registered toolset can never satisfy — and
      joining an existing toolset evicts it.)
 
-  3. Enables the plugin (``hermes plugins enable u1-form`` — user plugins
-     are opt-in by design; prints the manual command if the CLI call
-     fails).
+  3. Deploys the **snapmaker_u1 hook plugin** (auto-skill load, the
+     next-action directive, and the image / review-doc attachment injector)
+     as a folder plugin to ``<HERMES_HOME>/plugins/snapmaker_u1/``:
+     ``plugin/plugin.yaml`` plus the ``plugin/src/snapmaker_u1/`` package.
+     Hermes loads it straight from that folder, so nothing has to be
+     installed into a Python environment. Hermes 0.21.6+ runs the gateway
+     from a package-manager environment that ships without pip and is
+     rebuilt whenever a plugin is installed or removed; a pip-installed copy
+     would be dropped on every rebuild.
 
-  4. Edits ``gateway/run.py`` ONCE to publish a per-turn form callback into
+  4. Uninstalls the pip copy of that hook plugin earlier releases installed
+     (``snapmaker-u1-toolkit-plugin``) from the venv and from any
+     package-manager environment under ``<HERMES_HOME>/installs/``, with pip
+     or, where an environment has no pip, uv.
+
+  5. Enables both plugins (``hermes plugins enable u1-form`` and
+     ``snapmaker_u1`` — user plugins are opt-in by design; prints the manual
+     command if the CLI call fails).
+
+  6. Edits ``gateway/run.py`` ONCE to publish a per-turn form callback into
      ``tools.form_gateway`` keyed by ``agent.session_id`` — the same value
      Hermes' registry dispatch passes to tool handlers, which is the only
      bridge a registered tool has back to the gateway (generic dispatch
@@ -40,18 +55,26 @@ What this does (idempotent, re-run safe):
      marker-guarded, backed up; re-runs replace the marked block when its
      body changed (upgrades) and no-op when identical.
 
-  5. Verifies the REAL invariant in the venv: with a bare-composite config
+  7. Verifies the REAL invariant in the venv: with a bare-composite config
      (``platform_toolsets.telegram: [hermes-telegram]``) both ``clarify``
      AND ``form`` must resolve from ``_get_platform_tools`` — i.e. form is
-     offered and clarify was not harmed.
+     offered and clarify was not harmed. Then loads the deployed hook-plugin
+     folder the way Hermes does and checks all three hooks register.
+
+Run it as root or as the user Hermes runs as. As root, Hermes commands,
+probes and package removals run as the owner of ``HERMES_HOME`` (or of the
+environment being cleaned), and every file it copies takes the owner of the
+folder it lands in, so a root run leaves nothing the gateway cannot write.
 
 ``--uninstall`` restores the run.py backup (skipped when a Hermes upgrade
-already replaced run.py), removes the plugin dir and copied tool files
-(including files from pre-plugin layouts), and disables the plugin.
+already replaced run.py), removes both plugin dirs and the copied tool files
+(including files from pre-plugin layouts), uninstalls any pip copy of the hook
+plugin, and disables both plugins.
 """
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -134,6 +157,16 @@ PLUGIN_FILES = ("plugin.yaml", "__init__.py", "telegram_patch.py")
 # upgraded deployment never double-registers the form tool.
 LEGACY_TOOLS_FILES = ("form_tool.py", "u1_form_telegram.py")
 
+# The snapmaker_u1 hook plugin: a folder plugin since 3.2.0. Releases before
+# that pip-installed it as an entry point from this distribution.
+HOOK_PLUGIN_KEY = "snapmaker_u1"
+HOOK_PLUGIN_DIST = "snapmaker-u1-toolkit-plugin"
+HOOK_PLUGIN_HOOKS = ("pre_gateway_dispatch", "transform_tool_result",
+                     "transform_llm_output")
+# Inside the deployed folder: the files this installer put there, so a later
+# run removes only those (never a user's notes or backups).
+HOOK_MANIFEST = ".u1-installed-files"
+
 
 def _site_packages(venv: Path) -> Path:
     """Find the site-packages under a venv — POSIX (lib/pythonX.Y/) or
@@ -182,9 +215,8 @@ def _live_package_dirs(venv_python: Path | None) -> tuple[Path, Path] | None:
         "print(os.path.dirname(os.path.abspath(gateway.__file__)))\n"
     )
     try:
-        proc = subprocess.run([str(venv_python), "-c", src], text=True,
-                              capture_output=True, timeout=60,
-                              cwd=tempfile.gettempdir())
+        proc = _run_probe([str(venv_python), "-c", src], timeout=60,
+                          owner=_owner_for(_hermes_home()))
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -212,6 +244,77 @@ def _hermes_home() -> Path:
     return Path(env) if env else Path.home() / ".hermes"
 
 
+def _stat_owner(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_uid, st.st_gid
+
+
+def _owner_for(path: Path) -> tuple[int, int] | None:
+    """When the installer runs as root: the (uid, gid) that owns ``path`` (or
+    its nearest existing parent), if that is not root. Hermes commands,
+    probes and package removals run as that owner, so a root run never
+    leaves root-owned files where the gateway's user has to write. Hermes
+    0.21.6 crash-loops the gateway on root-owned package-manager state, and
+    root-owned bytecode in a source tree breaks its later rebuilds. None
+    when not root, on Windows, or when the path is root's anyway."""
+    if os.name != "posix" or os.geteuid() != 0:
+        return None
+    probe = Path(path)
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        owner = _stat_owner(probe)
+    except OSError:
+        return None
+    return None if owner[0] == 0 else owner
+
+
+def _as_owner(owner: tuple[int, int] | None) -> dict:
+    """``subprocess.run`` keyword arguments that run a command as ``owner``."""
+    if owner is None:
+        return {}
+    uid, gid = owner
+    env = dict(os.environ)
+    try:
+        import pwd
+        env["HOME"] = pwd.getpwuid(uid).pw_dir
+    except (ImportError, KeyError):
+        env["HOME"] = str(_hermes_home())
+    return {"user": uid, "group": gid, "extra_groups": [], "env": env}
+
+
+def _adopt_parent_owner(path: Path) -> None:
+    """As root, give a file or folder this installer created the owner of the
+    folder it sits in, so a root run never leaves root-owned files in a tree
+    another user owns."""
+    if os.name != "posix" or os.geteuid() != 0:
+        return
+    try:
+        want = _stat_owner(path.parent)
+        st = path.lstat()
+    except OSError:
+        return
+    if (st.st_uid, st.st_gid) != want:
+        os.chown(path, want[0], want[1], follow_symlinks=False)
+
+
+def _run_probe(cmd: list[str], *, timeout: int,
+               owner: tuple[int, int] | None = None):
+    """Run an interpreter probe from a fresh private directory, as ``owner``
+    when given (see _owner_for).
+
+    ``python -c`` puts the working directory first on ``sys.path``. In a
+    shared directory such as /tmp, anyone who can write there could plant a
+    module (``tools/``, ``csv.py``) that the probe imports, possibly running
+    as root. A new 0700 directory per call leaves nothing to import.
+    """
+    with tempfile.TemporaryDirectory(prefix="u1-install-") as cwd:
+        if owner is not None:
+            os.chown(cwd, owner[0], owner[1])
+        return subprocess.run(cmd, text=True, capture_output=True,
+                              timeout=timeout, cwd=cwd, **_as_owner(owner))
+
+
 def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else ""
 
@@ -219,8 +322,16 @@ def _sha256(p: Path) -> str:
 def _copy_if_changed(src: Path, dst: Path) -> bool:
     if _sha256(src) == _sha256(dst):
         return False
+    missing = []
+    parent = dst.parent
+    while not parent.exists() and parent.parent != parent:
+        missing.append(parent)
+        parent = parent.parent
     dst.parent.mkdir(parents=True, exist_ok=True)
+    for folder in reversed(missing):  # top-down: each takes its parent's owner
+        _adopt_parent_owner(folder)
     shutil.copy2(src, dst)
+    _adopt_parent_owner(dst)
     return True
 
 
@@ -305,35 +416,37 @@ def _plugin_dir_dest() -> Path:
     return _hermes_home() / "plugins" / PLUGIN_KEY
 
 
-def _enable_plugin(venv: Path, *, dry_run: bool) -> str:
-    """Enable the plugin via the Hermes CLI (user plugins are opt-in)."""
+def _enable_plugin(venv: Path, *, dry_run: bool, key: str = PLUGIN_KEY) -> str:
+    """Enable a plugin via the Hermes CLI (user plugins are opt-in)."""
     hermes_bin = _venv_hermes_bin(venv)
-    cmd = [str(hermes_bin), "plugins", "enable", PLUGIN_KEY]
+    cmd = [str(hermes_bin), "plugins", "enable", key]
     if dry_run:
         return f"would run: {' '.join(cmd)}"
     if not hermes_bin.exists():
         return (f"SKIPPED — {hermes_bin} not found; run manually: "
-                f"hermes plugins enable {PLUGIN_KEY}")
+                f"hermes plugins enable {key}")
     try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60,
+                              **_as_owner(_owner_for(_hermes_home())))
     except Exception as exc:
         return (f"FAILED ({exc}); run manually: "
-                f"hermes plugins enable {PLUGIN_KEY}")
+                f"hermes plugins enable {key}")
     if proc.returncode != 0:
         return (f"FAILED (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}\n"
-                f"  run manually: hermes plugins enable {PLUGIN_KEY}")
+                f"  run manually: hermes plugins enable {key}")
     return proc.stdout.strip() or "enabled"
 
 
-def _disable_plugin(venv: Path, *, dry_run: bool) -> str:
+def _disable_plugin(venv: Path, *, dry_run: bool, key: str = PLUGIN_KEY) -> str:
     hermes_bin = _venv_hermes_bin(venv)
-    cmd = [str(hermes_bin), "plugins", "disable", PLUGIN_KEY]
+    cmd = [str(hermes_bin), "plugins", "disable", key]
     if dry_run:
         return f"would run: {' '.join(cmd)}"
     if not hermes_bin.exists():
         return f"SKIPPED — {hermes_bin} not found"
     try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60,
+                              **_as_owner(_owner_for(_hermes_home())))
     except Exception as exc:
         return f"FAILED ({exc})"
     if proc.returncode != 0:
@@ -361,64 +474,297 @@ def _verify(venv_python: Path, tools_dir: Path) -> str:
         "                      'plugin enabled? (hermes plugins enable u1-form)')\n"
         "print('OK: clarify held, form resolves; toolsets=' + repr(sorted(ts)))\n"
     ).format(tools_dir=str(tools_dir))
-    proc = subprocess.run([str(venv_python), "-c", src],
-                          text=True, capture_output=True, timeout=60,
-                          cwd=tempfile.gettempdir())
+    proc = _run_probe([str(venv_python), "-c", src], timeout=60,
+                      owner=_owner_for(_hermes_home()))
     if proc.returncode != 0:
         return f"FAIL\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
     return proc.stdout.strip()
 
 
-def _install_hook_plugin(venv_python: Path, plugin_pkg: Path, *,
-                         dry_run: bool) -> str:
-    """pip-install the ``snapmaker_u1`` entry-point plugin into the Hermes venv.
-
-    This is a DIFFERENT plugin from the u1-form one deployed above: it carries
-    the pip ``hermes_agent.plugins`` entry point that registers the auto-skill
-    loader, the next-action directive, and the v2.4 transform_llm_output image /
-    review-doc attach hook. Because it is an entry-point plugin, pip-installing
-    it is all Hermes needs to discover and load it (no ``plugins enable`` step).
-    Editable (-e) so a later ``git pull`` in the clone takes effect without a
-    reinstall."""
-    if not (plugin_pkg / "pyproject.toml").is_file():
-        return f"SKIPPED: no plugin package at {plugin_pkg}"
-    cmd = [str(venv_python), "-m", "pip", "install", "-e", str(plugin_pkg)]
-    if dry_run:
-        return "would run: " + " ".join(cmd)
-    try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=300)
-    except Exception as exc:  # noqa: BLE001 - surface any launch failure
-        return f"FAILED to launch pip: {exc}"
-    if proc.returncode != 0:
-        return f"FAILED (rc={proc.returncode}): {proc.stderr.strip()[:400]}"
-    return "installed (editable)"
+def _hook_plugin_dir_dest() -> Path:
+    return _hermes_home() / "plugins" / HOOK_PLUGIN_KEY
 
 
-def _verify_hook_plugin(venv_python: Path) -> str:
-    """Confirm the snapmaker_u1 plugin loads in the venv and registers all three
-    hooks -- in particular transform_llm_output, without which v2.4 image and
-    review-doc delivery silently does nothing."""
+def _hook_plugin_files(plugin_pkg: Path) -> dict[str, Path] | None:
+    """Relative path -> source file for the hook plugin's folder deploy:
+    ``plugin.yaml`` plus everything in ``src/snapmaker_u1/`` (the package
+    becomes the plugin folder), minus bytecode and build metadata. None when
+    the checkout has no hook plugin package (a partial checkout)."""
+    src_pkg = plugin_pkg / "src" / HOOK_PLUGIN_KEY
+    manifest = plugin_pkg / "plugin.yaml"
+    if not src_pkg.is_dir() or not manifest.is_file():
+        return None
+    files = {"plugin.yaml": manifest}
+    for path in sorted(src_pkg.rglob("*")):
+        rel = path.relative_to(src_pkg)
+        if not path.is_file() or path.suffix in (".pyc", ".pyo"):
+            continue
+        if any(part == "__pycache__" or part.endswith(".egg-info")
+               for part in rel.parts):
+            continue
+        files[rel.as_posix()] = path
+    return files
+
+
+def _make_readable(dst: Path, files: dict[str, Path]) -> None:
+    """The gateway may run as a different user than the installer: make the
+    deployed files and their folders readable to it whatever the umask or
+    the checkout's own modes were."""
+    for rel in files:
+        path = dst / rel
+        mode = path.stat().st_mode
+        if mode & 0o444 != 0o444:
+            path.chmod(mode | 0o444)
+        parent = path.parent
+        while True:
+            pmode = parent.stat().st_mode
+            if pmode & 0o555 != 0o555:
+                parent.chmod(pmode | 0o555)
+            if parent == dst:
+                break
+            parent = parent.parent
+
+
+def _deploy_hook_plugin(files: dict[str, Path], dst: Path, *,
+                        dry_run: bool) -> list[str]:
+    """Mirror ``files`` into ``dst``: copy what changed and remove files an
+    earlier run of this installer deployed (recorded in HOOK_MANIFEST) that
+    this release no longer ships, so a module removed upstream cannot keep
+    loading. Files the installer never put there are left alone."""
+    lines = []
+    for rel, src in files.items():
+        if not src.exists():
+            raise SystemExit(f"source missing: {src}")
+        tgt = dst / rel
+        if dry_run:
+            changed = _sha256(src) != _sha256(tgt)
+            lines.append(f"{'would copy' if changed else 'unchanged '} {tgt}")
+        else:
+            changed = _copy_if_changed(src, tgt)
+            lines.append(f"{'copied   ' if changed else 'unchanged '} {tgt}")
+    manifest = dst / HOOK_MANIFEST
+    previous = []
+    if manifest.is_file():
+        previous = [ln.strip() for ln in
+                    manifest.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    root = dst.resolve()
+    for rel in previous:
+        if rel in files:
+            continue
+        tgt = dst / rel
+        try:
+            tgt.resolve().relative_to(root)  # never follow a path out of the folder
+        except (ValueError, OSError):
+            continue
+        if not tgt.is_file():
+            continue
+        if dry_run:
+            lines.append(f"would remove {tgt} (no longer shipped)")
+        else:
+            tgt.unlink()
+            lines.append(f"removed    {tgt} (no longer shipped)")
+    if not dry_run:
+        manifest.write_text("".join(f"{rel}\n" for rel in sorted(files)),
+                            encoding="utf-8")
+        _adopt_parent_owner(manifest)
+        _make_readable(dst, files)
+    return lines
+
+
+def _managed_env_pythons(notes: list[str] | None = None) -> list[Path]:
+    """Interpreters of the package-manager environments Hermes 0.21.6+ runs
+    the gateway from (``installs/<key>/facts.json``). Hermes keeps that
+    state in the root home even when HERMES_HOME names a profile
+    (``<root>/profiles/<name>``), so both are searched. Unreadable state is
+    reported in ``notes`` instead of being skipped silently."""
+    home = _hermes_home()
+    roots = [home]
+    if home.parent.name == "profiles":
+        roots.append(home.parent.parent)
+    found = []
+    for root in roots:
+        for facts in sorted((root / "installs").glob("*/facts.json")):
+            try:
+                data = json.loads(facts.read_text(encoding="utf-8-sig"))
+                env = data["packages"]["venv"]["environment"]
+            except OSError as exc:
+                if notes is not None:
+                    notes.append(f"could not read {facts} ({exc.strerror or exc}); "
+                                 f"run the installer as its owner to check that environment")
+                continue
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not isinstance(env, str):
+                continue
+            py = _venv_python(Path(env))
+            if py is not None and py.exists() and py not in found:
+                found.append(py)
+    return found
+
+
+def _uv_executable() -> str | None:
+    """uv on PATH, else the copy Hermes's package manager keeps under
+    ``<HERMES_HOME>/tools/`` (its environments ship without pip)."""
+    found = shutil.which("uv")
+    if found:
+        return found
+    for name in ("uv", "uv.exe"):
+        for cand in sorted((_hermes_home() / "tools").glob(f"uv-*/{name}"),
+                           reverse=True):
+            if cand.is_file():
+                return str(cand)
+    return None
+
+
+def _env_dir(python: Path) -> Path:
+    """The environment root of a venv interpreter (bin/ or Scripts/ parent)."""
+    return Path(python).parent.parent
+
+
+def _has_dist(python: Path, dist: str) -> bool | None:
+    """True / False: ``dist`` is / is not installed for ``python``. None: the
+    probe itself failed (launch error, timeout, crash), so the caller must not
+    treat that environment as clean."""
     src = (
-        "import logging; logging.disable(logging.CRITICAL)\n"
-        "class C:\n"
-        "    def __init__(s): s.h=[]\n"
-        "    def register_hook(s,n,cb): s.h.append(n)\n"
-        "    def register_skill(s,*a,**k): pass\n"
-        "import importlib\n"
-        "m=importlib.import_module('snapmaker_u1')\n"
-        "c=C(); m.register(c)\n"
-        "need={'pre_gateway_dispatch','transform_tool_result','transform_llm_output'}\n"
-        "miss=need-set(c.h)\n"
-        "print('OK: hooks='+','.join(c.h)) if not miss "
-        "else print('MISSING hooks: '+','.join(sorted(miss)))\n"
+        "import importlib.metadata as m, sys\n"
+        "try:\n"
+        "    m.distribution(sys.argv[1])\n"
+        "except m.PackageNotFoundError:\n"
+        "    print('U1DIST:no')\n"
+        "else:\n"
+        "    print('U1DIST:yes')\n"
     )
     try:
-        proc = subprocess.run([str(venv_python), "-c", src], text=True,
-                              capture_output=True, timeout=60)
+        proc = _run_probe([str(python), "-c", src, dist], timeout=60,
+                          owner=_owner_for(_env_dir(python)))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = (proc.stdout or "").split()
+    if proc.returncode == 0 and "U1DIST:yes" in words:
+        return True
+    if proc.returncode == 0 and "U1DIST:no" in words:
+        return False
+    return None
+
+
+def _remove_legacy_hook_dist(pythons: list[Path], *, dry_run: bool) -> list[str]:
+    """Uninstall the pip copy of the hook plugin that releases before 3.2.0
+    installed. Hermes 0.21.6+ prefers the folder copy when both exist, but a
+    leftover loads again as soon as the folder is removed, and older Hermes
+    may load both and register every hook twice."""
+    lines = []
+    seen = set()
+    for py in pythons:
+        key = str(py.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        pip_cmd = [str(py), "-m", "pip", "uninstall", "-y", HOOK_PLUGIN_DIST]
+        uv = _uv_executable()
+        uv_cmd = [uv or "uv", "pip", "uninstall", "--python", str(py), HOOK_PLUGIN_DIST]
+        manual = (f"run `{' '.join(pip_cmd)}` or, where the environment has no "
+                  f"pip, `{' '.join(uv_cmd)}`")
+        state = _has_dist(py, HOOK_PLUGIN_DIST)
+        if state is None:
+            lines.append(f"COULD NOT CHECK {py} for {HOOK_PLUGIN_DIST} (the probe "
+                         f"failed); if a copy is installed there, {manual}")
+            continue
+        if not state:
+            lines.append(f"not installed  {py}")
+            continue
+        if dry_run:
+            lines.append(f"would uninstall {HOOK_PLUGIN_DIST} from {py}")
+            continue
+        attempts = [("pip", pip_cmd)] + ([("uv", uv_cmd)] if uv else [])
+        done = False
+        for label, cmd in attempts:
+            try:
+                proc = subprocess.run(cmd, text=True, capture_output=True,
+                                      timeout=300,
+                                      **_as_owner(_owner_for(_env_dir(py))))
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if proc.returncode == 0:
+                lines.append(f"uninstalled ({label}) {HOOK_PLUGIN_DIST} from {py}")
+                done = True
+                break
+        if not done:
+            lines.append(f"COULD NOT uninstall {HOOK_PLUGIN_DIST} from {py}; {manual}")
+    return lines
+
+
+def _verify_hook_plugin(venv_python: Path, plugin_dir: Path) -> str:
+    """Load the deployed folder the way Hermes loads a directory plugin (a
+    package rooted at the folder, so the hooks' relative imports resolve) and
+    confirm register() wires all three hooks, in particular
+    transform_llm_output, without which image and review-doc delivery
+    silently does nothing. Then ask Hermes's own plugin manager: it must load
+    snapmaker_u1 from this folder, enabled and without a load error. Returns
+    a line starting with ``OK:`` or ``FAIL:``."""
+    src = (
+        "import importlib.util, logging, os, sys\n"
+        "logging.disable(logging.CRITICAL)\n"
+        "d, need, key = sys.argv[1], set(sys.argv[2].split(',')), sys.argv[3]\n"
+        "spec = importlib.util.spec_from_file_location(\n"
+        "    'u1_verify_hook_plugin', os.path.join(d, '__init__.py'),\n"
+        "    submodule_search_locations=[d])\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "class C:\n"
+        "    def __init__(s): s.h = []\n"
+        "    def register_hook(s, n, cb): s.h.append(n)\n"
+        "    def register_skill(s, *a, **k): pass\n"
+        "c = C(); m.register(c)\n"
+        "miss = need - set(c.h)\n"
+        "if miss:\n"
+        "    print('FAIL: hooks missing from the folder: ' + ','.join(sorted(miss)))\n"
+        "    sys.exit(1)\n"
+        "msg = 'hooks=' + ','.join(c.h)\n"
+        "try:\n"
+        "    from hermes_cli.plugins import discover_plugins, get_plugin_manager\n"
+        "except Exception as exc:\n"
+        "    print('OK: ' + msg + '; plugin-manager check skipped (' + type(exc).__name__ + ')')\n"
+        "    sys.exit(0)\n"
+        "try:\n"
+        "    discover_plugins()\n"
+        "except Exception as exc:\n"
+        "    print('FAIL: ' + msg + '; Hermes plugin discovery raised ' + type(exc).__name__ + ': ' + str(exc))\n"
+        "    sys.exit(1)\n"
+        "plugins = getattr(get_plugin_manager(), '_plugins', None)\n"
+        "if not isinstance(plugins, dict):\n"
+        "    print('OK: ' + msg + '; plugin-manager check skipped (unknown Hermes layout)')\n"
+        "    sys.exit(0)\n"
+        "lp = plugins.get(key)\n"
+        "enable = ' (run: hermes plugins enable ' + key + ')'\n"
+        "if lp is None:\n"
+        "    print('FAIL: ' + msg + '; Hermes does not see ' + key + enable)\n"
+        "    sys.exit(1)\n"
+        "err = getattr(lp, 'error', None)\n"
+        "if err:\n"
+        "    print('FAIL: ' + msg + '; Hermes failed to load ' + key + ': ' + str(err))\n"
+        "    sys.exit(1)\n"
+        "if not getattr(lp, 'enabled', True):\n"
+        "    print('FAIL: ' + msg + '; Hermes found ' + key + ' but it is not enabled' + enable)\n"
+        "    sys.exit(1)\n"
+        "path = getattr(getattr(lp, 'manifest', None), 'path', None)\n"
+        "if not path or os.path.realpath(str(path)) != os.path.realpath(d):\n"
+        "    print('FAIL: ' + msg + '; Hermes loads ' + key + ' from ' + str(path)\n"
+        "          + ', not from ' + d + ' (an old pip copy may still be installed)')\n"
+        "    sys.exit(1)\n"
+        "print('OK: ' + msg + '; Hermes loads it from ' + d + ' (enabled)')\n"
+    )
+    try:
+        proc = _run_probe(
+            [str(venv_python), "-c", src, str(plugin_dir),
+             ",".join(HOOK_PLUGIN_HOOKS), HOOK_PLUGIN_KEY],
+            timeout=120, owner=_owner_for(_hermes_home()))
     except Exception as exc:  # noqa: BLE001
-        return f"verify FAILED to launch: {exc}"
-    return (proc.stdout or proc.stderr or
-            f"no output (rc={proc.returncode})").strip()
+        return f"FAIL: verify could not launch: {exc}"
+    out = (proc.stdout or "").strip()
+    if out.startswith(("OK:", "FAIL:")):
+        return out
+    return f"FAIL: verify crashed (rc={proc.returncode}): {(proc.stderr or '').strip()[-400:]}"
 
 
 def main(argv=None) -> int:
@@ -455,10 +801,12 @@ def main(argv=None) -> int:
     here = Path(__file__).resolve().parent
     plugin_src = here / "plugin"
     plugin_dst = _plugin_dir_dest()
-    # The pip entry-point plugin (auto-skill loader + next-action guard + the
-    # v2.4 attachment injector) lives at <repo>/plugin, two levels up from
-    # adapters/hermes/.
+    # The snapmaker_u1 hook plugin (auto-skill loader + next-action guard +
+    # the v2.4 attachment injector) lives at <repo>/plugin, two levels up from
+    # adapters/hermes/, and deploys as a folder plugin.
     hook_plugin_src = here.parent.parent / "plugin"
+    hook_plugin_dst = _hook_plugin_dir_dest()
+    hook_files = _hook_plugin_files(hook_plugin_src)
     # u1_form_telegram.py (the L1 pure renderer) is single-sourced from the
     # sibling adapters/telegram/ directory — the hermes tree carries no copy.
     renderer_src = here.parent / "telegram" / "u1_form_telegram.py"
@@ -471,6 +819,7 @@ def main(argv=None) -> int:
     print(f"layout:         {layout}")
     print(f"python:         {venv_python}")
     print(f"plugin dest:    {plugin_dst}")
+    print(f"hook plugin:    {hook_plugin_dst}")
     print(f"action:         {'uninstall' if a.uninstall else 'install'}{' (dry-run)' if a.dry_run else ''}")
     print()
 
@@ -483,24 +832,23 @@ def main(argv=None) -> int:
                 else:
                     tgt.unlink()
                     print(f"removed       {tgt}")
-        if plugin_dst.is_dir():
-            if a.dry_run:
-                print(f"would remove {plugin_dst}")
-            else:
-                shutil.rmtree(plugin_dst)
-                print(f"removed       {plugin_dst}")
-        print(f"plugin disable: {_disable_plugin(venv, dry_run=a.dry_run)}")
-        # Remove the pip entry-point plugin too (best-effort).
-        _uni = [str(venv_python), "-m", "pip", "uninstall", "-y",
-                "snapmaker-u1-toolkit-plugin"]
-        if a.dry_run:
-            print("would run: " + " ".join(_uni))
-        else:
-            try:
-                _p = subprocess.run(_uni, text=True, capture_output=True, timeout=120)
-                print(f"hook plugin pip uninstall: rc={_p.returncode}")
-            except Exception as _exc:  # noqa: BLE001
-                print(f"hook plugin pip uninstall failed to launch: {_exc}")
+        # Disable while the folders still exist: Hermes's `plugins disable`
+        # only knows plugins it can discover.
+        for key in (PLUGIN_KEY, HOOK_PLUGIN_KEY):
+            print(f"plugin disable {key}: "
+                  f"{_disable_plugin(venv, dry_run=a.dry_run, key=key)}")
+        for pdir in (plugin_dst, hook_plugin_dst):
+            if pdir.is_dir():
+                if a.dry_run:
+                    print(f"would remove {pdir}")
+                else:
+                    shutil.rmtree(pdir)
+                    print(f"removed       {pdir}")
+        # A pip copy of the hook plugin from a release before 3.2.0, if any.
+        notes: list[str] = []
+        pythons = [venv_python] + _managed_env_pythons(notes)
+        for line in notes + _remove_legacy_hook_dist(pythons, dry_run=a.dry_run):
+            print(f"hook plugin pip copy: {line}")
         bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
         # Only restore the backup when OUR patch is actually present in the
         # current run.py. If Hermes was upgraded since install, pip replaced
@@ -537,7 +885,7 @@ def main(argv=None) -> int:
         print("      the form callback itself, so the form still works.")
         print()
 
-    print("[1/6] copy tools/ (form_gateway) + remove pre-plugin layout files")
+    print("[1/7] copy tools/ (form_gateway) + remove pre-plugin layout files")
     for name, src in tools_src.items():
         if not src.exists():
             raise SystemExit(f"source missing: {src}")
@@ -558,7 +906,7 @@ def main(argv=None) -> int:
                 print(f"  removed   {tgt} (superseded by the plugin)")
 
     print()
-    print(f"[2/6] deploy plugin -> {plugin_dst}")
+    print(f"[2/7] deploy the u1-form plugin -> {plugin_dst}")
     plugin_files = {name: plugin_src / name for name in PLUGIN_FILES}
     plugin_files["u1_form_telegram.py"] = renderer_src
     for name, src in plugin_files.items():
@@ -573,15 +921,30 @@ def main(argv=None) -> int:
             print(f"  {'copied   ' if changed else 'unchanged '} {tgt}")
 
     print()
-    print("[3/6] enable plugin (user plugins are opt-in)")
-    print(f"  {_enable_plugin(venv, dry_run=a.dry_run)}")
+    print(f"[3/7] deploy the snapmaker_u1 hook plugin (folder plugin) -> {hook_plugin_dst}")
+    if hook_files is None:
+        print(f"  SKIPPED: no hook plugin package under {hook_plugin_src} "
+              f"(partial checkout?)")
+    else:
+        for line in _deploy_hook_plugin(hook_files, hook_plugin_dst,
+                                        dry_run=a.dry_run):
+            print(f"  {line}")
 
     print()
-    print("[4/6] install the snapmaker_u1 hook plugin (pip entry point)")
-    print(f"  {_install_hook_plugin(venv_python, hook_plugin_src, dry_run=a.dry_run)}")
+    print("[4/7] remove the pip copy of the hook plugin (releases before 3.2.0)")
+    notes: list[str] = []
+    pythons = [venv_python] + _managed_env_pythons(notes)
+    for line in notes + _remove_legacy_hook_dist(pythons, dry_run=a.dry_run):
+        print(f"  {line}")
 
     print()
-    print("[5/6] patch gateway/run.py (OPTIONAL fallback; anchor-based, marker-guarded)")
+    print("[5/7] enable the plugins (user plugins are opt-in)")
+    keys = (PLUGIN_KEY,) if hook_files is None else (PLUGIN_KEY, HOOK_PLUGIN_KEY)
+    for key in keys:
+        print(f"  {key}: {_enable_plugin(venv, dry_run=a.dry_run, key=key)}")
+
+    print()
+    print("[6/7] patch gateway/run.py (OPTIONAL fallback; anchor-based, marker-guarded)")
     if not _run_anchor_present:
         print("  skipped: no anchor in this Hermes build; the plugin publish covers it")
     else:
@@ -607,9 +970,21 @@ def main(argv=None) -> int:
         return 0
 
     print()
-    print("[6/6] verify: toolset resolution + hook-plugin registration")
-    print(" ", _verify(venv_python, tools_dir))
-    print(" ", _verify_hook_plugin(venv_python))
+    print("[7/7] verify: toolset resolution + hook-plugin registration")
+    toolset_result = _verify(venv_python, tools_dir)
+    print(" ", toolset_result)
+    failed = toolset_result.startswith("FAIL")
+    if hook_files is None:
+        print("  hook plugin: SKIPPED (not deployed)")
+    else:
+        hook_result = _verify_hook_plugin(venv_python, hook_plugin_dst)
+        print(" ", hook_result)
+        failed = failed or not hook_result.startswith("OK:")
+    if failed:
+        print()
+        print("VERIFY FAILED: see [7/7] above. The plugins will not work as")
+        print("installed until that is fixed; re-run this installer afterwards.")
+        return 1
 
     print()
     print("Done. Restart the Hermes gateway so the plugins load (and any run.py")

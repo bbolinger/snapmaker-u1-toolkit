@@ -25,7 +25,7 @@ python3 adapters/hermes/install.py
 bash tools/install_hermes_u1_hooks.sh
 ```
 
-The installer adds both required plugins. It should finish with a `[6/6]` verification line that reports the expected hooks.
+The installer adds both required plugins. It should finish with a `[7/7]` verification line that reports the expected hooks and where Hermes loads `snapmaker_u1` from.
 
 Restart the gateway from a separate terminal outside the active Hermes chat:
 

@@ -18,9 +18,14 @@ Architecture (hermes-agent v0.17):
 Skill discovery:
   Plugin-bundled SKILL.md first (the namespaced form); falls back to the
   deployed copy under ~/.hermes/skills (where deploy_to_runtime.sh puts it).
-  This keeps the plugin pip-installable while matching the standard deploy.
 
-Distribution: `pip install -e ./plugin/` from the repo root.
+Distribution: `adapters/hermes/install.py` deploys this package as a folder
+plugin at ~/.hermes/plugins/snapmaker_u1/ (plugin.yaml + this package) and
+enables it. Hermes imports the folder as a package, so the hooks use relative
+imports only. The pip packaging in ./plugin/ remains for development; since
+3.2.0 the installer no longer pip-installs it, because Hermes 0.21.6+ runs the
+gateway from a package-manager environment without pip that drops undeclared
+installs whenever it is rebuilt.
 """
 
 from __future__ import annotations

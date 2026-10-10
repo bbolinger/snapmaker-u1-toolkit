@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The auto-slice plugin keeps working on Hermes 0.21.6 and later.** Those
+  releases run the gateway from a package-manager environment as soon as a
+  catalog plugin is installed. That environment has no pip and is rebuilt
+  whenever a plugin is installed or removed. The `snapmaker_u1` plugin
+  (auto-skill load, next-action guard, image and review-doc attachments) was
+  pip-installed into Hermes's venv, so it was missing from the environment the
+  gateway actually ran from: models arrived without the slicing skill and
+  replies without their images. `install.py` now deploys it as a folder plugin
+  under `<HERMES_HOME>/plugins/snapmaker_u1/`, like `u1-form`. Hermes loads it
+  from there, so nothing has to be installed into any environment.
+- **`install.py` no longer needs pip.** It removes the pip copy earlier
+  releases installed, from the venv and from Hermes's package-manager
+  environment (also when `HERMES_HOME` names a profile), falling back to uv
+  where an environment has no pip. If neither works, or the check itself
+  fails, it says so and prints the commands to run by hand.
+
+- **Running the installer as root no longer leaves root-owned files behind.**
+  Hermes commands, the installer's probes and the package removals now run as
+  the owner of `HERMES_HOME` (or of the environment being cleaned), and every
+  copied file takes the owner of its folder. Hermes 0.21.6 crash-loops the
+  gateway on root-owned package-manager state, and root-owned bytecode in a
+  Hermes source tree breaks its later rebuilds.
+
+### Changed
+
+- **The installer's final check loads the deployed folder the way Hermes
+  does** and asks Hermes's plugin manager how it loaded `snapmaker_u1`. A
+  plugin that is disabled, failed to load, or loads from somewhere else (an
+  old pip copy) now fails the check, and the installer exits non-zero when
+  any check fails. The steps are now numbered 1 to 7 and both plugins are
+  enabled.
+- **Updates only remove what the installer put there.** The plugin folder
+  keeps a list of the files it deployed; a later run removes files from that
+  list that a release no longer ships and leaves anything else in the folder
+  alone. Deployed files are made readable to the user the gateway runs as.
+- **`--uninstall` disables both plugins before removing their folders**, so
+  Hermes can still find them to disable.
+- **The installer's interpreter probes run from a new private directory.**
+  They ran from the shared temp directory, where `python -c` would import
+  any module someone had placed there.
+- **The checks against a real Hermes tree pass on 0.21.6.** They now accept
+  the `u1_kit` tool next to `form`, find `form` behind Hermes's tool search,
+  and skip the optional `gateway/run.py` patch on builds without its anchor.
+
+### Upgrading
+
+`git pull`, re-run `python3 adapters/hermes/install.py`, restart the gateway.
+The hook plugin used to be an editable pip install that picked up new code by
+itself; it is now a copy like `u1-form`, so re-run the installer after every
+pull.
+
+---
+
 ## [3.1.4] — 2026-10-09
 
 ### Fixed

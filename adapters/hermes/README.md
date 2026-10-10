@@ -59,7 +59,7 @@ Two more load-bearing facts, both proven against hermes-agent 0.18 source:
 | `plugin/__init__.py` | Plugin entry point: `register(ctx)` registers the `form` tool (own `form` toolset — surfaced by the plugin path, see above) and the `pre_gateway_dispatch` hook. Also the tool core: schema, answer shaping, and the session-keyed callback lookup. |
 | `plugin/telegram_patch.py` | `ensure_patched(cls)` — class-level `send_form` + form callback routing applied to the live adapter class handed in by the hook. Callback ownership is matched by `(chat_id, message_id)`, so Hermes' own callbacks (`cl:`, `ea:`, `mp:`, `gt:`…) always fall through untouched. Carries the gateway-side answers-file writer (`U1_FORM_ANSWERS_DIR`). |
 | `tools/form_gateway.py` | Gateway-side blocking primitive (mirrors `tools/clarify_gateway.py`): thread-safe registry of pending forms + the session-keyed form-callback registry that bridges registry dispatch back to the gateway. Copied into Hermes' `tools/` (run.py imports it by that stable path). |
-| `install.py` | Idempotent installer: copies `form_gateway.py`, deploys the plugin to `<HERMES_HOME>/plugins/u1-form/` (renderer included), enables it, applies the single anchor-based `gateway/run.py` edit, removes pre-plugin layout files from earlier v2.2-dev deploys, and **verifies the real invariant** in the venv: on a bare-composite config both `clarify` and `form` must resolve. `--dry-run` and `--uninstall` supported; re-runs replace the marked run.py block in place when its body changed. |
+| `install.py` | Idempotent installer: copies `form_gateway.py`, deploys the plugin to `<HERMES_HOME>/plugins/u1-form/` (renderer included), deploys the `snapmaker_u1` hook plugin from `<repo>/plugin/` as a folder plugin to `<HERMES_HOME>/plugins/snapmaker_u1/` (no pip; it removes the pip copy releases before 3.2.0 installed, with uv where an environment has no pip), enables both, applies the single anchor-based `gateway/run.py` edit, removes pre-plugin layout files from earlier v2.2-dev deploys, and **verifies the real invariant** in the venv: on a bare-composite config both `clarify` and `form` must resolve. `--dry-run` and `--uninstall` supported; re-runs replace the marked run.py block in place when its body changed. |
 
 The L1 renderer `u1_form_telegram.py` is **single-sourced** from the sibling
 [`adapters/telegram/`](../telegram/) directory — this tree keeps no copy.
@@ -73,7 +73,7 @@ copied-out `hermes/` directory alone).
   live-class hook patching, answers writer, callback registry, installer).
 - Against the real package: `tests/test_hermes_real_package.py` — baseline
   bug reproduction, the no-eviction superset invariant
-  (`with_plugin == baseline | {"form"}`), schema delivery through
+  (the plugin adds `form`, plus `u1_kit` when the tree carries it, and removes nothing), schema delivery through
   `get_tool_definitions`, clean load under the real plugin manager, and the
   run.py patcher against the real `gateway/run.py`. Gated on
   `U1_HERMES_AGENT_SRC` (see the module docstring for how to point it at an
@@ -81,8 +81,9 @@ copied-out `hermes/` directory alone).
 
 ## Upgrade story
 
-The plugin itself survives Hermes upgrades untouched (`~/.hermes/plugins/`
-is user data). Two pieces are still patch-shaped and re-applied by re-running
+Both plugins survive Hermes upgrades untouched (`~/.hermes/plugins/`
+is user data), including the package-manager environment rebuilds of Hermes
+0.21.6 and later, which drop anything pip-installed. Two pieces are still patch-shaped and re-applied by re-running
 `install.py` after an upgrade: the `tools/form_gateway.py` copy and the
 anchor-based `gateway/run.py` edit. The installer is idempotent and
 marker-guarded — it refuses cleanly if Hermes changes the clarify-wiring

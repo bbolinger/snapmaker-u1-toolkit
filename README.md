@@ -316,9 +316,13 @@ contract (every event the workflow + audit log emit, with payload shapes), see
 
 **Install on Linux.** The deploy scripts are bash and `install.py` targets a
 Linux venv (`bin/`, `lib/pythonX.Y/`). Run it inside the Hermes container, on a
-Linux host, or under WSL / Git Bash on Windows — not raw Windows `cmd`. Hermes
-typically ships `numpy` + `Pillow` in its bundled venv (verify:
-`/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'`).
+Linux host, or under WSL / Git Bash on Windows — not raw Windows `cmd`. Older
+Hermes images usually have `numpy` + `Pillow` in the bundled venv (verify:
+`/opt/hermes/.venv/bin/python -c 'import numpy, PIL; print("ok")'`). Hermes
+0.21.6 and later run the gateway from a package-manager environment that does
+not ship `numpy`; the workflow then switches to the first interpreter that has it (see
+*Choosing a Python interpreter* above), so make sure one does, for example a
+project `venv` or `U1_TOOLKIT_PYTHON`.
 
 Run each step and let it finish before the next. Step 1 asks a `y/N` you have to
 answer, so do not paste the whole block at once.
@@ -344,11 +348,24 @@ next-action guard, and the image / review-doc attachment injector). Add
 python3 adapters/hermes/install.py
 ```
 
-`install.py` loads two plugins: `u1-form` and `snapmaker_u1` (a pip entry point,
-installed editable so `git pull` updates it). Without this step the form, the
+`install.py` deploys two folder plugins under `<HERMES_HOME>/plugins/`,
+`u1-form` and `snapmaker_u1`, and enables both. Without this step the form, the
 auto-skill trigger, and the image/review-doc attachments do not load. Watch for
-its `[4/6] install the snapmaker_u1 hook plugin` and a `[6/6]` verify ending
-`OK: hooks=...transform_llm_output`.
+its `[3/7] deploy the snapmaker_u1 hook plugin` and a `[7/7]` verify ending
+`OK: hooks=...transform_llm_output; Hermes loads it from ... (enabled)`.
+
+Nothing is pip-installed. Hermes 0.21.6 and later run the gateway from a
+package-manager environment that has no pip and is rebuilt whenever a plugin is
+installed or removed, so a pip-installed plugin goes missing there. Releases
+before 3.2.0 installed `snapmaker_u1` with pip; `install.py` removes that copy
+from the venv and from the package-manager environment, using uv where there
+is no pip. The plugins are copies, so re-run `install.py` after every
+`git pull`.
+
+Run it as root or as the user Hermes runs as. As root it runs Hermes's own
+commands as the owner of `HERMES_HOME` and gives every file it copies the owner
+of the folder it lands in: Hermes 0.21.6 stops the gateway when root-owned
+files appear in its package-manager state.
 
 `install.py` asks the venv interpreter where Hermes's own `tools/` and
 `gateway/` packages live, so it works for a PyPI install and for a source

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -436,6 +437,7 @@ def test_tg_required_warning_escapes_field_labels():
 # the against-the-real-package proof of that invariant.
 
 _PLUGIN_DIR = _ADAPTERS / "hermes" / "plugin"
+_HOOK_PLUGIN_PKG = _ADAPTERS.parent / "plugin"
 
 
 def _load_plugin_pkg(monkeypatch, tmp_path):
@@ -1073,6 +1075,9 @@ def _fake_hermes(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
 def _stub_subprocess_run(calls):
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if len(cmd) > 2 and cmd[1] == "-c" and "U1DIST" in cmd[2]:
+            # the probe for an old pip copy of the hook plugin: "installed"
+            return types.SimpleNamespace(returncode=0, stdout="U1DIST:yes\n", stderr="")
         return types.SimpleNamespace(returncode=0, stdout="OK: stubbed\n", stderr="")
     return fake_run
 
@@ -1109,31 +1114,40 @@ def test_install_copies_deploys_plugin_patches_and_verifies(tmp_path, monkeypatc
     bak = run_py.with_suffix(run_py.suffix + ".u1-bak")
     assert bak.read_text() == _STOCK_RUN_PY
 
-    # Five subprocess steps run, in order: the live-package probe (the stub
-    # answers nonsense, so the site-packages scan carries this test), enable
-    # u1-form, pip-install the snapmaker_u1 hook plugin, the bare-composite
-    # toolset invariant verify, and the hook-plugin registration verify.
-    assert len(calls) == 5
-    assert calls[0][0] == str(venv / "bin" / "python3")
-    assert calls[0][1] == "-c"
+    # The hook plugin is a folder plugin: plugin.yaml plus the package.
+    hdir = tmp_path / "hermes-home" / "plugins" / "snapmaker_u1"
+    assert (hdir / "plugin.yaml").read_bytes() == (_HOOK_PLUGIN_PKG / "plugin.yaml").read_bytes()
+    assert (hdir / "__init__.py").read_bytes() == \
+        (_HOOK_PLUGIN_PKG / "src" / "snapmaker_u1" / "__init__.py").read_bytes()
+    assert (hdir / "hooks" / "attachment_injector.py").is_file()
+
+    # Seven subprocess steps run, in order: the live-package probe (the stub
+    # answers nonsense, so the site-packages scan carries this test), the
+    # probe for an old pip copy of the hook plugin (the stub says "present"),
+    # its pip uninstall, enable u1-form, enable snapmaker_u1, the
+    # bare-composite toolset invariant verify, and the hook-plugin verify.
+    py = str(venv / "bin" / "python3")
+    assert len(calls) == 7
+    assert calls[0][:2] == [py, "-c"]
     assert "tools.__file__" in calls[0][2]
-    assert calls[1][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
-    # pip install -e <repo>/plugin
-    assert calls[2][0] == str(venv / "bin" / "python3")
-    assert calls[2][1:5] == ["-m", "pip", "install", "-e"]
-    # Path, not string suffix: Windows stringifies with backslashes.
-    assert Path(calls[2][5]).name == "plugin"
+    assert calls[1][:2] == [py, "-c"]
+    assert calls[1][3] == hermes_install.HOOK_PLUGIN_DIST
+    assert calls[2] == [py, "-m", "pip", "uninstall", "-y", hermes_install.HOOK_PLUGIN_DIST]
+    assert calls[3][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "u1-form"]
+    assert calls[4][:4] == [str(venv / "bin" / "hermes"), "plugins", "enable", "snapmaker_u1"]
+    # Nothing is pip-installed any more.
+    assert not any("install" in c and "-e" in c for c in calls)
     # bare-composite invariant check with syntactically valid source
-    assert calls[3][0] == str(venv / "bin" / "python3")
-    assert calls[3][1] == "-c"
-    compile(calls[3][2], "<verify-src>", "exec")
-    assert "'clarify' in ts" in calls[3][2]  # the eviction regression check
-    assert "'form' in ts" in calls[3][2]
-    # hook-plugin registration verify must assert transform_llm_output loads
-    assert calls[4][0] == str(venv / "bin" / "python3")
-    assert calls[4][1] == "-c"
-    compile(calls[4][2], "<hook-verify-src>", "exec")
-    assert "transform_llm_output" in calls[4][2]
+    assert calls[5][:2] == [py, "-c"]
+    compile(calls[5][2], "<verify-src>", "exec")
+    assert "'clarify' in ts" in calls[5][2]  # the eviction regression check
+    assert "'form' in ts" in calls[5][2]
+    # hook-plugin verify loads the deployed folder and needs all three hooks
+    assert calls[6][:2] == [py, "-c"]
+    compile(calls[6][2], "<hook-verify-src>", "exec")
+    assert Path(calls[6][3]) == hdir
+    assert set(calls[6][4].split(",")) == {
+        "pre_gateway_dispatch", "transform_tool_result", "transform_llm_output"}
 
 
 def _fake_hermes_windows(tmp_path, monkeypatch, run_py_text=_STOCK_RUN_PY):
@@ -1171,9 +1185,10 @@ def test_install_supports_windows_venv_layout(tmp_path, monkeypatch):
 
     # Subprocess steps target the Windows executables.
     assert calls[0][0] == str(venv / "Scripts" / "python.exe")  # live-package probe
-    assert calls[1][0] == str(venv / "Scripts" / "hermes.exe")
+    assert calls[1][0] == str(venv / "Scripts" / "python.exe")  # old pip copy probe
     assert calls[2][0] == str(venv / "Scripts" / "python.exe")
-    assert calls[2][1:5] == ["-m", "pip", "install", "-e"]
+    assert calls[2][1:4] == ["-m", "pip", "uninstall"]
+    assert calls[3][0] == str(venv / "Scripts" / "hermes.exe")
 
 
 def test_install_targets_the_tree_the_interpreter_imports_from(tmp_path, monkeypatch):
@@ -1323,6 +1338,480 @@ def test_uninstall_after_hermes_upgrade_does_not_clobber_run_py(tmp_path, monkey
     rc = hermes_install.main(["--venv", str(venv), "--uninstall"])
     assert rc == 0
     assert run_py.read_text() == upgraded  # NOT clobbered by the stale backup
+
+
+# --------------------------------------------------------------------------- #
+# 3.2.0 — snapmaker_u1 hook plugin deployed as a folder plugin, no pip
+# --------------------------------------------------------------------------- #
+
+def _hook_dir(tmp_path):
+    return tmp_path / "hermes-home" / "plugins" / "snapmaker_u1"
+
+
+def _expected_hook_files():
+    src_pkg = _HOOK_PLUGIN_PKG / "src" / "snapmaker_u1"
+    rels = {"plugin.yaml"}
+    for path in src_pkg.rglob("*"):
+        rel = path.relative_to(src_pkg)
+        if path.is_file() and path.suffix not in (".pyc", ".pyo") and \
+                "__pycache__" not in rel.parts and \
+                not any(p.endswith(".egg-info") for p in rel.parts):
+            rels.add(rel.as_posix())
+    return rels
+
+
+def test_install_deploys_hook_plugin_folder_mirroring_the_package(tmp_path, monkeypatch):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    hdir = _hook_dir(tmp_path)
+    deployed = {p.relative_to(hdir).as_posix() for p in hdir.rglob("*")
+                if p.is_file() and "__pycache__" not in p.relative_to(hdir).parts}
+    assert deployed == _expected_hook_files() | {hermes_install.HOOK_MANIFEST}
+    assert "hooks/__init__.py" in deployed and "pending.py" in deployed
+
+
+def test_deployed_hook_plugin_loads_the_way_hermes_loads_a_folder(tmp_path, monkeypatch):
+    """Not stubbed: import the deployed folder as a package rooted at the
+    folder (Hermes's directory loader does exactly this) and register it.
+    Proves the relative imports, including hooks/attachment_injector's
+    ``from ..pending import``, resolve without the pip package on sys.path."""
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    hdir = _hook_dir(tmp_path)
+    name = "u1_test_folder_plugin"
+    spec = importlib.util.spec_from_file_location(
+        name, hdir / "__init__.py", submodule_search_locations=[str(hdir)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+
+        class Ctx:
+            def __init__(self):
+                self.hooks = []
+
+            def register_hook(self, hook, cb):
+                assert callable(cb)
+                self.hooks.append(hook)
+
+            def register_skill(self, *a, **k):
+                pass
+
+        ctx = Ctx()
+        mod.register(ctx)
+        assert set(ctx.hooks) == set(hermes_install.HOOK_PLUGIN_HOOKS)
+        # the hooks came from the folder, not from plugin/src on sys.path
+        assert Path(sys.modules[name + ".hooks.attachment_injector"].__file__).parent == hdir / "hooks"
+    finally:
+        for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
+            del sys.modules[key]
+
+
+def test_install_removes_only_files_an_earlier_install_deployed(tmp_path, monkeypatch):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    hdir = _hook_dir(tmp_path)
+    manifest = hdir / hermes_install.HOOK_MANIFEST
+    assert set(manifest.read_text().split()) == _expected_hook_files()
+    # An earlier release shipped hooks/retired_hook.py; the operator keeps
+    # notes and a backup in the folder; a tampered entry points outside it.
+    (hdir / "hooks" / "retired_hook.py").write_text("raise SystemExit('stale')\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    manifest.write_text(manifest.read_text() + "hooks/retired_hook.py\n../../../outside.txt\n")
+    (hdir / "MY_NOTES.md").write_text("mine")
+    (hdir / "__init__.py.bak-local").write_text("mine")
+    (hdir / "__pycache__").mkdir(exist_ok=True)
+    (hdir / "__pycache__" / "x.cpython-314.pyc").write_bytes(b"")
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert not (hdir / "hooks" / "retired_hook.py").exists()
+    assert (hdir / "MY_NOTES.md").exists() and (hdir / "__init__.py.bak-local").exists()
+    assert outside.read_text() == "keep"
+    assert (hdir / "__pycache__" / "x.cpython-314.pyc").exists()  # left to Python
+    assert (hdir / "hooks" / "attachment_router.py").exists()
+    assert "retired_hook.py" not in manifest.read_text()
+
+
+def test_install_rerun_reports_the_hook_folder_unchanged(tmp_path, monkeypatch, capsys):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    capsys.readouterr()
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    out = capsys.readouterr().out
+    step = out.split("[3/7]")[1].split("[4/7]")[0]
+    assert "copied" not in step and "removed" not in step
+    assert "unchanged" in step
+
+
+def test_dry_run_leaves_hook_folder_and_pip_copy_alone(tmp_path, monkeypatch, capsys):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+    assert hermes_install.main(["--venv", str(venv), "--dry-run"]) == 0
+    assert not _hook_dir(tmp_path).exists()
+    assert not any(c[1:4] == ["-m", "pip", "uninstall"] for c in calls)
+    out = capsys.readouterr().out
+    assert "would uninstall " + hermes_install.HOOK_PLUGIN_DIST in out
+    assert "would copy" in out.split("[3/7]")[1].split("[4/7]")[0]
+
+
+def test_legacy_pip_copy_not_installed_means_no_uninstall(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="U1DIST:no\n", stderr="")
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    py = tmp_path / "python3"
+    py.write_text("stub")
+    lines = hermes_install._remove_legacy_hook_dist([py], dry_run=False)
+    assert len(calls) == 1 and calls[0][1] == "-c"
+    assert lines == [f"not installed  {py}"]
+
+
+def test_legacy_pip_copy_removed_with_uv_when_env_has_no_pip(tmp_path, monkeypatch):
+    """Hermes 0.21.6+ package-manager environments ship without pip."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["-m", "pip"]:
+            return types.SimpleNamespace(returncode=1, stdout="",
+                                         stderr="No module named pip")
+        if cmd[1] == "-c":
+            return types.SimpleNamespace(returncode=0, stdout="U1DIST:yes\n", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_install.shutil, "which",
+                        lambda name: "/usr/local/bin/uv" if name == "uv" else None)
+    py = tmp_path / "env" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("stub")
+    lines = hermes_install._remove_legacy_hook_dist([py], dry_run=False)
+    assert calls[-1] == ["/usr/local/bin/uv", "pip", "uninstall", "--python", str(py),
+                         hermes_install.HOOK_PLUGIN_DIST]
+    assert lines == [f"uninstalled (uv) {hermes_install.HOOK_PLUGIN_DIST} from {py}"]
+
+
+def test_legacy_pip_copy_failure_prints_both_manual_commands(tmp_path, monkeypatch):
+    """No pip and no uv: the hint must not just repeat the pip command that
+    cannot work in a package-manager environment."""
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "-c":
+            return types.SimpleNamespace(returncode=0, stdout="U1DIST:yes\n", stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="nope")
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_install.shutil, "which", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    py = tmp_path / "python3"
+    py.write_text("stub")
+    (line,) = hermes_install._remove_legacy_hook_dist([py], dry_run=False)
+    dist = hermes_install.HOOK_PLUGIN_DIST
+    assert line.startswith("COULD NOT uninstall")
+    assert f"`{py} -m pip uninstall -y {dist}`" in line
+    assert f"`uv pip uninstall --python {py} {dist}`" in line
+
+
+def test_failed_dist_probe_is_reported_not_treated_as_clean(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=1, stdout="",
+                                     stderr="Traceback ... ImportError")
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    py = tmp_path / "python3"
+    py.write_text("stub")
+    (line,) = hermes_install._remove_legacy_hook_dist([py], dry_run=False)
+    assert line.startswith(f"COULD NOT CHECK {py}")
+    assert len(calls) == 1  # no uninstall attempted blind
+
+
+def test_uv_found_in_hermes_tools_when_not_on_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(hermes_install.shutil, "which", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    assert hermes_install._uv_executable() is None
+    uv = tmp_path / "home" / "tools" / "uv-0.12.3-linux-x64" / "uv"
+    uv.parent.mkdir(parents=True)
+    uv.write_text("stub")
+    assert hermes_install._uv_executable() == str(uv)
+
+
+def _fake_managed_env(tmp_path, key="b169975ea30c0066", env_id="0675"):
+    env = tmp_path / "hermes-home" / "installs" / key / "environments" / env_id / "venv"
+    (env / "bin").mkdir(parents=True)
+    (env / "bin" / "python").write_text("stub")
+    facts = tmp_path / "hermes-home" / "installs" / key / "facts.json"
+    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(env)}},
+                                 "schema": 1}))
+    return env / "bin" / "python"
+
+
+def test_managed_env_pythons_read_from_package_manager_facts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    py = _fake_managed_env(tmp_path)
+    broken = tmp_path / "hermes-home" / "installs" / "deadbeef" / "facts.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text("{not json")
+    gone = tmp_path / "hermes-home" / "installs" / "cafe" / "facts.json"
+    gone.parent.mkdir(parents=True)
+    gone.write_text(json.dumps({"packages": {"venv": {"environment": str(tmp_path / "nope")}}}))
+    assert hermes_install._managed_env_pythons() == [py]
+
+
+def test_install_also_cleans_the_package_manager_environment(tmp_path, monkeypatch):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    managed_py = _fake_managed_env(tmp_path)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    uninstalls = [c for c in calls if c[1:4] == ["-m", "pip", "uninstall"]]
+    assert [c[0] for c in uninstalls] == [str(venv / "bin" / "python3"), str(managed_py)]
+
+
+def test_uninstall_removes_hook_folder_and_disables_both_plugins(tmp_path, monkeypatch):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    calls = []
+    stub = _stub_subprocess_run(calls)
+    folders_at_disable = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1:3] == ["plugins", "disable"]:
+            # Hermes's `plugins disable` only finds plugins it can discover.
+            folders_at_disable.append(
+                ((tmp_path / "hermes-home" / "plugins" / "u1-form").is_dir(),
+                 _hook_dir(tmp_path).is_dir()))
+        return stub(cmd, **kwargs)
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert _hook_dir(tmp_path).is_dir()
+    calls.clear()
+    assert hermes_install.main(["--venv", str(venv), "--uninstall"]) == 0
+    assert not _hook_dir(tmp_path).exists()
+    assert folders_at_disable == [(True, True), (True, True)]
+    hermes = str(venv / "bin" / "hermes")
+    assert [hermes, "plugins", "disable", "u1-form"] in calls
+    assert [hermes, "plugins", "disable", "snapmaker_u1"] in calls
+    assert [str(venv / "bin" / "python3"), "-m", "pip", "uninstall", "-y",
+            hermes_install.HOOK_PLUGIN_DIST] in calls
+
+
+def test_probes_run_from_a_private_directory(tmp_path, monkeypatch):
+    """``python -c`` puts the cwd first on sys.path; a shared /tmp would let
+    anyone plant modules there that an installer running as root imports."""
+    import stat
+    import tempfile
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    seen = []
+    stub = _stub_subprocess_run([])
+
+    def fake_run(cmd, **kwargs):
+        if len(cmd) > 1 and cmd[1] == "-c":
+            cwd = kwargs.get("cwd")
+            assert cwd and Path(cwd).is_dir()
+            assert Path(cwd).resolve() != Path(tempfile.gettempdir()).resolve()
+            assert list(Path(cwd).iterdir()) == []
+            if os.name == "posix":
+                assert stat.S_IMODE(Path(cwd).stat().st_mode) == 0o700
+            seen.append(cwd)
+        return stub(cmd, **kwargs)
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    assert len(seen) == 4  # live-package, pip-copy, toolset verify, hook verify
+    assert not any(Path(c).exists() for c in seen)  # cleaned up after each call
+
+
+def test_a_failed_hook_check_fails_the_install(tmp_path, monkeypatch, capsys):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    stub = _stub_subprocess_run([])
+
+    def fake_run(cmd, **kwargs):
+        if len(cmd) > 2 and cmd[1] == "-c" and "spec_from_file_location" in cmd[2]:
+            return types.SimpleNamespace(
+                returncode=1, stderr="",
+                stdout="FAIL: hooks=x; Hermes found snapmaker_u1 but it is not enabled\n")
+        return stub(cmd, **kwargs)
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    assert hermes_install.main(["--venv", str(venv)]) == 1
+    assert "VERIFY FAILED" in capsys.readouterr().out
+
+
+def test_partial_checkout_skips_the_hook_plugin(tmp_path, monkeypatch, capsys):
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run(calls))
+    monkeypatch.setattr(hermes_install, "_hook_plugin_files", lambda pkg: None)
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED: no hook plugin package" in out
+    assert not _hook_dir(tmp_path).exists()
+    assert (tmp_path / "hermes-home" / "plugins" / "u1-form" / "__init__.py").exists()
+    assert not any(c[1:4] == ["plugins", "enable", "snapmaker_u1"] for c in calls)
+
+
+def test_deployed_files_are_readable_by_the_gateway_user(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX modes")
+    import stat
+    files = {"plugin.yaml": tmp_path / "src" / "plugin.yaml",
+             "hooks/x.py": tmp_path / "src" / "x.py"}
+    for f in files.values():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x")
+        f.chmod(0o600)
+    dst = tmp_path / "dst"
+    old = os.umask(0o077)
+    try:
+        hermes_install._deploy_hook_plugin(files, dst, dry_run=False)
+    finally:
+        os.umask(old)
+    for rel in files:
+        assert stat.S_IMODE((dst / rel).stat().st_mode) & 0o444 == 0o444
+    assert stat.S_IMODE((dst / "hooks").stat().st_mode) & 0o555 == 0o555
+    assert stat.S_IMODE(dst.stat().st_mode) & 0o555 == 0o555
+
+
+def test_managed_env_found_from_a_profile_home(tmp_path, monkeypatch):
+    """Hermes keeps package-manager state in the root home even when
+    HERMES_HOME names a profile."""
+    root = tmp_path / "hermes-home"
+    py = _fake_managed_env(tmp_path)
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    assert hermes_install._managed_env_pythons() == [py]
+
+
+def test_unreadable_package_manager_state_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    facts = tmp_path / "hermes-home" / "installs" / "k1" / "facts.json"
+    facts.mkdir(parents=True)  # reading a directory raises like a permission error
+    notes = []
+    assert hermes_install._managed_env_pythons(notes) == []
+    assert len(notes) == 1 and str(facts) in notes[0]
+
+
+def _fake_hermes_cli(tmp_path, state):
+    """A stand-in hermes_cli.plugins whose plugin manager reports ``state``
+    for snapmaker_u1 (None = not seen)."""
+    pkg = tmp_path / "fake-hermes" / "hermes_cli"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "plugins.py").write_text(
+        "import types\n"
+        f"_STATE = {state!r}\n"
+        "def discover_plugins():\n"
+        "    pass\n"
+        "def get_plugin_manager():\n"
+        "    plugins = {}\n"
+        "    if _STATE is not None:\n"
+        "        plugins['snapmaker_u1'] = types.SimpleNamespace(\n"
+        "            enabled=_STATE['enabled'], error=_STATE['error'],\n"
+        "            manifest=types.SimpleNamespace(path=_STATE['path']))\n"
+        "    return types.SimpleNamespace(_plugins=plugins)\n")
+    return pkg.parent
+
+
+@pytest.mark.parametrize("state,expect", [
+    ("folder", "OK:"),
+    (None, "does not see snapmaker_u1"),
+    ({"enabled": False, "error": None}, "not enabled"),
+    ({"enabled": False, "error": "ImportError: boom"}, "failed to load snapmaker_u1: ImportError: boom"),
+    ({"enabled": True, "error": None, "path": "snapmaker_u1"}, "Hermes loads snapmaker_u1 from snapmaker_u1"),
+])
+def test_hook_check_reports_what_hermes_actually_loaded(tmp_path, monkeypatch, state, expect):
+    """Not stubbed: the real check script against a stand-in plugin manager."""
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_install.subprocess, "run", _stub_subprocess_run([]))
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+    hdir = _hook_dir(tmp_path)
+    monkeypatch.undo()  # real subprocess.run from here on
+    if state == "folder":
+        state = {"enabled": True, "error": None, "path": str(hdir)}
+    elif isinstance(state, dict):
+        state = {"path": str(hdir), **state}
+    monkeypatch.setenv("PYTHONPATH", str(_fake_hermes_cli(tmp_path, state)))
+    result = hermes_install._verify_hook_plugin(Path(sys.executable), hdir)
+    assert expect in result, result
+    assert result.startswith("OK:" if expect == "OK:" else "FAIL:"), result
+
+
+def test_owner_for_only_drops_privileges_when_root_and_owned_by_someone_else(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX ownership")
+    target = tmp_path / "missing" / "deeper"  # walks up to the nearest existing folder
+    monkeypatch.setattr(hermes_install.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(hermes_install, "_stat_owner", lambda path: (4242, 4243))
+    assert hermes_install._owner_for(target) == (4242, 4243)
+    monkeypatch.setattr(hermes_install, "_stat_owner", lambda path: (0, 0))
+    assert hermes_install._owner_for(target) is None
+    monkeypatch.setattr(hermes_install.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(hermes_install, "_stat_owner", lambda path: (4242, 4243))
+    assert hermes_install._owner_for(target) is None
+
+
+def test_root_run_executes_hermes_commands_as_the_home_owner(tmp_path, monkeypatch):
+    """Run as root against a HERMES_HOME owned by the gateway's user: every
+    Hermes command and probe runs as that user (Hermes 0.21.6 crash-loops the
+    gateway on root-owned package-manager state), the pip copy in a root-owned
+    venv is removed as root, the one in the package-manager environment as
+    its owner."""
+    if os.name != "posix":
+        pytest.skip("POSIX ownership")
+    venv, _sp, _run_py = _fake_hermes(tmp_path, monkeypatch)
+    managed_py = _fake_managed_env(tmp_path)
+    home = tmp_path / "hermes-home"
+    owner = (4242, 4243)
+    monkeypatch.setattr(hermes_install, "_owner_for",
+                        lambda path: owner if str(path).startswith(str(home)) else None)
+    chowned = []
+    monkeypatch.setattr(hermes_install.os, "chown",
+                        lambda path, uid, gid, **kw: chowned.append((str(path), uid, gid)))
+    calls = []
+    stub = _stub_subprocess_run([])
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs.get("user"), kwargs.get("group"), kwargs.get("cwd")))
+        return stub(cmd, **kwargs)
+    monkeypatch.setattr(hermes_install.subprocess, "run", fake_run)
+    assert hermes_install.main(["--venv", str(venv)]) == 0
+
+    hermes = str(venv / "bin" / "hermes")
+    venv_py = str(venv / "bin" / "python3")
+    for cmd, user, group, cwd in calls:
+        if cmd[0] == hermes:
+            assert (user, group) == owner, cmd
+        elif cmd[0] == venv_py and cmd[1] == "-c" and "U1DIST" in cmd[2]:
+            assert user is None, cmd  # root-owned venv: probed as root
+        elif cmd[0] == venv_py and cmd[1] == "-c":
+            assert (user, group) == owner, cmd  # tree / toolset / hook probes
+            assert (cwd, *owner) in chowned  # its private dir handed over
+        elif cmd[0] == venv_py:
+            assert user is None, cmd  # pip uninstall in the root-owned venv
+        elif cmd[0] == str(managed_py):
+            assert (user, group) == owner, cmd  # package-manager env: as its owner
+    assert any(c[0][0] == str(managed_py) and c[0][1:4] == ["-m", "pip", "uninstall"]
+               for c in calls)
+
+
+def test_copies_take_the_owner_of_their_folder(tmp_path, monkeypatch):
+    if os.name != "posix" or os.geteuid() != 0:
+        pytest.skip("needs root to change ownership")
+    parent = tmp_path / "plugins"
+    parent.mkdir()
+    os.chown(parent, 4242, 4243)
+    src = tmp_path / "x.py"
+    src.write_text("x = 1\n")
+    dst = parent / "snapmaker_u1" / "hooks" / "x.py"
+    assert hermes_install._copy_if_changed(src, dst)
+    for path in (parent / "snapmaker_u1", parent / "snapmaker_u1" / "hooks", dst):
+        st = path.stat()
+        assert (st.st_uid, st.st_gid) == (4242, 4243), path
 
 
 # --------------------------------------------------------------------------- #
