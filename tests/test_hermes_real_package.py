@@ -113,7 +113,10 @@ def test_plugin_adds_form_without_evicting_anything(tmp_path):
     assert "clarify" in with_plugin
     missing = baseline - with_plugin
     assert not missing, f"plugin evicted toolsets: {sorted(missing)}"
-    assert with_plugin == baseline | {"form"}
+    # u1_kit joins form when the tree carries tools/u1_kit_tool.py, which
+    # install.py copies in; a bare Hermes tree yields form alone.
+    added = with_plugin - baseline
+    assert "form" in added and added <= {"form", "u1_kit"}, sorted(added)
 
 
 def test_form_schema_reaches_get_tool_definitions(tmp_path):
@@ -124,12 +127,22 @@ def test_form_schema_reaches_get_tool_definitions(tmp_path):
     out = _run_probe(home, """
 from hermes_cli.plugins import discover_plugins
 discover_plugins()
+import inspect
 from model_tools import get_tool_definitions
-defs = get_tool_definitions(enabled_toolsets=['clarify', 'form'], quiet_mode=True)
-out = {'tools': sorted(d['function']['name'] for d in defs)}
+sets = ['clarify', 'form']
+defs = get_tool_definitions(enabled_toolsets=sets, quiet_mode=True)
+out = {'tools': sorted(d['function']['name'] for d in defs), 'full': None}
+if 'skip_tool_search_assembly' in inspect.signature(get_tool_definitions).parameters:
+    full = get_tool_definitions(enabled_toolsets=sets, quiet_mode=True,
+                                skip_tool_search_assembly=True)
+    out['full'] = sorted(d['function']['name'] for d in full)
 """)
-    assert "form" in out["tools"]
     assert "clarify" in out["tools"]
+    if "form" not in out["tools"]:
+        # Hermes 0.21.6+ offers plugin tools through tool_search instead of
+        # listing them directly; the model reaches form from there.
+        assert "tool_search" in out["tools"], out
+        assert out["full"] and "form" in out["full"], out
 
 
 def test_plugin_loads_clean_under_real_plugin_manager(tmp_path):
@@ -151,7 +164,8 @@ out = {
 """)
     assert out["found"] and out["enabled"], out
     assert out["error"] is None, out
-    assert out["tools"] == ["form"]
+    # u1_kit registers too when the tree carries tools/u1_kit_tool.py.
+    assert "form" in out["tools"] and set(out["tools"]) <= {"form", "u1_kit"}, out
     assert out["hooks"] == ["pre_gateway_dispatch"]
 
 
@@ -170,7 +184,10 @@ def test_run_py_patcher_against_real_gateway_run_py(tmp_path):
     work = tmp_path / "run.py"
     shutil.copy(real_run_py, work)
     pristine = work.read_text()
-    assert inst.RUN_PY_ANCHOR in pristine
+    if inst.RUN_PY_ANCHOR not in pristine:
+        pytest.skip("no clarify-callback anchor in this Hermes build (0.21+): "
+                    "install.py skips the optional run.py fallback and the "
+                    "u1-form plugin publishes the form callback itself")
 
     assert inst._patch_run_py(work, dry_run=False) == "inserted"
     compile(work.read_text(), str(work), "exec")
