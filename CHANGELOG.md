@@ -26,12 +26,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   where an environment has no pip. If neither works, or the check itself
   fails, it says so and prints the commands to run by hand.
 
+- **The print-ready files attach on the tap-form path too.** The hook that
+  records the plate previews, bed photo and review doc for a reply only read
+  the terminal tool, so when the tap form ran the kit through the `u1_kit`
+  tool, those files arrived only if the model copied their paths correctly.
+  It now reads the `u1_kit` tool's output as well.
 - **Running the installer as root no longer leaves root-owned files behind.**
   Hermes commands, the installer's probes and the package removals now run as
   the owner of `HERMES_HOME` (or of the environment being cleaned), and every
   copied file takes the owner of its folder. Hermes 0.21.6 crash-loops the
   gateway on root-owned package-manager state, and root-owned bytecode in a
-  Hermes source tree breaks its later rebuilds.
+  Hermes source tree breaks its later rebuilds. `deploy_to_runtime.sh`'s own
+  check no longer writes root-owned bytecode into the runtime scripts folder.
 
 ### Changed
 
