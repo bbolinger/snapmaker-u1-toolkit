@@ -224,7 +224,9 @@ else
   # Capture stderr+stdout. The workflow's bootstrap prints "[env] current
   # python lacks X; switching to Y" to stderr if it re-execs; that's
   # information worth surfacing on success.
-  HELP_OUTPUT=$("$DEPLOYED_WORKFLOW" --help 2>&1) || HELP_RC=$?
+  # No bytecode: run as root, this check would leave root-owned __pycache__
+  # files in the runtime scripts dir, which the Hermes user cannot replace.
+  HELP_OUTPUT=$(PYTHONDONTWRITEBYTECODE=1 "$DEPLOYED_WORKFLOW" --help 2>&1) || HELP_RC=$?
 
   if (( HELP_RC == 0 )); then
     printf '  ✓  workflow starts cleanly at %s\n' "$DEPLOYED_WORKFLOW"
