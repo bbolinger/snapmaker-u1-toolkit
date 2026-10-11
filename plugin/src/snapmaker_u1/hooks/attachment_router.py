@@ -153,6 +153,15 @@ def make_handler(skill_identifier: str) -> Callable[..., Any]:
 
     def handler(event: Any = None, gateway: Any = None, session_store: Any = None,
                 **kwargs: Any):
+        # Every inbound message: make sure the live adapters can post the
+        # bed-clear question after a reply's photos (idempotent, cheap).
+        if gateway is not None:
+            try:
+                from . import followup
+                followup.install(gateway)
+            except Exception:
+                logger.warning("snapmaker_u1: follow-up sender install failed",
+                               exc_info=True)
         if event is None:
             return None
         try:

@@ -35,6 +35,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **The print-ready message is now written by the toolkit, with the decision
+  last.** The model used to paraphrase the plan into a long message: filler
+  first, a request id, and the yes/no as one plain sentence that scrolled up
+  out of view behind the photos. The reply is now a short card (the model's
+  name; head, material, profile and supports; time and filament; anything to
+  watch, such as a missing bed photo or parts that may need supports), then
+  the plate preview, 3D view, bed photo and review doc, and then the
+  bed-clear question as its own last message, which notifies. Where a chat
+  platform cannot send that follow-up, the question ends the card instead.
+  The YES that starts a print works exactly as before.
 - **The installer's final check loads the deployed folder the way Hermes
   does** and asks Hermes's plugin manager how it loaded `snapmaker_u1`. A
   plugin that is disabled, failed to load, or loads from somewhere else (an

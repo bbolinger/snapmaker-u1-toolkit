@@ -228,6 +228,31 @@ def test_installer_hook_verify_against_real_plugin_manager(tmp_path, monkeypatch
     assert f"Hermes loads it from {hdir}" in result and "(enabled)" in result, result
 
 
+def test_followup_hooks_exist_in_real_hermes(tmp_path):
+    """The bed-clear question is posted from a wrapper around the adapter's
+    on_processing_complete, in the reply's thread, flagged notify. If Hermes
+    renames any of those, this fails instead of the question silently falling
+    back into the card."""
+    home = tmp_path / "home-followup"
+    home.mkdir()
+    out = _run_probe(home, """
+import inspect
+from gateway.platforms import base
+meta = base._mark_notify_metadata(None)
+out = {
+    'complete_is_async': inspect.iscoroutinefunction(
+        base.BasePlatformAdapter.on_processing_complete),
+    'send_params': list(inspect.signature(base.BasePlatformAdapter.send).parameters),
+    'thread_helper': callable(getattr(base, '_thread_metadata_for_event', None)),
+    'notify': meta.get('notify'),
+}
+""")
+    assert out["complete_is_async"], out
+    assert out["send_params"][:3] == ["self", "chat_id", "content"], out
+    assert "metadata" in out["send_params"], out
+    assert out["thread_helper"] and out["notify"] is True, out
+
+
 def test_run_py_patcher_against_real_gateway_run_py(tmp_path):
     """The anchor exists in the real run.py, the patched file compiles, and
     strip-and-reinsert round-trips (idempotent re-runs, in-place upgrades)."""

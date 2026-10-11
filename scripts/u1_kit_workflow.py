@@ -2270,6 +2270,21 @@ def _strip_doc_prefix(stem: str) -> str:
     return stripped or str(stem)
 
 
+def _profile_label_for(profile_slug: str | None, nozzle: str | None) -> str | None:
+    """The profile's own label (e.g. '0.20 Standard') for the operator card;
+    None when the catalog has no entry for it. Fail-soft: a card label must
+    never stop a slice."""
+    if not profile_slug:
+        return None
+    try:
+        for opt in list_profiles(nozzle=nozzle):
+            if opt.get("value") == profile_slug:
+                return opt.get("label")
+    except Exception:
+        return None
+    return None
+
+
 def _invoke_stage2_gate(gate_py: str, argv: list[str], out_dir):
     """Launch the Stage-2 gate DETACHED and return its result, or None if it's
     still running (in the grace window).
@@ -3450,6 +3465,10 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                     "printer_storage_filename": p["printer_storage_filename"],
                     "gcode_hash": p["gcode_hash"]} for p in plates_state],
         "tool": tool_choice, "material": material, "profile": profile_slug,
+        # Human names for the operator card (the model's name without the
+        # chat-cache prefix, the profile's own label).
+        "title": _strip_doc_prefix(archive.stem),
+        "profile_label": _profile_label_for(profile_slug, nozzle),
         "orient": orient, "supports": supports,
         "supports_summary": supports_line,
         "overhang_buckets": overhang_summary,
@@ -5805,6 +5824,8 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                     "printer_storage_filename": p["printer_storage_filename"],
                     "gcode_hash": p["gcode_hash"]} for p in plates_state],
         "tool": tool, "material": material, "profile": profile_slug,
+        "title": _strip_doc_prefix(archive.stem),
+        "profile_label": _profile_label,
         "orient": values.get("orient"), "supports": supports,
         "estimates": _form_estimates,
         "estimated": _form_estimates.get("summary_line"),

@@ -141,6 +141,40 @@ def _session_key() -> str:
     return os.environ.get("HERMES_SESSION_KEY", "").strip()
 
 
+def _session_env(name: str) -> str:
+    """A HERMES_SESSION_* value for this turn (contextvar first, env fallback),
+    the same way ``_session_key`` resolves the key."""
+    try:
+        from gateway.session_context import get_session_env
+        value = (get_session_env(name) or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.environ.get(name, "").strip()
+
+
+_CARD_MAX = 1500
+_QUESTION_MAX = 300
+_PATHLIKE = re.compile(r"^(?:/|~/|[A-Za-z]:[\\/])")
+
+
+def _neutralize(text: Any, limit: int) -> str:
+    """Card text from the marker is untrusted (same-uid writable) and goes into
+    the reply, where core delivers MEDIA: directives and bare local paths as
+    files. Drop every such token, so the text can never smuggle a file out the
+    way a forged path could (audit #2), and cap the length."""
+    if not isinstance(text, str):
+        return ""
+    lines = []
+    for line in text.splitlines():
+        kept = [tok for tok in line.split(" ")
+                if not tok.upper().lstrip("`*_(").startswith("MEDIA:")
+                and not _PATHLIKE.match(tok.lstrip("`*_("))]
+        lines.append(" ".join(kept).rstrip())
+    return "\n".join(lines).strip()[:limit]
+
+
 def _marker_path_for_session() -> Path | None:
     key = _session_key()
     if not key:
@@ -298,6 +332,8 @@ def arm_from_tool_result(tool_output: str) -> int:
         images: list[str] = []
         docs: list[str] = []
         request_id: str | None = None
+        readiness: dict[str, Any] | None = None
+        need: dict[str, Any] | None = None
         for line in tool_output.splitlines():
             line = line.strip()
             if not line.startswith("{"):
@@ -315,6 +351,11 @@ def arm_from_tool_result(tool_output: str) -> int:
                 images.append(str(ev["image"]))
             elif stage == "review_doc" and ev.get("path"):
                 docs.append(str(ev["path"]))
+            elif stage == "kit_readiness_card":
+                readiness = ev
+            elif stage == "need_input" and "bed_clear_start" in (ev.get("key"),
+                                                                 ev.get("need")):
+                need = ev
         safe_imgs = [p for p in dict.fromkeys(images) if _is_safe_artifact(p)]
         safe_docs = [p for p in dict.fromkeys(docs) if _is_safe_artifact(p)]
         if not safe_imgs and not safe_docs:
@@ -330,6 +371,16 @@ def arm_from_tool_result(tool_output: str) -> int:
             "operator": None,
             "created_at": time.time(),
         }
+        if readiness is not None and need is not None:
+            # The print-ready turn: the toolkit writes the operator's message
+            # itself (card + bed-clear question), see operator_card.
+            try:
+                from .operator_card import compose
+                payload["card_text"], payload["question_text"] = compose(readiness, need)
+            except Exception:
+                logger.warning("snapmaker_u1 attach: could not build the "
+                               "operator card; the model's reply stays",
+                               exc_info=True)
         tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, path)
@@ -341,6 +392,32 @@ def arm_from_tool_result(tool_output: str) -> int:
         return len(safe_imgs) + len(safe_docs)
     except Exception:
         return 0
+
+
+def _card_reply(card: str, question: str, paths: list[str],
+                request_id: Any) -> str:
+    """The print-ready reply: the toolkit's card in place of the model's text,
+    then the attachment paths. The bed-clear question goes out as its own last
+    message, after the photos (followup), when this chat's adapter can send
+    one; otherwise it ends the card, so it is never lost."""
+    body = card
+    if question:
+        platform = _session_env("HERMES_SESSION_PLATFORM")
+        chat_id = _session_env("HERMES_SESSION_CHAT_ID")
+        try:
+            from . import followup
+            deferred = bool(platform and chat_id and followup.ready(platform))
+            if deferred:
+                followup.queue(platform, chat_id, question)
+        except Exception:
+            deferred = False
+        if not deferred:
+            body = f"{body}\n\n{question}"
+    logger.info("snapmaker_u1 attachment_injector: replaced the reply with the "
+                "operator card (request_id=%s, %d attachment(s), question %s)",
+                request_id, len(paths),
+                "as a follow-up" if question and body == card else "inline")
+    return body + ("\n\n" + "\n".join(paths) if paths else "")
 
 
 def transform(response_text: str = "", session_id: str = "", model: str = "",
@@ -395,6 +472,12 @@ def transform(response_text: str = "", session_id: str = "", model: str = "",
                                "requests root: %r", sp)
 
         cleaned = _strip_echoed_u1_images(sanitized)
+
+        card = _neutralize(marker.get("card_text"), _CARD_MAX)
+        if card:
+            return _card_reply(card, _neutralize(marker.get("question_text"),
+                                                 _QUESTION_MAX),
+                               paths, marker.get("request_id"))
 
         if not paths:
             # Marker existed but nothing survives on disk. Return the cleaned
