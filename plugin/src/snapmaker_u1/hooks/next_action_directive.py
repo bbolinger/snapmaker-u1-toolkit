@@ -41,6 +41,24 @@ _REQUEST_ID_RE = re.compile(r"u1_\d{4}_\d{4}_[a-f0-9]+")
 def transform(tool_name: str = "", args: Any = None, result: Any = None,
               **kwargs: Any) -> Any:
     """Wrap workflow output containing next_action_required with directive prefix."""
+    if tool_name == "u1_kit":
+        # The deterministic kit tool returns the workflow's own event lines
+        # (render / review_doc / readiness card / bed-clear prompt) as its
+        # result string. Arm the attach marker from them exactly as for the
+        # terminal path below; the tool's own docstring relies on this, but
+        # the terminal-only guard skipped it, so on the tap-form path the
+        # attachments rode on the model echoing paths (live 2026-10-11).
+        # It never carries next_action_required, so nothing is rewritten.
+        text = result
+        if isinstance(result, dict):
+            text = result.get("output") or json.dumps(result)
+        if isinstance(text, str) and text:
+            try:
+                from .attachment_injector import arm_from_tool_result
+                arm_from_tool_result(text)
+            except Exception:
+                pass
+        return None
     if tool_name != "terminal":
         return None  # only target terminal tool output
     if not result:

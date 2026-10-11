@@ -269,3 +269,28 @@ def test_profile_label_comes_from_the_catalog(monkeypatch):
 def test_title_drops_the_chat_cache_prefix():
     assert wf._strip_doc_prefix("doc_f0e7f2d14308_Magnet pocket test coupon") == \
         "Magnet pocket test coupon"
+
+
+# --------------------------------------------------------------------------- #
+# The tap-form path: the u1_kit tool's result arms the card too
+# --------------------------------------------------------------------------- #
+
+def test_u1_kit_tool_result_arms_the_card(hook):
+    """Live 2026-10-11: the tool-result hook only read the terminal tool, so on
+    the u1_kit (tap form) path nothing armed and the model's own text went out."""
+    from snapmaker_u1.hooks import next_action_directive as nad
+    out, paths = _output(hook)
+    summary = json.dumps({"phase": "ready", "request_id": _RID, "readiness_card": _READY})
+    followup._ready_platforms.add("telegram")
+    assert nad.transform(tool_name="u1_kit", args={}, result=out + "\n" + summary) is None
+    reply = ai.transform(response_text=_MODEL_REPLY, session_id="s", platform="telegram")
+    card, question = oc.compose(_READY, _NEED)
+    assert reply == card + "\n\n" + "\n".join(paths)
+    assert followup.pop("telegram", "42") == [question]
+
+
+def test_other_tools_still_do_not_arm(hook):
+    from snapmaker_u1.hooks import next_action_directive as nad
+    out, _ = _output(hook)
+    assert nad.transform(tool_name="web_search", args={}, result=out) is None
+    assert ai.transform(response_text="hello", session_id="s") is None
