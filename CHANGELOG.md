@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [Unreleased]
+## [3.2.0] — 2026-10-11
 
 ### Fixed
 
@@ -25,7 +25,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   environment (also when `HERMES_HOME` names a profile), falling back to uv
   where an environment has no pip. If neither works, or the check itself
   fails, it says so and prints the commands to run by hand.
-
 - **The print-ready files attach on the tap-form path too.** The hook that
   records the plate previews, bed photo and review doc for a reply only read
   the terminal tool, so when the tap form ran the kit through the `u1_kit`
@@ -38,6 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   gateway on root-owned package-manager state, and root-owned bytecode in a
   Hermes source tree breaks its later rebuilds. `deploy_to_runtime.sh`'s own
   check no longer writes root-owned bytecode into the runtime scripts folder.
+- **The installer's interpreter probes run from a new private directory.**
+  They ran from the shared temp directory, where `python -c` would import
+  any module someone had placed there.
 
 ### Changed
 
@@ -63,19 +65,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   alone. Deployed files are made readable to the user the gateway runs as.
 - **`--uninstall` disables both plugins before removing their folders**, so
   Hermes can still find them to disable.
-- **The installer's interpreter probes run from a new private directory.**
-  They ran from the shared temp directory, where `python -c` would import
-  any module someone had placed there.
 - **The checks against a real Hermes tree pass on 0.21.6.** They now accept
   the `u1_kit` tool next to `form`, find `form` behind Hermes's tool search,
   and skip the optional `gateway/run.py` patch on builds without its anchor.
 
 ### Upgrading
 
-`git pull`, re-run `python3 adapters/hermes/install.py`, restart the gateway.
-The hook plugin used to be an editable pip install that picked up new code by
-itself; it is now a copy like `u1-form`, so re-run the installer after every
-pull.
+`git pull`, then `bash deploy_to_runtime.sh` and
+`python3 adapters/hermes/install.py`, then restart the gateway. The hook
+plugin used to be an editable pip install that picked up new code by itself;
+it is now a copy like `u1-form`, so re-run the installer after every pull.
 
 ---
 
