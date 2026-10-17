@@ -27,6 +27,12 @@ python3 tools/extract_profiles_from_printer.py
 
 You can run both. The picker dedupes by profile value (slug), with the higher-priority source winning collisions.
 
+Extracted profiles carry the print's speed, acceleration and jerk settings
+alongside layers, walls and infill, and are stamped with the extractor
+version that wrote them. Profiles from an older extractor are fetched again
+on the next run (or the next form build), so a `from-printer/` populated by
+a release before this one heals itself; nothing needs deleting by hand.
+
 ## See also
 
 - `examples/profiles/` — Brent's personal community profiles, kept as **examples** for handwriting reference. Do not use as defaults; they're tuned for a specific filament/plate combo.

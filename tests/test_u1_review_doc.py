@@ -396,3 +396,41 @@ def test_norm_strips_quotes_so_empty_and_text_fields_match():
            "enable_prime_tower": "1"}
     out = u1_review_doc._sweep_deviations(cfg, ref, skip_keys=set())
     assert {k for k, _, _ in out} == {"enable_prime_tower"}   # only the real one
+
+
+def test_orca_generic_speeds_are_called_out(tmp_path):
+    """A slice that ran at Orca's hard-coded defaults is a slow print waiting
+    to happen; the review doc says so under KEY SETTINGS."""
+    g = tmp_path / "slow.gcode"
+    g.write_text("""G28
+; CONFIG_BLOCK_START
+; layer_height = 0.16
+; outer_wall_speed = 60
+; travel_speed = 120
+; default_acceleration = 500
+; CONFIG_BLOCK_END
+""")
+    plates = _plates(tmp_path)
+    plates[0]["gcode_path"] = str(g)
+    doc = u1_review_doc.generate("u1_2026_1017_abc123", tmp_path / "out", plates, state={})
+    text = Path(doc).read_text()
+    assert "SPEEDS ARE ORCASLICER'S GENERIC DEFAULTS" in text
+    assert "Acceleration (mm/s2):" in text and "500" in text
+
+
+def test_tuned_speeds_are_not_called_out(tmp_path):
+    g = tmp_path / "fast.gcode"
+    g.write_text("""G28
+; CONFIG_BLOCK_START
+; layer_height = 0.16
+; outer_wall_speed = 60
+; travel_speed = 500
+; default_acceleration = 4000
+; CONFIG_BLOCK_END
+""")
+    plates = _plates(tmp_path)
+    plates[0]["gcode_path"] = str(g)
+    doc = u1_review_doc.generate("u1_2026_1017_abc123", tmp_path / "out", plates, state={})
+    text = Path(doc).read_text()
+    assert "GENERIC DEFAULTS" not in text
+    assert "Travel speed (mm/s):" in text

@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Profiles extracted from your prints keep their speeds.** Every
+  `profiles/from-printer/` JSON carried layers, walls, infill and supports,
+  but none of the speed, acceleration or jerk settings, so a slice through
+  the toolkit ran at OrcaSlicer's generic defaults (60 mm/s walls,
+  500 mm/s² acceleration, 120 mm/s travel) instead of the U1's own tuning
+  (150-300 mm/s, 4000-10000 mm/s², 500 mm/s travel). A plate the desktop
+  slicer put at 4.5 h came out at 8.8 h. The extractor now carries all 42
+  speed keys Orca writes into the G-code config block, stamps each profile
+  with its version, and `extract_profiles_from_printer.py` (also the
+  refresh that runs at form build) fetches a profile again when it was
+  written by an older extractor, so an existing `from-printer/` heals
+  itself from the printer's history.
+- **A profile with no speed tuning never reaches the slicer as-is.** At the
+  point every slice goes through, the workflow now fills a speed-less
+  process profile with Snapmaker's stock values for its layer height
+  (`fdm_process_U1_0.16` for 0.16 mm, and so on; `fdm_process_U1_common`
+  otherwise). Only speed, acceleration and jerk keys are copied, a profile
+  that carries any of its own is left alone, and the review document lists
+  the backfill under "Overrides applied to the preset".
+- **A slow print cannot teach the next one to be slow.** A print that ran
+  at Orca's generic defaults would have been extracted as a tuned-looking
+  profile, and because the picker prefers the newest profile of a name, the
+  slow print would have become "0.16 High Quality" for the next slice. The
+  extractor now recognises that exact signature (60 mm/s outer wall,
+  500 mm/s² acceleration, 120 mm/s travel), leaves the speed keys out and
+  notes why, so the stock backfill takes over. Fourteen such prints were
+  found in one printer history.
+- **Short prints extract again.** Moonraker refuses a suffix Range request
+  on a file shorter than the requested tail, so every test coupon and small
+  part came back "no slicer metadata block found". The head+tail fetch now
+  falls back to one bounded request for the whole file when it fits.
+- **Extracted profiles keep their print's date.** A bulk re-extraction used
+  to give every profile the same timestamp, so the picker's "newest wins"
+  tie-break between same-named profiles became arbitrary. Each profile file
+  now carries the G-code's own modified time.
+- **The review document shows inner wall, infill and travel speed and the
+  accelerations**, read from the sliced G-code, and calls out a slice that
+  ran at Orca's generic defaults, so a slow plate is visible before the
+  bed-clear question rather than after the print starts.
+
 ## [3.2.0] — 2026-10-11
 
 ### Fixed

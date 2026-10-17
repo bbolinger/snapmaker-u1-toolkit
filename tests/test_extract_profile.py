@@ -343,3 +343,111 @@ def test_real_world_gcode_end_to_end(tmp_path):
     assert '"' not in p["name"]
     # bed_type mirrored from curr_bed_type so Orca knows the plate
     assert f["bed_type"] == ["Textured PEI Plate"]
+
+
+# ---------- speed / acceleration keys (extractor version 2) ----------
+
+SPEED_GCODE = SAMPLE_GCODE.replace(b"; layer_height = 0.20\n", b"""; layer_height = 0.20
+; outer_wall_speed = 120
+; inner_wall_speed = 300
+; sparse_infill_speed = 270
+; travel_speed = 500
+; travel_speed_z = 12
+; default_acceleration = 10000
+; outer_wall_acceleration = 3000
+; travel_acceleration = 10000
+; overhang_1_4_speed = 0
+; small_perimeter_speed = 50%
+; default_jerk = 0
+""")
+
+
+def test_speed_keys_are_extracted_into_the_process_profile(tmp_path):
+    """A from-printer profile without the speed/acceleration block slices at
+    Orca's generic 60 mm/s / 500 mm/s^2 defaults (a 4.5 h plate took 8.8 h,
+    live 2026-10-17). Every speed key Orca writes must ride along."""
+    g = tmp_path / "fast.gcode"
+    g.write_bytes(SPEED_GCODE)
+    meta = epfg.parse_gcode_metadata(g)
+    prof = epfg.build_process_profile(meta, "P", "Snapmaker U1 (0.4 nozzle)")
+    assert prof["outer_wall_speed"] == "120"
+    assert prof["inner_wall_speed"] == "300"
+    assert prof["sparse_infill_speed"] == "270"
+    assert prof["travel_speed"] == "500"
+    assert prof["travel_speed_z"] == "12"          # prefix sibling kept apart
+    assert prof["default_acceleration"] == "10000"
+    assert prof["outer_wall_acceleration"] == "3000"
+    assert prof["travel_acceleration"] == "10000"
+    assert prof["overhang_1_4_speed"] == "0"
+    assert prof["small_perimeter_speed"] == "50%"
+    assert prof["default_jerk"] == "0"
+
+
+def test_speed_keys_never_leak_into_the_filament_profile(tmp_path):
+    g = tmp_path / "fast.gcode"
+    g.write_bytes(SPEED_GCODE)
+    meta = epfg.parse_gcode_metadata(g)
+    fil = epfg.build_filament_profile(meta, "F", "Snapmaker U1 (0.4 nozzle)")
+    assert not any(k in fil for k in epfg.PROCESS_SPEED_KEYS)
+
+
+def test_process_profile_is_stamped_with_the_extractor_version():
+    prof = epfg.build_process_profile({"layer_height": "0.2"}, "P", "Snapmaker U1 (0.4 nozzle)")
+    assert prof[epfg.EXTRACTOR_VERSION_KEY] == epfg.EXTRACTOR_VERSION
+    assert epfg.EXTRACTOR_VERSION >= 2
+
+
+def test_speed_key_list_matches_the_workflow_copy():
+    """The workflow backfills exactly the keys the extractor carries; the two
+    lists live in different stdlib-only modules and must not drift."""
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    sys.path.insert(0, str(scripts))
+    import u1_slice_workflow as sw
+    assert list(sw.PROCESS_SPEED_KEYS) == list(epfg.PROCESS_SPEED_KEYS)
+
+
+GENERIC_GCODE = SAMPLE_GCODE.replace(b"; layer_height = 0.20\n", b"""; layer_height = 0.20
+; outer_wall_speed = 60
+; inner_wall_speed = 60
+; sparse_infill_speed = 100
+; travel_speed = 120
+; default_acceleration = 500
+; outer_wall_acceleration = 500
+""")
+
+
+def test_orca_generic_speeds_are_not_learned_back(tmp_path):
+    """A print sliced at Orca's hard-coded defaults (a profile with no speed
+    tuning) must not become a tuned-looking profile: the picker prefers the
+    newest profile of a name, so the slow print would make the next slice slow
+    again (live 2026-10-17). Its speed keys are left out and the reason noted."""
+    g = tmp_path / "slow.gcode"
+    g.write_bytes(GENERIC_GCODE)
+    meta = epfg.parse_gcode_metadata(g)
+    assert epfg.speeds_are_orca_generic(meta)
+    prof = epfg.build_process_profile(meta, "P", "Snapmaker U1 (0.4 nozzle)")
+    assert not any(k in prof for k in epfg.PROCESS_SPEED_KEYS)
+    assert "generic defaults" in prof[epfg.SPEEDS_DROPPED_KEY]
+    assert prof["wall_loops"] == "6"            # everything else still carried
+    assert prof[epfg.EXTRACTOR_VERSION_KEY] >= 3
+
+
+def test_tuned_speeds_that_merely_share_one_default_are_kept(tmp_path):
+    """Brent's own 0.16 tuning has outer_wall_speed 60 too, but 4000 mm/s^2
+    and 500 mm/s travel: that is tuning, and it stays."""
+    g = tmp_path / "tuned.gcode"
+    g.write_bytes(SAMPLE_GCODE.replace(b"; layer_height = 0.20\n", b"""; layer_height = 0.16
+; outer_wall_speed = 60
+; travel_speed = 500
+; default_acceleration = 4000
+"""))
+    meta = epfg.parse_gcode_metadata(g)
+    assert not epfg.speeds_are_orca_generic(meta)
+    prof = epfg.build_process_profile(meta, "P", "Snapmaker U1 (0.4 nozzle)")
+    assert prof["default_acceleration"] == "4000"
+    assert epfg.SPEEDS_DROPPED_KEY not in prof
+
+
+def test_missing_speed_keys_are_not_called_generic():
+    assert not epfg.speeds_are_orca_generic({"outer_wall_speed": "60"})
+    assert not epfg.speeds_are_orca_generic({})

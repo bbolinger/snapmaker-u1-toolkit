@@ -112,7 +112,7 @@ OrcaSlicer's bundled Snapmaker process profiles **do not always resolve inherita
 
 **Workaround**: use profiles whose inheritance chain CLI can resolve. Three good options today:
 
-- `tools/extract_profiles_from_printer.py` writes **flat process JSONs from your successful prints** (no inheritance) — physics-validated AND CLI-safe by construction. Best default.
+- `tools/extract_profiles_from_printer.py` writes **flat process JSONs from your successful prints** (no inheritance, speeds and accelerations included) — physics-validated AND CLI-safe by construction. Best default. A flat profile that carries no speed settings at all is topped up with Snapmaker's stock values for its layer height at slice time, so it cannot fall through to Orca's generic 60 mm/s defaults.
 - `tools/fetch_snapmaker_profiles.py` pulls Snapmaker's upstream stock — CLI resolves these against the bundled OrcaSlicer install when the install matches the stock branch.
 - `examples/profiles/community_merged_*` (in `examples/`) is the legacy flat-profile shape; if you're handwriting your own, follow that pattern. The `_override` variants only work in the GUI where Orca resolves the official base profile. The same flatness logic applies to the bundled machine profile above.
 

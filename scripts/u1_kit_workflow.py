@@ -179,6 +179,7 @@ from u1_slice_workflow import (
     profile_path,
     apply_supports_override,
     apply_profile_overrides,
+    speed_backfill_note,
     _tool_to_index,
 )
 
@@ -3427,7 +3428,8 @@ def _emit_confirm_card(args, operator: str, archive: Path, kit: dict[str, Any],
                        "parts": ", ".join(p["part_id"] for p in selected)},
             overrides=([f"supports forced {'ON' if supports == 'supports' else 'OFF'} "
                         f"by your answer (preset value overridden)"]
-                       if supports in ("supports", "no_supports") else None),
+                       if supports in ("supports", "no_supports") else [])
+                      + [n for n in [speed_backfill_note(process)] if n],
             operator=operator,
             reference=u1_review_doc.build_reference(
                 profile_slug, material, nozzle=nozzle, out_dir=out_dir),
@@ -5790,6 +5792,7 @@ def _commit_kit_legacy(args, request_id, operator, out_dir, events_file,
                        "supports": supports,
                        "parts": _parts_display,
                        **({"quantity": quantity} if quantity > 1 else {})},
+            overrides=[n for n in [speed_backfill_note(process)] if n],
             operator=operator,
             reference=u1_review_doc.build_reference(
                 profile_slug, material, nozzle=nozzle, out_dir=out_dir),

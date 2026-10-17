@@ -49,6 +49,11 @@ _KEY_SETTINGS: list[tuple[str, list[str]]] = [
     ("Support type", ["support_type"]),
     ("Brim", ["brim_type"]),
     ("Outer wall speed (mm/s)", ["outer_wall_speed"]),
+    ("Inner wall speed (mm/s)", ["inner_wall_speed"]),
+    ("Infill speed (mm/s)", ["sparse_infill_speed"]),
+    ("Travel speed (mm/s)", ["travel_speed"]),
+    ("Acceleration (mm/s2)", ["default_acceleration"]),
+    ("Outer wall acceleration (mm/s2)", ["outer_wall_acceleration"]),
     ("Seam position", ["seam_position"]),
     ("Fuzzy skin", ["fuzzy_skin"]),
 ]
@@ -290,6 +295,24 @@ def _ascii(v: Any) -> str:
     return out.encode("ascii", "ignore").decode("ascii")
 
 
+# OrcaSlicer's hard-coded speed defaults: what a slice gets when the process
+# profile carries no speed tuning (mirrors
+# tools/extract_profile_from_gcode.ORCA_GENERIC_SPEED_SIGNATURE).
+_ORCA_GENERIC_SPEEDS = {"outer_wall_speed": 60.0, "default_acceleration": 500.0,
+                        "travel_speed": 120.0}
+
+
+def _speeds_are_orca_generic(config: dict[str, str]) -> bool:
+    for key, default in _ORCA_GENERIC_SPEEDS.items():
+        try:
+            got = float(str(config.get(key, "")).strip().strip('"'))
+        except ValueError:
+            return False
+        if abs(got - default) > 1e-6:
+            return False
+    return True
+
+
 def generate(
     request_id: str,
     out_dir: Path,
@@ -386,6 +409,12 @@ def generate(
             if note:
                 line += "   " + note
             L.append(line)
+        if _speeds_are_orca_generic(config):
+            L.append("")
+            L.append("  !! SPEEDS ARE ORCASLICER'S GENERIC DEFAULTS (60 mm/s outer wall,")
+            L.append("     500 mm/s^2, 120 mm/s travel), not Snapmaker U1 tuning. The")
+            L.append("     picked profile carries no speed settings; expect a print about")
+            L.append("     twice as long as the U1 stock profile would take.")
         others = []
         if reference:
             curated_keys = {k for _, keys in _KEY_SETTINGS for k in keys}

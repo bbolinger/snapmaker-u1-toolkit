@@ -745,6 +745,148 @@ def _materialize_flat_filament(filament_path: Path, out_dir: Path, orca_bin: Pat
     return out
 
 
+# Speed, acceleration and jerk keys of a process profile. Mirrors
+# tools/extract_profile_from_gcode.PROCESS_SPEED_KEYS (a test keeps the two
+# lists identical). A process profile that carries NONE of them slices at
+# Orca's built-in defaults (60 mm/s walls, 500 mm/s^2, 120 mm/s travel), far
+# below the U1's stock tuning (150-300 mm/s, 4000-10000 mm/s^2, 500 mm/s
+# travel). Every profiles/from-printer JSON written before extractor
+# version 2 was like that, and a 4.5 h plate re-sliced through the toolkit
+# took 8.8 h (live 2026-10-17). backfill_speed_settings() closes the hole
+# at the single materialization point every slice goes through.
+PROCESS_SPEED_KEYS = (
+    "outer_wall_speed", "inner_wall_speed", "small_perimeter_speed",
+    "small_perimeter_threshold",
+    "sparse_infill_speed", "internal_solid_infill_speed",
+    "top_surface_speed", "gap_infill_speed", "ironing_speed",
+    "support_speed", "support_interface_speed", "bridge_speed",
+    "initial_layer_speed", "initial_layer_infill_speed",
+    "initial_layer_travel_speed",
+    "travel_speed", "travel_speed_z",
+    "enable_overhang_speed", "overhang_speed_classic",
+    "overhang_1_4_speed", "overhang_2_4_speed", "overhang_3_4_speed",
+    "overhang_4_4_speed", "overhang_totally_speed",
+    "default_acceleration", "outer_wall_acceleration",
+    "inner_wall_acceleration", "sparse_infill_acceleration",
+    "internal_solid_infill_acceleration", "top_surface_acceleration",
+    "initial_layer_acceleration", "bridge_acceleration",
+    "travel_acceleration", "accel_to_decel_enable", "accel_to_decel_factor",
+    "default_jerk", "outer_wall_jerk", "inner_wall_jerk", "infill_jerk",
+    "top_surface_jerk", "initial_layer_jerk", "travel_jerk",
+)
+
+# The two keys whose absence means "this profile has no speed tuning at
+# all". Any real Orca process layer carries at least one of them.
+_SPEED_SENTINEL_KEYS = ("outer_wall_speed", "default_acceleration")
+
+SPEED_BACKFILL_KEY = "_u1_speed_backfill"
+
+
+def _vendor_profile_dirs(orca_bin: Path | None = None) -> list[Path]:
+    """Directories holding Snapmaker's bundled vendor profiles (the
+    fdm_process_U1_* chain), in lookup order. Empty when no Orca tree is
+    reachable (test harnesses, wrapper binaries)."""
+    if orca_bin is None:
+        orca_bin = DEFAULT_ORCA
+    vendor_dirs: list[Path] = []
+    resources = orca_resources_root(orca_bin)
+    vendor_root_candidates = (
+        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
+    ) + [
+        Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
+        Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
+    ]
+    for vendor_root in vendor_root_candidates:
+        try:
+            if not vendor_root.exists():
+                continue
+        except OSError:
+            continue
+        if vendor_root not in vendor_dirs:
+            vendor_dirs.append(vendor_root)
+        for sub in ('process', 'filament', 'machine'):
+            cand = vendor_root / sub
+            if cand.is_dir() and cand not in vendor_dirs:
+                vendor_dirs.append(cand)
+    return vendor_dirs
+
+
+def stock_speed_layer(layer_height: str | float | None, orca_bin: Path | None = None,
+                      vendor_dirs: list[Path] | None = None) -> tuple[str, dict[str, Any]] | None:
+    """The flattened stock U1 process layer whose speed tuning matches
+    ``layer_height`` (``fdm_process_U1_0.16`` for 0.16 mm, ...), falling back
+    to ``fdm_process_U1_common``. Returns ``(layer_name, flattened_dict)`` or
+    None when the vendor chain is not reachable."""
+    dirs = list(vendor_dirs) if vendor_dirs is not None else _vendor_profile_dirs(orca_bin)
+    names: list[str] = []
+    try:
+        lh = float(str(layer_height).strip())
+        names.append(f"fdm_process_U1_{lh:.2f}")
+    except (TypeError, ValueError):
+        pass
+    names.append("fdm_process_U1_common")
+    for name in names:
+        for d in dirs:
+            cand = d / f"{name}.json"
+            try:
+                if not cand.is_file():
+                    continue
+            except OSError:
+                continue
+            merged = _flatten_process_profile(cand, orca_bin)
+            if any(k in merged for k in _SPEED_SENTINEL_KEYS):
+                return name, merged
+    return None
+
+
+def backfill_speed_settings(data: dict[str, Any], orca_bin: Path | None = None,
+                            vendor_dirs: list[Path] | None = None) -> list[str]:
+    """If ``data`` (a flattened process profile) carries no speed tuning at
+    all, copy the stock U1 speed/acceleration/jerk values for its layer
+    height into it. Returns the list of keys that were filled in (empty when
+    the profile already had speeds, or no stock layer was found).
+
+    Only PROCESS_SPEED_KEYS are copied, nothing else from the stock layer, and
+    a profile that carries even one sentinel key is left untouched: this is a
+    floor under a hole, not a re-tune."""
+    if any(k in data for k in _SPEED_SENTINEL_KEYS):
+        return []
+    found = stock_speed_layer(data.get("layer_height"), orca_bin, vendor_dirs)
+    if found is None:
+        return []
+    layer_name, stock = found
+    filled: list[str] = []
+    for key in PROCESS_SPEED_KEYS:
+        if key in stock and key not in data:
+            data[key] = stock[key]
+            filled.append(key)
+    if filled:
+        data[SPEED_BACKFILL_KEY] = {"from": layer_name, "keys": filled}
+        data.setdefault('_u1_workflow_notes', []).append(
+            f'speed/acceleration settings backfilled from Snapmaker stock '
+            f'{layer_name} ({len(filled)} keys): the picked profile carried none, '
+            f'and Orca would have sliced at its generic 60 mm/s / 500 mm/s^2 defaults')
+    return filled
+
+
+def speed_backfill_note(process_path: Path | str | None) -> str | None:
+    """Human-readable line for the review doc when the materialized process
+    profile at ``process_path`` had its speeds backfilled; None otherwise."""
+    if not process_path:
+        return None
+    try:
+        data = json.loads(Path(process_path).read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    info = data.get(SPEED_BACKFILL_KEY)
+    if not isinstance(info, dict) or not info.get("keys"):
+        return None
+    return (f"speed/acceleration settings taken from Snapmaker stock "
+            f"{info.get('from', '?')} because the picked profile had none "
+            f"(outer wall {data.get('outer_wall_speed', '?')} mm/s, "
+            f"acceleration {data.get('default_acceleration', '?')} mm/s^2)")
+
+
 def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -> dict[str, Any]:
     """Walk the `inherits` chain and merge each layer into a self-contained
     dict. Most-derived (leaf) wins on conflicts.
@@ -771,29 +913,10 @@ def _flatten_process_profile(process_path: Path, orca_bin: Path | None = None) -
 
     if orca_bin is None:
         orca_bin = DEFAULT_ORCA
-    vendor_dirs: list[Path] = []
     # Primary path: orca_bin's own resources tree (portable OR AppImage, via
     # orca_resources_root). Fallbacks for the test-harness/wrapper case where
     # the binary isn't inside a real Orca tree.
-    resources = orca_resources_root(orca_bin)
-    vendor_root_candidates = (
-        [resources / 'profiles' / 'Snapmaker'] if resources is not None else []
-    ) + [
-        Path('/opt/data/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
-        Path('/appdata/hermes/tools/orcaslicer/squashfs-root/resources/profiles/Snapmaker'),
-    ]
-    for vendor_root in vendor_root_candidates:
-        try:
-            if not vendor_root.exists():
-                continue
-        except OSError:
-            continue
-        if vendor_root not in vendor_dirs:
-            vendor_dirs.append(vendor_root)
-        for sub in ('process', 'filament', 'machine'):
-            cand = vendor_root / sub
-            if cand.is_dir() and cand not in vendor_dirs:
-                vendor_dirs.append(cand)
+    vendor_dirs = _vendor_profile_dirs(orca_bin)
 
     while cur_path is not None and cur_path.exists():
         try:
@@ -854,6 +977,11 @@ def apply_supports_override(process_path: Path, enable_support: bool, out_dir: P
     Returns the temp file path."""
     data = _flatten_process_profile(process_path)
     data['enable_support'] = '1' if enable_support else '0'
+    # A profile with no speed tuning (every from-printer JSON before extractor
+    # version 2) must never reach Orca as-is: it would slice at the generic
+    # 60 mm/s / 500 mm/s^2 defaults. Fill the stock U1 values for its layer
+    # height; the review doc reports the backfill as an override.
+    backfill_speed_settings(data)
     # The toolkit's plate previews (top-down footprint + 3D iso) are built by
     # parsing M486 object markers out of the sliced gcode, which Orca only emits
     # when exclude_object is on. Stock/user presets carry exclude_object=1, but a

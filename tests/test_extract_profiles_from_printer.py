@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -23,6 +24,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(TOOLS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import extract_profile_from_gcode as epfg  # noqa: E402
 import extract_profiles_from_printer as epfp  # noqa: E402
 
 
@@ -238,21 +240,45 @@ def test_head_tail_download_concatenates_ranges(tmp_path, monkeypatch):
     assert any(r.startswith('bytes=-') for r in seen)
 
 
-def test_head_tail_download_distrusts_ignored_range(tmp_path, monkeypatch):
-    """If the server ignores Range (200), don't treat the body as a settings
-    tail — write head-only so the caller finds no footer and skips."""
+def test_head_tail_download_distrusts_ignored_range_on_a_long_file(tmp_path, monkeypatch):
+    """If the server ignores Range (200) on a file longer than the head+tail
+    window, don't treat the body as a settings tail — write head-only so the
+    caller finds no footer and skips."""
     monkeypatch.setattr(urllib.request, 'urlopen',
-                        lambda req, timeout=None: _Resp(200, b'X' * 30))
+                        lambda req, timeout=None: _Resp(200, b'X' * 300))
     dest = tmp_path / 'g.gcode'
     epfp.http_download_head_tail('http://x/g', dest, head_bytes=16, tail_bytes=16)
-    assert dest.stat().st_size == 16  # head-only, not both slices
+    assert dest.stat().st_size == 16  # head-only, not a truncated prefix
+
+
+def test_head_tail_download_fetches_a_short_file_whole(tmp_path, monkeypatch):
+    """A print shorter than tail_bytes makes Moonraker refuse the suffix range
+    (416). Every toolkit-sliced test coupon is like that, and the old head-only
+    fallback found no footer for any of them (live 2026-10-17). The file fits in
+    the head+tail window, so it is fetched whole, footer included."""
+    whole = b'HEAD\n' + b'.' * 40 + b'\n; layer_height = 0.2\n'
+
+    def fake_urlopen(req, timeout=None):
+        rng = req.headers.get('Range', '')
+        if rng.startswith('bytes=-'):
+            raise urllib.error.HTTPError(req.full_url, 416, 'Range Not Satisfiable', {}, None)
+        start, _, end = rng[len('bytes='):].partition('-')
+        return _Resp(206, whole[int(start):int(end) + 1])
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    dest = tmp_path / 'g.gcode'
+    n = epfp.http_download_head_tail('http://x/g', dest, head_bytes=16, tail_bytes=64)
+    assert n == len(whole)
+    assert dest.read_bytes() == whole
+    assert epfg.parse_gcode_metadata(dest)['layer_height'] == '0.2'
 
 
 def test_refresh_from_printer_incremental_skip(tmp_path, monkeypatch):
     """Skips prints already extracted, tail-fetches only the new ones."""
     out = tmp_path / 'from-printer'
     out.mkdir()
-    (out / (epfp.safe_basename('g1.gcode') + '_process.json')).write_text('{}')
+    (out / (epfp.safe_basename('g1.gcode') + '_process.json')).write_text(
+        json.dumps({epfg.EXTRACTOR_VERSION_KEY: epfg.EXTRACTOR_VERSION}))
     monkeypatch.setattr(epfp, 'list_gcodes',
                         lambda h, p, timeout=12.0: [{'path': 'g1.gcode'}, {'path': 'g2.gcode'}])
     seen = {}
@@ -267,3 +293,67 @@ def test_refresh_from_printer_incremental_skip(tmp_path, monkeypatch):
     assert summary['skipped'] == 1          # g1 already had a profile
     assert summary['extracted'] == ['g2']   # only g2 fetched
     assert seen['tail_bytes']               # fetched tail-only, not the full file
+
+
+def test_refresh_from_printer_re_extracts_profiles_from_an_older_extractor(tmp_path, monkeypatch):
+    """A version-1 profile (no stamp, no speed keys) is fetched again so an
+    existing from-printer/ heals itself; a current one is still skipped."""
+    out = tmp_path / 'from-printer'
+    out.mkdir()
+    (out / (epfp.safe_basename('old.gcode') + '_process.json')).write_text(
+        json.dumps({"layer_height": "0.16", "wall_loops": "4"}))
+    (out / (epfp.safe_basename('cur.gcode') + '_process.json')).write_text(
+        json.dumps({epfg.EXTRACTOR_VERSION_KEY: epfg.EXTRACTOR_VERSION}))
+    (out / (epfp.safe_basename('junk.gcode') + '_process.json')).write_text('not json')
+    monkeypatch.setattr(epfp, 'list_gcodes',
+                        lambda h, p, timeout=12.0: [{'path': 'old.gcode'}, {'path': 'cur.gcode'},
+                                                    {'path': 'junk.gcode'}])
+    fetched = []
+
+    def fake_extract_one(host, port, name, output_dir, *, tail_bytes=None, **k):
+        fetched.append(name)
+        (output_dir / (epfp.safe_basename(name) + '_process.json')).write_text(
+            json.dumps({epfg.EXTRACTOR_VERSION_KEY: epfg.EXTRACTOR_VERSION}))
+        return {'ok': True}
+
+    monkeypatch.setattr(epfp, 'extract_one', fake_extract_one)
+    summary = epfp.refresh_from_printer(host='h', port=1, output_dir=out, limit=5)
+    assert fetched == ['old.gcode', 'junk.gcode']
+    assert summary['skipped'] == 1
+    assert summary['extracted'] == ['old', 'junk']
+    # now everything is current: a second pass fetches nothing
+    fetched.clear()
+    epfp.refresh_from_printer(host='h', port=1, output_dir=out, limit=5)
+    assert fetched == []
+
+
+def test_extracted_profiles_carry_the_print_time_as_mtime(tmp_path, monkeypatch):
+    """The picker breaks a name tie by newest file; a bulk re-extraction gives
+    every profile the same mtime, so "0.16 High Quality" would resolve to an
+    arbitrary print (live 2026-10-17). The profile files take the G-code's
+    own modified time instead, so the latest print still wins."""
+    gcode = b'; layer_height = 0.2\n; print_settings_id = P\nT0\n'
+    monkeypatch.setattr(epfp, 'http_download_head_tail',
+                        lambda url, dest, **k: (dest.write_bytes(gcode), len(gcode))[1])
+    out = tmp_path / 'from-printer'
+    res = epfp.extract_one('h', 1, 'old_print.gcode', out, tail_bytes=64, modified=1700000000.0)
+    assert res['ok']
+    assert int(Path(res['process_out']).stat().st_mtime) == 1700000000
+    assert int(Path(res['filament_out']).stat().st_mtime) == 1700000000
+
+
+def test_refresh_passes_the_listing_modified_time(tmp_path, monkeypatch):
+    out = tmp_path / 'from-printer'
+    out.mkdir()
+    monkeypatch.setattr(epfp, 'list_gcodes',
+                        lambda h, p, timeout=12.0: [{'path': 'g.gcode', 'modified': 1700000000.0}])
+    seen = {}
+
+    def fake_extract_one(host, port, name, output_dir, *, modified=None, **k):
+        seen['modified'] = modified
+        (output_dir / (epfp.safe_basename(name) + '_process.json')).write_text('{}')
+        return {'ok': True}
+
+    monkeypatch.setattr(epfp, 'extract_one', fake_extract_one)
+    epfp.refresh_from_printer(host='h', port=1, output_dir=out, limit=5)
+    assert seen['modified'] == 1700000000.0

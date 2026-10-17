@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -146,10 +147,19 @@ def http_download_head_tail(url: str, dest: Path, *, head_bytes: int = 262144,
 
     hs, head = _range(f"bytes=0-{head_bytes - 1}", head_bytes)
     ts, tail = _range(f"bytes=-{tail_bytes}", tail_bytes)
-    # Only trust the tail slice when the server honored the suffix range (206);
-    # otherwise `tail` is just the file start again and carries no settings
-    # footer, so write head-only and let the caller find no metadata + skip.
-    body = ((head if hs == 206 else b"") + tail) if ts == 206 else head
+    if ts == 206:
+        # Only trust the tail slice when the server honored the suffix range.
+        body = (head if hs == 206 else b"") + tail
+    else:
+        # The suffix range was refused (416: the file is shorter than
+        # tail_bytes, which every small print is) or ignored (200). One more
+        # BOUNDED request for the first head+tail bytes: a file that fits in
+        # that window arrives whole, settings footer included; a longer file
+        # arrives truncated (detected by reading one byte past the window) and
+        # is written head-only, so the caller finds no footer and skips.
+        cap = head_bytes + tail_bytes
+        ws, whole = _range(f"bytes=0-{cap - 1}", cap + 1)
+        body = whole if (ws in (200, 206) and 0 < len(whole) <= cap) else head
     dest.write_bytes(body)
     return len(body)
 
@@ -187,9 +197,15 @@ def extract_one(
     download_dir: Path | None = None,
     head_bytes: int = 262144,
     tail_bytes: int | None = None,
+    modified: float | None = None,
 ) -> dict[str, Any]:
     """Download one G-code from the printer + extract its process + filament
     profiles into output_dir. Returns a summary dict for reporting.
+
+    ``modified`` (the G-code's Moonraker ``modified`` timestamp) is stamped
+    onto both profile files as their mtime: the picker breaks a name tie by
+    newest file, and a bulk re-extraction would otherwise make every profile
+    the same age and let an arbitrary print win (live 2026-10-17).
 
     When ``tail_bytes`` is set, only the G-code's head + tail are fetched via
     Range requests (settings live in the trailing comment block; the tool in the
@@ -236,6 +252,13 @@ def extract_one(
     filament_out = output_dir / f"{slug}_filament.json"
     process_out.write_text(json.dumps(process, indent=4), encoding="utf-8")
     filament_out.write_text(json.dumps(filament, indent=4), encoding="utf-8")
+    if modified:
+        try:
+            ts = float(modified)
+            os.utime(process_out, (ts, ts))
+            os.utime(filament_out, (ts, ts))
+        except (OSError, ValueError, TypeError):
+            pass
 
     if not keep_gcode:
         local.unlink(missing_ok=True)
@@ -253,9 +276,23 @@ def extract_one(
 
 
 def already_extracted(output_dir: Path, file_path: str) -> bool:
-    """True if this G-code's process profile is already in output_dir — the
-    incremental-skip key so a spool of reprints doesn't re-fetch every time."""
-    return (output_dir / f"{safe_basename(file_path)}_process.json").exists()
+    """True if this G-code's process profile is already in output_dir AND was
+    written by the current extractor — the incremental-skip key so a spool of
+    reprints doesn't re-fetch every time.
+
+    A profile stamped by an older extractor (or not stamped at all) counts as
+    NOT extracted, so it is fetched again and rewritten with the keys the
+    current version carries. Version 1 profiles had no speed/acceleration
+    settings and sliced at Orca's generic defaults (live 2026-10-17)."""
+    out = output_dir / f"{safe_basename(file_path)}_process.json"
+    if not out.exists():
+        return False
+    try:
+        data = json.loads(out.read_text(encoding="utf-8"))
+        stamp = int(data.get(epfg.EXTRACTOR_VERSION_KEY) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return stamp >= epfg.EXTRACTOR_VERSION
 
 
 def refresh_from_printer(host: str | None = None, port: int | None = None,
@@ -288,7 +325,8 @@ def refresh_from_printer(host: str | None = None, port: int | None = None,
                 summary["skipped"] += 1
                 continue
             res = extract_one(host, int(port), name, output_dir, vendor=vendor,
-                              head_bytes=head_bytes, tail_bytes=tail_bytes)
+                              head_bytes=head_bytes, tail_bytes=tail_bytes,
+                              modified=g.get("modified"))
             if res.get("ok"):
                 summary["extracted"].append(safe_basename(name))
             else:
@@ -381,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
         result = extract_one(
             host, port, g["path"], args.output_dir,
             vendor=args.vendor, brand_label=args.brand_label,
-            keep_gcode=args.keep_gcode,
+            keep_gcode=args.keep_gcode, modified=g.get("modified"),
         )
         if result["ok"]:
             ok_count += 1

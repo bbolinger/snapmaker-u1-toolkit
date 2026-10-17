@@ -36,6 +36,61 @@ from typing import Any
 # Keys we'll pull from the G-code metadata block. Mirrors the "wanted" list in
 # u1_upload_gcode.parse_gcode_metadata, plus the slicer keys we actually use to
 # reconstruct profiles. Keep this list broad — missing keys are silently skipped.
+# Speed, acceleration and jerk keys of a process profile. Orca writes every
+# one of them into the G-code config block as a plain scalar. They MUST be
+# carried into the extracted profile: a process JSON without them makes the
+# headless slicer fall back to Orca's generic defaults (60 mm/s walls,
+# 500 mm/s^2, 120 mm/s travel) instead of the U1's own tuning (150-300 mm/s,
+# 4000-10000 mm/s^2, 500 mm/s travel). Every from-printer profile extracted
+# before version 2 lacked them, and a 4.5 h plate re-sliced through the
+# toolkit took 8.8 h (live 2026-10-17). u1_slice_workflow.PROCESS_SPEED_KEYS
+# mirrors this list; tests keep the two in sync.
+PROCESS_SPEED_KEYS = [
+    "outer_wall_speed", "inner_wall_speed", "small_perimeter_speed",
+    "small_perimeter_threshold",
+    "sparse_infill_speed", "internal_solid_infill_speed",
+    "top_surface_speed", "gap_infill_speed", "ironing_speed",
+    "support_speed", "support_interface_speed", "bridge_speed",
+    "initial_layer_speed", "initial_layer_infill_speed",
+    "initial_layer_travel_speed",
+    "travel_speed", "travel_speed_z",
+    "enable_overhang_speed", "overhang_speed_classic",
+    "overhang_1_4_speed", "overhang_2_4_speed", "overhang_3_4_speed",
+    "overhang_4_4_speed", "overhang_totally_speed",
+    "default_acceleration", "outer_wall_acceleration",
+    "inner_wall_acceleration", "sparse_infill_acceleration",
+    "internal_solid_infill_acceleration", "top_surface_acceleration",
+    "initial_layer_acceleration", "bridge_acceleration",
+    "travel_acceleration", "accel_to_decel_enable", "accel_to_decel_factor",
+    "default_jerk", "outer_wall_jerk", "inner_wall_jerk", "infill_jerk",
+    "top_surface_jerk", "initial_layer_jerk", "travel_jerk",
+]
+
+# OrcaSlicer's hard-coded process defaults, the values a slice gets when the
+# process profile carries no speed tuning at all. A print whose config block
+# shows exactly these did not run on anybody's tuning; it ran on the hole.
+# Learning them back into a from-printer profile would make the hole
+# self-perpetuating: the slow print becomes the newest profile of its name,
+# the picker prefers the newest, and the next slice is slow again (live
+# 2026-10-17: the 8.8 h plate became "0.16 High Quality"). Such a profile
+# is written WITHOUT speed keys, so the slice-time backfill supplies the
+# U1 stock values instead.
+ORCA_GENERIC_SPEED_SIGNATURE = {
+    "outer_wall_speed": "60",
+    "default_acceleration": "500",
+    "travel_speed": "120",
+}
+SPEEDS_DROPPED_KEY = "_u1_speeds_dropped"
+
+# Bumped whenever build_process_profile() changes what it carries.
+# extract_profiles_from_printer re-extracts a profile whose stamp is older
+# than this, so an existing from-printer/ heals itself.
+#   1: no speed keys at all
+#   2: speed/acceleration/jerk keys carried
+#   3: speed keys dropped again when they are Orca's generic defaults
+EXTRACTOR_VERSION = 3
+EXTRACTOR_VERSION_KEY = "_u1_extractor_version"
+
 GCODE_KEYS = [
     # process
     "printer_settings_id", "print_settings_id", "nozzle_diameter",
@@ -49,6 +104,7 @@ GCODE_KEYS = [
     "brim_type", "brim_width", "raft_layers",
     "curr_bed_type", "bed_temperature", "first_layer_bed_temperature",
     "skirt_loops",
+    *PROCESS_SPEED_KEYS,
     # filament
     "filament_type", "filament_vendor", "filament_settings_id",
     "filament_diameter", "filament_flow_ratio", "filament_density",
@@ -141,6 +197,7 @@ PROCESS_FIELDS_FROM_META = [
     "enable_support", "support_type", "support_threshold_angle",
     "brim_type", "brim_width", "raft_layers", "skirt_loops",
     "curr_bed_type",
+    *PROCESS_SPEED_KEYS,
 ]
 
 FILAMENT_FIELDS_FROM_META = [
@@ -159,6 +216,25 @@ FILAMENT_FIELDS_FROM_META = [
 ]
 
 
+def _num(value: Any) -> float | None:
+    try:
+        return float(str(value).strip().rstrip('%'))
+    except (TypeError, ValueError):
+        return None
+
+
+def speeds_are_orca_generic(meta: dict[str, Any]) -> bool:
+    """True when the config block carries exactly Orca's hard-coded speed
+    defaults (see ORCA_GENERIC_SPEED_SIGNATURE), i.e. the print was sliced
+    from a profile with no speed tuning. Any key missing or different means
+    somebody tuned it, and the values are kept."""
+    for key, default in ORCA_GENERIC_SPEED_SIGNATURE.items():
+        got = _num(meta.get(key))
+        if got is None or abs(got - float(default)) > 1e-6:
+            return False
+    return True
+
+
 def build_process_profile(
     meta: dict[str, str],
     name: str,
@@ -175,10 +251,18 @@ def build_process_profile(
         "setting_id": "GP003",
         "compatible_printers": [compatible_printer],
         "print_settings_id": name,
+        EXTRACTOR_VERSION_KEY: EXTRACTOR_VERSION,
     }
     for key in PROCESS_FIELDS_FROM_META:
         if key in meta:
             profile[key] = meta[key]
+    if speeds_are_orca_generic(meta):
+        for key in PROCESS_SPEED_KEYS:
+            profile.pop(key, None)
+        profile[SPEEDS_DROPPED_KEY] = (
+            "the print ran at OrcaSlicer's generic defaults (60 mm/s outer wall, "
+            "500 mm/s^2, 120 mm/s travel), not on U1 tuning; left out so the "
+            "slice-time backfill supplies Snapmaker's stock speeds")
     # nozzle_diameter belongs to the printer config, but slicers also write
     # it into the per-process metadata. Multi-tool G-code emits it as a CSV
     # (e.g. "0.4,0.4,0.4,0.4") — we want the single per-extruder value here.
